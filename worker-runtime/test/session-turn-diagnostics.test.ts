@@ -28,7 +28,7 @@ it("distinguishes a failed tool from a failed model across a reset without retur
       return { isError: true, output: [{ type: "text", text: "private-tool-result" }] };
     },
   }] }] });
-  await (await run.submit("private-first-prompt")).wait(BACKGROUND_CONTEXT);
+  await (await run.submit("private-first-prompt", null)).wait(BACKGROUND_CONTEXT);
   const first = run.hosted.sessionSummary();
   if (first.state !== "observed") throw new Error("missing first generation");
   await run.reset();
@@ -80,7 +80,7 @@ it("bounds sparse pages even when no diagnostic events appear in the newest stor
   expect(newest?.events).toEqual([]);
   if (newest?.nextBefore == null) throw new Error("the empty window must still advance");
   expect(run.hosted.sessionTurnDiagnostics(summary.session.sessionId, newest.nextBefore)?.events)
-    .toContainEqual({ kind: "input", at: expect.any(Number), messageId: "operation-1" });
+    .toContainEqual({ kind: "input", at: expect.any(Number), messageId: "operation-1", settlement: { outcome: "answered" } });
 });
 
 it("reports a bounded evidence gap without discarding other turns", async () => {
@@ -93,7 +93,31 @@ it("reports a bounded evidence gap without discarding other turns", async () => 
     data: { text: "private oversize content ".repeat(10_000) },
   });
   const page = run.hosted.sessionTurnDiagnostics(summary.session.sessionId);
-  expect(page?.events.map(({ kind }) => kind)).toEqual(["input", "response_finished", "evidence_gap"]);
+  expect(page?.events.map(({ kind }) => kind)).toEqual(["input", "model_attempt", "evidence_gap"]);
   expect(page?.events.at(-1)).toEqual({ kind: "evidence_gap", at: null, code: "record_too_large" });
   expect(JSON.stringify(page)).not.toContain("private oversize content");
+});
+
+it("pages through compaction heads without mistaking them for a reset boundary", async () => {
+  const run = await session(() => answer("private-answer"));
+  const first = await (await run.submit("private-before-reset")).wait(BACKGROUND_CONTEXT);
+  if (first.type !== "input" || first.status !== "done") throw new Error("expected a retained input");
+  const summary = run.hosted.sessionSummary();
+  if (summary.state !== "observed") throw new Error("expected the first generation");
+  for (let i = 0; i < 68; i++)
+    await run.writeRecord({ kind: "pi.compaction", head: first.entry, data: { text: "private-summary" } });
+  await run.reset();
+  await (await run.submit("private-after-reset")).wait(BACKGROUND_CONTEXT);
+  const events = [];
+  let before: number | undefined;
+  for (let i = 0; i < 4; i++) {
+    const page = run.hosted.sessionTurnDiagnostics(summary.session.sessionId, before);
+    if (!page) throw new Error("expected retained evidence");
+    events.unshift(...page.events);
+    if (page.nextBefore === null) break;
+    before = page.nextBefore;
+  }
+  expect(events.filter((event) => event.kind === "input").map((event) => event.messageId))
+    .toEqual(["operation-1"]);
+  expect(JSON.stringify(events)).not.toMatch(/private-/);
 });

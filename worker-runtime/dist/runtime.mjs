@@ -51670,41 +51670,27 @@ var REFUSED_STATUS = word("401|402|403");
 var TOOL_CALL = /tool.?call/i;
 var TOOL_CALL_OUTPUT_LIMIT = /output.?(?:limit|space|token)/i;
 var TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|supported.?limit/i;
-function modelDiagnosticCode(errorMessage) {
+function failedTurnReason(errorMessage) {
   const raw = errorMessage ?? "";
   if (raw.includes("billing_unavailable"))
     return "billing_unavailable";
   if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
-    return "image_input_unavailable";
+    return "The selected model cannot read images.";
   if (TIMEOUT.test(raw))
-    return "model_timeout";
+    return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
-    return "model_unreachable";
+    return "The model service could not be reached.";
   if (BUSY.test(raw) || BUSY_STATUS.test(raw))
-    return "model_busy";
+    return "The model is busy right now.";
   if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
-    return "model_refused";
+    return "The model request was refused.";
   if (TOOL_CALL.test(raw)) {
     if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
-      return "tool_output_limit";
+      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
     if (TOOL_CALL_TOO_LARGE.test(raw))
-      return "tool_input_limit";
+      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
   }
-  return "model_error";
-}
-var modelFailureText = {
-  billing_unavailable: "billing_unavailable",
-  image_input_unavailable: "The selected model cannot read images.",
-  model_timeout: "The model request timed out.",
-  model_unreachable: "The model service could not be reached.",
-  model_busy: "The model is busy right now.",
-  model_refused: "The model request was refused.",
-  tool_output_limit: "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.",
-  tool_input_limit: "The model wrote a tool call that was too large. Ask for the content in smaller parts.",
-  model_error: "The model request failed."
-};
-function failedTurnReason(errorMessage) {
-  return modelFailureText[modelDiagnosticCode(errorMessage)];
+  return "The model request failed.";
 }
 function terminalError(messages, index) {
   const message = messages[index];
@@ -57261,6 +57247,12 @@ function readSessionBounds(sql, objectId, sessionId) {
     return null;
   }
 }
+function ensureDiagnosticResetIndex(sql) {
+  if (!sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_entries'").toArray()[0])
+    return;
+  sql.exec(`CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads
+    ON pi_entries (conversation_id, id) WHERE head=id`);
+}
 function readBoundedDiagnosticWindow(sql, objectId, sessionId) {
   const prefix = `${objectId}:`;
   if (!sessionId.startsWith(prefix))
@@ -57270,26 +57262,19 @@ function readBoundedDiagnosticWindow(sql, objectId, sessionId) {
   if (!Number.isSafeInteger(anchor) || anchor < 0 || String(anchor) !== suffix)
     return null;
   const maxHeadBytes = 128 * 1024;
-  const maxHeads = 64;
   try {
     if (anchor !== 0 && !sql.exec(`SELECT id FROM pi_entries WHERE conversation_id=? AND id=? AND head=id
        AND CASE WHEN length(CAST(record AS BLOB)) <= ? THEN json_extract(record, '$.kind') END = ?`, ROOT_CONVERSATION_ID, anchor, maxHeadBytes, RESET_KIND).toArray()[0])
       return null;
-    const heads = sql.exec(`SELECT id, head, CASE WHEN head=id AND length(CAST(record AS BLOB)) <= ?
-           THEN json_extract(record, '$.kind') END AS kind
-       FROM pi_entries INDEXED BY pi_entry_heads_by_conversation
-       WHERE conversation_id=? AND id>? AND head IS NOT NULL ORDER BY id LIMIT ?`, maxHeadBytes, ROOT_CONVERSATION_ID, anchor, maxHeads + 1).toArray();
-    for (const row of heads) {
-      if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || row.id <= anchor)
-        return null;
-      if (row.head !== row.id)
-        continue;
-      if (typeof row.kind !== "string")
-        return null;
-      if (row.kind === RESET_KIND)
-        return { anchor, upper: row.id - 1 };
-    }
-    return heads.length > maxHeads ? null : { anchor, upper: MAX_ID };
+    const next = sql.exec(`SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ?
+                      THEN json_extract(record, '$.kind') END AS kind
+       FROM pi_entries INDEXED BY cadence_diagnostic_reset_heads
+       WHERE conversation_id=? AND id>? AND head=id ORDER BY id LIMIT 1`, maxHeadBytes, ROOT_CONVERSATION_ID, anchor).toArray()[0];
+    if (!next)
+      return { anchor, upper: MAX_ID };
+    if (next.kind !== RESET_KIND || typeof next.id !== "number" || !Number.isSafeInteger(next.id) || next.id <= anchor)
+      return null;
+    return { anchor, upper: next.id - 1 };
   } catch {
     return null;
   }
@@ -57364,6 +57349,50 @@ var MAX_MODEL_MESSAGES = 4;
 var MAX_RECORD_BYTES2 = 128 * 1024;
 var IDENTIFIER = /^[A-Za-z0-9_.:-]{1,200}$/;
 var MODEL = /^[A-Za-z0-9_-][A-Za-z0-9_./:-]{0,159}$/;
+var STOP_REASONS = ["stop", "length", "toolUse", "error", "aborted", "pending", "deferred"];
+var UNANSWERED_REASONS = [
+  "model_error",
+  "no_model",
+  "aborted",
+  "reset",
+  "stale",
+  "faulted",
+  "orphaned",
+  "interrupted",
+  "restart_limit",
+  "nothing_to_answer",
+  "turn_limit"
+];
+function known(allowed, value) {
+  return typeof value === "string" && allowed.includes(value) ? value : null;
+}
+function safeModel(value) {
+  return typeof value === "string" && MODEL.test(value) && !value.includes("://") ? value : null;
+}
+function inputSettlement(sql, messageId, entryId, upper) {
+  const rows = sql.exec(`WITH candidates AS MATERIALIZED (
+       SELECT status, CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record END AS record
+       FROM pi_submissions INDEXED BY pi_submissions_by_request
+       WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2
+     )
+     SELECT status, json_extract(record, '$.status') AS storedStatus, json_extract(record, '$.type') AS type,
+       json_extract(record, '$.entry') AS entry, json_extract(record, '$.answer') AS answer,
+       substr(json_extract(record, '$.reason'), 1, 32) AS reason
+     FROM candidates`, MAX_RECORD_BYTES2, ROOT_CONVERSATION_ID, JSON.stringify(messageId)).toArray();
+  const row = rows[0];
+  if (rows.length !== 1 || row?.type !== "input" || row.entry !== entryId || row.status !== row.storedStatus)
+    return null;
+  if (row.status === "unanswered") {
+    return { outcome: "unanswered", reason: known(UNANSWERED_REASONS, row.reason) };
+  }
+  if (row.status === "done" && typeof row.answer === "number" && Number.isSafeInteger(row.answer) && row.answer > entryId && row.answer <= upper) {
+    return { outcome: "answered" };
+  }
+  return null;
+}
+function safeToolName(value) {
+  return typeof value === "string" && IDENTIFIER.test(value) ? value : null;
+}
 function toolReference(value) {
   if (typeof value !== "string" || value.length === 0)
     return null;
@@ -57376,6 +57405,9 @@ function gap(code) {
 }
 function timestamp(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000 ? value : null;
+}
+function boundedInteger(value, min, max) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
 }
 function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
   const bounds = readBoundedDiagnosticWindow(sql, objectId, sessionId);
@@ -57394,8 +57426,7 @@ function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
          WHERE conversation_id=? AND id>? AND id<=? ORDER BY id DESC LIMIT ?
        )
        SELECT id, record IS NULL AS oversized,
-         CASE WHEN json_extract(record,'$.kind') = ?
-           AND json_extract(record,'$.data.transcriptRole') = 'operator' THEN 1 ELSE 0 END AS isInput,
+         CASE WHEN json_extract(record,'$.kind') = ? THEN 1 ELSE 0 END AS isInput,
          CASE WHEN json_type(record, '$.data.messageId')='text'
            THEN substr(json_extract(record, '$.data.messageId'), 1, 201) END AS messageId,
          json_extract(record, '$.model[0].timestamp') AS inputAt,
@@ -57405,11 +57436,21 @@ function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
              'role', json_extract(m.value, '$.role'),
              'at', json_extract(m.value, '$.timestamp'),
              'model', substr(json_extract(m.value, '$.model'), 1, 161),
+             'responseModel', substr(json_extract(m.value, '$.responseModel'), 1, 161),
              'stop', json_extract(m.value, '$.stopReason'),
-             'error', CASE WHEN json_extract(m.value, '$.stopReason')='error'
-               THEN substr(json_extract(m.value, '$.errorMessage'), 1, 4096) END,
+             'toolName', substr(json_extract(m.value, '$.toolName'), 1, 201),
              'toolUseId', json_extract(m.value, '$.toolCallId'),
-             'isError', json_extract(m.value, '$.isError'),
+             'isError', json_type(m.value, '$.isError'),
+             'failure', json(CASE WHEN json_extract(m.value, '$.stopReason')='error' THEN (
+               SELECT json_object(
+                 'status', CASE WHEN json_type(d.value, '$.details.status')='integer'
+                   THEN json_extract(d.value, '$.details.status') END,
+                 'code', CASE WHEN json_type(d.value, '$.details.code')='integer'
+                   THEN json_extract(d.value, '$.details.code') END
+               ) FROM json_each(m.value, '$.diagnostics') d
+               WHERE d.type='object' AND json_extract(d.value, '$.type')='cloudflare-error'
+               ORDER BY d.key DESC LIMIT 1
+             ) END),
              'calls', json(CASE WHEN json_extract(m.value, '$.role')='assistant' THEN (
                SELECT json_group_array(json(call)) FROM (
                  SELECT json_object(
@@ -57438,42 +57479,53 @@ function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
       if (row.oversized === 1)
         group.push(gap("record_too_large"));
       if (row.isInput === 1) {
+        let messageId;
         try {
-          group.push({ kind: "input", at: timestamp(row.inputAt), messageId: requireOperationId(row.messageId) });
+          messageId = requireOperationId(row.messageId);
         } catch {
           group.push(gap("identifier_unavailable"));
+        }
+        if (messageId !== undefined) {
+          group.push({
+            kind: "input",
+            at: timestamp(row.inputAt),
+            messageId,
+            settlement: inputSettlement(sql, messageId, row.id, bounds.upper)
+          });
         }
       }
       const evidence = JSON.parse(row.evidence);
       if (evidence.length > MAX_MODEL_MESSAGES || evidence.some((entry) => entry.calls.length > MAX_EVENTS)) {
         group = [gap("too_many_events")];
-      } else
+      } else {
         for (const entry of evidence) {
           const at = timestamp(entry.at);
           if (entry.role === "toolResult") {
             const toolUseId = toolReference(entry.toolUseId);
-            group.push(toolUseId === null ? gap("identifier_unavailable") : { kind: "tool_result", at, toolUseId, outcome: entry.isError === 1 ? "error" : "ok" });
+            const toolName = safeToolName(entry.toolName);
+            group.push(toolUseId === null || entry.isError !== "true" && entry.isError !== "false" ? gap("identifier_unavailable") : { kind: "tool_result", at, toolName, toolUseId, outcome: entry.isError === "true" ? "error" : "ok" });
             continue;
           }
+          group.push({
+            kind: "model_attempt",
+            at,
+            model: safeModel(entry.model),
+            responseModel: safeModel(entry.responseModel),
+            stopReason: known(STOP_REASONS, entry.stop),
+            httpStatus: boundedInteger(entry.failure?.status, 400, 599),
+            providerCode: boundedInteger(entry.failure?.code, 0, 999999)
+          });
           for (const call of entry.calls) {
-            const toolName = typeof call.name === "string" && IDENTIFIER.test(call.name) ? call.name : null;
+            const toolName = safeToolName(call.name);
             const toolUseId = toolReference(call.id);
             group.push(toolName === null || toolUseId === null ? gap("identifier_unavailable") : { kind: "tool_call", at, toolName, toolUseId });
           }
-          const model = typeof entry.model === "string" && MODEL.test(entry.model) && !entry.model.includes("://") ? entry.model : null;
-          if (entry.stop === "error") {
-            group.push({ kind: "model_error", at, model, code: modelDiagnosticCode(entry.error ?? undefined) });
-          } else if (entry.stop === "stop" || entry.stop === "length") {
-            group.push({ kind: "response_finished", at, model, reason: entry.stop });
-          }
         }
+      }
       if (group.length > MAX_EVENTS)
         group = [gap("too_many_events")];
-      if (eventCount + group.length > MAX_EVENTS) {
-        if (oldest === null)
-          return null;
+      if (eventCount + group.length > MAX_EVENTS)
         break;
-      }
       groups.push(group);
       eventCount += group.length;
       oldest = row.id;
@@ -58033,6 +58085,7 @@ class HostedSession extends DurableObject {
       throw new Error("HostedSession requires a named conversation");
     this.operationScopes = new OperationScopes(ctx.storage.sql);
     this.contextBudgetProofs = new ContextBudgetProofs(ctx.storage.sql);
+    ensureDiagnosticResetIndex(ctx.storage.sql);
     const acceptsImages = options.acceptsToolImages === true;
     const model = defaultModel(options.modelAlias, acceptsImages || options.attachedImages !== undefined);
     const authority = {
@@ -58108,6 +58161,7 @@ class HostedSession extends DurableObject {
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
+        ensureDiagnosticResetIndex(this.ctx.storage.sql);
         configureOperationReplyCapture(this.ctx.storage.sql, options.captureOperationReplies === true);
         if (skillsEnabled) {
           const sources = await runtimeSkillSources(options.workspaceSkills === undefined ? undefined : () => options.workspaceSkills());

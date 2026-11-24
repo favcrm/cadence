@@ -10,7 +10,7 @@ export type {
   AskResult,
   AssistantIdentityContext,
   GenerationIdentity,
-  HostedModelDiagnosticCode,
+  HostedInputSettlement,
   HostedRunFailureCode,
   HostedSessionInspection,
   HostedSessionOptions,

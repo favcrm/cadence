@@ -1,17 +1,18 @@
 {
   "toolFailure": {
     "events": [
-      { "kind": "input", "at": null, "messageId": "operation-1" },
+      { "kind": "input", "at": null, "messageId": "operation-1", "settlement": { "outcome": "answered" } },
+      { "kind": "model_attempt", "at": null, "model": "default", "responseModel": "synthetic-model", "stopReason": "toolUse", "httpStatus": null, "providerCode": null },
       { "kind": "tool_call", "at": null, "toolName": "lookup_audit_catalog", "toolUseId": "lookup:1" },
-      { "kind": "tool_result", "at": null, "toolUseId": "lookup:1", "outcome": "error" },
-      { "kind": "response_finished", "at": null, "model": "default", "reason": "stop" }
+      { "kind": "tool_result", "at": null, "toolName": "lookup_audit_catalog", "toolUseId": "lookup:1", "outcome": "error" },
+      { "kind": "model_attempt", "at": null, "model": "default", "responseModel": "synthetic-model", "stopReason": "stop", "httpStatus": null, "providerCode": null }
     ],
     "nextBefore": null
   },
   "modelFailure": {
     "events": [
-      { "kind": "input", "at": null, "messageId": "operation-2" },
-      { "kind": "model_error", "at": null, "model": "default", "code": "model_refused" }
+      { "kind": "input", "at": null, "messageId": "operation-2", "settlement": { "outcome": "unanswered", "reason": "model_error" } },
+      { "kind": "model_attempt", "at": null, "model": "default", "responseModel": null, "stopReason": "error", "httpStatus": 403, "providerCode": null }
     ],
     "nextBefore": null
   }

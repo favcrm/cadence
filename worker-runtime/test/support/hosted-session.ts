@@ -12,6 +12,7 @@ import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { BOARD_MESSAGE_KIND, type GenerationIdentity, type ThreadEntry } from "../../src/contract.ts";
 import { defaultModel } from "../../src/model.ts";
 import type { ModelTaskContext } from "../../src/model-task-context.ts";
+import { ensureDiagnosticResetIndex } from "../../src/session-summary.ts";
 
 // The Workers module is absent in Bun; install its lifecycle stub before
 // loading the real session. The engine and SQLite are not stubbed. A runtime
@@ -175,6 +176,7 @@ export async function session(
     },
     BACKGROUND_CONTEXT,
   );
+  ensureDiagnosticResetIndex(sql);
   cleanups.push(async () => { await harness.close(BACKGROUND_CONTEXT); database.close(); });
   const conversation = await harness.root(BACKGROUND_CONTEXT, {
     agent: { model: { provider: defaultModel("default").provider, modelId: "default" } },
@@ -204,11 +206,11 @@ export async function session(
       ctx: { id, storage: { sql: { exec() { throw new Error("SQL unavailable"); } } } },
       options: {},
     }) as InstanceType<typeof HostedSession>).sessionTranscript(sessionId, 0),
-    async submit(content: string) {
+    async submit(content: string, transcriptRole: "operator" | null = "operator") {
       const id = `operation-${++operations}`;
       return conversation.submit({
         type: "input", requestId: id, content,
-        entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: id, transcriptRole: "operator" } },
+        entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: id, ...(transcriptRole && { transcriptRole }) } },
       }, BACKGROUND_CONTEXT);
     },
   };

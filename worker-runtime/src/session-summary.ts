@@ -132,10 +132,17 @@ export function readSessionBounds(
 }
 
 /**
- * Diagnostics needs only identity and a reset window, not the summary's
- * first/last activity or run scans. Bound the partial-index head candidates
- * before inspecting their records. Too much head evidence fails closed.
+ * Install during session storage initialization, not during a diagnostics read.
+ * Pi's ordinary head index also contains compaction anchors, which are not resets.
  */
+export function ensureDiagnosticResetIndex(sql: TaskSql): void {
+  if (!sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_entries'").toArray()[0])
+    return;
+  sql.exec(`CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads
+    ON pi_entries (conversation_id, id) WHERE head=id`);
+}
+
+/** Diagnostics needs only a proven reset window, not the summary's activity or run scans. */
 export function readBoundedDiagnosticWindow(
   sql: TaskSql,
   objectId: string,
@@ -147,7 +154,6 @@ export function readBoundedDiagnosticWindow(
   const anchor = Number(suffix);
   if (!Number.isSafeInteger(anchor) || anchor < 0 || String(anchor) !== suffix) return null;
   const maxHeadBytes = 128 * 1024;
-  const maxHeads = 64;
   try {
     if (anchor !== 0 && !sql.exec(
       `SELECT id FROM pi_entries WHERE conversation_id=? AND id=? AND head=id
@@ -155,20 +161,17 @@ export function readBoundedDiagnosticWindow(
       ROOT_CONVERSATION_ID, anchor, maxHeadBytes, RESET_KIND,
     ).toArray()[0]) return null;
 
-    const heads = sql.exec(
-      `SELECT id, head, CASE WHEN head=id AND length(CAST(record AS BLOB)) <= ?
-           THEN json_extract(record, '$.kind') END AS kind
-       FROM pi_entries INDEXED BY pi_entry_heads_by_conversation
-       WHERE conversation_id=? AND id>? AND head IS NOT NULL ORDER BY id LIMIT ?`,
-      maxHeadBytes, ROOT_CONVERSATION_ID, anchor, maxHeads + 1,
-    ).toArray();
-    for (const row of heads) {
-      if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || row.id <= anchor) return null;
-      if (row.head !== row.id) continue;
-      if (typeof row.kind !== "string") return null;
-      if (row.kind === RESET_KIND) return { anchor, upper: row.id - 1 };
-    }
-    return heads.length > maxHeads ? null : { anchor, upper: MAX_ID };
+    const next = sql.exec(
+      `SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ?
+                      THEN json_extract(record, '$.kind') END AS kind
+       FROM pi_entries INDEXED BY cadence_diagnostic_reset_heads
+       WHERE conversation_id=? AND id>? AND head=id ORDER BY id LIMIT 1`,
+      maxHeadBytes, ROOT_CONVERSATION_ID, anchor,
+    ).toArray()[0];
+    if (!next) return { anchor, upper: MAX_ID };
+    if (next.kind !== RESET_KIND || typeof next.id !== "number" ||
+        !Number.isSafeInteger(next.id) || next.id <= anchor) return null;
+    return { anchor, upper: next.id - 1 };
   } catch {
     return null;
   }

@@ -446,24 +446,23 @@ export type HostedSessionInspection =
   | { readonly state: "observed"; readonly session: HostedSessionSummary }
   | { readonly state: "unobserved" | "unknown" };
 
-export type HostedModelDiagnosticCode =
-  | "model_error"
-  | "model_timeout"
-  | "model_unreachable"
-  | "model_busy"
-  | "model_refused"
-  | "image_input_unavailable"
-  | "billing_unavailable"
-  | "tool_output_limit"
-  | "tool_input_limit";
+export type HostedInputSettlement =
+  | { outcome: "answered" }
+  | { outcome: "unanswered"; reason: HostedRunFailureCode | "aborted" | "reset" | "stale" | "nothing_to_answer" | null };
 
 /** Committed observations, not inferred turn outcomes. No conversation content. */
 export type HostedTurnDiagnosticEvent = { at: number | null } & (
-  | { kind: "input"; messageId: string }
+  | { kind: "input"; messageId: string; settlement: HostedInputSettlement | null }
   | { kind: "tool_call"; toolName: string; toolUseId: string }
-  | { kind: "tool_result"; toolUseId: string; outcome: "ok" | "error" }
-  | { kind: "model_error"; model: string | null; code: HostedModelDiagnosticCode }
-  | { kind: "response_finished"; model: string | null; reason: "stop" | "length" }
+  | { kind: "tool_result"; toolName: string | null; toolUseId: string; outcome: "ok" | "error" }
+  | {
+      kind: "model_attempt";
+      model: string | null;
+      responseModel: string | null;
+      stopReason: "stop" | "length" | "toolUse" | "error" | "aborted" | "pending" | "deferred" | null;
+      httpStatus: number | null;
+      providerCode: number | null;
+    }
   | { kind: "evidence_gap"; code: "record_too_large" | "too_many_events" | "identifier_unavailable" }
 );
 

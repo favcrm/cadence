@@ -3,7 +3,6 @@ import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import {
   BOARD_MESSAGE_KIND,
-  type HostedModelDiagnosticCode,
   type ThreadEntry,
   type ThreadProjection,
 } from "./contract.ts";
@@ -31,35 +30,25 @@ const TOOL_CALL_OUTPUT_LIMIT = /output.?(?:limit|space|token)/i;
 const TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|supported.?limit/i;
 
 /** Classify private provider text; never expose its URLs, keys or diagnostics. */
-export function modelDiagnosticCode(errorMessage: string | undefined): HostedModelDiagnosticCode {
+export function failedTurnReason(errorMessage: string | undefined): string {
   const raw = errorMessage ?? "";
   if (raw.includes("billing_unavailable")) return "billing_unavailable";
-  if (raw.includes(IMAGE_INPUT_UNAVAILABLE)) return "image_input_unavailable";
-  if (TIMEOUT.test(raw)) return "model_timeout";
-  if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw)) return "model_unreachable";
-  if (BUSY.test(raw) || BUSY_STATUS.test(raw)) return "model_busy";
-  if (REFUSED.test(raw) || REFUSED_STATUS.test(raw)) return "model_refused";
+  if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
+    return "The selected model cannot read images.";
+  if (TIMEOUT.test(raw)) return "The model request timed out.";
+  if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
+    return "The model service could not be reached.";
+  if (BUSY.test(raw) || BUSY_STATUS.test(raw))
+    return "The model is busy right now.";
+  if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
+    return "The model request was refused.";
   if (TOOL_CALL.test(raw)) {
-    if (TOOL_CALL_OUTPUT_LIMIT.test(raw)) return "tool_output_limit";
-    if (TOOL_CALL_TOO_LARGE.test(raw)) return "tool_input_limit";
+    if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
+      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
+    if (TOOL_CALL_TOO_LARGE.test(raw))
+      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
   }
-  return "model_error";
-}
-
-const modelFailureText: Record<HostedModelDiagnosticCode, string> = {
-  billing_unavailable: "billing_unavailable",
-  image_input_unavailable: "The selected model cannot read images.",
-  model_timeout: "The model request timed out.",
-  model_unreachable: "The model service could not be reached.",
-  model_busy: "The model is busy right now.",
-  model_refused: "The model request was refused.",
-  tool_output_limit: "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.",
-  tool_input_limit: "The model wrote a tool call that was too large. Ask for the content in smaller parts.",
-  model_error: "The model request failed.",
-};
-
-export function failedTurnReason(errorMessage: string | undefined): string {
-  return modelFailureText[modelDiagnosticCode(errorMessage)];
+  return "The model request failed.";
 }
 
 export type PiMessage = NonNullable<EntryRecord["model"]>[number];
