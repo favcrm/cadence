@@ -505,7 +505,7 @@ function AuditTab({ write, t }: { write: StagedWrite; t: Say }) {
 }
 
 /** How long a newly shown item ignores Approve and Deny. */
-const ARM_MS = 800;
+export const ARM_MS = 800;
 
 /**
  * CAD-2186: one staged write in the shared DrawerShell, with the queue of

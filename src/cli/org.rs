@@ -521,6 +521,9 @@ pub(super) fn run(action: OrgAction) -> Result<i32> {
             file.write(&registry)?;
             view(&c, true)
         }
+        OrgAction::Login { .. } => {
+            unreachable!("org login dispatches before org::run");
+        }
     };
     print_json(&out);
     Ok(0)
@@ -1380,6 +1383,30 @@ pub(crate) enum OrgAction {
     Inspect {
         /// Org name; default is the saved/`CADENCE_ORG` selection.
         name: Option<String>,
+    },
+    /// Sign in to a hosted org (`cadence org login [--as-assistant]`).
+    Login {
+        /// Workspace slug hint.
+        #[arg(value_name = "SLUG", conflicts_with = "slug")]
+        hint: Option<String>,
+        /// Override hosted issuer URL.
+        #[arg(long)]
+        issuer: Option<String>,
+        /// Workspace slug hint (`--slug <org>`).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Switch default org to this workspace after login.
+        #[arg(long = "use")]
+        use_: bool,
+        /// Do not print browser launch links automatically.
+        #[arg(long)]
+        no_open: bool,
+        /// Override credential directory.
+        #[arg(long)]
+        auth_dir: Option<PathBuf>,
+        /// CAD-2747: request an assistant-scoped session (`actor_mode: "assistant"`).
+        #[arg(long)]
+        as_assistant: bool,
     },
 }
 

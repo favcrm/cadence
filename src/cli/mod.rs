@@ -205,6 +205,14 @@ pub(crate) struct Cli {
     /// still starting. Only used when the selected org is remote.
     #[arg(long, global = true, default_value_t = cadence_agent::remote_cli::WAKE_TIMEOUT_DEFAULT)]
     wake_timeout: u64,
+    /// CAD-2747: impersonate a workspace agent profile (`ap_<id>`) for unmanaged
+    /// hosted CLI calls instead of defaulting to the user's personal assistant.
+    #[arg(long, value_name = "PROFILE_ID")]
+    agent: Option<String>,
+    /// CAD-2747: explicitly act with the human login credential on unmanaged
+    /// external harness CLI calls (requires a human-mode login).
+    #[arg(long, global = true)]
+    as_human: bool,
     /// The argument ids the command line itself typed, read at the CLI
     /// entry (`action_dispatch::run`). `None` when no entry read them, so
     /// the client-only updater refuses instead of assuming none were typed.

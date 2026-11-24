@@ -598,5 +598,6 @@ pub(super) fn refuse_managed(target: &RemoteTarget, command: &str) -> Result<()>
              Nothing was sent."
         )));
     }
+    cadence_agent::remote_cli::refuse_non_human_actor(Some(target), command)?;
     Ok(())
 }

@@ -4693,4 +4693,116 @@ mod cad2009_device_token_uncertainty_acceptance {
             }
         }
     }
+    #[test]
+    fn cad2747_assistant_device_flow_requests_and_persists_actor_mode() {
+        struct AssistantRuntime {
+            baseline: Instant,
+            elapsed: u64,
+            saw_actor_mode: bool,
+            grant: Value,
+        }
+        impl LoginRuntime for AssistantRuntime {
+            fn now(&mut self) -> Instant {
+                self.baseline + Duration::from_secs(self.elapsed)
+            }
+            fn wait(&mut self, interval: Duration) {
+                self.elapsed += interval.as_secs();
+            }
+            fn post_public(
+                &mut self,
+                _issuer: &str,
+                path: &str,
+                body: Value,
+                _access: Option<&AccessIngress>,
+            ) -> Result<(u16, Value)> {
+                match path {
+                    "/v1/hosted-cadence/device/code" => {
+                        assert_eq!(body["actor_mode"], "assistant");
+                        self.saw_actor_mode = true;
+                        Ok((200, browser_code(60)))
+                    }
+                    "/v1/hosted-cadence/device/token" => Ok((200, self.grant.clone())),
+                    other => panic!("unexpected path {other}"),
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("assistant");
+        let issuer = "https://issuer.example.test";
+        trust(&dir, issuer);
+        let mut assistant_grant = login_grant_body();
+        assistant_grant["organization_slug"] = json!("acme");
+        assistant_grant["audience"] = json!(format!("https://acme{CLOUD_SUFFIX}"));
+        assistant_grant["capabilities"] =
+            json!(["cli.read", "cli.write", "wiki.read", "wiki.write"]);
+        assistant_grant["cli_session"]["actor_mode"] = json!("assistant");
+
+        let mut runtime = AssistantRuntime {
+            baseline: Instant::now(),
+            elapsed: 0,
+            saw_actor_mode: false,
+            grant: assistant_grant,
+        };
+        let grant = login_device_flow_with(
+            issuer,
+            None,
+            Some("acme"),
+            &dir,
+            |_, _| Ok(()),
+            &mut runtime,
+            LoginScope::Wiki,
+            false,
+            false,
+            true,
+        )
+        .expect("assistant device login must succeed");
+        assert!(runtime.saw_actor_mode);
+        assert_eq!(grant.actor_mode(), Some("assistant"));
+        grant.save_credential(&dir).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&fs::read(dir.join("cli-acme.json")).unwrap()).unwrap();
+        assert_eq!(saved["cli_session"]["actor_mode"], "assistant");
+
+        // An omitted or downgraded actor_mode on `--as-assistant` must refuse.
+        let mut omitted_grant = login_grant_body();
+        omitted_grant["organization_slug"] = json!("acme");
+        omitted_grant["audience"] = json!(format!("https://acme{CLOUD_SUFFIX}"));
+        omitted_grant["capabilities"] = json!(["cli.read", "cli.write", "wiki.read", "wiki.write"]);
+        let mut bad_runtime = AssistantRuntime {
+            baseline: Instant::now(),
+            elapsed: 0,
+            saw_actor_mode: false,
+            grant: omitted_grant,
+        };
+        assert!(login_device_flow_with(
+            issuer,
+            None,
+            Some("acme"),
+            &dir,
+            |_, _| Ok(()),
+            &mut bad_runtime,
+            LoginScope::Wiki,
+            false,
+            false,
+            true,
+        )
+        .is_err());
+
+        // Production CLI session POST wrapper must admit `/actor-credential`.
+        let answer = cli_session_post_with(
+            &dir,
+            issuer,
+            "/v1/hosted-cadence/cli-session/actor-credential",
+            BRIDGE,
+            json!({"version": "hosted-cadence-cli-session.v1", "organization_id": "ws_real", "audience": "https://acme.cadencecloud.app", "mode": "assistant"}),
+            Instant::now() + Duration::from_secs(5),
+            |_url, _bearer, _access, body, _timeout| {
+                assert_eq!(body["mode"], "assistant");
+                Ok((200, br#"{"ok":true}"#.to_vec(), None))
+            },
+        )
+        .expect("actor-credential path must be allowed on trusted issuer");
+        assert_eq!(answer.status, 200);
+    }
 }
