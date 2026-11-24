@@ -1,3 +1,4 @@
+import { failedTurnContextExtension } from "./failed-turn-context.ts";
 import { DurableObject } from "cloudflare:workers";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -227,6 +228,7 @@ export class HostedSession<
         }),
       ],
     });
+    this.registry.install(failedTurnContextExtension());
     this.registry.install(intentGuard(options.toolRefusal));
     // Install after intentGuard so policy and authority refusals always take precedence.
     this.registry.install(loopGuardExtension(this.loopGuard));

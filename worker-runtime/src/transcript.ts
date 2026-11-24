@@ -23,13 +23,24 @@ const BUSY = /rate.?limit|too many requests|overloaded|server.?busy/i;
 const BUSY_STATUS = word("429");
 const REFUSED = /refused|forbidden|unauthori[sz]ed|denied/i;
 const REFUSED_STATUS = word("401|402|403");
+// The gateway's tool-call messages carry no code to the runtime, so match the
+// distinguishing words and let the sentence around them change.
+const TOOL_CALL = /tool.?call/i;
+const TOOL_CALL_OUTPUT_LIMIT = /output.?(?:limit|space|token)/i;
+const TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|exceed/i;
 
 /** Classify private provider text; never expose its URLs, keys or diagnostics. */
-function failedTurnReason(errorMessage: string | undefined): string {
+export function failedTurnReason(errorMessage: string | undefined): string {
   const raw = errorMessage ?? "";
   if (raw.includes("billing_unavailable")) return "billing_unavailable";
   if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
     return "The selected model cannot read images.";
+  if (TOOL_CALL.test(raw)) {
+    if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
+      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
+    if (TOOL_CALL_TOO_LARGE.test(raw))
+      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
+  }
   if (TIMEOUT.test(raw)) return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
     return "The model service could not be reached.";
@@ -40,13 +51,13 @@ function failedTurnReason(errorMessage: string | undefined): string {
   return "The model request failed.";
 }
 
-type PiMessage = NonNullable<EntryRecord["model"]>[number];
+export type PiMessage = NonNullable<EntryRecord["model"]>[number];
 
 /**
  * Retry/compaction errors stay hidden until their outcome is known. A stream
  * must never emit a failure entry that a subsequent successful retry removes.
  */
-function terminalError(messages: readonly PiMessage[], index: number): boolean {
+export function terminalError(messages: readonly PiMessage[], index: number): boolean {
   const message = messages[index];
   if (message?.role !== "assistant" || message.stopReason !== "error")
     return false;
