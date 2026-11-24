@@ -25,6 +25,11 @@ import {
   reportBrowserPresence,
   releaseBrowserAlerts,
 } from "./pushOptIn";
+import {
+  HUMAN_LIVE_POLL_MS,
+  isHumanThreadsStreamLive,
+  subscribeHumanThreadsStream,
+} from "./humanThreadsStream";
 import { useNotificationToast } from "./NotificationToast";
 
 /** The newest eligible unread alert intent already observed per room. */
@@ -128,6 +133,8 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
     let latest = 0;
     let active = true;
     let timer = 0;
+    let pollMs = INBOX_POLL_MS;
+    let stopStream: (() => void) | null = null;
     let linked = false;
     let linking: Promise<void> | null = null;
     const linkBeforeFeed = () => {
@@ -159,7 +166,34 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
       }
       return linking;
     };
-    const stop = () => window.clearInterval(timer);
+    const restartTimer = (nextMs: number) => {
+      if (nextMs === pollMs) return;
+      window.clearInterval(timer);
+      pollMs = nextMs;
+      timer = window.setInterval(load, pollMs);
+    };
+    const stop = () => {
+      window.clearInterval(timer);
+      stopStream?.();
+      stopStream = null;
+    };
+    const ensureStream = () => {
+      if (stopStream !== null || !active) return;
+      stopStream = subscribeHumanThreadsStream((msg) => {
+        if (!active) return;
+        if (msg.kind === "open") {
+          restartTimer(HUMAN_LIVE_POLL_MS);
+          if (msg.reconnected) load();
+          return;
+        }
+        if (msg.kind === "degraded") {
+          restartTimer(INBOX_POLL_MS);
+          return;
+        }
+        if (msg.scopes.includes("notifications")) load();
+      });
+      if (isHumanThreadsStreamLive()) restartTimer(HUMAN_LIVE_POLL_MS);
+    };
     const releaseDevice = () => {
       // Serialized before any new enable, so clearing the id here cannot erase a newer one.
       void releaseBrowserAlerts()
@@ -199,6 +233,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
           known.current = next.human.id;
           setInbox(next);
           surfaceNew(next, toast, tRef.current);
+          ensureStream();
         })
         .catch((e: unknown) => {
           if (!active || sent !== latest || generation.current !== started || e instanceof StaleEnableError) return;
@@ -220,7 +255,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
         });
     };
     void load();
-    timer = window.setInterval(load, INBOX_POLL_MS);
+    timer = window.setInterval(load, pollMs);
     return () => {
       active = false;
       generation.current++;

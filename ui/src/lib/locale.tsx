@@ -4225,6 +4225,8 @@ Object.assign(zhTW, {
   "No access to this channel.": "沒有權限存取此頻道。",
   "Loading participants…": "正在載入參與者…",
   "Loading…": "載入中…",
+  "No channels yet.": "尚無頻道。",
+  "Loading teammates…": "正在載入團隊成員…",
   "You": "您",
   "unread": "未讀",
   "queued": "已排隊",

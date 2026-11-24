@@ -31,13 +31,14 @@ export interface HumanMember {
   kind: "human" | "agent";
   id: string;
   label: string;
+  look?: string | null;
 }
 
 export interface HumanPost {
   id: string;
   /** Opaque, per-human marker for this visible post. */
   read_cursor: string;
-  sender: { id: string | null; label: string };
+  sender: { id: string | null; label: string; kind?: "human" | "agent" };
   /** Already sanitized by the daemon (`conversations::body`). Plain text. */
   body: string;
   created: number;
@@ -72,6 +73,7 @@ export interface HumanRoomPage {
 export interface HumanAgent {
   uid: string;
   alias: string;
+  look?: string | null;
 }
 
 export interface HumanAskReceipt {
@@ -170,7 +172,8 @@ function humanPost(value: unknown): value is HumanPost {
     && typeof post.silent === "boolean"
     && Array.isArray(post.outcomes) && post.outcomes.every(mentionOutcome)
     && (who.id === null || typeof who.id === "string")
-    && typeof who.label === "string";
+    && typeof who.label === "string"
+    && (who.kind === undefined || who.kind === "human" || who.kind === "agent");
 }
 
 function roomEvent(value: unknown): value is HumanRoomEvent {
@@ -196,7 +199,8 @@ export function readHumanRoom(id: string, at: { before?: string; limit?: number 
       || typeof page.scope_id !== "string" || !page.scope_id.startsWith("csrid_") || page.scope_id.length <= 6
       || !Array.isArray(page.members) || !page.members.every((member) => member
         && (member.kind === "human" || member.kind === "agent")
-        && typeof member.id === "string" && typeof member.label === "string")
+        && typeof member.id === "string" && typeof member.label === "string"
+        && (member.look === undefined || member.look === null || typeof member.look === "string"))
       || !Array.isArray(page.posts) || !page.posts.every(humanPost)
       || !Array.isArray(page.events) || !page.events.every(roomEvent)
       || typeof page.can_ask !== "boolean"

@@ -66,6 +66,9 @@ import {
   type ThreadsUrlState,
 } from "./threadsView";
 import {
+  ChannelTimelineSkeleton,
+  ConversationListSkeleton,
+  DetailsPanelSkeleton,
   HumanContextPanel,
   HumanRoomRows,
   HumanRoomTimeline,
@@ -235,28 +238,33 @@ export default function ThreadsPage({
     return set;
   }, [humanRooms.rooms]);
   const humanRoom = humanId ? humanRooms.rooms?.find((r) => r.id === humanId) ?? null : null;
-  const humanContext = human.me && humanRoom && humanState !== null && humanState.id === humanId ? (
-    <HumanContextPanel
-      room={humanRoom}
-      me={human.me}
-      members={humanState.members}
-      denied={humanState.denied}
-      canManage={humanState.canManage}
-      agentChainCount={humanState.agentChainCount}
-      agentChainLimit={humanState.agentChainLimit}
-      people={people.people}
-      peopleError={people.error}
-      agents={agents.agents}
-      onChanged={() => {
-        setHumanRefresh((n) => n + 1);
-        void humanRooms.reload();
-      }}
-      onOpened={(id) => {
-        setMobileContextOpen(false);
-        void humanRooms.reload();
-        navigate(humanHref(id), { replace: true });
-      }}
-    />
+  const humanContext = humanId ? (
+    human.me && humanRoom && humanState !== null && humanState.id === humanId ? (
+      <HumanContextPanel
+        room={humanRoom}
+        me={human.me}
+        members={humanState.members}
+        denied={humanState.denied}
+        canManage={humanState.canManage}
+        agentChainCount={humanState.agentChainCount}
+        agentChainLimit={humanState.agentChainLimit}
+        people={people.people}
+        peopleError={people.error}
+        agents={agents.agents}
+        boardAgents={agentsState.data?.agents ?? null}
+        onChanged={() => {
+          setHumanRefresh((n) => n + 1);
+          void humanRooms.reload();
+        }}
+        onOpened={(id) => {
+          setMobileContextOpen(false);
+          void humanRooms.reload();
+          navigate(humanHref(id), { replace: true });
+        }}
+      />
+    ) : human.loading || (human.me !== null && humanRooms.error === null && !humanState?.denied) ? (
+      <DetailsPanelSkeleton />
+    ) : null
   ) : null;
 
   // Only the newest list request for the current scope may publish. A slow
@@ -264,10 +272,13 @@ export default function ThreadsPage({
   // is dropped and resolves to null.
   const listRequest = useRef(0);
   const listLegacyRef = useRef(false);
-  const listScope = `${operator}|${url.project ?? ""}|${url.agent ?? ""}|${url.includeSystem}`;
+  const listScope = `${operator}|${workConversationsEnabled}|${url.project ?? ""}|${url.agent ?? ""}|${url.includeSystem}`;
   const listScopeNow = useRef(listScope);
   const loadList = useCallback(async (): Promise<ConversationRow[] | null> => {
-    if (!operator || !workConversationsEnabled || listLegacyRef.current) return [];
+    if (!operator || !workConversationsEnabled || listLegacyRef.current) {
+      setList({ rows: [], error: null, legacy: listLegacyRef.current });
+      return [];
+    }
     const n = ++listRequest.current;
     // Publish only the newest request; a rows result is still returned to a
     // caller in the same scope (the send that opened a draft needs it).
@@ -482,13 +493,39 @@ export default function ThreadsPage({
     />
   ) : null;
 
+  const workLoading =
+    operator && workConversationsEnabled && list.rows === null && !list.legacy && list.error === null;
+  const humanLoading =
+    humanThreadsEnabled &&
+    (human.loading || (human.me !== null && humanRooms.rooms === null && humanRooms.error === null));
+  const visibleHumanRooms = useMemo(() => {
+    if (!human.me || url.kind !== "all" || humanRooms.rooms === null) return [];
+    const q = query.trim().toLowerCase();
+    return humanRooms.rooms.filter((r) => q === "" || r.title.toLowerCase().includes(q));
+  }, [human.me, url.kind, humanRooms.rooms, query]);
+  const hasVisibleRows = visible.length > 0 || visibleHumanRooms.length > 0;
+  const sidebarLoading = (workLoading || humanLoading) && !hasVisibleRows;
+  const hasFilters =
+    query.trim() !== "" ||
+    url.kind !== "all" ||
+    url.project !== null ||
+    url.agent !== null;
+
   const page = (
     <section className="threads-page" aria-labelledby="threads-title">
       <div className="threads-layout">
         <aside className="threads-list" aria-label={t("Conversations")}>
           <div className="threads-list-head">
             <h1 id="threads-title">{t("Channels")}</h1>
-            <Button variant="ghost" size="sm" onClick={() => void loadList()} aria-label={t("Refresh conversations")}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                if (operator && workConversationsEnabled) void loadList();
+                if (human.me) void humanRooms.reload();
+              }}
+              aria-label={t("Refresh conversations")}
+            >
               <IconRefresh size={12} />
             </Button>
             <Button variant="secondary" size="sm" onClick={() => {
@@ -508,49 +545,51 @@ export default function ThreadsPage({
               aria-label={t("Search conversations")}
             />
           </label>
-          {list.legacy ? (
+          {list.legacy && operator && workConversationsEnabled ? (
             <p className="threads-note">{t("This daemon predates Channels. Update it to see agent conversations.")}</p>
           ) : list.error ? (
             <p className="threads-note" role="status">{t("Conversations could not load:")} {list.error}</p>
-          ) : list.rows === null ? (
-            // A non-operator never fetches agent conversations: no loading state for them.
-            operator ? <p className="threads-note">{t("Loading conversations…")}</p> : null
-          ) : visible.length === 0 ? (
-            (humanRooms.rooms?.length ?? 0) > 0 &&
-            query.trim() === "" &&
-            url.kind === "all" &&
-            url.project === null &&
-            url.agent === null ? null : (
-              <p className="threads-note">{t("No conversations match these filters.")}</p>
-            )
+          ) : null}
+          {sidebarLoading ? (
+            <ConversationListSkeleton />
           ) : (
-            <ul className="threads-rows">
-              {visible.map((row) => (
-                <li key={row.id}>
-                  <Link
-                    href={`/threads${threadsUrlSearch({ ...url, conversation: row.id })}`}
-                    aria-current={row.id === open?.id ? "true" : undefined}
-                    className={row.id === open?.id ? "threads-row on" : "threads-row"}
-                  >
-                    <span className="threads-row-top">
-                      <span className="threads-row-title">{conversationTitle(row, t)}</span>
-                      <span className="threads-row-kind">{t(KIND_LABEL[row.kind])}</span>
-                    </span>
-                    <span className="threads-row-meta">{rowDescriptor(row, t)}</span>
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          )}
-          {human.error !== null && <p className="threads-note">{t("Channels are unavailable for this sign-in.")}</p>}
-          {human.me && url.kind === "all" && humanRooms.rooms !== null && humanRooms.rooms.length > 0 && (
-            <ul className="threads-rows" aria-label={t("Channels")}>
-              <HumanRoomRows
-                rooms={humanRooms.rooms.filter((r) => query.trim() === "" || r.title.toLowerCase().includes(query.trim().toLowerCase()))}
-                openId={humanId}
-                hrefFor={humanHref}
-              />
-            </ul>
+            <>
+              {visible.length > 0 && (
+                <ul className="threads-rows">
+                  {visible.map((row) => (
+                    <li key={row.id}>
+                      <Link
+                        href={`/threads${threadsUrlSearch({ ...url, conversation: row.id })}`}
+                        aria-current={row.id === open?.id ? "true" : undefined}
+                        className={row.id === open?.id ? "threads-row on" : "threads-row"}
+                      >
+                        <span className="threads-row-top">
+                          <span className="threads-row-title">{conversationTitle(row, t)}</span>
+                          <span className="threads-row-kind">{t(KIND_LABEL[row.kind])}</span>
+                        </span>
+                        <span className="threads-row-meta">{rowDescriptor(row, t)}</span>
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {human.error !== null && <p className="threads-note">{t("Channels are unavailable for this sign-in.")}</p>}
+              {humanRooms.error !== null && <p className="threads-note" role="status">{humanRooms.error}</p>}
+              {visibleHumanRooms.length > 0 && (
+                <ul className="threads-rows" aria-label={t("Channels")}>
+                  <HumanRoomRows
+                    rooms={visibleHumanRooms}
+                    openId={humanId}
+                    hrefFor={humanHref}
+                  />
+                </ul>
+              )}
+              {!hasVisibleRows && !list.error && human.error === null && humanRooms.error === null && (
+                <p className="threads-note">
+                  {hasFilters ? t("No conversations match these filters.") : t("No channels yet.")}
+                </p>
+              )}
+            </>
           )}
         </aside>
 
@@ -579,7 +618,14 @@ export default function ThreadsPage({
                 isDm={humanRoom?.kind === "dm"}
                 roomTitle={humanRoom?.title}
                 people={people.people}
+                boardAgents={agentsState.data?.agents ?? null}
               />
+            ) : human.loading ? (
+              <div className="threads-timeline">
+                <div className="threads-messages">
+                  <ChannelTimelineSkeleton />
+                </div>
+              </div>
             ) : (
               <div className="threads-empty">
                 <p>{t("Channels are unavailable for this sign-in.")}</p>
