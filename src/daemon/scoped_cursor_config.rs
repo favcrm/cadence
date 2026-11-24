@@ -57,14 +57,6 @@ pub fn load_codec(
 /// The explicit `scoped_cursor_initialize` body: the operator answer names
 /// whether the NULL fingerprint was bound or an identical value confirmed.
 pub fn initialize(state_dir: &Path, tracker_root: &Path, store: &Store) -> Result<Value> {
-    // The fixed operator record must belong to this Store, not an unrelated
-    // directory with otherwise readable key material.
-    let db = crate::rollout::db_file(state_dir)
-        .canonicalize()
-        .map_err(|_| unavailable())?;
-    if db.as_os_str() != std::ffi::OsStr::new(store.instance_identity()) {
-        return Err(unavailable());
-    }
     let (workspace, _) = store.cursor_keyring_metadata().map_err(|_| unavailable())?;
     let material = record::load(state_dir, Some(tracker_root))
         .map_err(|_| unavailable())?

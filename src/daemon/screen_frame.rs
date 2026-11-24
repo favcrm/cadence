@@ -113,6 +113,8 @@ pub fn render_checked_package_frame_html(
 /// Revalidate public, caller-constructible package bytes before selecting
 /// scripts. The declaration alone supplies explicit order; absent startup
 /// retains entry-only execution, regardless of the map's file order.
+#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
+#[cfg_attr(not(test), doc(hidden))]
 pub fn render_package_frame_html(
     csp_nonce: &str,
     tag: &str,

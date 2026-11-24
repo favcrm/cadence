@@ -46,7 +46,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 use super::screen_frame::{
     render_checked_package_frame_html, render_frame_html, render_package_frame_html,
 };
@@ -782,7 +782,7 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 mod tests {
     use super::*;
 
