@@ -57247,6 +57247,42 @@ function readSessionBounds(sql, objectId, sessionId) {
     return null;
   }
 }
+function ensureDiagnosticResetIndex(sql) {
+  try {
+    if (!sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_entries'").toArray()[0])
+      return;
+    sql.exec(`CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads
+      ON pi_entries (conversation_id, id) WHERE head=id`);
+  } catch {
+    console.warn("Hosted conversation diagnostics index unavailable.");
+  }
+}
+function readBoundedDiagnosticWindow(sql, objectId, sessionId) {
+  const prefix = `${objectId}:`;
+  if (!sessionId.startsWith(prefix))
+    return null;
+  const suffix = sessionId.slice(prefix.length);
+  const anchor = Number(suffix);
+  if (!Number.isSafeInteger(anchor) || anchor < 0 || String(anchor) !== suffix)
+    return null;
+  const maxHeadBytes = 128 * 1024;
+  try {
+    if (anchor !== 0 && !sql.exec(`SELECT id FROM pi_entries WHERE conversation_id=? AND id=? AND head=id
+       AND CASE WHEN length(CAST(record AS BLOB)) <= ? THEN json_extract(record, '$.kind') END = ?`, ROOT_CONVERSATION_ID, anchor, maxHeadBytes, RESET_KIND).toArray()[0])
+      return null;
+    const next = sql.exec(`SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ?
+                      THEN json_extract(record, '$.kind') END AS kind
+       FROM pi_entries INDEXED BY cadence_diagnostic_reset_heads
+       WHERE conversation_id=? AND id>? AND head=id ORDER BY id LIMIT 1`, maxHeadBytes, ROOT_CONVERSATION_ID, anchor).toArray()[0];
+    if (!next)
+      return { anchor, upper: MAX_ID };
+    if (next.kind !== RESET_KIND || typeof next.id !== "number" || !Number.isSafeInteger(next.id) || next.id <= anchor)
+      return null;
+    return { anchor, upper: next.id - 1 };
+  } catch {
+    return null;
+  }
+}
 
 // src/session-transcript.ts
 var VISIBLE = `(json_extract(record, '$.kind') = 'pi.assistant' OR
@@ -57304,6 +57340,205 @@ function readSessionTranscript(sql, objectId, sessionId, after, project) {
       processed = row.id;
     }
     return { messages, nextCursor: rows.length > PAGE_RECORDS ? processed : null };
+  } catch {
+    return null;
+  }
+}
+
+// src/session-turn-diagnostics.ts
+import { createHash as createHash2 } from "node:crypto";
+var PAGE_RECORDS2 = 24;
+var MAX_EVENTS = 100;
+var MAX_MODEL_MESSAGES = 4;
+var MAX_RECORD_BYTES2 = 128 * 1024;
+var IDENTIFIER = /^[A-Za-z0-9_.:-]{1,200}$/;
+var MODEL = /^(?:@cf\/)?[A-Za-z0-9_-][A-Za-z0-9_./:+~-]*$/;
+var PROVIDER_CODES = ["auth", "rate-limit", "not-found", "bad-request", "provider-error", "gateway-error", "unknown"];
+var STOP_REASONS = ["stop", "length", "toolUse", "error", "aborted", "pending", "deferred"];
+var UNANSWERED_REASONS = [
+  "model_error",
+  "no_model",
+  "aborted",
+  "reset",
+  "stale",
+  "faulted",
+  "orphaned",
+  "interrupted",
+  "restart_limit",
+  "nothing_to_answer",
+  "turn_limit"
+];
+function known(allowed, value) {
+  return typeof value === "string" && allowed.includes(value) ? value : null;
+}
+function safeModel(value) {
+  return typeof value === "string" && value.length <= 160 && MODEL.test(value) && !value.includes("://") ? value : null;
+}
+function inputSettlement(sql, messageId, entryId, upper) {
+  const rows = sql.exec(`WITH candidates AS MATERIALIZED (
+       SELECT status, CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record END AS record
+       FROM pi_submissions INDEXED BY pi_submissions_by_request
+       WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2
+     )
+     SELECT status, json_extract(record, '$.status') AS storedStatus, json_extract(record, '$.type') AS type,
+       json_extract(record, '$.entry') AS entry, json_extract(record, '$.answer') AS answer,
+       substr(json_extract(record, '$.reason'), 1, 32) AS reason
+     FROM candidates`, MAX_RECORD_BYTES2, ROOT_CONVERSATION_ID, JSON.stringify(messageId)).toArray();
+  const row = rows[0];
+  if (rows.length !== 1 || row?.type !== "input" || row.entry !== entryId || row.status !== row.storedStatus)
+    return null;
+  if (row.status === "unanswered") {
+    return { outcome: "unanswered", reason: known(UNANSWERED_REASONS, row.reason) };
+  }
+  if (row.status === "done" && typeof row.answer === "number" && Number.isSafeInteger(row.answer) && row.answer > entryId && row.answer <= upper) {
+    return { outcome: "answered" };
+  }
+  return null;
+}
+function safeToolName(value) {
+  return typeof value === "string" && IDENTIFIER.test(value) ? value : null;
+}
+function toolReference(value) {
+  if (typeof value !== "string" || value.length === 0)
+    return null;
+  if (IDENTIFIER.test(value))
+    return value;
+  return `$sha256:${createHash2("sha256").update("cadence.diagnostics.tool-use/v1\x00").update(JSON.stringify(value)).digest("hex")}`;
+}
+function gap(code) {
+  return { kind: "evidence_gap", at: null, code };
+}
+function timestamp(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000 ? value : null;
+}
+function boundedInteger(value, min, max) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+}
+function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
+  const bounds = readBoundedDiagnosticWindow(sql, objectId, sessionId);
+  if (bounds === null)
+    return null;
+  try {
+    if (before !== undefined) {
+      if (!Number.isSafeInteger(before) || before <= bounds.anchor || before > bounds.upper)
+        return null;
+      if (!sql.exec("SELECT id FROM pi_entries WHERE conversation_id=? AND id=?", ROOT_CONVERSATION_ID, before).toArray()[0])
+        return null;
+    }
+    const rows = sql.exec(`WITH candidates AS MATERIALIZED (
+         SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record END AS record
+         FROM pi_entries INDEXED BY pi_entries_by_conversation
+         WHERE conversation_id=? AND id>? AND id<=? ORDER BY id DESC LIMIT ?
+       )
+       SELECT id, record IS NULL AS oversized,
+         CASE WHEN json_extract(record,'$.kind') = ? THEN 1 ELSE 0 END AS isInput,
+         CASE WHEN json_type(record, '$.data.messageId')='text'
+           THEN substr(json_extract(record, '$.data.messageId'), 1, 201) END AS messageId,
+         json_extract(record, '$.model[0].timestamp') AS inputAt,
+         CASE WHEN json_extract(record, '$.kind') IN ('pi.assistant', 'pi.tool-result') THEN
+         (SELECT json_group_array(json(evidence)) FROM (
+           SELECT json_object(
+             'role', json_extract(m.value, '$.role'),
+             'at', json_extract(m.value, '$.timestamp'),
+             'model', substr(json_extract(m.value, '$.model'), 1, 161),
+             'responseModel', substr(json_extract(m.value, '$.responseModel'), 1, 161),
+             'stop', json_extract(m.value, '$.stopReason'),
+             'toolName', substr(json_extract(m.value, '$.toolName'), 1, 201),
+             'toolUseId', json_extract(m.value, '$.toolCallId'),
+             'isError', json_type(m.value, '$.isError'),
+             'failure', json(CASE WHEN json_extract(m.value, '$.stopReason')='error' THEN (
+               SELECT json_object(
+                 'status', CASE WHEN json_type(d.value, '$.details.status')='integer'
+                   THEN json_extract(d.value, '$.details.status') END,
+                 'code', CASE WHEN json_type(d.value, '$.details.code')='text'
+                   THEN substr(json_extract(d.value, '$.details.code'), 1, 32) END
+               ) FROM json_each(m.value, '$.diagnostics') d
+               WHERE d.type='object' AND json_extract(d.value, '$.type')='cloudflare-error'
+               ORDER BY d.key DESC LIMIT 1
+             ) END),
+             'calls', json(CASE WHEN json_extract(m.value, '$.role')='assistant' THEN (
+               SELECT json_group_array(json(call)) FROM (
+                 SELECT json_object(
+                   'name', substr(json_extract(p.value, '$.name'), 1, 201),
+                   'id', json_extract(p.value, '$.id')
+                 ) AS call FROM json_each(m.value, '$.content') p
+                 WHERE p.type='object' AND json_extract(p.value, '$.type')='toolCall'
+                 ORDER BY p.key LIMIT ?
+               )
+             ) ELSE '[]' END)
+           ) AS evidence FROM json_each(record, '$.model') m
+           WHERE m.type='object' AND json_extract(m.value, '$.role') IN ('assistant', 'toolResult')
+           ORDER BY m.key LIMIT ?
+         )) ELSE '[]' END AS evidence
+       FROM candidates ORDER BY id DESC`, MAX_RECORD_BYTES2, ROOT_CONVERSATION_ID, bounds.anchor, before === undefined ? bounds.upper : before - 1, PAGE_RECORDS2 + 1, BOARD_MESSAGE_KIND, MAX_EVENTS + 1, MAX_MODEL_MESSAGES + 1).toArray();
+    if (bounds.anchor === 0 && before === undefined && rows.length === 0)
+      return null;
+    const groups = [];
+    let eventCount = 0;
+    let oldest = null;
+    for (let i = 0;i < Math.min(rows.length, PAGE_RECORDS2); i++) {
+      const row = rows[i];
+      if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || typeof row.evidence !== "string")
+        return null;
+      let group = [];
+      if (row.oversized === 1)
+        group.push(gap("record_too_large"));
+      if (row.isInput === 1) {
+        let messageId;
+        try {
+          messageId = requireOperationId(row.messageId);
+        } catch {
+          group.push(gap("identifier_unavailable"));
+        }
+        if (messageId !== undefined) {
+          group.push({
+            kind: "input",
+            at: timestamp(row.inputAt),
+            messageId,
+            settlement: inputSettlement(sql, messageId, row.id, bounds.upper)
+          });
+        }
+      }
+      const evidence = JSON.parse(row.evidence);
+      if (evidence.length > MAX_MODEL_MESSAGES || evidence.some((entry) => entry.calls.length > MAX_EVENTS)) {
+        group = [gap("too_many_events")];
+      } else {
+        for (const entry of evidence) {
+          const at = timestamp(entry.at);
+          if (entry.role === "toolResult") {
+            const toolUseId = toolReference(entry.toolUseId);
+            const toolName = safeToolName(entry.toolName);
+            group.push(toolUseId === null || entry.isError !== "true" && entry.isError !== "false" ? gap("identifier_unavailable") : { kind: "tool_result", at, toolName, toolUseId, outcome: entry.isError === "true" ? "error" : "ok" });
+            continue;
+          }
+          group.push({
+            kind: "model_attempt",
+            at,
+            model: safeModel(entry.model),
+            responseModel: safeModel(entry.responseModel),
+            stopReason: known(STOP_REASONS, entry.stop),
+            httpStatus: boundedInteger(entry.failure?.status, 400, 599),
+            providerCode: known(PROVIDER_CODES, entry.failure?.code)
+          });
+          for (const call of entry.calls) {
+            const toolName = safeToolName(call.name);
+            const toolUseId = toolReference(call.id);
+            group.push(toolName === null || toolUseId === null ? gap("identifier_unavailable") : { kind: "tool_call", at, toolName, toolUseId });
+          }
+        }
+      }
+      if (group.length > MAX_EVENTS)
+        group = [gap("too_many_events")];
+      if (eventCount + group.length > MAX_EVENTS)
+        break;
+      groups.push(group);
+      eventCount += group.length;
+      oldest = row.id;
+    }
+    const events = [];
+    for (let i = groups.length - 1;i >= 0; i--)
+      events.push(...groups[i]);
+    return { events, nextBefore: rows.length > groups.length ? oldest : null };
   } catch {
     return null;
   }
@@ -57855,6 +58090,7 @@ class HostedSession extends DurableObject {
       throw new Error("HostedSession requires a named conversation");
     this.operationScopes = new OperationScopes(ctx.storage.sql);
     this.contextBudgetProofs = new ContextBudgetProofs(ctx.storage.sql);
+    ensureDiagnosticResetIndex(ctx.storage.sql);
     const acceptsImages = options.acceptsToolImages === true;
     const model = defaultModel(options.modelAlias, acceptsImages || options.attachedImages !== undefined);
     const authority = {
@@ -57930,6 +58166,7 @@ class HostedSession extends DurableObject {
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
+        ensureDiagnosticResetIndex(this.ctx.storage.sql);
         configureOperationReplyCapture(this.ctx.storage.sql, options.captureOperationReplies === true);
         if (skillsEnabled) {
           const sources = await runtimeSkillSources(options.workspaceSkills === undefined ? undefined : () => options.workspaceSkills());
@@ -58155,6 +58392,9 @@ data: ${JSON.stringify(entry)}
   }
   sessionTranscript(sessionId, after) {
     return readSessionTranscript(this.ctx.storage.sql, this.ctx.id.toString(), sessionId, after, this.options.projectThread);
+  }
+  sessionTurnDiagnostics(sessionId, before) {
+    return readSessionTurnDiagnostics(this.ctx.storage.sql, this.ctx.id.toString(), sessionId, before);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;

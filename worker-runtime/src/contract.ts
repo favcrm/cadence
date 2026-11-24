@@ -446,6 +446,32 @@ export type HostedSessionInspection =
   | { readonly state: "observed"; readonly session: HostedSessionSummary }
   | { readonly state: "unobserved" | "unknown" };
 
+export type HostedInputSettlement =
+  | { outcome: "answered" }
+  | { outcome: "unanswered"; reason: HostedRunFailureCode | "aborted" | "reset" | "stale" | "nothing_to_answer" | null };
+
+/** Committed observations, not inferred turn outcomes. No conversation content. */
+export type HostedTurnDiagnosticEvent = { at: number | null } & (
+  | { kind: "input"; messageId: string; settlement: HostedInputSettlement | null }
+  | { kind: "tool_call"; toolName: string; toolUseId: string }
+  | { kind: "tool_result"; toolName: string | null; toolUseId: string; outcome: "ok" | "error" }
+  | {
+      kind: "model_attempt";
+      model: string | null;
+      responseModel: string | null;
+      stopReason: "stop" | "length" | "toolUse" | "error" | "aborted" | "pending" | "deferred" | null;
+      httpStatus: number | null;
+      providerCode: "auth" | "rate-limit" | "not-found" | "bad-request" | "provider-error" | "gateway-error" | "unknown" | null;
+    }
+  | { kind: "evidence_gap"; code: "record_too_large" | "too_many_events" | "identifier_unavailable" }
+);
+
+export interface HostedTurnDiagnosticsPage {
+  events: HostedTurnDiagnosticEvent[];
+  /** Exclusive position for the next (older) page of the same runtime generation. */
+  nextBefore: number | null;
+}
+
 /** Shown when a blocking compaction failed and its run ended without an answer. */
 export const COMPACTION_FAILURE_TEXT =
   "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";

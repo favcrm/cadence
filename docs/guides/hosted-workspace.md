@@ -516,6 +516,17 @@ and omits inputs without recorded visibility, including older input records
 that predate that marker. Missing proof or an older host/runtime never falls
 back to whole-conversation history.
 
+For support triage, `HostedSession.sessionTurnDiagnostics(sessionId, before?)`
+reads the newest committed observations inside the same proven generation.
+Use `nextBefore` to fetch an older page even if this bounded page contains no
+events. An unavailable or unproven generation returns `null`, not an empty
+result. Model attempts include recorded stop reasons and structured failure
+status where available; a failed attempt does not imply a failed turn. The
+terminal settlement is shown on its placed input because Pi does not record
+the settlement time. Tool calls and results use the same correlation ID.
+The read sends no prompts, reasoning, tool arguments/results, or provider error
+text and never starts work.
+
 From `worker-runtime/`, using its pinned Bun version:
 
 ```sh

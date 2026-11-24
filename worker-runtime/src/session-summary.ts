@@ -130,3 +130,55 @@ export function readSessionBounds(
     return null;
   }
 }
+
+/**
+ * Install during session storage initialization, not during a diagnostics read.
+ * Pi's ordinary head index also contains compaction anchors, which are not resets.
+ */
+export function ensureDiagnosticResetIndex(sql: TaskSql): void {
+  try {
+    if (!sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_entries'").toArray()[0])
+      return;
+    sql.exec(`CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads
+      ON pi_entries (conversation_id, id) WHERE head=id`);
+  } catch {
+    // The indexed diagnostics read will refuse. An unavailable support index
+    // must not take down ordinary chat or transcript reads.
+    console.warn("Hosted conversation diagnostics index unavailable.");
+  }
+}
+
+/** Diagnostics needs only a proven reset window, not the summary's activity or run scans. */
+export function readBoundedDiagnosticWindow(
+  sql: TaskSql,
+  objectId: string,
+  sessionId: string,
+): { anchor: number; upper: number } | null {
+  const prefix = `${objectId}:`;
+  if (!sessionId.startsWith(prefix)) return null;
+  const suffix = sessionId.slice(prefix.length);
+  const anchor = Number(suffix);
+  if (!Number.isSafeInteger(anchor) || anchor < 0 || String(anchor) !== suffix) return null;
+  const maxHeadBytes = 128 * 1024;
+  try {
+    if (anchor !== 0 && !sql.exec(
+      `SELECT id FROM pi_entries WHERE conversation_id=? AND id=? AND head=id
+       AND CASE WHEN length(CAST(record AS BLOB)) <= ? THEN json_extract(record, '$.kind') END = ?`,
+      ROOT_CONVERSATION_ID, anchor, maxHeadBytes, RESET_KIND,
+    ).toArray()[0]) return null;
+
+    const next = sql.exec(
+      `SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ?
+                      THEN json_extract(record, '$.kind') END AS kind
+       FROM pi_entries INDEXED BY cadence_diagnostic_reset_heads
+       WHERE conversation_id=? AND id>? AND head=id ORDER BY id LIMIT 1`,
+      maxHeadBytes, ROOT_CONVERSATION_ID, anchor,
+    ).toArray()[0];
+    if (!next) return { anchor, upper: MAX_ID };
+    if (next.kind !== RESET_KIND || typeof next.id !== "number" ||
+        !Number.isSafeInteger(next.id) || next.id <= anchor) return null;
+    return { anchor, upper: next.id - 1 };
+  } catch {
+    return null;
+  }
+}

@@ -85,8 +85,9 @@ import { runtimeProfile, skillFreeRuntimeProfile } from "./profile.ts";
 import { runtimeSkillSources } from "./workspace-skills.ts";
 import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
-import { readSessionSummary } from "./session-summary.ts";
+import { ensureDiagnosticResetIndex, readSessionSummary } from "./session-summary.ts";
 import { readSessionTranscript } from "./session-transcript.ts";
+import { readSessionTurnDiagnostics } from "./session-turn-diagnostics.ts";
 import { renderSummarySource } from "./summary-source.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
@@ -198,6 +199,7 @@ export class HostedSession<
     this.contextBudgetProofs = new ContextBudgetProofs(
       ctx.storage.sql as unknown as TaskSql,
     );
+    ensureDiagnosticResetIndex(ctx.storage.sql as unknown as TaskSql);
     const acceptsImages = options.acceptsToolImages === true;
     const model = defaultModel(
       options.modelAlias,
@@ -325,6 +327,7 @@ export class HostedSession<
     }
     this.harness = new PiHarness({
       harness: async ({ storage, context, onWake }) => {
+        ensureDiagnosticResetIndex(this.ctx.storage.sql as unknown as TaskSql);
         configureOperationReplyCapture(
           this.ctx.storage.sql as unknown as TaskSql,
           options.captureOperationReplies === true,
@@ -659,6 +662,16 @@ export class HostedSession<
       sessionId,
       after,
       this.options.projectThread,
+    );
+  }
+
+  /** Read bounded, content-free evidence for one exact, committed generation. */
+  sessionTurnDiagnostics(sessionId: string, before?: number) {
+    return readSessionTurnDiagnostics(
+      this.ctx.storage.sql as unknown as TaskSql,
+      this.ctx.id.toString(),
+      sessionId,
+      before,
     );
   }
 
