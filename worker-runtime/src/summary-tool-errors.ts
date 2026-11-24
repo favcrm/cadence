@@ -42,12 +42,13 @@ const ROLE = String.raw`\[(?:User|Assistant|Assistant tool calls|Tool result)\]:
 const SEGMENT_START = new RegExp(String.raw`(?:^|\n\n|<conversation>\n)(?=${ROLE})`, "g");
 const CONVERSATION_END = "\n</conversation>";
 
-/** A closed diagnostics block as the engine renders it in a tool result. */
-const HARNESS_BLOCK = /<harness>\n([\s\S]*?)\n<\/harness>/g;
 const HARNESS_OPEN = "<harness>";
 const HARNESS_CLOSE = "</harness>";
-/** A quoted block longer than a tool result can be is not one: never let it swallow later text. */
-const MAX_QUOTED_BLOCK = 2_000;
+/**
+ * The engine cuts a tool result to 2,000 characters, so a longer block is not
+ * one: it is never rewritten, and the search for its end never looks further.
+ */
+const MAX_BLOCK = 2_000;
 /** The engine's diagnostic severities (pi-durable `Diagnostic`). */
 const DIAGNOSTIC = /^\[(info|warn|error)\] ?(.*)$/;
 
@@ -69,9 +70,37 @@ function segments(text: string): Segment[] {
   });
 }
 
-/** Rewrite each `[error]` diagnostic of a closed harness block; collect what it said. */
+/**
+ * Each closed `open … close` block of at most MAX_BLOCK characters, passed to
+ * `rewrite`. Every search looks at most MAX_BLOCK characters ahead, so a text
+ * full of unclosed openings is still scanned in linear time; a block with
+ * another opening before its end is skipped, so it cannot swallow later text.
+ */
+function eachBlock(body: string, open: string, close: string, rewrite: (inner: string) => string): string {
+  let out = "";
+  let from = 0;
+  let at = 0;
+  for (;;) {
+    const start = body.indexOf(open, at);
+    if (start < 0) break;
+    const inner = start + open.length;
+    const window = body.slice(inner, inner + MAX_BLOCK + close.length);
+    const end = window.indexOf(close);
+    const nested = window.indexOf(HARNESS_OPEN);
+    if (end < 0 || (nested >= 0 && nested < end)) {
+      at = inner;
+      continue;
+    }
+    out += body.slice(from, start) + rewrite(window.slice(0, end));
+    from = at = inner + end + close.length;
+  }
+  return out + body.slice(from);
+}
+
+/** Rewrite each `[error]` diagnostic of a closed harness block in a tool result; collect what it said. */
 function redactHarness(body: string, removed: Set<string>): string {
-  return body.replace(HARNESS_BLOCK, (block, inner: string) => {
+  return eachBlock(body, `${HARNESS_OPEN}\n`, `\n${HARNESS_CLOSE}`, (inner) => {
+    const block = `${HARNESS_OPEN}\n${inner}\n${HARNESS_CLOSE}`;
     const lines = inner.split("\n");
     const out: string[] = [];
     let inError = false;
@@ -102,28 +131,10 @@ function redactHarness(body: string, removed: Set<string>): string {
 /**
  * An earlier summary's quoted harness block, in any layout (often one line,
  * sometimes in backticks): each `[error]` diagnostic in it becomes the fixed
- * line. Scanned with indexOf, not a regex, so a long or unclosed quote costs
- * linear time; a block without its closing tag within MAX_QUOTED_BLOCK is
- * left as it is.
+ * line.
  */
 function redactQuotedHarness(body: string, removed: Set<string>): string {
-  let out = "";
-  let from = 0;
-  for (;;) {
-    const open = body.indexOf(HARNESS_OPEN, from);
-    if (open < 0) break;
-    const inner = open + HARNESS_OPEN.length;
-    const close = body.indexOf(HARNESS_CLOSE, inner);
-    const nested = body.indexOf(HARNESS_OPEN, inner);
-    if (close < 0 || close - inner > MAX_QUOTED_BLOCK || (nested >= 0 && nested < close)) {
-      out += body.slice(from, inner);
-      from = inner;
-      continue;
-    }
-    out += body.slice(from, open) + quotedBlock(body.slice(inner, close), removed);
-    from = close + HARNESS_CLOSE.length;
-  }
-  return out + body.slice(from);
+  return eachBlock(body, HARNESS_OPEN, HARNESS_CLOSE, (inner) => quotedBlock(inner, removed));
 }
 
 function quotedBlock(inner: string, removed: Set<string>): string {

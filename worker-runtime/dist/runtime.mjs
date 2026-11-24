@@ -55246,10 +55246,9 @@ var ROLE = String.raw`\[(?:User|Assistant|Assistant tool calls|Tool result)\]: `
 var SEGMENT_START = new RegExp(String.raw`(?:^|\n\n|<conversation>\n)(?=${ROLE})`, "g");
 var CONVERSATION_END = `
 </conversation>`;
-var HARNESS_BLOCK = /<harness>\n([\s\S]*?)\n<\/harness>/g;
 var HARNESS_OPEN = "<harness>";
 var HARNESS_CLOSE = "</harness>";
-var MAX_QUOTED_BLOCK = 2000;
+var MAX_BLOCK = 2000;
 var DIAGNOSTIC = /^\[(info|warn|error)\] ?(.*)$/;
 function segments(text) {
   const end = text.lastIndexOf(CONVERSATION_END);
@@ -55267,8 +55266,34 @@ function segments(text) {
     return { role, start, end: Math.max(start, stop) };
   });
 }
+function eachBlock(body, open, close, rewrite) {
+  let out = "";
+  let from = 0;
+  let at = 0;
+  for (;; ) {
+    const start = body.indexOf(open, at);
+    if (start < 0)
+      break;
+    const inner = start + open.length;
+    const window2 = body.slice(inner, inner + MAX_BLOCK + close.length);
+    const end = window2.indexOf(close);
+    const nested = window2.indexOf(HARNESS_OPEN);
+    if (end < 0 || nested >= 0 && nested < end) {
+      at = inner;
+      continue;
+    }
+    out += body.slice(from, start) + rewrite(window2.slice(0, end));
+    from = at = inner + end + close.length;
+  }
+  return out + body.slice(from);
+}
 function redactHarness(body, removed) {
-  return body.replace(HARNESS_BLOCK, (block, inner) => {
+  return eachBlock(body, `${HARNESS_OPEN}
+`, `
+${HARNESS_CLOSE}`, (inner) => {
+    const block = `${HARNESS_OPEN}
+${inner}
+${HARNESS_CLOSE}`;
     const lines = inner.split(`
 `);
     const out = [];
@@ -55304,24 +55329,7 @@ ${out.join(`
   });
 }
 function redactQuotedHarness(body, removed) {
-  let out = "";
-  let from = 0;
-  for (;; ) {
-    const open = body.indexOf(HARNESS_OPEN, from);
-    if (open < 0)
-      break;
-    const inner = open + HARNESS_OPEN.length;
-    const close = body.indexOf(HARNESS_CLOSE, inner);
-    const nested = body.indexOf(HARNESS_OPEN, inner);
-    if (close < 0 || close - inner > MAX_QUOTED_BLOCK || nested >= 0 && nested < close) {
-      out += body.slice(from, inner);
-      from = inner;
-      continue;
-    }
-    out += body.slice(from, open) + quotedBlock(body.slice(inner, close), removed);
-    from = close + HARNESS_CLOSE.length;
-  }
-  return out + body.slice(from);
+  return eachBlock(body, HARNESS_OPEN, HARNESS_CLOSE, (inner) => quotedBlock(inner, removed));
 }
 function quotedBlock(inner, removed) {
   const parts = inner.split(/(\[(?:info|warn|error)\])/);

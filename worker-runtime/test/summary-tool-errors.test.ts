@@ -97,6 +97,21 @@ describe("CAD-2744: tool error text leaves the summary source", () => {
     expect(performance.now() - started).toBeLessThan(500);
   });
 
+  it("scans many unclosed openings in linear time, in tool results and in an earlier summary", () => {
+    const fakeResult = `[Tool result]: ${"<harness>\n[error] x ".repeat(16_000)}`;
+    const summary = `[User]: ${EARLIER}${"<harness>[error] y ".repeat(16_000)}\n</summary>`;
+    for (const text of [source(fakeResult), source(summary)]) {
+      const started = performance.now();
+      expect(redactToolErrors(text)).toBe(text);
+      expect(performance.now() - started).toBeLessThan(500);
+    }
+  });
+
+  it("leaves a block longer than a tool result can be", () => {
+    const text = source(`[Tool result]: ${harness(`[error] ${"z".repeat(2_100)}`)}`);
+    expect(redactToolErrors(text)).toBe(text);
+  });
+
   it("cleans a multi-diagnostic quote in an earlier summary, keeping its warning", () => {
     const summary = `[User]: ${EARLIER}- Result: <harness>\n[warn] output shortened\n[error] ${MESSAGE}\n</harness>\n</summary>`;
     const out = redactToolErrors(source(summary));
