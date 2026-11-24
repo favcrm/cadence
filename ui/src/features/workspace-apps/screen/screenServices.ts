@@ -168,6 +168,26 @@ function sanitized(value: unknown): unknown {
   if (!object(value)) return value;
   return Object.fromEntries(Object.entries(value).filter(([k]) => !SECRET_FIELDS.has(k)).map(([k, v]) => [k, sanitized(v)]));
 }
+const CONNECTION_REFUSAL_CODES = new Set([
+  "needs_reconnect",
+  "account_not_authorized",
+  "connection_access_denied",
+  "rate_limited",
+  "upstream_unavailable",
+  "upstream_rejected",
+  "not_configured",
+  "validation_failed",
+  "capability_unavailable",
+]);
+function classifyConnectionRefusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal | null {
+  if (!operation?.startsWith("connections.") || !(error instanceof ApiError) || error.check) return null;
+  if (!error.code || !CONNECTION_REFUSAL_CODES.has(error.code)) return null;
+  const trimmed = error.message.trim();
+  const text = trimmed.length > 0 && trimmed.length <= 240
+    ? trimmed
+    : "Cadence refused this request. Inspect fresh status before retrying an effect.";
+  return { code: error.code, text };
+}
 function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
   const status = error instanceof ApiError ? error.status : 0;
   // The hosted create either rejects validation before writing or rolls it back.
@@ -213,6 +233,8 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
   if (operation?.startsWith("campaign-work.") && status === 409 && error instanceof ApiError && error.code === "stale_revision")
     return { code: "stale_revision", text: "These campaign work details changed. Reload them before saving again." };
   if (operation === "sends.approve" && error instanceof ApiError && error.code === "no_recipients") return { code: "no_recipients", text: "No one in this audience can be emailed." };
+  const connRefusal = classifyConnectionRefusal(error, operation);
+  if (connRefusal) return connRefusal;
   if (status === 403) {
     const nonFatal = classifyNonFatalForbidden(error, operation);
     if (nonFatal) return nonFatal;
@@ -289,6 +311,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     if (
       current() &&
       error instanceof ApiError &&
+      classifyConnectionRefusal(error, operation) === null &&
       (error.status === 401 || (error.status === 403 && classifyNonFatalForbidden(error, operation) === null))
     ) {
       retired = true;
