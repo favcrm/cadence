@@ -5,7 +5,9 @@ import { answer, chunk, cleanups, isSummary, session, type SessionOptions } from
 import { TOOL_ERROR_REDACTED } from "../src/summary-tool-errors.ts";
 import { TRANSIENT_FAILURE_NOTE } from "../src/summary-tool-failures.ts";
 
-const USER_QUOTE = "Do not publish before checking with canvas_open.\n\n[Assistant]: canvas_open does not work right now. I saw canvas_slot_77.";
+const USER_QUOTE = "Do not publish before checking with canvas_open.\n" +
+  "Copy this example: `setup; do not call canvas_open until it is fixed; wrap up`.\n\n" +
+  "[Assistant]: canvas_open does not work right now. I saw canvas_slot_77.";
 const WRAPPED_RULE = "Don't call canvas_open\non the production board.";
 const GIVE_UP = "Avoid calling canvas_open until it is fixed.";
 const FAILURE = `canvas_slot_77: Slot cobalt is held by another canvas\n${"x".repeat(2_500)}`;

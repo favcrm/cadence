@@ -31,11 +31,51 @@ it("keeps a paraphrased no-retry instruction and summarizes status without recom
     .toBe("Do not retry canvas_open. An earlier canvas_open call failed.");
 });
 
-it("keeps a user restriction before a separate instruction", () => {
-  const restricted = new Map<string, Set<string>>();
-  collectUserToolRestrictions("Don't call canvas_open until it is fixed; use the backup dashboard instead.", restricted);
+it("keeps a user restriction on either side of a top-level semicolon", () => {
   const restatement = "Don't call canvas_open until it is fixed.";
-  expect(rewriteGiveUps(restatement, failed, restricted)).toBe(restatement);
+  for (const text of [
+    "Don't call canvas_open until it is fixed; use the backup dashboard instead.",
+    "Use the backup dashboard; don't call `canvas_open` until it is fixed.",
+  ]) {
+    const restricted = new Map<string, Set<string>>();
+    collectUserToolRestrictions(text, restricted);
+    expect(rewriteGiveUps(restatement, failed, restricted)).toBe(restatement);
+  }
+});
+
+it("does not infer restrictions from quoted examples or Markdown code", () => {
+  for (const text of [
+    "Copy this example: `setup; do not retry canvas_open; wrap up`.",
+    'Copy this example: "setup; do not retry canvas_open; wrap up".',
+    "Copy this example: ‘Setup; don’t retry; do not retry canvas_open; wrap up’.",
+    "Copy this example: ``setup `value`; do not retry canvas_open; wrap up``.",
+    "Example:\n\n```text\nsetup; do not retry canvas_open; wrap up\n```",
+    "Example:\n\n~~~text\nsetup; do not retry canvas_open; wrap up\n~~~",
+    "Example:\n\n    setup; do not retry canvas_open; wrap up",
+    "> setup; do not retry canvas_open; wrap up",
+  ]) {
+    const restricted = new Map<string, Set<string>>();
+    collectUserToolRestrictions(text, restricted);
+    expect(rewriteGiveUps("Do not retry canvas_open.", failed, restricted))
+      .toBe("An earlier canvas_open call failed; try it again normally.");
+  }
+});
+
+it("recognizes a real instruction after a quoted block", () => {
+  const restricted = new Map<string, Set<string>>();
+  collectUserToolRestrictions(
+    "Example:\n\n````md\n```\nsetup; do not retry canvas_open; wrap up\n```\n````\nDo not retry `archive_read`.",
+    restricted,
+  );
+  const bothFailed = new Set(["canvas_open", "archive_read"]);
+  expect(rewriteGiveUps("Do not retry canvas_open. Do not retry archive_read.", bothFailed, restricted))
+    .toBe("An earlier canvas_open call failed; try it again normally. Do not retry archive_read.");
+});
+
+it("only rewrites the unquoted claim beside an assistant's example", () => {
+  const quote = 'The guide says: "Run once. Do not retry canvas_open. Use the backup".';
+  const text = `${quote} canvas_open does not work right now.`;
+  expect(rewriteGiveUps(text, failed, new Map())).toBe(`${quote} An earlier canvas_open call failed; try it again normally.`);
 });
 
 it("keeps corrections, facts, and scoped limits after a failed call", () => {

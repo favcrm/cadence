@@ -57372,6 +57372,172 @@ function errorEchoScrubber(removed) {
   };
 }
 
+// src/summary-prose.ts
+function* proseClauses(text, semicolons) {
+  let start = 0;
+  let quoted = false;
+  for (let at = 0;at < text.length; ) {
+    const mark = text[at];
+    if (at === start && (at === 0 || text[at - 1] === `
+`) && isCodeIndent(text, at)) {
+      start = at = indentedCodeEnd(text, at);
+      continue;
+    }
+    if (mark === ">" && blockStart(text, at)) {
+      if (!quoted && start < at)
+        yield [start, at];
+      start = at = blockQuoteEnd(text, at);
+      quoted = false;
+      continue;
+    }
+    if (mark === "`" || mark === "~") {
+      const after = runEnd(text, at, mark);
+      const width = after - at;
+      if (width >= 3 && blockStart(text, at)) {
+        if (!quoted && start < at)
+          yield [start, at];
+        start = at = fenceEnd(text, after, mark, width);
+        quoted = false;
+        continue;
+      }
+      if (mark === "`") {
+        const close = codeEnd(text, after, width);
+        if (close === text.length || width !== 1 || !/^[A-Za-z_][\w.-]*$/.test(text.slice(after, close)))
+          quoted = true;
+        at = close < text.length ? close + width : close;
+      } else
+        at = after;
+      continue;
+    }
+    const close = quoteCloser(mark);
+    if (close !== undefined && (!(mark === "'" || mark === "‘") || !word2(text[at - 1]))) {
+      quoted = true;
+      at = quoteEnd(text, at + 1, close);
+      continue;
+    }
+    if (mark === "\\") {
+      if (/[;.!?]/.test(text[at + 1] ?? ""))
+        at++;
+    } else if (mark === ";" && semicolons) {
+      if (!quoted && start < at)
+        yield [start, at];
+      start = at + 1;
+      quoted = false;
+    } else if (/[.!?]/.test(mark) && (at + 1 === text.length || /\s/.test(text[at + 1]))) {
+      if (!quoted)
+        yield [start, at + 1];
+      start = at + 1;
+      quoted = false;
+    } else if (mark === `
+`) {
+      const blank = blankLineEnd(text, at + 1);
+      if (blank !== undefined) {
+        if (!quoted && start < at)
+          yield [start, at];
+        start = at = blank;
+        quoted = false;
+        continue;
+      }
+    }
+    at++;
+  }
+  if (!quoted && start < text.length)
+    yield [start, text.length];
+}
+function blockStart(text, at) {
+  for (let spaces = 0;spaces < 3 && text[at - 1] === " "; spaces++)
+    at--;
+  return at === 0 || text[at - 1] === `
+`;
+}
+function blankLineEnd(text, at) {
+  while (text[at] === " " || text[at] === "\t" || text[at] === "\r")
+    at++;
+  return text[at] === `
+` ? at + 1 : undefined;
+}
+function blockQuoteEnd(text, start) {
+  for (let line = text.indexOf(`
+`, start);line !== -1; line = text.indexOf(`
+`, line + 1)) {
+    const end = blankLineEnd(text, line + 1);
+    if (end !== undefined)
+      return end;
+  }
+  return text.length;
+}
+function isCodeIndent(text, at) {
+  return text[at] === "\t" || text.startsWith("    ", at);
+}
+function indentedCodeEnd(text, start) {
+  let at = start;
+  do {
+    const newline = text.indexOf(`
+`, at);
+    if (newline === -1)
+      return text.length;
+    at = newline + 1;
+    for (;; ) {
+      const blank = blankLineEnd(text, at);
+      if (blank === undefined)
+        break;
+      at = blank;
+    }
+  } while (isCodeIndent(text, at));
+  return at;
+}
+function runEnd(text, at, mark) {
+  while (text[at] === mark)
+    at++;
+  return at;
+}
+function fenceEnd(text, start, mark, width) {
+  for (let newline = text.indexOf(`
+`, start);newline !== -1; ) {
+    let at = newline + 1;
+    while (at <= newline + 3 && text[at] === " ")
+      at++;
+    const end = runEnd(text, at, mark);
+    const next = text.indexOf(`
+`, end);
+    if (end - at >= width && text.slice(end, next < 0 ? text.length : next).trim() === "")
+      return next < 0 ? text.length : next + 1;
+    newline = next;
+  }
+  return text.length;
+}
+function codeEnd(text, start, width) {
+  for (let at = text.indexOf("`", start);at !== -1; ) {
+    const end = runEnd(text, at, "`");
+    if (end - at === width)
+      return at;
+    at = text.indexOf("`", end);
+  }
+  return text.length;
+}
+function quoteCloser(mark) {
+  if (mark === '"' || mark === "'")
+    return mark;
+  if (mark === "“")
+    return "”";
+  if (mark === "‘")
+    return "’";
+  return;
+}
+function word2(char) {
+  return char !== undefined && /[\p{L}\p{N}_]/u.test(char);
+}
+function quoteEnd(text, start, close) {
+  const apostrophe = close === "'" || close === "’";
+  for (let at = start;at < text.length; at++) {
+    if (text[at] === "\\")
+      at++;
+    else if (text[at] === close && !(apostrophe && word2(text[at - 1]) && word2(text[at + 1])))
+      return at + 1;
+  }
+  return text.length;
+}
+
 // src/summary-tool-failures.ts
 var TRANSIENT_FAILURE_NOTE = "[Runtime note]: Past tool failures are runtime events, not standing facts about the tools. " + "Keep user restrictions and scoped limits; otherwise the next turn should try again normally if needed.";
 var TOOL = String.raw`[\x60]?(?<tool>[A-Za-z_][\w.-]*)[\x60]?`;
@@ -57381,7 +57547,6 @@ var AVOID = new RegExp(String.raw`^${AVOID_ACTION} ${TOOL}(?: (?<condition>again
 var TIME2 = "right now|currently|at the moment|for now|any ?more|still|today";
 var OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED].map((marker) => marker.replace(/[()]/g, "\\$&")).join("|");
 var BROKEN = new RegExp(String.raw`^${TOOL} (?:(?:does not work|doesn't work|won't work|is broken|is not working|isn't working|keeps failing|keeps refusing)(?: (?:${TIME2}|though)| with (?:${OMITTED_ERROR})(?:: (?:${OMITTED_ERROR}))?|, avoid it)?|(?:is unavailable|is not available|isn't available) (?:${TIME2}))$`, "i");
-var SENTENCE = /(?:[^.!?]|[.!?](?!\s|$))+[.!?]?/g;
 function restrictionScope(groups) {
   const condition = groups.condition?.toLowerCase().replace(/^until (?:it )?(?:is )?/, "until ");
   if (condition !== undefined)
@@ -57389,32 +57554,38 @@ function restrictionScope(groups) {
   return /^(?:retr|re-?call)/i.test(groups.action ?? "") ? "again" : "";
 }
 function collectUserToolRestrictions(text, restricted) {
-  for (const clause of text.split(";")) {
-    for (const match of clause.matchAll(SENTENCE)) {
-      const rule = AVOID.exec(match[0].trim().replace(/[.!]$/, "").replace(/\s+/g, " "))?.groups;
-      if (!rule)
-        continue;
-      const tool = rule.tool;
-      let scopes = restricted.get(tool);
-      if (!scopes)
-        restricted.set(tool, scopes = new Set);
-      scopes.add(restrictionScope(rule));
-    }
+  for (const [start, end] of proseClauses(text, true)) {
+    const claim = text.slice(start, end).trim().replace(/[.!]$/, "").replace(/\s+/g, " ");
+    const rule = AVOID.exec(claim)?.groups;
+    if (!rule)
+      continue;
+    const tool = rule.tool;
+    let scopes = restricted.get(tool);
+    if (!scopes)
+      restricted.set(tool, scopes = new Set);
+    scopes.add(restrictionScope(rule));
   }
 }
 function rewriteGiveUps(body, failed, userRules) {
-  return body.replace(SENTENCE, (sentence) => {
-    const claim = sentence.trim().replace(/[.!]$/, "");
+  let out = "";
+  let from = 0;
+  for (const [start, end] of proseClauses(body, false)) {
+    const sentence = body.slice(start, end);
+    const leading = sentence.length - sentence.trimStart().length;
+    const trimmed = sentence.trim();
+    const claim = trimmed.replace(/[.!]$/, "");
     const avoid = AVOID.exec(claim)?.groups;
     const tool = avoid?.tool ?? BROKEN.exec(claim)?.groups?.tool;
     if (tool === undefined || !failed.has(tool))
-      return sentence;
+      continue;
     const scopes = userRules.get(tool);
     if (avoid && (scopes?.has("") || scopes?.has(restrictionScope(avoid))))
-      return sentence;
-    const leading = sentence.slice(0, sentence.length - sentence.trimStart().length);
-    return `${leading}An earlier ${tool} call failed${scopes ? "." : "; try it again normally."}`;
-  });
+      continue;
+    out += body.slice(from, start + leading);
+    out += `An earlier ${tool} call failed${scopes ? "." : "; try it again normally."}`;
+    from = start + leading + trimmed.length;
+  }
+  return from === 0 ? body : out + body.slice(from);
 }
 
 // src/summary-source.ts
