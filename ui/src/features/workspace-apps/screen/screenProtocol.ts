@@ -57,6 +57,7 @@ export type ChildToHost =
   | { v: 2; op: "whatsapp-compose"; conversation_id: string | null; provider?: WhatsAppComposeProvider }
   | { v: 2; op: "whatsapp-reply-layout"; nomination: number; bounds: WhatsAppReplyBounds | null }
   | { v: 2; op: "whatsapp-reply-inset-ready"; nomination: number; seq: number; px: number }
+  | { v: 2; op: "whatsapp-thread-unread"; conversation_id: string; provider: WhatsAppComposeProvider; unread: boolean }
   | WhatsAppMediaRequest
   | AudioRequest
   | AudioSessionRequest
@@ -287,6 +288,33 @@ export function validLinkedMediaId(value: unknown): value is string {
     if (code < 32 || code === 127) return false;
   }
   return true;
+}
+
+/** CAD-2743 — opt-in host<->child UX sync (unread clear/mark, deep-link, draft previews, optimistic send echo). */
+export const SCREEN_WHATSAPP_UX_V1 = "screen-whatsapp-ux.v1";
+export type WhatsAppOutboundEchoPhase = "pending" | "sent" | "failed" | "cancelled";
+export type WhatsAppUxMediaKind = "image" | "video" | "audio" | "document";
+export interface WhatsAppOpenThreadMessage {
+  v: 2;
+  op: "whatsapp-open-thread";
+  conversation_id: string;
+}
+export interface WhatsAppDraftsMessage {
+  v: 2;
+  op: "whatsapp-drafts";
+  drafts: Record<string, string>;
+}
+export interface WhatsAppOutboundEchoMessage {
+  v: 2;
+  op: "whatsapp-outbound-echo";
+  phase: WhatsAppOutboundEchoPhase;
+  temp_id: string;
+  conversation_id: string;
+  provider: WhatsAppComposeProvider;
+  text: string;
+  media_kind: WhatsAppUxMediaKind | null;
+  file_name: string | null;
+  created_at: string;
 }
 /** Generic host-mediated microphone recording and audio file upload (`screen-audio.v1`). */
 export const SCREEN_AUDIO_V1 = "screen-audio.v1";
@@ -556,7 +584,7 @@ export const SCREEN_ROUTE_PARAMS_V1 = "screen-route-params.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2 | typeof SCREEN_WHATSAPP_MEDIA_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2 | typeof SCREEN_WHATSAPP_MEDIA_V1 | typeof SCREEN_WHATSAPP_UX_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -890,7 +918,7 @@ export interface ScreenPush {
   presentation_locale?: "en" | "zh-TW";
 }
 
-export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface | AudioSessionEvent | WhatsAppMediaReply;
+export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface | AudioSessionEvent | WhatsAppMediaReply | WhatsAppOpenThreadMessage | WhatsAppDraftsMessage | WhatsAppOutboundEchoMessage;
 
 /** Parse a window message into a `ScreenInit`, or `null`. The port is a
  *  `MessagePort` in `event.ports[0]` — the caller checks `event.origin`
@@ -968,7 +996,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     new Set(d.accepts).size === d.accepts.length &&
     !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
     !(d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1) && d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2)) &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2 || a === SCREEN_WHATSAPP_MEDIA_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2 || a === SCREEN_WHATSAPP_MEDIA_V1 || a === SCREEN_WHATSAPP_UX_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -1088,6 +1116,22 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       conversation_id: d.conversation_id,
       message_id: d.message_id,
       ...(d.disposition !== undefined ? { disposition: d.disposition as WhatsAppMediaDisposition } : {}),
+    };
+  }
+  if (
+    d.v === 2 &&
+    d.op === "whatsapp-thread-unread" &&
+    Object.keys(d).sort().join() === "conversation_id,op,provider,unread,v" &&
+    validLinkedMediaId(d.conversation_id) &&
+    (d.provider === "linked" || d.provider === "official") &&
+    typeof d.unread === "boolean"
+  ) {
+    return {
+      v: 2,
+      op: "whatsapp-thread-unread",
+      conversation_id: d.conversation_id,
+      provider: d.provider,
+      unread: d.unread,
     };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&

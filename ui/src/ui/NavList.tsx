@@ -12,6 +12,7 @@ import { IconAgents, IconApps, IconCaret, IconDocuments, IconHome, IconMyWork, I
 import { AppGlyph } from "../features/explorer/shared";
 import { useLocale } from "../lib/locale";
 import { useAssistantUnread } from "../features/app-shell/chat/assistantUnread";
+import { useWhatsAppUnread } from "../features/app-shell/whatsappUnread";
 
 const prefetchApp = (app: Pick<AppNavEntry, "installId" | "kind">) => {
   if (app.kind === "social-content") prefetchWorkspaceApp(app.installId);
@@ -90,8 +91,13 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
   const foldId = useId();
   // CAD-1700: a quiet dot where an assistant reply waits unseen.
   const assistantUnread = useAssistantUnread();
+  const whatsappUnread = useWhatsAppUnread();
   const apps = appMenu?.apps ?? [];
   const currentApp = apps.find((a) => a.current) ?? null;
+  const totalWaUnread = apps.reduce((sum, app) => {
+    const entry = whatsappUnread.get(app.installId);
+    return sum + (entry?.available ? entry.totalUnread : 0);
+  }, 0);
   return (
     <nav className="grid gap-[2px]" aria-label={t(label)}>
       {items.map((item) => {
@@ -129,6 +135,11 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
         // the parent stays current for assistive tech only.
         const open = prefs.appsOpen;
         const parent = here && currentApp !== null && open && !rail;
+        const appsBadgeText = totalWaUnread > 99 ? "99+" : String(totalWaUnread);
+        const appsLabel = [
+          currentApp && here ? `${t(item.label)} · ${currentApp.title}` : t(item.label),
+          totalWaUnread > 0 ? `${totalWaUnread} ${t("Unread WhatsApp messages")}` : "",
+        ].filter(Boolean).join(" · ");
         return (
           <div key={item.screen} className="navgroup">
             <div className="navrow">
@@ -136,13 +147,21 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 href={navHref(item.route)}
                 onClick={onNavigate}
                 className="navlink"
-                data-rail-label={currentApp && here ? `${t(item.label)} · ${currentApp.title}` : t(item.label)}
-                aria-label={rail ? (currentApp && here ? `${t(item.label)} · ${currentApp.title}` : t(item.label)) : undefined}
+                data-rail-label={appsLabel}
+                aria-label={rail ? appsLabel : undefined}
                 aria-current={here ? (parent ? "true" : "page") : undefined}
                 data-parent-current={parent ? "" : undefined}
               >
                 {NAV_ICONS[item.screen]}
                 <span className="navlabel">{t(item.label)}</span>
+                {totalWaUnread > 0 && (!open || rail) && (
+                  <span
+                    className="navbadge navbadge-accent num"
+                    aria-label={`${totalWaUnread} ${t("Unread WhatsApp messages")}`}
+                  >
+                    {appsBadgeText}
+                  </span>
+                )}
               </Link>
               <Disclosure
                 open={open}
@@ -175,6 +194,19 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                         >
                           <AppGlyph name={app.kind ?? app.installId} title={app.title} size="xs" />
                           <span className="truncate">{app.title}</span>
+                          {(() => {
+                            const entry = whatsappUnread.get(app.installId);
+                            const count = entry?.available ? entry.totalUnread : 0;
+                            if (count <= 0) return null;
+                            return (
+                              <span
+                                className="navbadge navbadge-accent num"
+                                aria-label={`${count} ${t("Unread WhatsApp messages")}`}
+                              >
+                                {count > 99 ? "99+" : count}
+                              </span>
+                            );
+                          })()}
                           {assistantUnread.has(app.installId) && (
                             <span className="navdot" role="img" aria-label={t("New assistant reply")} />
                           )}

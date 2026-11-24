@@ -122,6 +122,7 @@ import PrintView from "./features/print/PrintView";
 import { isPrintPath } from "./features/print/printRequest";
 import { useHomeUnread } from "./features/app-shell/chat/homeUnread";
 import { AssistantUnreadProbes } from "./features/app-shell/chat/unreadShell";
+import { WhatsAppUnreadProbes } from "./features/app-shell/WhatsAppUnreadProbes";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
 import type { Agent, AgentsPayload } from "./lib/types";
 import { cache, onIssueUnavailable, resources, type MyWorkList } from "./lib/resources";
@@ -1318,6 +1319,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         </header>
 
         <AssistantUnreadProbes apps={installed} />
+        <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />
 
         {updateBanner && (
           <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">
