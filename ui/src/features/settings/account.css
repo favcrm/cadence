@@ -689,25 +689,6 @@
   font-size: var(--text-label);
   color: var(--color-ink-400);
 }
-.billing-extra-standby {
-  margin-block-start: 1rem;
-  padding-block-start: 0.875rem;
-  border-block-start: 1px solid var(--color-ink-700);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 0.45rem 0.75rem;
-  font-size: var(--text-label);
-  color: var(--color-ink-400);
-}
-.billing-extra-standby-left {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45rem;
-  color: var(--color-ink-300);
-  font-weight: 500;
-}
 .billing-plan-card-head {
   display: flex;
   align-items: center;

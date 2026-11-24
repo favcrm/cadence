@@ -581,16 +581,6 @@ function HostedBilling({
           <Button icon={<IconRefresh />} loading={loading} onClick={() => void refresh()}>
             {t("Refresh")}
           </Button>
-          {data?.canManage && account && subActive && !isIapManaged && (
-            <Button
-              variant="primary"
-              loading={busyAction === "portal"}
-              disabled={busyAction !== null}
-              onClick={() => void runAction("portal", "/api/account/billing/portal", {})}
-            >
-              {t("Manage billing")}
-            </Button>
-          )}
         </div>
       </header>
 
@@ -875,7 +865,7 @@ function HostedBilling({
                               {t("{pct}% remaining").replace("{pct}", String(summary.extra.poolRemainingPercent))}
                             </span>
                           </div>
-                          <div className="usage-track billing-usage-track" aria-hidden="true">
+                          <div className="billing-usage-track" aria-hidden="true">
                             <div
                               className="billing-usage-fill"
                               data-tone="info"

@@ -474,8 +474,8 @@ async function run(): Promise<void> {
     win.document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   });
 
-  const portalBtn = Array.from(host.querySelectorAll("button")).find(
-    (b) => b.textContent === "管理帳單",
+  const portalBtn = Array.from(host.querySelectorAll('[data-testid="billing-manage-strip"] button')).find(
+    (b) => b.textContent === "開啟帳單入口網站",
   ) as HTMLButtonElement;
   assert(portalBtn, "active Stripe subscription shows Open billing portal button");
   nextPostPayload = { url: "https://billing.stripe.com/p/session/bps_synth_1" };
