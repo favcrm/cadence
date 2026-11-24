@@ -1,0 +1,26 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.review.check",
+    "input": {
+      "current": 2,
+      "revision": 2,
+      "review_status": "pending",
+      "pending": 2,
+      "trashed": false,
+      "author": "human:acme:alice",
+      "reviewer": "human:acme:bob",
+      "decision": "changes",
+      "note": "Tighten the opening."
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.review.check",
+    "value": {
+      "allowed": true,
+      "review_status": "changes_requested",
+      "refusals": []
+    }
+  }
+}

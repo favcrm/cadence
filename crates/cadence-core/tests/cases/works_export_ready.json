@@ -1,0 +1,25 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.export.check",
+    "input": {
+      "current": 2,
+      "revision": 2,
+      "review_status": "approved",
+      "reviewed": 2,
+      "trashed": false,
+      "format": "html"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.export.check",
+    "value": {
+      "allowed": true,
+      "review_state": "reviewed",
+      "export_state": "ready",
+      "reason": "This revision is reviewed and ready for host export.",
+      "refusals": []
+    }
+  }
+}

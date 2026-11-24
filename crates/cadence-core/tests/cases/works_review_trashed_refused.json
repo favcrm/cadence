@@ -1,0 +1,30 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.review.check",
+    "input": {
+      "current": 1,
+      "revision": 2,
+      "review_status": "pending",
+      "pending": 2,
+      "trashed": true,
+      "author": "human:acme:alice",
+      "reviewer": "human:acme:bob",
+      "decision": "approve"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.review.check",
+    "value": {
+      "allowed": false,
+      "refusals": [
+        {
+          "kind": "rejected",
+          "code": "not_found",
+          "message": "works content was not found"
+        }
+      ]
+    }
+  }
+}

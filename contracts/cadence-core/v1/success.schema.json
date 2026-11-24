@@ -110,6 +110,54 @@
       ]
     },
     {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "works.draft.validate"
+        },
+        "value": {
+          "$ref": "#/$defs/DraftValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "works.review.check"
+        },
+        "value": {
+          "$ref": "#/$defs/ReviewValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "works.export.check"
+        },
+        "value": {
+          "$ref": "#/$defs/ExportValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
       "description": "The delivery-requirements document: the class, the reviews it needs and\nthe policy it was decided under (CAD-1946).",
       "type": "object",
       "properties": {
@@ -315,6 +363,95 @@
         "policy_source",
         "policy_digest",
         "requirements"
+      ]
+    },
+    "DraftValue": {
+      "description": "Success value of `works.draft.validate`. The two material fields are the\nexact bytes a host hashes: a revision's `contentDigest` is `sha256:` plus\nthe hex SHA-256 of the UTF-8 `content_material` bytes, and\n`payload_material` also covers tags.",
+      "type": "object",
+      "properties": {
+        "content_material": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "The normalized kind, present only when the draft is valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_material": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refusals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorksRefusal"
+          }
+        },
+        "tags": {
+          "description": "Tags after trimming and de-duplication, present only when valid.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "title": {
+          "description": "The trimmed title, present only when the draft is valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "valid",
+        "refusals"
+      ]
+    },
+    "ExportValue": {
+      "description": "Success value of `works.export.check`.",
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "export_state": {
+          "description": "`ready` | `blocked`.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "The card's export explanation for this state.",
+          "type": "string"
+        },
+        "refusals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorksRefusal"
+          }
+        },
+        "review_state": {
+          "description": "`draft` | `edited` | `reviewed`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowed",
+        "review_state",
+        "export_state",
+        "reason",
+        "refusals"
       ]
     },
     "FieldRefusal": {
@@ -860,6 +997,40 @@
         }
       ]
     },
+    "ReviewValue": {
+      "description": "Success value of `works.review.check`: the state the host must write.",
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "refusals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorksRefusal"
+          }
+        },
+        "review_status": {
+          "description": "`approved` or `changes_requested`; absent when refused.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewed_revision": {
+          "description": "The revision an approval records; absent when refused, or for\n`changes`, which leaves the stored reviewed revision unchanged.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "allowed",
+        "refusals"
+      ]
+    },
     "RiskRule": {
       "type": "object",
       "properties": {
@@ -1010,6 +1181,28 @@
       "required": [
         "valid",
         "refusals"
+      ]
+    },
+    "WorksRefusal": {
+      "description": "One refused Works domain step, in the native wire shape.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "`invalid` | `conflict` | `forbidden` | `not_found` | `needs_review`.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`rejected` or `conflict`.",
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "code",
+        "message"
       ]
     }
   }
