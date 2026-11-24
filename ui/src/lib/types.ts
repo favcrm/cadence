@@ -1856,6 +1856,8 @@ export type CustomMcpAuthKind = "auto" | "oauth" | "oauth_static" | "bearer" | "
 export type CustomMcpStoredAuthKind = "oauth" | "oauth_static" | "bearer" | "header" | "none";
 export type CustomMcpToolMode = "off" | "approval" | "read";
 export type CustomMcpStatus = "pending_oauth" | "active" | "auth_expired" | "needs_review" | "revoked";
+export type CustomMcpCheckOutcome = "ok" | "changes_found" | "auth_needed" | "error";
+export type CustomMcpPendingChange = "new" | "changed" | "removed";
 
 export interface CustomMcpToolPin {
   tool_name: string;
@@ -1864,9 +1866,12 @@ export interface CustomMcpToolPin {
   annotations: Record<string, unknown> | null;
   tool_digest: string;
   mode: CustomMcpToolMode;
+  auto?: boolean;
   drifted: boolean;
   pending_description: string | null;
   pending_tool_digest: string | null;
+  pending_change?: CustomMcpPendingChange | null;
+  pending_annotations?: Record<string, unknown> | null;
   updated_at: number;
 }
 
@@ -1900,6 +1905,8 @@ export interface CustomMcpConnectionSummary {
   has_agent_guide: boolean;
   agent_guide_source: string | null;
   last_synced_at: number | null;
+  last_checked_at?: number | null;
+  last_check_outcome?: CustomMcpCheckOutcome | null;
   last_used_at: number | null;
   created_at: number;
   updated_at: number;

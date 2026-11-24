@@ -19,7 +19,11 @@ import {
   customMcpAuthLabel,
   customMcpAuthOptionLabel,
   customMcpAuthorizationUrl,
+  customMcpCheckedText,
+  customMcpCheckOutcomeView,
   customMcpErrorText,
+  customMcpPendingAnnotationRisk,
+  customMcpPendingChangeLabel,
   customMcpReturn,
   customMcpStatusView,
   customMcpToolModeLabel,
@@ -212,5 +216,52 @@ const connectEntry: ThreadEntry = {
   payload: { v: 1, toolkit: "custom_mcp", toolkit_label: "Acme Billing" },
 };
 equal(parseConnectRef(connectEntry), { toolkit: "custom_mcp", label: "Acme Billing" }, "custom_mcp connect_ref parses");
+
+// 5. AOS-738 / CAD-2759 per-tool drift labels, Last checked outcomes, and annotation risks.
+equal(customMcpCheckedText(null), "Not checked yet", "null last_checked_at text");
+assert(customMcpCheckedText(1_795_000_000_000) !== "Not checked yet", "timestamp formatted");
+equal(customMcpCheckOutcomeView("ok"), { label: "Up to date", tone: "ok" }, "ok outcome");
+equal(customMcpCheckOutcomeView("changes_found"), { label: "Changes found", tone: "warn" }, "changes_found outcome");
+equal(customMcpCheckOutcomeView("auth_needed"), { label: "Auth needed", tone: "fail" }, "auth_needed outcome");
+equal(customMcpCheckOutcomeView("error"), { label: "Check failed", tone: "fail" }, "error outcome");
+equal(customMcpCheckOutcomeView(null), null, "null outcome");
+equal(customMcpPendingChangeLabel("new"), "New", "new change chip");
+equal(customMcpPendingChangeLabel("changed"), "Changed", "changed change chip");
+equal(customMcpPendingChangeLabel("removed"), "Removed upstream", "removed change chip");
+equal(customMcpPendingChangeLabel(null), "Drifted", "fallback drifted chip");
+equal(
+  customMcpPendingAnnotationRisk({
+    tool_name: "t1",
+    description: "",
+    input_schema: {},
+    annotations: { readOnlyHint: true },
+    tool_digest: "sha256:a",
+    mode: "approval",
+    drifted: true,
+    pending_description: null,
+    pending_tool_digest: "sha256:b",
+    pending_annotations: { destructiveHint: true },
+    updated_at: 1,
+  }),
+  "Pending annotations mark this tool destructive.",
+  "destructive hint warning",
+);
+equal(
+  customMcpPendingAnnotationRisk({
+    tool_name: "t2",
+    description: "",
+    input_schema: {},
+    annotations: { readOnlyHint: true },
+    tool_digest: "sha256:a",
+    mode: "approval",
+    drifted: true,
+    pending_description: null,
+    pending_tool_digest: "sha256:b",
+    pending_annotations: { readOnlyHint: false },
+    updated_at: 1,
+  }),
+  "Pending annotations remove the read-only hint.",
+  "removed readOnlyHint warning",
+);
 
 console.log("customMcp: ok");

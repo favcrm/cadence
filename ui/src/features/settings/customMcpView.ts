@@ -2,7 +2,9 @@ import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
 import type {
   CustomMcpAuthKind,
+  CustomMcpCheckOutcome,
   CustomMcpConnectionSummary,
+  CustomMcpPendingChange,
   CustomMcpStoredAuthKind,
   CustomMcpToolMode,
   CustomMcpToolPin,
@@ -346,6 +348,53 @@ export function customMcpToolModeLabel(mode: CustomMcpToolMode): string {
 
 export function customMcpSyncedText(ms: number | null): string {
   return ms === null ? "Not synced yet" : fmtTime(new Date(ms).toISOString());
+}
+
+export function customMcpCheckedText(ms: number | null | undefined): string {
+  return ms == null ? "Not checked yet" : fmtTime(new Date(ms).toISOString());
+}
+
+export function customMcpCheckOutcomeView(
+  outcome: CustomMcpCheckOutcome | null | undefined,
+): { label: string; tone: "ok" | "warn" | "fail" | "muted" } | null {
+  switch (outcome) {
+    case "ok":
+      return { label: "Up to date", tone: "ok" };
+    case "changes_found":
+      return { label: "Changes found", tone: "warn" };
+    case "auth_needed":
+      return { label: "Auth needed", tone: "fail" };
+    case "error":
+      return { label: "Check failed", tone: "fail" };
+    default:
+      return null;
+  }
+}
+
+export function customMcpPendingChangeLabel(
+  change: CustomMcpPendingChange | null | undefined,
+): string {
+  switch (change) {
+    case "new":
+      return "New";
+    case "changed":
+      return "Changed";
+    case "removed":
+      return "Removed upstream";
+    default:
+      return "Drifted";
+  }
+}
+
+export function customMcpPendingAnnotationRisk(pin: CustomMcpToolPin): string | null {
+  if (!pin.drifted || !pin.pending_annotations) return null;
+  if (pin.pending_annotations.destructiveHint === true && pin.annotations?.destructiveHint !== true) {
+    return "Pending annotations mark this tool destructive.";
+  }
+  if (pin.annotations?.readOnlyHint === true && pin.pending_annotations.readOnlyHint !== true) {
+    return "Pending annotations remove the read-only hint.";
+  }
+  return null;
 }
 
 /** Parse multiline `Header-Name: Value` pairs for header-authenticated MCP servers. */
