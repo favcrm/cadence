@@ -277,7 +277,7 @@
 }
 .billing-catalog-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(13.5rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(12.5rem, 1fr));
   gap: 0.75rem;
 }
 .billing-catalog-card {
@@ -286,6 +286,7 @@
   justify-content: space-between;
   gap: 0.875rem;
   padding: 1.125rem;
+  border: 1px solid var(--color-ink-700);
   min-inline-size: 0;
 }
 .billing-catalog-card[data-current="true"] {
@@ -477,6 +478,39 @@
   background: color-mix(in oklab, var(--color-info) 12%, transparent);
   color: var(--color-info);
 }
+.billing-usage-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.625rem;
+  margin-block-start: 0.25rem;
+}
+.billing-usage-row .account-balance {
+  margin-block-start: 0;
+}
+.billing-usage-sub {
+  color: var(--color-ink-400);
+  font-size: var(--text-secondary);
+}
+.billing-usage-track {
+  margin-block-start: 0.75rem;
+  block-size: 8px;
+  border-radius: 9999px;
+  background: var(--color-ink-800);
+  border: 1px solid var(--color-ink-700);
+  overflow: hidden;
+}
+.billing-usage-fill {
+  block-size: 100%;
+  border-radius: 9999px;
+  background: var(--color-ok);
+}
+.billing-usage-fill[data-tone="warn"] {
+  background: var(--color-warn);
+}
+.billing-usage-fill[data-tone="fail"] {
+  background: var(--color-fail);
+}
 .billing-usage-fill[data-tone="info"] {
   background: var(--color-info);
 }
@@ -488,12 +522,21 @@
   flex-direction: column;
   justify-content: space-between;
   gap: 0.9rem;
+  border: 1px solid var(--color-ink-700);
+}
+.billing-hero-card .billing-card-head {
+  align-items: flex-start;
+  flex-wrap: nowrap;
+}
+.billing-hero-card .billing-card-head > .btn {
+  flex-shrink: 0;
 }
 .billing-hero-title-group {
+  flex: 1 1 auto;
   min-inline-size: 0;
 }
-.billing-hero-heading {
-  font-size: var(--text-cardtitle);
+.account-summary-card .billing-hero-heading {
+  font-size: 0.9375rem;
   font-weight: 600;
   color: var(--color-ink-100);
   margin: 0;
@@ -521,6 +564,7 @@
   flex-wrap: wrap;
   gap: 0.75rem 1.25rem;
   padding: 0.875rem 1.25rem;
+  border: 1px solid var(--color-ink-700);
   margin-block-end: 1.5rem;
 }
 .billing-manage-title {
@@ -558,7 +602,7 @@
   max-inline-size: 51rem;
 }
 .billing-modal-extra {
-  max-inline-size: 36rem;
+  max-inline-size: 46rem;
 }
 .billing-modal-head {
   display: flex;
@@ -611,6 +655,9 @@
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+.billing-extra-reserve-box .billing-usage-track {
+  margin-block-start: 0.25rem;
 }
 .billing-extra-reserve-row {
   display: flex;
@@ -988,5 +1035,10 @@
   .account-usage-table:has(th:nth-child(4)) tbody td:nth-child(3) {
     grid-column: 1 / -1;
     grid-row: 3;
+  }
+}
+@media (max-width: 480px) {
+  .billing-hero-card .billing-card-head {
+    flex-wrap: wrap;
   }
 }
