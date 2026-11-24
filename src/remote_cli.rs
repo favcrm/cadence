@@ -273,6 +273,14 @@ pub const REMOTE_VERBS: &[&str] = &[
     "document_create",
     "document_show",
     "document_export",
+    // CAD-2758 / AOS-739: enroll a hosted CLI login (`hosted_cli_sessions`)
+    // as an existing agent profile. Answered by the platform (control/tenant),
+    // never forwarded to a runtime.
+    "agent_enroll_start",
+    "agent_enroll_status",
+    "agent_enroll_list",
+    "agent_enroll_approve",
+    "agent_enroll_revoke",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -311,6 +319,9 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "template_show"
         | "template_blob_read"
         | "document_show" => &["cli.read"],
+        "agent_enroll_start" | "agent_enroll_status" => &["cli.read", "cli.write"],
+        "agent_enroll_list" => &["cli.read", "audit.approve"],
+        "agent_enroll_approve" | "agent_enroll_revoke" => &["cli.write", "audit.approve"],
         // CAD-2286: the tenant admits `document_submit` with cli.write alone.
         "document_submit" | "template_create" | "template_revise" | "template_sample"
         | "template_intake" | "template_approve" | "document_create" | "document_export" => {
@@ -448,6 +459,9 @@ const RECONCILE_TEMPLATE_APPROVE: &str = "the template approval may or may not h
 const RECONCILE_TEMPLATE_PREVIEW: &str = "the template preview/intake request did not return a usable answer — nothing was approved or issued";
 const RECONCILE_DOCUMENT_CREATE: &str = "the document draft may or may not have been created — check `artifact find` (if --save-artifact was set) before repeating it";
 const RECONCILE_DOCUMENT_EXPORT: &str = "the document export may or may not have been recorded — read `document show` for the same id before repeating it";
+const RECONCILE_AGENT_ENROLL_START: &str = "the enrollment request may or may not have been created — run `cadence agent enroll status` before repeating it";
+const RECONCILE_AGENT_ENROLL_APPROVE: &str = "the enrollment approval may or may not have been recorded — run `cadence agent enroll list` before repeating it";
+const RECONCILE_AGENT_ENROLL_REVOKE: &str = "the enrollment revocation may or may not have been recorded — run `cadence agent enroll list` before repeating it";
 const RECONCILE_UNKNOWN: &str =
     "the action may or may not have been applied — read the same resource before repeating it";
 
@@ -509,7 +523,12 @@ fn cli_effect(verb: &str) -> Effect {
         | "template_list"
         | "template_show"
         | "template_blob_read"
-        | "document_show" => Effect::Read,
+        | "document_show"
+        | "agent_enroll_status"
+        | "agent_enroll_list" => Effect::Read,
+        "agent_enroll_start" => mutation(RECONCILE_AGENT_ENROLL_START),
+        "agent_enroll_approve" => mutation(RECONCILE_AGENT_ENROLL_APPROVE),
+        "agent_enroll_revoke" => mutation(RECONCILE_AGENT_ENROLL_REVOKE),
         "template_create" | "template_revise" => mutation(RECONCILE_TEMPLATE_WRITE),
         "template_approve" => mutation(RECONCILE_TEMPLATE_APPROVE),
         "template_sample" | "template_intake" => mutation(RECONCILE_TEMPLATE_PREVIEW),
@@ -5566,6 +5585,83 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "this workspace's wiki has no readable page at that path for this login; nothing \
              was read",
         )),
+        (
+            "agent_enroll_list" | "agent_enroll_approve" | "agent_enroll_revoke",
+            Some("approval_scope_required"),
+        ) => Some((
+            "approval_scope_required",
+            "this login does not carry `audit.approve`; run `cadence login --audit-approve` once \
+             and retry. Nothing was changed",
+        )),
+        (
+            "agent_enroll_list" | "agent_enroll_approve" | "agent_enroll_revoke",
+            Some("owner_required" | "not_permitted"),
+        ) => Some((
+            "owner_required",
+            "listing, approving, or revoking CLI enrollments requires a live human workspace \
+             owner; this login is not one. Nothing was changed",
+        )),
+        ("agent_enroll_start", Some("approver_login_cannot_enroll")) => Some((
+            "approver_login_cannot_enroll",
+            "a login carrying `audit.approve` cannot enroll as an agent profile; use a separate \
+             `cadence login` without `--audit-approve`. Nothing was written",
+        )),
+        ("agent_enroll_approve", Some("self_approval_refused")) => Some((
+            "self_approval_refused",
+            "a login cannot approve its own CLI enrollment request; approve from a separate owner \
+             login carrying `audit.approve`. Nothing was changed",
+        )),
+        ("agent_enroll_approve" | "agent_enroll_revoke", Some("not_found")) => Some((
+            "not_found",
+            "this workspace has no CLI enrollment request with that id; check `cadence agent \
+             enroll list --org <name>`. Nothing was changed",
+        )),
+        ("agent_enroll_start" | "agent_enroll_status", Some("renewable_login_required")) => Some((
+            "renewable_login_required",
+            "CLI enrollment requires a renewable CLI login session; run `cadence login` again. \
+             Nothing was changed",
+        )),
+        ("agent_enroll_approve", Some("not_pending")) => Some((
+            "not_pending",
+            "this CLI enrollment request is no longer pending (it was already decided or expired); \
+             check `cadence agent enroll list --org <name>`. Nothing was changed",
+        )),
+        ("agent_enroll_approve", Some("authority_changed")) => Some((
+            "authority_changed",
+            "the requesting login or workspace membership changed before approval committed; ask \
+             the agent session to run `cadence agent enroll start` again. Nothing was changed",
+        )),
+        ("agent_enroll_approve", Some("profile_unavailable")) => Some((
+            "profile_unavailable",
+            "that agent profile is missing or not active in this workspace; inspect `cadence agent \
+             profile ls --org <name>` and retry with an active `ap_...` profile id. Nothing was \
+             changed",
+        )),
+        ("agent_enroll_start", Some("login_revoked")) => Some((
+            "login_revoked",
+            "this CLI login session is no longer live; run `cadence login` again from a fresh \
+             session. Nothing was written",
+        )),
+        (
+            "agent_enroll_start"
+            | "agent_enroll_status"
+            | "agent_enroll_list"
+            | "agent_enroll_approve"
+            | "agent_enroll_revoke",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the board refused the request: a value was not accepted, or this workspace predates \
+             CLI enrollment commands. Nothing was changed",
+        )),
+        (
+            "agent_enroll_status" | "agent_enroll_list",
+            Some("capability_unavailable"),
+        ) => Some((
+            "capability_unavailable",
+            "CLI enrollment is currently unavailable on this workspace (approval page missing or \
+             feature disabled). Nothing was changed",
+        )),
         _ => None,
     };
     match action {
@@ -6507,6 +6603,53 @@ fn skill_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, V
     }
 }
 
+fn enroll_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, Value>) -> bool {
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(data) = reply.get("data").and_then(Value::as_object) else {
+        return false;
+    };
+    let non_empty_str = |obj: &Map<String, Value>, key: &str| {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
+    match verb {
+        "agent_enroll_start" => match data.get("state").and_then(Value::as_str) {
+            Some("pending") => {
+                non_empty_str(data, "request_id") && non_empty_str(data, "approval_url")
+            }
+            Some("active") => {
+                non_empty_str(data, "enrollment_id") && non_empty_str(data, "profile_id")
+            }
+            _ => false,
+        },
+        "agent_enroll_approve" => {
+            let Some(enrollment) = data.get("enrollment").and_then(Value::as_object) else {
+                return false;
+            };
+            let req_id = arguments.get("request_id").and_then(Value::as_str);
+            let prof_id = arguments.get("profile_id").and_then(Value::as_str);
+            req_id.is_some()
+                && prof_id.is_some()
+                && enrollment.get("id").and_then(Value::as_str) == req_id
+                && enrollment.get("profile_id").and_then(Value::as_str) == prof_id
+                && enrollment.get("state").and_then(Value::as_str) == Some("active")
+        }
+        "agent_enroll_revoke" => {
+            let Some(enrollment) = data.get("enrollment").and_then(Value::as_object) else {
+                return false;
+            };
+            let req_id = arguments.get("request_id").and_then(Value::as_str);
+            req_id.is_some()
+                && enrollment.get("id").and_then(Value::as_str) == req_id
+                && enrollment.get("state").and_then(Value::as_str) == Some("revoked")
+        }
+        _ => false,
+    }
+}
+
 /// CAD-2101: a tenant board that predates the profile verbs answers
 /// `501 not_implemented` before it reads anything. Say to update the board,
 /// never that coordination is unavailable. A newer tenant behind an older
@@ -7019,6 +7162,12 @@ fn call_verb_until_retry(
     if require_agent && on_agent.is_none() {
         return Err(agent_credential::platform_agent_required());
     }
+    if agent.is_some() && verb.starts_with("agent_enroll_") {
+        return Err(Error::invalid(
+            "managed_caller_refused",
+            "hosted CLI enrollment verbs cannot run inside a managed daemon session — never sent",
+        ));
+    }
     let managed_pane = agent.is_some();
     let mut reissued = false;
     loop {
@@ -7455,6 +7604,9 @@ fn call_verb_until_retry(
                 }
                 "template_create" | "template_revise" | "template_approve" | "document_create"
                 | "document_export" => !template_receipt_correlates(verb, reply, &arguments),
+                "agent_enroll_start" | "agent_enroll_approve" | "agent_enroll_revoke" => {
+                    !enroll_receipt_correlates(verb, reply, &arguments)
+                }
                 _ => false,
             });
         if receipt_missing {
@@ -8220,9 +8372,9 @@ mod actor_credential;
 #[cfg(any(debug_assertions, feature = "test-seam"))]
 pub use actor_credential::unbind_cli_actor;
 pub use actor_credential::{
-    bind_cli_actor, cli_actor, cli_actor_is_non_human, detect_unmanaged_actor,
-    refuse_non_human_actor, saved_login_is_assistant_only, valid_profile_id, CliActor,
-    CliActorMode,
+    bind_cli_actor, cli_actor, cli_actor_is_explicit_non_human, cli_actor_is_non_human,
+    detect_unmanaged_actor, refuse_non_human_actor, saved_login_is_assistant_only,
+    valid_profile_id, CliActor, CliActorMode,
 };
 mod agent_credential;
 pub use agent_credential::{bind_managed_session, bound_session, AgentSlot};

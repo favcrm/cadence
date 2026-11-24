@@ -43,6 +43,10 @@ pub enum CliActorMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliActor {
     pub mode: CliActorMode,
+    /// True only when `detect_unmanaged_actor` implicitly selected `Assistant`
+    /// from an external coding-harness environment marker (`CLAUDECODE`, etc.),
+    /// false for `--agent`, `--as-human`, or explicit `CADENCE_CLI_ACTOR`.
+    pub implicit_harness: bool,
 }
 
 static BOUND_ACTOR: Mutex<Option<CliActor>> = Mutex::new(None);
@@ -70,7 +74,23 @@ pub fn cli_actor() -> Option<CliActor> {
         .clone()
 }
 
-/// Whether the active unmanaged CLI actor explicitly restricts out human/owner authority.
+/// Whether the active unmanaged CLI actor explicitly restricts out human/owner
+/// authority (explicit `--agent` or `CADENCE_CLI_ACTOR=assistant`, not an
+/// implicit external-harness default).
+pub fn cli_actor_is_explicit_non_human() -> bool {
+    matches!(
+        cli_actor(),
+        Some(CliActor {
+            mode: CliActorMode::Agent(_),
+            ..
+        }) | Some(CliActor {
+            mode: CliActorMode::Assistant,
+            implicit_harness: false,
+        })
+    )
+}
+/// Whether the active unmanaged CLI actor explicitly or implicitly restricts
+/// out human/owner authority.
 pub fn cli_actor_is_non_human() -> bool {
     matches!(
         cli_actor().map(|actor| actor.mode),
@@ -104,11 +124,13 @@ pub fn detect_unmanaged_actor(agent: Option<&str>, as_human: bool) -> Result<Opt
         }
         return Ok(Some(CliActor {
             mode: CliActorMode::Agent(profile_id.to_owned()),
+            implicit_harness: false,
         }));
     }
     if as_human {
         return Ok(Some(CliActor {
             mode: CliActorMode::Human,
+            implicit_harness: false,
         }));
     }
     if let Ok(raw) = std::env::var("CADENCE_CLI_ACTOR") {
@@ -117,9 +139,11 @@ pub fn detect_unmanaged_actor(agent: Option<&str>, as_human: bool) -> Result<Opt
             return match trimmed {
                 "assistant" => Ok(Some(CliActor {
                     mode: CliActorMode::Assistant,
+                    implicit_harness: false,
                 })),
                 "human" => Ok(Some(CliActor {
                     mode: CliActorMode::Human,
+                    implicit_harness: false,
                 })),
                 _ => Err(Error::usage(
                     "CADENCE_CLI_ACTOR must be `assistant` or `human`",
@@ -130,6 +154,7 @@ pub fn detect_unmanaged_actor(agent: Option<&str>, as_human: bool) -> Result<Opt
     if is_external_harness_terminal() {
         return Ok(Some(CliActor {
             mode: CliActorMode::Assistant,
+            implicit_harness: true,
         }));
     }
     Ok(None)
@@ -276,8 +301,14 @@ pub(super) fn is_assistant_allowed_call(
 
 pub(super) enum ActorSource {
     HumanLogin,
+    EnrolledLogin,
     Cached(PathBuf),
     Minted,
+}
+
+enum MintOutcome {
+    Credential(Box<Credential>),
+    EnrolledCliLogin,
 }
 
 impl ActorSource {
@@ -350,6 +381,24 @@ fn bearer_for_with(
         return Ok((login, ActorSource::HumanLogin));
     }
 
+    // AOS-739: `agent enroll start` and `agent enroll status` act on the
+    // caller's own CLI login (`hosted_cli_sessions`), so in an external coding
+    // harness without explicit `--agent` / `CADENCE_CLI_ACTOR=assistant` /
+    // `--as-assistant` they must send that login's own `hct_` bridge directly.
+    if matches!(surface, Surface::Cli)
+        && matches!(verb, "agent_enroll_start" | "agent_enroll_status")
+    {
+        if assistant_login || cli_actor_is_explicit_non_human() {
+            return Err(non_human_authority_refusal(verb, assistant_login));
+        }
+        return Ok((login, ActorSource::HumanLogin));
+    }
+
+    let implicit_assistant_enrolled_allowed = !assistant_login
+        && actor
+            .as_ref()
+            .is_some_and(|a| matches!(a.mode, CliActorMode::Assistant) && a.implicit_harness);
+
     let effective_mode = match actor.map(|a| a.mode) {
         Some(CliActorMode::Agent(profile_id)) => Some(CliActorMode::Agent(profile_id)),
         Some(CliActorMode::Assistant) => Some(CliActorMode::Assistant),
@@ -383,9 +432,21 @@ fn bearer_for_with(
         return Ok((cached, ActorSource::Cached(path)));
     }
 
-    let cred = mint_with(&login, target, dir, deadline, &mode, post)?;
-    let _ = write_cache(&path, target, &mode, session_id, &cred);
-    Ok((cred, ActorSource::Minted))
+    match mint_with(&login, target, dir, deadline, &mode, post)? {
+        MintOutcome::Credential(cred) => {
+            let cred = *cred;
+            let _ = write_cache(&path, target, &mode, session_id, &cred);
+            Ok((cred, ActorSource::Minted))
+        }
+        MintOutcome::EnrolledCliLogin if implicit_assistant_enrolled_allowed => {
+            let _ = fs::remove_file(&path);
+            Ok((login, ActorSource::EnrolledLogin))
+        }
+        MintOutcome::EnrolledCliLogin => Err(reject(
+            "hosted issuer refused CLI actor credential (HTTP 409, enrolled_cli_login); nothing \
+             was sent, and your human login was not used in its place",
+        )),
+    }
 }
 
 fn cache_path(dir: &Path, target: &RemoteTarget, mode: &CliActorMode) -> Result<PathBuf> {
@@ -416,7 +477,7 @@ fn mint_with(
         Value,
         Instant,
     ) -> Result<crate::remote_enrollment::IssuerAnswer>,
-) -> Result<Credential> {
+) -> Result<MintOutcome> {
     let issuer = login.issuer.as_deref().ok_or_else(|| {
         reject("hosted session issuer missing — run `cadence login` again; nothing was sent")
     })?;
@@ -452,6 +513,11 @@ fn mint_with(
         ))
     })?;
     let at = now()?;
+    if answer.status == 409
+        && answer.body.get("error").and_then(Value::as_str) == Some("enrolled_cli_login")
+    {
+        return Ok(MintOutcome::EnrolledCliLogin);
+    }
     if answer.status != 200 {
         let code = answer.body.get("error").and_then(Value::as_str);
         return Err(reject(format!(
@@ -462,6 +528,8 @@ fn mint_with(
         )));
     }
     validated(target, mode, &answer.body, at)
+        .map(Box::new)
+        .map(MintOutcome::Credential)
 }
 
 fn validated(
@@ -838,6 +906,7 @@ mod tests {
 
         bind_cli_actor(Some(CliActor {
             mode: CliActorMode::Human,
+            implicit_harness: false,
         }));
         let err = bearer_for(
             &target,
@@ -923,6 +992,7 @@ mod tests {
 
         bind_cli_actor(Some(CliActor {
             mode: CliActorMode::Assistant,
+            implicit_harness: false,
         }));
         let (cred1, src1) = bearer_for_with(
             &target,
@@ -982,6 +1052,7 @@ mod tests {
 
         bind_cli_actor(Some(CliActor {
             mode: CliActorMode::Agent("ap_dev".into()),
+            implicit_harness: false,
         }));
         let (cred3, src3) = bearer_for_with(
             &target,
@@ -1028,6 +1099,7 @@ mod tests {
 
         bind_cli_actor(Some(CliActor {
             mode: CliActorMode::Agent("ap_denied".into()),
+            implicit_harness: false,
         }));
         let err = bearer_for_with(
             &target,
@@ -1052,6 +1124,122 @@ mod tests {
             "{err}"
         );
         assert_eq!(posts.get(), 3);
+
+        // Implicit external harness:
+        // - `agent_enroll_start` & `agent_enroll_status` use the login directly (`HumanLogin`)
+        // - `agent_enroll_list` is refused
+        // - normal assistant-allowed call receives `409 enrolled_cli_login`, clears stale cache,
+        //   and returns `EnrolledLogin` (falling back to the login's own `hct_` bridge)
+        // - explicit `--agent` and `assistant_login` still refuse `409 enrolled_cli_login`.
+        bind_cli_actor(Some(CliActor {
+            mode: CliActorMode::Assistant,
+            implicit_harness: true,
+        }));
+        let (enroll_start_cred, enroll_start_src) = bearer_for_with(
+            &target,
+            &dir,
+            Instant::now() + AUTH_TIMEOUT,
+            Surface::Cli,
+            "agent_enroll_start",
+            None,
+            |_, _, _, _, _, _| {
+                panic!("agent_enroll_start must use login directly, never actor-credential")
+            },
+        )
+        .unwrap();
+        assert!(matches!(enroll_start_src, ActorSource::HumanLogin));
+        assert_eq!(enroll_start_cred.access_token, login.access_token);
+
+        let list_err = bearer_for_with(
+            &target,
+            &dir,
+            Instant::now() + AUTH_TIMEOUT,
+            Surface::Cli,
+            "agent_enroll_list",
+            None,
+            |_, _, _, _, _, _| panic!("agent_enroll_list must refuse before posting"),
+        )
+        .err()
+        .expect("agent_enroll_list must be refused in implicit harness mode");
+        assert!(
+            list_err.to_string().contains("human/owner authority"),
+            "{list_err}"
+        );
+
+        // Clear the earlier assistant cache so mint_with runs and sees 409 enrolled_cli_login.
+        let asst_cache = dir.join("actor-acme-assistant.json");
+        assert!(asst_cache.exists());
+        let _ = fs::remove_file(&asst_cache);
+        let (enrolled_cred, enrolled_src) = bearer_for_with(
+            &target,
+            &dir,
+            Instant::now() + AUTH_TIMEOUT,
+            Surface::Cli,
+            "issue_ls",
+            None,
+            |_, _, path, bearer, body, _| {
+                assert_eq!(path, "/v1/hosted-cadence/cli-session/actor-credential");
+                assert_eq!(bearer, login.access_token);
+                assert_eq!(body["mode"], "assistant");
+                Ok(crate::remote_enrollment::IssuerAnswer {
+                    status: 409,
+                    body: serde_json::json!({ "error": "enrolled_cli_login" }),
+                    correlation: None,
+                })
+            },
+        )
+        .unwrap();
+        assert!(matches!(enrolled_src, ActorSource::EnrolledLogin));
+        assert_eq!(enrolled_cred.access_token, login.access_token);
+
+        let rev_err = bearer_for_with(
+            &target,
+            &dir,
+            Instant::now() + AUTH_TIMEOUT,
+            Surface::Cli,
+            "issue_ls",
+            None,
+            |_, _, _, _, _, _| {
+                Ok(crate::remote_enrollment::IssuerAnswer {
+                    status: 401,
+                    body: serde_json::json!({ "error": "unauthorized" }),
+                    correlation: None,
+                })
+            },
+        )
+        .err()
+        .expect("401 unauthorized must never fall back");
+        assert!(
+            rev_err.to_string().contains("human login was not used"),
+            "{rev_err}"
+        );
+
+        bind_cli_actor(Some(CliActor {
+            mode: CliActorMode::Agent("ap_dev".into()),
+            implicit_harness: false,
+        }));
+        let _ = fs::remove_file(dir.join("actor-acme-agent-ap_dev.json"));
+        let agent_409 = bearer_for_with(
+            &target,
+            &dir,
+            Instant::now() + AUTH_TIMEOUT,
+            Surface::Cli,
+            "issue_ls",
+            None,
+            |_, _, _, _, _, _| {
+                Ok(crate::remote_enrollment::IssuerAnswer {
+                    status: 409,
+                    body: serde_json::json!({ "error": "enrolled_cli_login" }),
+                    correlation: None,
+                })
+            },
+        )
+        .err()
+        .expect("--agent must not treat 409 enrolled_cli_login as EnrolledLogin");
+        assert!(
+            agent_409.to_string().contains("human login was not used"),
+            "{agent_409}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

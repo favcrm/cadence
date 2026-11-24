@@ -477,6 +477,11 @@ pub(crate) enum AgentAction {
         #[command(subcommand)]
         action: super::agent_profile::ProfileAction,
     },
+    /// Enroll a hosted CLI login as an agent profile (CAD-2758 / AOS-739).
+    Enroll {
+        #[command(subcommand)]
+        action: super::agent_enroll::EnrollAction,
+    },
     /// Print one agent profile's context: the profile and the job a runtime
     /// registered against it (`cadence join <group> <provider> --profile <id>`) is
     /// briefed with. A hosted org adds the wiki pages under
@@ -1243,6 +1248,9 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         }
         AgentAction::Profile { action } => {
             return super::agent_profile::run_native(state_dir, &action);
+        }
+        AgentAction::Enroll { action } => {
+            return super::agent_enroll::run_native(&action);
         }
         AgentAction::ProposeHire { role, name, job_file } => {
             // The job is read through the master's command-file rules, never

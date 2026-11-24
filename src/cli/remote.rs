@@ -203,6 +203,14 @@ fn verb_for(
             args = built;
             verb
         }
+        // CAD-2758 / AOS-739: hosted CLI login enrollment.
+        Commands::Agent {
+            action: AgentAction::Enroll { action },
+        } => {
+            let (verb, built) = super::agent_enroll::request(action);
+            args = built;
+            verb
+        }
         // CAD-2396: a hosted workspace's own skills. The board owns the
         // package rules, the revision fence and who may approve.
         Commands::WorkspaceSkill { action } => {
@@ -3050,6 +3058,15 @@ where
         super::agent_profile::refuse_managed_write(action, non_human_actor)?;
         super::agent_profile::resolve_latest(&target, action, wake_timeout)?;
     }
+    if let Commands::Agent {
+        action: AgentAction::Enroll { action },
+    } = &command
+    {
+        // CAD-2758: managed daemon panes are refused for all enroll verbs;
+        // owner verbs require human/owner authority; start/status stay allowed
+        // for an unmanaged coding harness on a normal login.
+        super::agent_enroll::refuse_disallowed_caller(action, &target)?;
+    }
     if let Commands::WorkspaceSkill { action } = &command {
         // CAD-2396: approve and revoke are an owner's decision, refused for a
         // managed caller before any request exists; the board cannot tell a
@@ -3273,6 +3290,19 @@ where
                         target.org, target.org
                     ));
                 }
+                let error = if matches!(
+                    verb,
+                    "agent_enroll_list" | "agent_enroll_approve" | "agent_enroll_revoke"
+                ) {
+                    scope_hint(
+                        error,
+                        &cadence_agent::remote_cli::saved_capabilities(&target),
+                        "audit.approve",
+                        "cadence login --audit-approve",
+                    )
+                } else {
+                    error
+                };
                 return remote_failure(error);
             }
         }
@@ -4881,6 +4911,67 @@ mod read_contract_tests {
         assert_eq!(
             args,
             json!({"id": id, "expectedRevision": 4, "status": "archived"})
+        );
+    }
+
+    #[test]
+    fn agent_enroll_commands_map_to_the_hosted_verbs() {
+        use crate::cli::agent_enroll::EnrollAction;
+        let id = "ap_11111111-2222-4333-8444-555555555555";
+        let req = "cae_11111111-2222-4333-8444-555555555555";
+        let enroll = |action| Commands::Agent {
+            action: AgentAction::Enroll { action },
+        };
+
+        assert_eq!(
+            outcome(&enroll(EnrollAction::Start { profile: None })).unwrap(),
+            ("agent_enroll_start", json!({}))
+        );
+        assert_eq!(
+            outcome(&enroll(EnrollAction::Start {
+                profile: Some(id.into()),
+            }))
+            .unwrap(),
+            ("agent_enroll_start", json!({"profile_id": id}))
+        );
+        assert_eq!(
+            outcome(&enroll(EnrollAction::Status)).unwrap(),
+            ("agent_enroll_status", json!({}))
+        );
+        assert_eq!(
+            outcome(&enroll(EnrollAction::List)).unwrap(),
+            ("agent_enroll_list", json!({}))
+        );
+        assert_eq!(
+            outcome(&enroll(EnrollAction::Approve {
+                request: req.into(),
+                profile: id.into(),
+                write: false,
+            }))
+            .unwrap(),
+            (
+                "agent_enroll_approve",
+                json!({"request_id": req, "profile_id": id})
+            )
+        );
+        assert_eq!(
+            outcome(&enroll(EnrollAction::Approve {
+                request: req.into(),
+                profile: id.into(),
+                write: true,
+            }))
+            .unwrap(),
+            (
+                "agent_enroll_approve",
+                json!({"request_id": req, "profile_id": id, "capabilities": ["cli.read", "cli.write"]})
+            )
+        );
+        assert_eq!(
+            outcome(&enroll(EnrollAction::Revoke {
+                request: req.into(),
+            }))
+            .unwrap(),
+            ("agent_enroll_revoke", json!({"request_id": req}))
         );
     }
 

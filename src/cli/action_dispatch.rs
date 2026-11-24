@@ -908,6 +908,10 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         };
         return web::run(&local_state, action, &target, cli.wake_timeout);
     }
+    // CAD-2758: hosted CLI enrollment acts on an unmanaged standalone CLI login;
+    // refuse managed daemon callers before client-only routing, sandbox adoption,
+    // or org resolution can load or renew the host's saved login.
+    agent_enroll::refuse_managed_env_caller(&cli.command)?;
     // CAD-1425: a client-only installation runs local commands never; it
     // routes only through an actual remote org, before any local action.
     if client_only {
@@ -1034,6 +1038,8 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             // `CADENCE_ORG` is not naming it: it could point at another
             // workspace than the caller means. Refused before any request.
             agent_profile::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
+            // CAD-2758: the same for hosted CLI login enrollment.
+            agent_enroll::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
             // CAD-2396: the same for a workspace's own skills.
             workspace_skill::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
             // CAD-1019 slice 2: a remote org never opens local state or

@@ -13,6 +13,7 @@ pub(crate) use daemon::{
 };
 mod action_dispatch;
 mod agent;
+mod agent_enroll;
 mod agent_profile;
 mod agent_uid;
 mod app;
