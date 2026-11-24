@@ -2,22 +2,28 @@
 
 Run this checklist before declaring the MVP complete and for each release candidate. Use the **same source SHA and toy scenario** on clean Linux and macOS arm64. The scripted, fake-provider journey is Tier A; it is not evidence of provider sign-in, real dispatch, or recovery of operator context.
 
+**macOS runtime is blocked on CAD-315.** Apple Silicon installation and version checks are supported, but the native setup, daemon and board are not. Record the macOS leg as blocked until the candidate supports those operations. An install-only pass or `--unconfined` is not a substitute.
+
 ## Before the run
 
 - Use a dedicated, non-root Linux test user (sandbox tier S2) and a disposable macOS arm64 machine or VM with a clean test user. Do not use a shared production host, home directory, Cadence instance, or browser profile. Each user needs an isolated login for the real Claude master and the approved worker and reviewer routes. Keep the author, reviewer, and operator roles separate.
 - Select the release tag and source SHA. Confirm that the corresponding Linux and arm64 macOS assets come from that SHA. Follow [installer provenance verification](INSTALL-AGENT.md) before running the installer. Do not let the installer select `latest` independently on each platform. Record the install source and asset digest.
 - Have an operator-owned, disposable Git remote for each run, with its own test credentials and the intended merge checks enabled. Never point a project at the Cadence repository or shared application data. Reserve a free loopback board port in `3110–3199`; confirm nothing is listening on it. Use a fresh browser profile and a plain operator terminal on the test machine.
-- Confirm the configured Claude model and login route. Do not copy a login from another account, switch providers, change model policy to get past a refusal, or add a spend cap. On macOS the master can require `--unconfined` because Landlock is unavailable. Only the operator may accept that risk, and only on the disposable machine with no mounted host files or unrelated credentials. Otherwise record the launch refusal as blocked. Do not use unconfined mode to pass the Linux run.
+- Confirm the configured Claude model and login route. Do not copy a login from another account, switch providers, change model policy to get past a refusal, or add a spend cap. Do not use unconfined mode to pass the Linux run.
 
 ## 1. Install and set up
 
-Set `CADENCE_QA_TAG`, `CADENCE_QA_SHA`, and `CADENCE_QA_PORT` to the verified tag, source SHA, and reserved port. For a prepublication rehearsal, set `CADENCE_QA_ASSET_ROOT` to the authorized HTTPS staging root that serves the verified installer and assets under that tag. Otherwise use the published GitHub release.
+Set `CADENCE_QA_TAG`, `CADENCE_QA_SHA`, and `CADENCE_QA_PORT` to the verified tag, source SHA, and reserved port. Use the published GitHub release, or set `CADENCE_QA_ASSET_ROOT` to an approved HTTPS staging source or an owned absolute `file://` mirror of the verified installer and assets. The source must serve all files under the selected tag.
 
 ```sh
 set -eu
 : "${CADENCE_QA_TAG:?Set the verified release tag}"
 : "${CADENCE_QA_SHA:?Set the full candidate source SHA}"
 : "${CADENCE_QA_PORT:?Set the reserved loopback port}"
+case "$(uname -s):$(uname -m)" in
+  Linux:x86_64|Linux:aarch64) ;;
+  *) printf 'Native Tier B is supported on Linux only pending CAD-315.\n' >&2; exit 2 ;;
+esac
 test "$(id -u)" -ne 0
 test -z "${CADENCE_ALIAS:-}${CADENCE_PROFILE:-}${CADENCE_ORG:-}"
 test ! -e "$HOME/.local/bin/cadence"
@@ -25,12 +31,12 @@ test ! -L "$HOME/.local/bin/cadence"
 printf '%s\n' "$CADENCE_QA_SHA" | grep -Eq '^[0-9a-f]{40}$'
 case "$CADENCE_QA_PORT" in 31[1-9][0-9]) ;; *) exit 2 ;; esac
 asset_root=${CADENCE_QA_ASSET_ROOT:-https://github.com/favcrm/cadence/releases/download}
-case "$asset_root" in https://*) ;; *) exit 2 ;; esac
+case "$asset_root" in https://*|file:///*) ;; *) exit 2 ;; esac
 qa_root=$(mktemp -d /tmp/cad434.XXXXXX)
 export CADENCE_STATE_DIR="$qa_root/state" CADENCE_PM_DIR="$qa_root/pm"
 export PATH="$HOME/.local/bin:$PATH"
 started_at=$(date +%s)
-curl -fsSL "${asset_root%/}/$CADENCE_QA_TAG/install.sh" -o "$qa_root/install.sh"
+curl --proto '=https,file' -fsSL "${asset_root%/}/$CADENCE_QA_TAG/install.sh" -o "$qa_root/install.sh"
 sh "$qa_root/install.sh" --version "$CADENCE_QA_TAG" --base-url "${asset_root%/}"
 installed=$(cadence --version)
 printf '%s\n' "$installed"
