@@ -199,6 +199,48 @@ await React.act(async () => { resolveMeta(json({ signed_in: true, hosted: true, 
 for (let n = 0; n < 20 && !host.textContent?.includes("PRIVATE WORKSPACE"); n += 1) await flush();
 assert(host.textContent?.includes("PRIVATE WORKSPACE"), "current server proof opens the sibling view");
 await React.act(async () => { siblingRoot.unmount(); });
+
+// Sliding expiry renewal extends session.expires_at without tearing down the mounted workspace.
+let currentSession = newSession;
+const workspaceState = { mounts: 0, unmounts: 0 };
+let latestRecheck: (() => Promise<boolean>) | null = null;
+function TrackedWorkspace() {
+  React.useEffect(() => {
+    workspaceState.mounts += 1;
+    return () => { workspaceState.unmounts += 1; };
+  }, []);
+  return React.createElement("main", null, "PRIVATE WORKSPACE");
+}
+globalThis.fetch = async (input) => {
+  const path = new URL(String(input), location.origin).pathname;
+  if (path === "/api/meta") return json({ signed_in: true, hosted: true, session: currentSession });
+  if (path === "/api/locale") return json({ organization_locale: "en", user_locale: "en" });
+  throw new Error(`Unexpected request: ${path}`);
+};
+const slidingRoot = createRoot(host);
+await React.act(async () => {
+  slidingRoot.render(React.createElement(LocaleProvider, null,
+    React.createElement(AuthBoundary, {
+      children: (_meta, recheck) => {
+        latestRecheck = recheck;
+        return React.createElement(TrackedWorkspace);
+      },
+    })));
+});
+const mounts = () => workspaceState.mounts;
+const unmounts = () => workspaceState.unmounts;
+for (let n = 0; n < 20 && mounts() < 1; n += 1) await flush();
+assert(mounts() === 1 && unmounts() === 0, "sliding session test mounts workspace once");
+currentSession = { ...newSession, expires_at: newSession.expires_at + 3600 };
+await React.act(async () => { await latestRecheck?.(); });
+await flush();
+assert(mounts() === 1 && unmounts() === 0, "extending session.expires_at keeps workspace mounted");
+currentSession = { ...currentSession, id: "session-3" };
+await React.act(async () => { await latestRecheck?.(); });
+for (let n = 0; n < 20 && mounts() < 2; n += 1) await flush();
+assert(unmounts() === 1 && mounts() === 2, "changing session.id still resets mounted workspace");
+await React.act(async () => { slidingRoot.unmount(); });
+
 console.log("hosted gate failure checks passed");
 }
 void main().catch((e: unknown) => { console.error(e); process.exit(1); });

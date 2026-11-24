@@ -29,6 +29,7 @@ import { resolveChatCollapsed, useChatCollapsed, selectConversation, setDraftSub
 import { installedAppHref } from "../apps/appViewModel";
 import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
+import ScreenFailurePane from "../workspace-apps/screen/ScreenFailurePane";
 import type { ScreenDrawerSize, ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 import RunLauncher from "./RunLauncher";
 import { parseNavigation, type MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
@@ -482,6 +483,22 @@ export default function AppShell({
   // below applies it here, so chat, screen and launcher share exactly
   // this value — never a second render-time writer.
   const emitByHost = useRef(false);
+  // Host-driven adoption: set the one scope without re-emitting as a user pick.
+  const adoptScope = useCallback((next: string) => {
+    emitByHost.current = true;
+    try {
+      setContextId(next);
+    } finally {
+      emitByHost.current = false;
+    }
+  }, []);
+  const hrefRef = useRef(href);
+  hrefRef.current = href;
+  const [scopeReload, setScopeReload] = useState(0);
+  const refreshScope = useCallback(() => {
+    setScopeReload((n) => n + 1);
+  }, []);
+  const autoScopeRefreshRef = useRef<{ key: string; at: number } | null>(null);
   const [launcherRun, setLauncherRun] = useState<{ name: string; contextId: string; installDigest: string; contextRevision: number | null; contextDigest: string | null } | null>(null);
   // Context receipts are per operator/install/selection and per scoped
   // conversation visit. The browser selection only invalidates a receipt;
@@ -496,6 +513,7 @@ export default function AppShell({
     installId,
     viewer.operator,
     screenViewer,
+    scopeReload,
     // CAD-2534: initial context adoption derives from the contexts response we
     // just fetched, so keeping `contextId` out avoids a Round-2 re-fetch.
     scopedConversationVisit,
@@ -700,6 +718,23 @@ export default function AppShell({
     readAppScopeFresh(installId, controller.signal)
       .then(([next, nextContexts]) => {
         if (!isCurrent()) return;
+        const search = hrefRef.current.split("?")[1] ?? "";
+        const currentQuery = new URLSearchParams(search);
+        const urlCtx = currentQuery.get("ctx");
+        const urlRecord = currentQuery.get("record");
+        const urlView = currentQuery.get("appview");
+        const nextActive = nextContexts.filter((c) => c.state === "active");
+        if (
+          urlCtx === null &&
+          urlRecord === null &&
+          urlView === null &&
+          (nextActive.length === 1 || (nextActive.length === 0 && !wantsGeneralContext(next)))
+        ) {
+          const cleanKey = JSON.stringify([installId, null, null, null]);
+          handledQuery.current = cleanKey;
+          setAdoptedContextKey(cleanKey);
+          adoptScope(nextActive[0]?.id ?? "");
+        }
         setInstallation(next);
         setContexts(nextContexts);
         setLoadFailure(null);
@@ -920,15 +955,16 @@ export default function AppShell({
   // It is the scope for every screen, chat and run; nothing remembers or
   // switches a selection.
   const fallbackContext = () => activeIds[0] ?? "";
-  // Host-driven adoption (the effect below and setup): set the one scope.
-  const adoptScope = (next: string) => {
-    emitByHost.current = true;
-    try {
-      setContextId(next);
-    } finally {
-      emitByHost.current = false;
-    }
-  };
+  const autoRefreshScope = useCallback((reportedDigest: string) => {
+    const currentDigest = installation?.digest ?? "";
+    const key = JSON.stringify([installId, currentDigest, reportedDigest]);
+    const now = Date.now();
+    const prev = autoScopeRefreshRef.current;
+    if (prev && prev.key === key && now - prev.at < 30_000) return false;
+    autoScopeRefreshRef.current = { key, at: now };
+    setScopeReload((n) => n + 1);
+    return true;
+  }, [installId, installation?.digest]);
 
   // Adopt the URL's context once contexts load, and on later external
   // URL changes (browser back). A linked context must be active here;
@@ -1452,6 +1488,14 @@ export default function AppShell({
                   onScreenDrawer={canDriveScreen ? onScreenDrawer : undefined} presentation={canDriveScreen && screenDrawer !== null ? "drawer" : "outlet"}
                   drawerTarget={independentOpen ? drawerTarget : null}
                   admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
+                  onRefreshScope={autoRefreshScope}
+                  renderFailure={(failure, retry) => (
+                    <ScreenFailurePane
+                      failure={failure}
+                      appName={title}
+                      onRetry={failure.kind === "invalid_receipt" ? refreshScope : retry}
+                    />
+                  )}
                   onRoute={screenRoute} onCommand={screenCommand} onNavigation={(navigation) => { setScreenNavigation(navigation); if (navigation === null) closeScreenDrawer(); }} onMediaAttach={attachMediaReference}
                   fallback={contextAdoptionReady
                     ? <ScreenUnavailable installation={installation} contexts={contexts} contextId={scope.contextId}

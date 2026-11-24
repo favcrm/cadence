@@ -71,10 +71,13 @@ function triggerWhatsAppMediaSave(bytes: ArrayBuffer, mimeType: string, fileName
   }
 }
 
-export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onMounted, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
+export default function ScreenOutlet({ projection, fallback, renderFailure, onRefreshScope, loadAsset, actions, onMounted, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
   renderFailure?: ScreenFailurePane;
+  /** Request an installation scope refresh when `/mount` returns a newer digest than `projection.digest`.
+   *  Return `false` to decline another automatic refresh and surface the failure pane instead. */
+  onRefreshScope?: (reportedDigest: string) => boolean | void;
   loadAsset?: AssetLoader;
   /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
   actions?: Pick<ScreenActions, "call" | "planner">;
@@ -181,9 +184,19 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const [failure, setFailure] = useState<ScreenPaneState | null>(null);
   const [attempt, setAttempt] = useState(0);
   const autoRemountRef = useRef<{ scope: string; at: number } | null>(null);
+  const refreshScopeRef = useRef(onRefreshScope);
+  refreshScopeRef.current = onRefreshScope;
+  const refreshedDigestRef = useRef<string | null>(null);
+  const hiddenRetriedRef = useRef<string | null>(null);
   /** Retry re-mounts the same projection: the effect's scope identity is
    *  unchanged, so only the attempt counter rebuilds the frame. */
-  const retry = () => { setFailure(null); setState("loading"); setAttempt(value => value + 1); };
+  const retry = () => {
+    refreshedDigestRef.current = null;
+    hiddenRetriedRef.current = null;
+    setFailure(null);
+    setState("loading");
+    setAttempt(value => value + 1);
+  };
   // CAD-1777 — the primary's own record of the independent drawer it asked
   // the shell to open, and the shell-private action token for the child's
   // mount POST (never rendered, never sent over a port).
@@ -293,6 +306,13 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     let retired = false;
     let owned: ScreenChannel | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let handshakeWaiting = false;
+    let hiddenRetryCleanup: (() => void) | null = null;
+    let stopHandshakeWait = () => {
+      handshakeWaiting = false;
+      clearTimeout(timer);
+      timer = undefined;
+    };
     // The live mount's action token, held host-side for invoke relay and
     // revoked on teardown so a stale mount's handle cannot be reused.
     let actionToken: string | null = null;
@@ -346,7 +366,46 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     // A new frame identity cannot keep the old identity's drawer.
     setOverlay(null);
     setOverlaySize(undefined);
-    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); inlineAudio?.dispose(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onMounted?.(null); navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setAudioModal(null); setState("fallback"); setOverlay(null); setOverlaySize(undefined); if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true); } };
+    const fail = (why: ScreenPaneState) => {
+      stopHandshakeWait();
+      clearLeaveGuard();
+      inlineAudio?.dispose();
+      if (!isCurrent()) return;
+      setFailure(why);
+      services?.retire();
+      mounted.current = null;
+      navigationCallbacks.current.onMounted?.(null);
+      navigationCallbacks.current.onNavigation?.(null);
+      setPreview(null);
+      setSlot(null);
+      setAudioModal(null);
+      setState("fallback");
+      setOverlay(null);
+      setOverlaySize(undefined);
+      if (overlayRef.current !== null) navigationCallbacks.current.onScreenDrawer?.("outlet", undefined, true);
+      const retryableWhileHidden = why.kind === "handshake_timeout" || why.kind === "frame_unavailable" ||
+        (why.kind === "refused" && (why.status === 0 || why.status >= 500));
+      if (
+        retryableWhileHidden &&
+        hiddenRetriedRef.current !== scope &&
+        typeof document !== "undefined" &&
+        document.visibilityState === "hidden" &&
+        hiddenRetryCleanup === null
+      ) {
+        const onReturnVisible = () => {
+          if (document.visibilityState === "hidden") return;
+          hiddenRetryCleanup?.();
+          hiddenRetryCleanup = null;
+          if (!isCurrent() || hiddenRetriedRef.current === scope) return;
+          hiddenRetriedRef.current = scope;
+          setFailure(null);
+          setState("loading");
+          setAttempt(value => value + 1);
+        };
+        document.addEventListener("visibilitychange", onReturnVisible);
+        hiddenRetryCleanup = () => document.removeEventListener("visibilitychange", onReturnVisible);
+      }
+    };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
     void (async () => {
@@ -376,7 +435,27 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         const receipt = mountReceipt && readOnly ? readOnlyReceipt(mountReceipt) : mountReceipt;
         if (!receipt) { pending = { kind: "invalid_receipt" }; throw new Error("Invalid screen mount receipt"); }
         session.assertCurrent();
-        if (receipt.host_contract === "screen-records.v1" && (receipt.install_id !== current.install_id || receipt.context_id !== current.context_id || receipt.digest !== current.digest)) { pending = { kind: "invalid_receipt" }; throw new Error("Screen receipt scope changed"); }
+        if (receipt.host_contract === "screen-records.v1" && (receipt.install_id !== current.install_id || receipt.context_id !== current.context_id || receipt.digest !== current.digest)) {
+          if (
+            receipt.install_id === current.install_id &&
+            receipt.context_id === current.context_id &&
+            typeof receipt.digest === "string" &&
+            receipt.digest !== current.digest &&
+            refreshScopeRef.current
+          ) {
+            const refreshKey = JSON.stringify([scope, receipt.digest]);
+            if (refreshedDigestRef.current !== refreshKey) {
+              refreshedDigestRef.current = refreshKey;
+              if (refreshScopeRef.current(receipt.digest) !== false) {
+                if (receipt.action_token) void revokeTool(receipt.action_token);
+                retired = true;
+                return;
+              }
+            }
+          }
+          pending = { kind: "invalid_receipt" };
+          throw new Error("Screen receipt scope changed");
+        }
         if (receipt.min_shell && compareShellVersions(receipt.min_shell, shellVersion) > 0) {
           fail({ kind: "needs_host_update", required: receipt.min_shell, current: shellVersion });
           return;
@@ -402,7 +481,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                 if (!prev || prev.scope !== scope || now - prev.at >= 30_000) {
                   autoRemountRef.current = { scope, at: now };
                   retired = true;
-                  clearTimeout(timer);
+                  stopHandshakeWait();
                   owned?.close();
                   retry();
                   return;
@@ -519,7 +598,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           });
         }
         owned = new ScreenChannel(frame.contentWindow, receipt, decorate(latest.current, receipt),
-          () => { clearLeaveGuard(); frame.remove(); }, () => fail({ kind: "frame_unavailable" }), () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
+          () => { clearLeaveGuard(); frame.remove(); }, () => fail({ kind: "frame_unavailable" }), () => { if (isCurrent()) { stopHandshakeWait(); hiddenRetriedRef.current = null; setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
           async ref => {
             const draft=parseDraftImageRef(ref);
             const upload=parseUploadImageRef(ref);
@@ -635,11 +714,42 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         owned.surface(surfaceRole, primary && overlayRef.current !== null, primary ? undefined : drawerSurface);
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
-        timer = setTimeout(() => {
-          if (!isCurrent() || owned === null || owned !== channel.current) return;
-          fail({ kind: "handshake_timeout" });
-          owned.close();
-        }, 10000);
+        handshakeWaiting = true;
+        const armHandshakeTimer = () => {
+          clearTimeout(timer);
+          timer = undefined;
+          if (!handshakeWaiting || !isCurrent() || owned === null || owned !== channel.current) return;
+          if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+          timer = setTimeout(() => {
+            timer = undefined;
+            if (!handshakeWaiting || !isCurrent() || owned === null || owned !== channel.current) return;
+            if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+            stopHandshakeWait();
+            fail({ kind: "handshake_timeout" });
+            owned.close();
+          }, 10000);
+        };
+        const onHandshakeVisibility = () => {
+          if (!handshakeWaiting) return;
+          if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+            clearTimeout(timer);
+            timer = undefined;
+          } else {
+            armHandshakeTimer();
+          }
+        };
+        stopHandshakeWait = () => {
+          handshakeWaiting = false;
+          clearTimeout(timer);
+          timer = undefined;
+          if (typeof document !== "undefined") {
+            document.removeEventListener("visibilitychange", onHandshakeVisibility);
+          }
+        };
+        if (typeof document !== "undefined") {
+          document.addEventListener("visibilitychange", onHandshakeVisibility);
+        }
+        armHandshakeTimer();
       } catch {
         if (!retired && !session.signal.aborted && !controller.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration()) {
           owned?.close(); container.current?.replaceChildren(); fail(pending);
@@ -661,7 +771,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       navigationCallbacks.current.onMounted?.(null);
       navigationCallbacks.current.onNavigation?.(null);
       controller.abort();
-      clearTimeout(timer);
+      stopHandshakeWait();
+      hiddenRetryCleanup?.();
+      hiddenRetryCleanup = null;
       window.removeEventListener("message", onMessage);
       owned?.close();
       channel.current = null;
