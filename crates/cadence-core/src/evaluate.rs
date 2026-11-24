@@ -293,6 +293,22 @@ pub struct DeliveryRequirementsInput {
     /// host record, never for text read from a repository or a PR head.
     #[serde(default)]
     pub policy_owner_approved: bool,
+    /// Trusted hosted adapter's CI-only evidence. Never accept this from an
+    /// agent, CLI argument, PR or other untrusted caller.
+    pub hosted_ci_only: Option<HostedCiOnlyInput>,
+}
+
+/// Host attestation accompanying the existing policy, diff and list facts.
+/// Presence asserts a selected project repository, an open non-draft exact
+/// head against the actual protected default branch at its live anchor, and a
+/// complete merge-base-to-head diff with real modes and valid line counts.
+/// The list texts were read at that anchor. This is not authorization to write.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostedCiOnlyInput {
+    pub selected_repo: String,
+    /// True only when both role lists are definitively absent, not unreadable.
+    pub both_role_lists_absent: bool,
 }
 
 /// The delivery half of a project work approval: the digest it recorded and
@@ -524,6 +540,9 @@ pub struct DeliveryRequirementsValue {
     /// the one in force.
     pub policy_note: Option<String>,
     pub requirements: crate::delivery_requirements::Requirements,
+    /// Present and true only for the trusted hosted CI-only lane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_only: Option<bool>,
 }
 
 /// Success value of `app.manifest.preflight`.
@@ -1008,28 +1027,50 @@ fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Valu
         })
     };
     let resolved = effective("project", file, approved.as_ref());
-    let requirements = if input.lists_absent {
-        if input.risk_paths.is_some() || input.one_review_paths.is_some() {
-            return Err(refuse(
-                Code::InvalidCommand,
-                "lists_absent contradicts a supplied list text".to_string(),
-            ));
-        }
-        crate::delivery_requirements::classify_without_lists(&resolved, &input.changes, input.lines)
-    } else {
-        let lists = crate::delivery_requirements::TrustedLists {
-            risk_paths: input.risk_paths.as_deref(),
-            one_review: input.one_review_paths.as_deref(),
-        };
-        crate::delivery_requirements::classify(&resolved, &input.changes, input.lines, &lists)
+    if input.lists_absent && (input.risk_paths.is_some() || input.one_review_paths.is_some()) {
+        return Err(refuse(
+            Code::InvalidCommand,
+            "lists_absent contradicts a supplied list text".to_string(),
+        ));
+    }
+    let lists = crate::delivery_requirements::TrustedLists {
+        risk_paths: input.risk_paths.as_deref(),
+        one_review: input.one_review_paths.as_deref(),
     };
-    serde_json::to_value(serde_json::json!({
-        "policy": resolved.policy,
-        "policy_source": resolved.source,
-        "policy_digest": resolved.digest,
-        "policy_note": resolved.note,
-        "requirements": requirements,
-    }))
+    let eligible = input
+        .hosted_ci_only
+        .as_ref()
+        .filter(|_| input.policy_owner_approved)
+        .and_then(|proof| {
+            crate::delivery_requirements::hosted_ci_only(
+                &resolved,
+                &input.changes,
+                input.lines,
+                &lists,
+                &proof.selected_repo,
+                proof.both_role_lists_absent,
+            )
+        });
+    let ci_only = eligible.is_some().then_some(true);
+    let requirements = eligible.unwrap_or_else(|| {
+        if input.lists_absent {
+            crate::delivery_requirements::classify_without_lists(
+                &resolved,
+                &input.changes,
+                input.lines,
+            )
+        } else {
+            crate::delivery_requirements::classify(&resolved, &input.changes, input.lines, &lists)
+        }
+    });
+    serde_json::to_value(DeliveryRequirementsValue {
+        policy: resolved.policy,
+        policy_source: resolved.source.to_string(),
+        policy_digest: resolved.digest,
+        policy_note: resolved.note,
+        requirements,
+        ci_only,
+    })
     .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))
 }
 

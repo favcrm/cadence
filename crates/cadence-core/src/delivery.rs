@@ -74,6 +74,17 @@ pub struct DeliveryPolicy {
     /// last-approved fallbacks (`delivery_unapproved` notes) do not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration_branch: Option<String>,
+    /// Owner-approved hosted CI-only scope. Absent policies retain their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_only: Option<CiOnlyScope>,
+}
+
+/// A single normalized project repository and its repo-relative allowlist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CiOnlyScope {
+    pub repo: String,
+    pub paths: Vec<String>,
 }
 
 /// The legacy solo-operator delivery profile (CAD-1298), still readable
@@ -208,6 +219,7 @@ pub fn default_policy() -> DeliveryPolicy {
         },
         solo_operator: None,
         integration_branch: None,
+        ci_only: None,
     }
 }
 
@@ -451,6 +463,7 @@ impl DeliveryPolicy {
             let mut rest = self.clone();
             rest.solo_operator = None;
             rest.integration_branch = None;
+            rest.ci_only = None;
             if rest != default_policy() {
                 return Err(err(
                     "solo_operator is supported only on the default delivery policy — \
@@ -467,6 +480,31 @@ impl DeliveryPolicy {
                 return Err(err(format!(
                     "integration_branch {b:?}: not a canonical GitHub branch name"
                 )));
+            }
+        }
+        if let Some(scope) = &self.ci_only {
+            let valid = |part: &str| {
+                !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && part.bytes().all(|b| {
+                        b.is_ascii_lowercase()
+                            || b.is_ascii_digit()
+                            || matches!(b, b'-' | b'_' | b'.')
+                    })
+            };
+            if !scope
+                .repo
+                .split_once('/')
+                .is_some_and(|(owner, repo)| valid(owner) && valid(repo))
+            {
+                return Err(err("ci_only.repo must be a normalized owner/name"));
+            }
+            if scope.paths.is_empty() {
+                return Err(err("ci_only.paths must not be empty"));
+            }
+            for path in &scope.paths {
+                check_glob(path).map_err(|e| err(format!("ci_only.{e}")))?;
             }
         }
         if self.reviews.is_empty() {
@@ -618,6 +656,8 @@ struct RawDelivery {
     solo_operator: Option<SoloOperatorProfile>,
     #[serde(default)]
     integration_branch: Option<String>,
+    #[serde(default)]
+    ci_only: Option<CiOnlyScope>,
 }
 
 #[derive(Deserialize)]
@@ -796,6 +836,7 @@ impl RawDelivery {
             oversized,
             solo_operator: self.solo_operator,
             integration_branch: self.integration_branch,
+            ci_only: self.ci_only,
         })
     }
 }

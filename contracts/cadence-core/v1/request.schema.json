@@ -272,6 +272,26 @@
         "required"
       ]
     },
+    "CiOnlyScope": {
+      "description": "A single normalized project repository and its repo-relative allowlist.",
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "repo",
+        "paths"
+      ]
+    },
     "DeliveryApprovalInput": {
       "description": "The delivery half of a project work approval: the digest it recorded and\nthe policy it approved.",
       "type": "object",
@@ -299,6 +319,17 @@
       "description": "A project's delivery policy — `PROJECT.md` `delivery:` or the\ndefaults. [`parse`] builds it through the strict raw types and\n[`DeliveryPolicy::validate`]; `serde` round-trips the validated\nform (the approval payload's `delivery` key).",
       "type": "object",
       "properties": {
+        "ci_only": {
+          "description": "Owner-approved hosted CI-only scope. Absent policies retain their digest.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CiOnlyScope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "heavy": {
           "description": "Over this a delivery is \"heavy\".",
           "$ref": "#/$defs/SizeLimit"
@@ -381,6 +412,17 @@
           "items": {
             "$ref": "#/$defs/Change"
           }
+        },
+        "hosted_ci_only": {
+          "description": "Trusted hosted adapter's CI-only evidence. Never accept this from an\nagent, CLI argument, PR or other untrusted caller.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostedCiOnlyInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "lines": {
           "description": "`git diff --numstat` total changed lines.",
@@ -508,6 +550,24 @@
       "additionalProperties": false,
       "required": [
         "spec"
+      ]
+    },
+    "HostedCiOnlyInput": {
+      "description": "Host attestation accompanying the existing policy, diff and list facts.\nPresence asserts a selected project repository, an open non-draft exact\nhead against the actual protected default branch at its live anchor, and a\ncomplete merge-base-to-head diff with real modes and valid line counts.\nThe list texts were read at that anchor. This is not authorization to write.",
+      "type": "object",
+      "properties": {
+        "both_role_lists_absent": {
+          "description": "True only when both role lists are definitively absent, not unreadable.",
+          "type": "boolean"
+        },
+        "selected_repo": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "selected_repo",
+        "both_role_lists_absent"
       ]
     },
     "ManifestPreflightInput": {
