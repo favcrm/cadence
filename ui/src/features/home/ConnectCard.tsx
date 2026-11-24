@@ -5,10 +5,13 @@ import { usingPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { routePath } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
-import type { CustomMcpConnectionSummary, CustomMcpToolPin } from "../../lib/types";
+import { useMaybeResource } from "../../lib/useResource";
+import { useVisiblePoll } from "../../lib/useVisiblePoll";
+import type { Connection, CustomMcpConnectionSummary, CustomMcpToolPin } from "../../lib/types";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import { useImageConversation } from "../canvas/imageConversation";
 import { CustomMcpConnectDrawer } from "../settings/CustomMcpDrawer";
+import { connectionNeedsAttention, hostedAccount } from "../settings/connectionsView";
 import { customMcpAuthorizationUrl, customMcpErrorText, customMcpReturn, isToolDestructiveHint, isToolReadOnlyHint } from "../settings/customMcpView";
 import { hostedConnectError, hostedConnectUrl, UI_HOSTED_REFUSED } from "../settings/hostedConnect";
 import { withoutConnectParams } from "../workspace-apps/socialConnect";
@@ -17,9 +20,44 @@ import { parseConnectRef, parseCustomMcpSetup, plainText, type CustomMcpSetup } 
 import { sendToMaster } from "./send";
 import type { ThreadEntry } from "./thread";
 
+export type ConnectToolkitStatus = "disconnected" | "waiting" | "connected" | "reconnect";
+
+/**
+ * CAD-2764: derive live connection status for a platform toolkit from
+ * `resources.connections`, preferring the newest healthy enrolled row.
+ */
+export function toolkitConnectionState(
+  toolkit: string,
+  label: string,
+  rows: readonly Connection[] | null,
+): { status: "disconnected" | "connected" | "reconnect"; account: string | null } {
+  if (!rows) return { status: "disconnected", account: null };
+  const matching = rows.filter((row) => row.provider === toolkit && row.kind === "enrolled");
+  if (matching.length === 0) return { status: "disconnected", account: null };
+  const active = matching.filter((row) => !connectionNeedsAttention(row));
+  if (active.length > 0) {
+    let newest = active[0];
+    let newestAt = hostedAccount(newest)?.connectedAt ?? 0;
+    for (let i = 1; i < active.length; i += 1) {
+      const candidate = active[i];
+      const at = hostedAccount(candidate)?.connectedAt ?? 0;
+      if (at > newestAt) {
+        newest = candidate;
+        newestAt = at;
+      }
+    }
+    const hostedLabel = hostedAccount(newest)?.label ?? "";
+    const trimmed = newest.account.trim();
+    const account = trimmed !== "" && trimmed !== label && trimmed !== hostedLabel ? trimmed : null;
+    return { status: "connected", account };
+  }
+  return { status: "reconnect", account: null };
+}
+
 /**
  * CAD-2443 / CAD-2556: the host's `connect_ref` card. For platform toolkits it
- * starts `/api/connection-providers/:toolkit/connect`. For Custom MCP it launches
+ * starts `/api/connection-providers/:toolkit/connect` and self-updates from
+ * `resources.connections`. For Custom MCP it launches
  * `/api/connections/mcp/:id/oauth/start` (falling back to Settings > Connections
  * when credentials are manual) and offers an inline "Continue reply" resume
  * button when returning to this conversation with `?aos_connect=connected`.
@@ -32,15 +70,41 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
   const [busy, setBusy] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [resumed, setResumed] = useState(false);
+  const [waiting, setWaiting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const setup = parseCustomMcpSetup(entry);
-  if (setup && writeBlock === null && operatorBlock === null) {
+  const model = parseConnectRef(entry);
+  const isOwner = writeBlock === null && operatorBlock === null;
+  const isPlatformOwner = !setup && model !== null && model.toolkit !== "custom_mcp" && isOwner;
+  const connectionsRes = isPlatformOwner ? resources.connections : null;
+  const connectionsState = useMaybeResource(connectionsRes);
+  const live = isPlatformOwner
+    ? toolkitConnectionState(model.toolkit, model.label, connectionsState?.data ?? null)
+    : null;
+
+  useEffect(() => {
+    if (connectionsRes) void connectionsRes.revalidate();
+  }, [connectionsRes]);
+
+  useEffect(() => {
+    if (live?.status === "connected" && waiting) setWaiting(false);
+  }, [live?.status, waiting]);
+
+  useVisiblePoll(
+    isPlatformOwner && live?.status !== "connected",
+    waiting ? 3_000 : null,
+    () => {
+      void resources.connections.refresh();
+    },
+    { onFocus: true, maxDurationMs: waiting ? 120_000 : undefined },
+  );
+
+  if (setup && isOwner) {
     return <CustomMcpSetupCard key={`${conversation}:${entry.seq}`} entry={entry} setup={setup} density={density} conversation={conversation} />;
   }
-  const model = parseConnectRef(entry);
   if (!model) return <p className="text-micro text-ink-500 break-words chatcard-line">· {plainText(entry.text, 500)}</p>;
   // Owner only: a member or an unconfirmed session reads the text line.
-  if (writeBlock !== null || operatorBlock !== null) {
+  if (!isOwner) {
     return <p className="text-micro text-ink-500 break-words chatcard-line" data-kind="connect_ref">· {plainText(entry.text, 500)}</p>;
   }
   const isCustomMcp = model.toolkit === "custom_mcp";
@@ -50,9 +114,40 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
       ? customMcpReturn(window.location.search)
       : null;
   const readyToContinue = isCustomMcp && mcpReturned?.outcome === "connected" && !resumed;
-  const label = isCustomMcp
-    ? t("Reconnect {label}").replace("{label}", () => model.label)
-    : t("Connect {label}").replace("{label}", () => model.label);
+  const platformStatus: ConnectToolkitStatus | null =
+    !isCustomMcp && live
+      ? live.status === "connected"
+        ? "connected"
+        : waiting
+          ? "waiting"
+          : live.status === "reconnect"
+            ? "reconnect"
+            : "disconnected"
+      : null;
+  const statusPill =
+    platformStatus === "connected"
+      ? { text: t("Connected"), tone: "ok" as const }
+      : platformStatus === "waiting"
+        ? { text: t("Waiting…"), tone: "info" as const }
+        : platformStatus === "reconnect"
+          ? { text: t("Reconnect needed"), tone: "warn" as const }
+          : undefined;
+  const label =
+    isCustomMcp || platformStatus === "reconnect"
+      ? t("Reconnect {label}").replace("{label}", () => model.label)
+      : t("Connect {label}").replace("{label}", () => model.label);
+  const bodyText =
+    platformStatus === "connected"
+      ? live?.account
+        ? t("{label} connected · {account}")
+            .replace("{label}", () => model.label)
+            .replace("{account}", () => live.account!)
+        : t("{label} connected").replace("{label}", () => model.label)
+      : platformStatus === "waiting"
+        ? t("Finish signing in to {label} in the opened tab.").replace("{label}", () => model.label)
+        : platformStatus === "reconnect"
+          ? t("Your {label} connection needs to be reconnected.").replace("{label}", () => model.label)
+          : plainText(entry.text, 500);
 
   const openConnectionsFocus = () => {
     const dest = routePath({ screen: "settings", section: "connections" });
@@ -106,6 +201,7 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
           return;
         }
         window.open(url, "_blank", "noopener,noreferrer");
+        setWaiting(true);
       })
       .catch((e: unknown) => setError(hostedConnectError(e)))
       .finally(() => setBusy(false));
@@ -146,11 +242,13 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
       bodyClassName="chatcard-body"
       density={density}
       data-kind="connect_ref"
+      data-connect-state={platformStatus ?? undefined}
       label={t("Connect card")}
       kindLabel={t("Connection")}
       subject={model.label}
+      status={statusPill}
       footer={
-        readyToContinue ? (
+        platformStatus === "connected" ? undefined : readyToContinue ? (
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
@@ -181,7 +279,7 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
         )
       }
     >
-      <p className="text-label text-ink-300 break-words">{plainText(entry.text, 500)}</p>
+      <p className="text-label text-ink-300 break-words">{bodyText}</p>
       {mcpReturned?.outcome === "connected" && (
         <p className="text-micro text-ok break-words" role="status">
           {resumed ? t("Reply resumed") : t("Reconnected — continue when ready.")}
