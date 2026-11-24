@@ -366,27 +366,91 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     run_with_verified_job(pm, id, args, actor, state_dir, None)
 }
 
-pub(super) fn run_with_verified_job(
-    pm: &Pm,
-    id: &str,
-    args: &StartArgs,
-    actor: &str,
-    state_dir: &Path,
-    verified_draft: Option<(&Value, &Value)>,
-) -> Result<Value> {
-    let verified_job = verified_draft.map(|(job, _)| job);
+struct StartRequest<'a> {
+    pm: &'a Pm,
+    id: &'a str,
+    args: &'a StartArgs,
+    actor: &'a str,
+    state_dir: &'a Path,
+    verified_job: Option<&'a Value>,
+}
+
+struct StartActors {
+    requester: String,
+    new_owner: Option<String>,
+}
+
+struct PreClaimContext {
+    project: crate::issue::project::Project,
+    dir: PathBuf,
+    initial_front: Front,
+    initial_intake: Option<String>,
+    job_probe: Option<(PathBuf, String, String)>,
+    cloud: bool,
+    cwd_override: Option<String>,
+}
+
+struct InitialBaseContext<'a> {
+    root: PathBuf,
+    cloud_draft: Option<&'a Value>,
+    cloud_reuse: bool,
+    initial_branch: String,
+    initial_reuse: bool,
+    base: String,
+    base_sha: String,
+    base_warning: Option<String>,
+    shared_deps: bool,
+}
+
+struct LockedLaneState {
+    front: Front,
+    body: String,
+    front_id: String,
+    branch: String,
+    wt_dir: PathBuf,
+    wt_str: String,
+    wt_name: String,
+    repo_label: String,
+    checkout_owner: String,
+    reuse: bool,
+    dir_exists: bool,
+    pinned_base: String,
+    lane_base_sha: String,
+    checked: claim::Check,
+    claim_at: Option<String>,
+    pre_claim: Option<(String, Option<String>, Option<model::Claim>)>,
+}
+
+struct WorktreeOutcome {
+    cargo_target: Option<PathBuf>,
+    created: bool,
+}
+
+struct StartOutputParams<'a> {
+    front: &'a Front,
+    body: &'a str,
+    worktree_path: &'a Path,
+    task_worktree: &'a str,
+    created: bool,
+    target_dir: Option<&'a PathBuf>,
+    slot_env: Value,
+    include_job_id_field: bool,
+    record_lease_warnings: bool,
+}
+
+fn validate_pre_claim(req: &StartRequest<'_>) -> Result<PreClaimContext> {
     // Daemon reachability + spec readability are checked before any
     // filesystem or tracker mutation — a `--job` that cannot be opened
     // must leave nothing behind.
-    let job_probe = match &args.job {
-        Some(job) => Some(check_job(state_dir, job)?),
+    let job_probe = match &req.args.job {
+        Some(job) => Some(check_job(req.state_dir, job)?),
         None => None,
     };
-    if args.job.is_none() {
-        if let Some(owner) = &args.owner {
+    if req.args.job.is_none() {
+        if let Some(owner) = &req.args.owner {
             // `issue_kickoff` may mint the worker after start; only an
             // already-registered sandbox owner is refused here.
-            match client::rpc(state_dir, "agent_show", json!({"alias": owner})) {
+            match client::rpc(req.state_dir, "agent_show", json!({"alias": owner})) {
                 Ok(show) if show["agent"]["enabled"].as_bool() == Some(false) => {
                     return Err(Error::rejected(format!(
                         "Agent '{owner}' is disabled — resume it before starting work"
@@ -410,19 +474,24 @@ pub(super) fn run_with_verified_job(
             }
         }
     }
-    let (project, dir) = write::issue_dir(pm, id)?;
+    let (project, dir) = write::issue_dir(req.pm, req.id)?;
     let (initial_front, initial_body) = write::load_front(&dir)?;
-    let initial_intake = crate::issue::plan::gate_snapshot(&pm.dir, &initial_front, &initial_body)?;
-    if let (Some(job), Some((_, spec, raw_digest))) = (verified_job, &job_probe) {
+    let initial_intake =
+        crate::issue::plan::gate_snapshot(&req.pm.dir, &initial_front, &initial_body)?;
+    if let (Some(job), Some((_, spec, raw_digest))) = (req.verified_job, &job_probe) {
         let canonical = Path::new(spec)
             .canonicalize()
             .ok()
             .zip(dir.join("issue.md").canonicalize().ok())
             .is_some_and(|(spec, issue)| spec == issue);
         if !(canonical && initial_intake.is_some()) {
-            let digest =
-                crate::issue::dispatch::canonical_issue_spec_digest(pm, id, Path::new(spec), true)?
-                    .unwrap_or_else(|| raw_digest.clone());
+            let digest = crate::issue::dispatch::canonical_issue_spec_digest(
+                req.pm,
+                req.id,
+                Path::new(spec),
+                true,
+            )?
+            .unwrap_or_else(|| raw_digest.clone());
             if job["spec_sha256"].as_str() != Some(digest.as_str()) {
                 return Err(Error::rejected(
                     "draft job spec changed; reopen or restore the pinned spec",
@@ -433,13 +502,13 @@ pub(super) fn run_with_verified_job(
     // CAD-202: a pty assignee whose pane cwd is deleted or outside the
     // project's repos refuses here, before anything is created.
     let mut cloud = false;
-    let cwd_override = match &args.job {
+    let cwd_override = match &req.args.job {
         Some(JobArgs {
             assignee: Some(assignee),
             force,
             ..
         }) => {
-            let show = client::rpc(state_dir, "agent_show", json!({"alias": assignee}))?;
+            let show = client::rpc(req.state_dir, "agent_show", json!({"alias": assignee}))?;
             if show["agent"]["enabled"].as_bool() == Some(false) {
                 return Err(Error::rejected(format!(
                     "Agent '{assignee}' is disabled — resume it before starting work"
@@ -450,18 +519,34 @@ pub(super) fn run_with_verified_job(
         }
         _ => None,
     };
+    Ok(PreClaimContext {
+        project,
+        dir,
+        initial_front,
+        initial_intake,
+        job_probe,
+        cloud,
+        cwd_override,
+    })
+}
+
+fn resolve_initial_base<'a>(
+    args: &StartArgs,
+    pre: &PreClaimContext,
+    verified_draft: Option<(&'a Value, &'a Value)>,
+) -> Result<InitialBaseContext<'a>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let cloud_draft = verified_draft.filter(|_| cloud).map(|(_, task)| task);
+    let root = resolve_repo(&pre.project, args.repo.as_deref(), &cwd)?;
+    let cloud_draft = verified_draft.filter(|_| pre.cloud).map(|(_, task)| task);
     let cloud_reuse = cloud_draft.is_some();
-    let (initial_lane, initial_branch) = if cloud {
-        let (branch, _) = resolve_cloud_branch(&initial_front, args.name.as_deref())?;
+    let (initial_lane, initial_branch) = if pre.cloud {
+        let (branch, _) = resolve_cloud_branch(&pre.initial_front, args.name.as_deref())?;
         (root.clone(), branch)
     } else {
-        resolve_lane(&initial_front, args.name.as_deref(), &root)?
+        resolve_lane(&pre.initial_front, args.name.as_deref(), &root)?
     };
-    let initial_open = open_worktrees(&initial_front);
-    let initial_branch_exists = !cloud
+    let initial_open = open_worktrees(&pre.initial_front);
+    let initial_branch_exists = !pre.cloud
         && git(
             &root,
             &[
@@ -472,25 +557,25 @@ pub(super) fn run_with_verified_job(
             ],
         )
         .is_ok();
-    if !cloud {
+    if !pre.cloud {
         refuse_terminal_lifecycle_record(
             &root,
             &initial_lane,
-            &initial_front,
+            &pre.initial_front,
             &initial_branch,
             initial_branch_exists,
         )?;
     }
     let initial_lane_str = initial_lane.to_string_lossy().into_owned();
-    let initial_refs_recorded = initial_front
-        .refs
-        .iter()
-        .any(|r| r.kind == "branch" && r.path.as_deref() == Some(initial_branch.as_str()))
-        && initial_front
+    let initial_refs_recorded =
+        pre.initial_front
             .refs
             .iter()
-            .any(|r| r.kind == "worktree" && r.path.as_deref() == Some(initial_lane_str.as_str()));
-    let initial_lifecycle_record = if cloud {
+            .any(|r| r.kind == "branch" && r.path.as_deref() == Some(initial_branch.as_str()))
+            && pre.initial_front.refs.iter().any(|r| {
+                r.kind == "worktree" && r.path.as_deref() == Some(initial_lane_str.as_str())
+            });
+    let initial_lifecycle_record = if pre.cloud {
         None
     } else {
         worktree::lifecycle::recoverable_record(
@@ -499,13 +584,14 @@ pub(super) fn run_with_verified_job(
             "development",
             "cadence issue start",
             Some(&initial_branch),
-            Some(&initial_front.id),
+            Some(&pre.initial_front.id),
         )?
     };
     let initial_reuse = initial_branch_exists
         && (!initial_open.is_empty()
             || initial_refs_recorded
             || initial_lifecycle_record.is_some());
+    let verified_job = verified_draft.map(|(job, _)| job);
     let (base, base_sha, base_warning) = if cloud_reuse {
         let base = verified_job
             .and_then(|job| job["base_ref"].as_str())
@@ -518,62 +604,73 @@ pub(super) fn run_with_verified_job(
         let resolved = resolve_base(
             &root,
             args.base.as_deref(),
-            configured_integration(&project, &root)?,
+            configured_integration(&pre.project, &root)?,
         )?;
         (resolved.name, resolved.sha, resolved.warning)
     };
-    let shared_deps = worktree::shared_deps_enabled(&project)?;
+    let shared_deps = worktree::shared_deps_enabled(&pre.project)?;
+    Ok(InitialBaseContext {
+        root,
+        cloud_draft,
+        cloud_reuse,
+        initial_branch,
+        initial_reuse,
+        base,
+        base_sha,
+        base_warning,
+        shared_deps,
+    })
+}
 
-    // CAD-383: who is asking, and the owner this start would record.
-    if let Some(by) = &args.by {
-        claim::check_alias(by, "--by")?;
-    }
-    let requester = write::actor_who(
-        actor,
-        args.by
-            .as_deref()
-            .or(args.job.as_ref().map(|j| j.pm.as_str())),
-    );
-    let new_owner = args
-        .owner
-        .clone()
-        .or_else(|| args.job.as_ref().and_then(|j| j.assignee.clone()));
-
+fn acquire_and_record_claim(
+    req: &StartRequest<'_>,
+    actors: &StartActors,
+    pre: &PreClaimContext,
+    init: &InitialBaseContext<'_>,
+) -> Result<LockedLaneState> {
     // CAD-1191: lock 1 (short) — claim check, take-over and, for a new
     // lane, the claim record. Worktree work runs unlocked; lock 2
     // records the lane refs.
-    if initial_intake.is_some() {
+    if pre.initial_intake.is_some() {
         crate::issue::lockseam::outside_lock("start-pre-claim");
     }
-    let lock = pm.lock()?;
-    let (mut front, body) = write::load_front(&dir)?;
+    let lock = req.pm.lock()?;
+    let (mut front, body) = write::load_front(&pre.dir)?;
     let front_id = front.id.clone();
     // CAD-383: a doing/review issue held by someone else refuses before
     // any lane is touched; a take-over is its own commit, made now.
-    let mut asking = vec![requester.as_str()];
-    asking.extend(new_owner.as_deref());
+    let mut asking = vec![actors.requester.as_str()];
+    asking.extend(actors.new_owner.as_deref());
     let checked = claim::check(
         &front,
         &asking,
-        args.take_over.as_deref(),
+        req.args.take_over.as_deref(),
         "issue start",
-        || claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2)),
+        || {
+            claim::since(
+                &req.pm.dir,
+                &pre.project.key,
+                &front,
+                Duration::from_secs(2),
+            )
+        },
     )?;
     // CAD-274: an open worktree ref IS the issue's lane — a re-start
     // reuses it (re-applying the cargo target) rather than minting a
     // second lane from the title.
     let open = open_worktrees(&front);
-    let (wt_dir, branch, cloud_branch_recorded) = if cloud {
-        let (branch, recorded) = resolve_cloud_branch(&front, args.name.as_deref())?;
-        if branch != initial_branch
-            || cloud_draft
+    let (wt_dir, branch, cloud_branch_recorded) = if pre.cloud {
+        let (branch, recorded) = resolve_cloud_branch(&front, req.args.name.as_deref())?;
+        if branch != init.initial_branch
+            || init
+                .cloud_draft
                 .is_some_and(|task| !recorded || task["branch"].as_str() != Some(branch.as_str()))
         {
             return Err(Error::rejected("verified cloud job branch binding changed"));
         }
-        (root.clone(), branch, recorded)
+        (init.root.clone(), branch, recorded)
     } else {
-        let (lane, branch) = resolve_lane(&front, args.name.as_deref(), &root)?;
+        let (lane, branch) = resolve_lane(&front, req.args.name.as_deref(), &init.root)?;
         (lane, branch, false)
     };
     // A reused lane's values come from the tracker and the checkout —
@@ -595,11 +692,11 @@ pub(super) fn run_with_verified_job(
             .iter()
             .any(|r| r.kind == kind && r.path.as_deref() == Some(target))
     };
-    let (dir_exists, branch_exists, lifecycle_record) = if cloud {
+    let (dir_exists, branch_exists, lifecycle_record) = if pre.cloud {
         (false, false, None)
     } else {
         let branch_exists = git(
-            &root,
+            &init.root,
             &[
                 "rev-parse",
                 "--verify",
@@ -608,9 +705,9 @@ pub(super) fn run_with_verified_job(
             ],
         )
         .is_ok();
-        refuse_terminal_lifecycle_record(&root, &wt_dir, &front, &branch, branch_exists)?;
+        refuse_terminal_lifecycle_record(&init.root, &wt_dir, &front, &branch, branch_exists)?;
         let record = worktree::lifecycle::recoverable_record(
-            &root,
+            &init.root,
             &wt_dir,
             "development",
             "cadence issue start",
@@ -619,81 +716,82 @@ pub(super) fn run_with_verified_job(
         )?;
         (wt_dir.is_dir(), branch_exists, record)
     };
-    let reuse = cloud_reuse
+    let reuse = init.cloud_reuse
         || branch_exists
             && (!open.is_empty()
                 || recorded("branch", &branch) && recorded("worktree", &wt_str)
                 || lifecycle_record.is_some());
-    if initial_reuse && !reuse && args.base.is_none() {
+    if init.initial_reuse && !reuse && req.args.base.is_none() {
         return Err(Error::rejected(
             "the recorded lane changed while issue start was waiting; retry to refresh and pin the default base",
         ));
     }
-    let pinned_base = if cloud_reuse {
-        base_sha.clone()
-    } else if reuse && initial_intake.is_some() {
+    let pinned_base = if init.cloud_reuse {
+        init.base_sha.clone()
+    } else if reuse && pre.initial_intake.is_some() {
         match lifecycle_record.as_ref().and_then(|r| r.base_sha.as_ref()) {
             Some(recorded) => recorded.clone(),
-            None => intake_branch_creation_base(&root, &branch)?,
+            None => intake_branch_creation_base(&init.root, &branch)?,
         }
     } else if branch_exists {
-        branch_base(&root, &branch, &base_sha)
+        branch_base(&init.root, &branch, &init.base_sha)
     } else {
-        base_sha.clone()
+        init.base_sha.clone()
     };
     let lane_base_sha = if reuse {
         pinned_base.clone()
     } else {
-        base_sha.clone()
+        init.base_sha.clone()
     };
     // Validate the actual selected lane under the same tracker lock as
     // claim, including a reused checkout that ignores an explicit --base.
-    crate::issue::plan::gate_claim(&pm.dir, &front, &body, &lane_base_sha)?;
+    crate::issue::plan::gate_claim(&req.pm.dir, &front, &body, &lane_base_sha)?;
     // A cloud start's admission is a read-only AOS probe, before the
     // take-over commit and before the ordinary new-lane claim. A denied
     // company leaves the tracker untouched.
-    if cloud {
-        client::rpc(state_dir, "cloud_probe", json!({}))?;
+    if pre.cloud {
+        client::rpc(req.state_dir, "cloud_probe", json!({}))?;
     }
     if let Some(t) = &checked.take_over {
         let mut taken = front.clone();
-        taken.claim = Some(claim::new_claim(&requester, Some(t.reason.clone())));
-        taken.owner = Some(new_owner.clone().unwrap_or_else(|| requester.clone()));
-        let (text, subject) = claim::take_over_record(&requester, t);
+        taken.claim = Some(claim::new_claim(&actors.requester, Some(t.reason.clone())));
+        taken.owner = Some(
+            actors
+                .new_owner
+                .clone()
+                .unwrap_or_else(|| actors.requester.clone()),
+        );
+        let (text, subject) = claim::take_over_record(&actors.requester, t);
         write::commit_front_with_comment(
-            pm, &dir, &front, &taken, &body, &requester, "claim", &text, &subject, actor,
+            req.pm,
+            &pre.dir,
+            &front,
+            &taken,
+            &body,
+            &actors.requester,
+            "claim",
+            &text,
+            &subject,
+            req.actor,
         )?;
         front = taken;
     }
-    let repo_label = root
+    let repo_label = init
+        .root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string());
+        .unwrap_or_else(|| init.root.display().to_string());
     let checkout_owner = front
         .owner
         .clone()
-        .or_else(|| new_owner.clone())
-        .unwrap_or_else(|| requester.clone());
+        .or_else(|| actors.new_owner.clone())
+        .unwrap_or_else(|| actors.requester.clone());
     let first_recorded = |kind: &str| {
         front
             .refs
             .iter()
             .find(|r| r.kind == kind)
             .and_then(|r| r.path.clone())
-    };
-    let checkout_record = || {
-        let mut record = worktree::lifecycle::new_record(worktree::lifecycle::CheckoutSpec {
-            repo: &root,
-            purpose: "development",
-            tool: "cadence issue start",
-            owner: &checkout_owner,
-            path: &wt_dir,
-            branch: Some(&branch),
-            pinned_sha: &pinned_base,
-            issue: Some(&front_id),
-        });
-        record.base_sha = Some(pinned_base.clone());
-        record
     };
 
     // A new lane is validated, then its claim is recorded under this
@@ -724,18 +822,19 @@ pub(super) fn run_with_verified_job(
         }
         if claimed.owner.is_none() {
             claimed.owner = Some(
-                new_owner
+                actors
+                    .new_owner
                     .clone()
-                    .unwrap_or_else(|| write::actor_who(actor, args.by.as_deref())),
+                    .unwrap_or_else(|| write::actor_who(req.actor, req.args.by.as_deref())),
             );
         }
         // CAD-383: the start that puts the issue into work claims it —
         // the requester (the dispatching PM), not the lane.
         if claimed.claim.is_none() || checked.warning.is_some() {
-            claimed.claim = Some(claim::new_claim(&requester, None));
+            claimed.claim = Some(claim::new_claim(&actors.requester, None));
         }
         claim_at = claimed.claim.as_ref().map(|c| c.at.clone());
-        let record_cloud_branch = cloud && !cloud_branch_recorded;
+        let record_cloud_branch = pre.cloud && !cloud_branch_recorded;
         if record_cloud_branch {
             claimed.refs.push(write::new_ref(
                 "branch",
@@ -750,18 +849,18 @@ pub(super) fn run_with_verified_job(
             || claimed.claim != front.claim
             || record_cloud_branch
         {
-            let committed = write::save_front(&dir, &claimed, &body).and_then(|_| {
+            let committed = write::save_front(&pre.dir, &claimed, &body).and_then(|_| {
                 write::commit_who(
-                    pm,
-                    &[dir.join("issue.md")],
+                    req.pm,
+                    &[pre.dir.join("issue.md")],
                     &format!("{}: start {branch} (claim)", front.id),
                     &[front.id.as_str()],
-                    actor,
-                    Some(&requester),
+                    req.actor,
+                    Some(&actors.requester),
                 )
             });
             if let Err(e) = committed {
-                let _ = write::save_front(&dir, &front, &body);
+                let _ = write::save_front(&pre.dir, &front, &body);
                 return Err(e);
             }
             pre_claim = Some((
@@ -772,230 +871,170 @@ pub(super) fn run_with_verified_job(
         }
     }
     drop(lock);
+    Ok(LockedLaneState {
+        front,
+        body,
+        front_id,
+        branch,
+        wt_dir,
+        wt_str,
+        wt_name,
+        repo_label,
+        checkout_owner,
+        reuse,
+        dir_exists,
+        pinned_base,
+        lane_base_sha,
+        checked,
+        claim_at,
+        pre_claim,
+    })
+}
 
-    if cloud {
-        // A cloud agent owns no host worktree. The remote runner clones the
-        // project repo. Record only the branch lane; the job carries the
-        // host repo path and branch/base for the daemon-side runner.
-        let mut claim_out = claim::json(&front, crate::issue::time::now_epoch());
-        claim_out["warning"] = json!(checked.warning);
-        claim_out["take_over"] = json!(checked
-            .take_over
-            .as_ref()
-            .map(|t| json!({"from": t.from, "reason": t.reason})));
-        let mut out = json!({
-            "issue": front.id,
-            "repo": root,
-            "worktree": root,
-            "branch": branch,
-            "base": {"ref": base, "sha": lane_base_sha},
-            "trailer": format!("Issue: {}", front.id),
-            "created": true,
-            "target_dir": null,
-            "slot_env": null,
-            "claim": claim_out,
-            "cloud": true,
-        });
-        if let Some(warning) = &base_warning {
-            eprintln!("cadence: {warning}");
-            out["base"]["warning"] = json!(warning);
-        }
-        if let (Some(job), Some((job_state_dir, spec, spec_sha256))) = (&args.job, &job_probe) {
-            let task_acceptance = if initial_intake.is_some() {
-                None
-            } else {
-                crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body))
-            };
-            let created_job = if let Some(job) = verified_job {
-                json!({"job": {"id": job["id"]}})
-            } else {
-                client::rpc(
-                    job_state_dir,
-                    "job_new",
-                    json!({"pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
-                           "title": front.title, "issue": front.id,
-                           "repo": root, "base_ref": lane_base_sha,
-                           "task_worktree": root.to_string_lossy(),
-                           "task_branch": branch,
-                           "task_base_sha": lane_base_sha,
-                           "task_assignee": job.assignee,
-                           "task_acceptance": task_acceptance}),
-                )?
-            };
-            let job_id = created_job["job"]["id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            out["job"] = json!(job_id.clone());
-            out["task"] = json!(format!("{job_id}-t1"));
-        }
-        if let Some(note) = &cwd_override {
-            write::add_comment(pm, id, note, None, Some("dispatch"), None, actor)?;
-            out["cwd_override"] = json!(note);
-        }
-        let mut leases =
-            crate::issue::areas::check_start(&pm.dir, state_dir, &project.key, &front, &requester);
-        let lines = crate::issue::areas::warning_lines(&leases);
-        if !lines.is_empty() {
-            let text = format!("Lease warnings at start:\n- {}", lines.join("\n- "));
-            if let Err(e) = write::add_comment(pm, id, &text, None, Some("lease"), None, actor) {
-                leases["record_error"] = json!(e.to_string());
-            }
-        }
-        out["leases"] = leases;
-        return Ok(out);
-    }
+fn build_checkout_record(root: &Path, state: &LockedLaneState) -> worktree::lifecycle::Checkout {
+    let mut record = worktree::lifecycle::new_record(worktree::lifecycle::CheckoutSpec {
+        repo: root,
+        purpose: "development",
+        tool: "cadence issue start",
+        owner: &state.checkout_owner,
+        path: &state.wt_dir,
+        branch: Some(&state.branch),
+        pinned_sha: &state.pinned_base,
+        issue: Some(&state.front_id),
+    });
+    record.base_sha = Some(state.pinned_base.clone());
+    record
+}
 
+fn fail_setup(root: &Path, wt_dir: &Path, err: Error) -> Error {
+    let _ = worktree::lifecycle::transition(root, wt_dir, "setup-failed", Some(&err.to_string()));
+    err
+}
+
+fn setup_worktree_lane(
+    init: &InitialBaseContext<'_>,
+    state: &LockedLaneState,
+) -> Result<WorktreeOutcome> {
+    let root = &init.root;
     // Unlocked: worktree creation and setup (cargo target, hooks). The
     // lifecycle ledger records the intent first, so a crash here leaves
     // an inventoried `preparing` checkout that a re-run reuses.
     crate::issue::lockseam::outside_lock("start-worktree");
     // Clear registrations whose dirs are gone — a deleted worktree
     // must not block its own re-creation.
-    let _ = git(&root, &["worktree", "prune"]);
-    let setup = || -> Result<(Option<PathBuf>, bool)> {
-        let mut created = false;
-        let cargo_target: Option<PathBuf>;
-        if reuse {
-            let reattached = !dir_exists;
-            if reattached {
-                // Refs still accurate — record the interrupted recovery before
-                // re-attaching the surviving branch.
-                worktree::ensure_cadence_ignored(&root)?;
-                worktree::lifecycle::begin(&root, checkout_record())?;
-                if let Err(e) = worktree::add(&root, &wt_dir, None, &branch) {
-                    let _ = worktree::lifecycle::transition(
-                        &root,
-                        &wt_dir,
-                        "setup-failed",
-                        Some(&e.to_string()),
-                    );
-                    return Err(e);
-                }
-            } else {
-                worktree::validate_registered_branch(&root, &wt_dir, &branch)?;
-            }
-            cargo_target = match worktree::setup_development(&wt_dir, &root, shared_deps) {
-                Ok(target) => target,
-                Err(e) => {
-                    let _ = worktree::lifecycle::transition(
-                        &root,
-                        &wt_dir,
-                        "setup-failed",
-                        Some(&e.to_string()),
-                    );
-                    return Err(e);
-                }
-            };
-            // Reused lanes re-heal shared cargo setup and the per-worktree hook.
-            if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
-                let _ = worktree::lifecycle::transition(
-                    &root,
-                    &wt_dir,
-                    "setup-failed",
-                    Some(&e.to_string()),
-                );
-                return Err(e);
-            }
+    let _ = git(root, &["worktree", "prune"]);
+    let mut created = false;
+    let cargo_target: Option<PathBuf>;
+    if state.reuse {
+        let reattached = !state.dir_exists;
+        if reattached {
+            // Refs still accurate — record the interrupted recovery before
+            // re-attaching the surviving branch.
+            worktree::ensure_cadence_ignored(root)?;
+            worktree::lifecycle::begin(root, build_checkout_record(root, state))?;
+            worktree::add(root, &state.wt_dir, None, &state.branch)
+                .map_err(|e| fail_setup(root, &state.wt_dir, e))?;
         } else {
-            // Persist intent first: if the process stops during setup, inventory
-            // reports an interrupted checkout instead of inferring ownership from
-            // its directory name.
-            worktree::ensure_cadence_ignored(&root)?;
-            worktree::lifecycle::begin(&root, checkout_record())?;
-            if let Err(e) = worktree::add(&root, &wt_dir, Some(&branch), &base_sha) {
-                let _ = worktree::lifecycle::transition(
-                    &root,
-                    &wt_dir,
-                    "setup-failed",
-                    Some(&e.to_string()),
-                );
-                return Err(e);
-            }
-            // Existing build-target and pre-push setup must succeed before the
-            // checkout becomes active in the tracker.
-            cargo_target = match worktree::setup_development(&wt_dir, &root, shared_deps) {
-                Ok(target) => target,
-                Err(e) => {
-                    let _ = worktree::lifecycle::transition(
-                        &root,
-                        &wt_dir,
-                        "setup-failed",
-                        Some(&e.to_string()),
-                    );
-                    return Err(e);
-                }
-            };
-            if let Err(e) = worktree::lifecycle::activate(&root, checkout_record()) {
-                let _ = worktree::lifecycle::transition(
-                    &root,
-                    &wt_dir,
-                    "setup-failed",
-                    Some(&e.to_string()),
-                );
-                return Err(e);
-            }
-            created = true;
+            worktree::validate_registered_branch(root, &state.wt_dir, &state.branch)?;
         }
-        Ok((cargo_target, created))
-    };
-    let (cargo_target, created) = match setup() {
-        Ok(done) => done,
-        Err(e) => {
-            // A refused new lane leaves the issue as it was: give the
-            // claim back (only if it is still the one lock 1 recorded).
-            if let (Some((status, owner, prev_claim)), Some(at)) = (pre_claim, &claim_at) {
-                let _lock = pm.lock()?;
-                let (mut cur, cur_body) = write::load_front(&dir)?;
-                if cur
-                    .claim
-                    .as_ref()
-                    .is_some_and(|c| c.by == requester && &c.at == at)
-                {
-                    cur.status = status;
-                    cur.owner = owner;
-                    cur.claim = prev_claim;
-                    let undone = write::save_front(&dir, &cur, &cur_body).and_then(|_| {
-                        write::commit_who(
-                            pm,
-                            &[dir.join("issue.md")],
-                            &format!("{}: start {branch} (claim released: setup failed)", cur.id),
-                            &[cur.id.as_str()],
-                            actor,
-                            Some(&requester),
-                        )
-                    });
-                    if undone.is_err() {
-                        let _ = write::save_front(&dir, &front, &cur_body);
-                    }
-                }
-            }
-            return Err(e);
-        }
-    };
+        cargo_target = worktree::setup_development(&state.wt_dir, root, init.shared_deps)
+            .map_err(|e| fail_setup(root, &state.wt_dir, e))?;
+        // Reused lanes re-heal shared cargo setup and the per-worktree hook.
+        worktree::lifecycle::activate(root, build_checkout_record(root, state))
+            .map_err(|e| fail_setup(root, &state.wt_dir, e))?;
+    } else {
+        // Persist intent first: if the process stops during setup, inventory
+        // reports an interrupted checkout instead of inferring ownership from
+        // its directory name.
+        worktree::ensure_cadence_ignored(root)?;
+        worktree::lifecycle::begin(root, build_checkout_record(root, state))?;
+        worktree::add(root, &state.wt_dir, Some(&state.branch), &init.base_sha)
+            .map_err(|e| fail_setup(root, &state.wt_dir, e))?;
+        // Existing build-target and pre-push setup must succeed before the
+        // checkout becomes active in the tracker.
+        cargo_target = worktree::setup_development(&state.wt_dir, root, init.shared_deps)
+            .map_err(|e| fail_setup(root, &state.wt_dir, e))?;
+        worktree::lifecycle::activate(root, build_checkout_record(root, state))
+            .map_err(|e| fail_setup(root, &state.wt_dir, e))?;
+        created = true;
+    }
+    Ok(WorktreeOutcome {
+        cargo_target,
+        created,
+    })
+}
 
+fn rollback_failed_claim(
+    req: &StartRequest<'_>,
+    actors: &StartActors,
+    dir: &Path,
+    state: &LockedLaneState,
+) -> Result<()> {
+    // A refused new lane leaves the issue as it was: give the
+    // claim back (only if it is still the one lock 1 recorded).
+    if let (Some((status, owner, prev_claim)), Some(at)) = (&state.pre_claim, &state.claim_at) {
+        let _lock = req.pm.lock()?;
+        let (mut cur, cur_body) = write::load_front(dir)?;
+        if cur
+            .claim
+            .as_ref()
+            .is_some_and(|c| c.by == actors.requester && &c.at == at)
+        {
+            cur.status = status.clone();
+            cur.owner = owner.clone();
+            cur.claim = prev_claim.clone();
+            let undone = write::save_front(dir, &cur, &cur_body).and_then(|_| {
+                write::commit_who(
+                    req.pm,
+                    &[dir.join("issue.md")],
+                    &format!(
+                        "{}: start {} (claim released: setup failed)",
+                        cur.id, state.branch
+                    ),
+                    &[cur.id.as_str()],
+                    req.actor,
+                    Some(&actors.requester),
+                )
+            });
+            if undone.is_err() {
+                let _ = write::save_front(dir, &state.front, &cur_body);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_and_record_lane_refs(
+    req: &StartRequest<'_>,
+    actors: &StartActors,
+    pre: &PreClaimContext,
+    init: &InitialBaseContext<'_>,
+    state: &LockedLaneState,
+    outcome: &WorktreeOutcome,
+) -> Result<(Front, String)> {
     // Lock 2 (short): re-load the issue and prove the claim is still
     // ours before recording the lane. The refs are merged onto the fresh
     // front, so an unrelated edit made meanwhile (a comment, a priority
     // change) is kept, never overwritten and never a reason to refuse.
-    let lock = pm.lock()?;
-    let (cur, cur_body) = write::load_front(&dir)?;
+    let lock = req.pm.lock()?;
+    let (cur, cur_body) = write::load_front(&pre.dir)?;
     let claim_lost = |why: String| {
         Error::rejected(format!(
-            "{}: {why} while the lane was being set up — refs for {branch} were not \
+            "{}: {why} while the lane was being set up — refs for {} were not \
              recorded. The worktree {} and its lifecycle record are left in place; \
              re-run `cadence issue start {}` to reuse the lane once the claim is yours",
             cur.id,
-            wt_dir.display(),
+            state.branch,
+            state.wt_dir.display(),
             cur.id
         ))
     };
-    if created || claim_at.is_some() {
+    if outcome.created || state.claim_at.is_some() {
         // A new lane: the claim lock 1 recorded must still be ours.
         let ours = cur
             .claim
             .as_ref()
-            .is_some_and(|c| c.by == requester && Some(&c.at) == claim_at.as_ref());
+            .is_some_and(|c| c.by == actors.requester && Some(&c.at) == state.claim_at.as_ref());
         if !ours {
             return Err(claim_lost(format!(
                 "the claim on it changed (now held by {})",
@@ -1005,8 +1044,8 @@ pub(super) fn run_with_verified_job(
     } else {
         // A reused lane: the same claim check lock 1 ran, with no
         // take-over available — only a holder that is not us refuses.
-        let mut asking = vec![requester.as_str()];
-        asking.extend(new_owner.as_deref());
+        let mut asking = vec![actors.requester.as_str()];
+        asking.extend(actors.new_owner.as_deref());
         match claim::check(&cur, &asking, None, "issue start", || None) {
             Ok(c) if c.take_over.is_none() => {}
             _ => {
@@ -1023,101 +1062,119 @@ pub(super) fn run_with_verified_job(
     // duplicated. Idempotent: the same lane commits nothing, unless its
     // refs need a fix (a stale cargo target, a closed pair re-opened, a
     // missing half of the pair).
-    let refreshed = with_lane_refs(&cur, &branch, &wt_str, &repo_label, &cargo_target);
-    front = cur;
+    let refreshed = with_lane_refs(
+        &cur,
+        &state.branch,
+        &state.wt_str,
+        &state.repo_label,
+        &outcome.cargo_target,
+    );
+    let mut front = cur;
     if refreshed.refs != front.refs {
         // `Actor:` is the requester (the dispatching PM), so the lane's
         // advisory code-area PM is bound to this record and not to live
         // frontmatter an agent can rewrite.
-        let subject = if created {
-            format!("{}: start {branch}", front.id)
+        let subject = if outcome.created {
+            format!("{}: start {}", front.id, state.branch)
         } else {
-            format!("{}: start {branch} (refs refreshed)", front.id)
+            format!("{}: start {} (refs refreshed)", front.id, state.branch)
         };
-        let committed = write::save_front(&dir, &refreshed, &body).and_then(|_| {
+        let committed = write::save_front(&pre.dir, &refreshed, &body).and_then(|_| {
             write::commit_who(
-                pm,
-                &[dir.join("issue.md")],
+                req.pm,
+                &[pre.dir.join("issue.md")],
                 &subject,
                 &[front.id.as_str()],
-                actor,
-                Some(&requester),
+                req.actor,
+                Some(&actors.requester),
             )
         });
         if let Err(e) = committed {
-            let _ = write::save_front(&dir, &front, &body);
-            if created {
+            let _ = write::save_front(&pre.dir, &front, &body);
+            if outcome.created {
                 // The managed checkout stays in setup-failed state for an
                 // explicit retry.
-                let _ = worktree::lifecycle::transition(
-                    &root,
-                    &wt_dir,
-                    "setup-failed",
-                    Some(&e.to_string()),
-                );
+                return Err(fail_setup(&init.root, &state.wt_dir, e));
             }
             return Err(e);
         }
         front = refreshed;
     }
     drop(lock);
+    Ok((front, body))
+}
 
-    // CAD-113: the worktree's slot environment — a write failure is
-    // reported, never silently swallowed.
-    let slot_env = match write_slot_env(&wt_dir, &pm.dir) {
-        Ok(path) => json!({"path": path}),
-        Err(e) => {
-            let _ = worktree::lifecycle::transition(
-                &root,
-                &wt_dir,
-                "setup-failed",
-                Some(&e.to_string()),
-            );
-            json!({"error": e.to_string(), "recovery": format!("retry issue start to reapply setup: {e}")})
-        }
-    };
-    let mut claim_out = claim::json(&front, crate::issue::time::now_epoch());
-    claim_out["warning"] = json!(checked.warning);
-    claim_out["take_over"] = json!(checked
+fn build_start_output(
+    init: &InitialBaseContext<'_>,
+    state: &LockedLaneState,
+    cloud: bool,
+    params: &StartOutputParams<'_>,
+) -> Value {
+    let mut claim_out = claim::json(params.front, crate::issue::time::now_epoch());
+    claim_out["warning"] = json!(state.checked.warning);
+    claim_out["take_over"] = json!(state
+        .checked
         .take_over
         .as_ref()
         .map(|t| json!({"from": t.from, "reason": t.reason})));
     let mut out = json!({
-        "issue": front.id,
-        "repo": root,
-        "worktree": wt_dir,
-        "branch": branch,
-        "base": {"ref": base, "sha": lane_base_sha},
-        "trailer": format!("Issue: {}", front.id),
-        "created": created,
-        "target_dir": cargo_target,
-        "slot_env": slot_env,
+        "issue": params.front.id,
+        "repo": init.root,
+        "worktree": params.worktree_path,
+        "branch": state.branch,
+        "base": {"ref": init.base, "sha": state.lane_base_sha},
+        "trailer": format!("Issue: {}", params.front.id),
+        "created": params.created,
+        "target_dir": params.target_dir,
+        "slot_env": params.slot_env,
         "claim": claim_out,
     });
-    if let Some(warning) = &base_warning {
+    if cloud {
+        out["cloud"] = json!(true);
+    }
+    if let Some(warning) = &init.base_warning {
         eprintln!("cadence: {warning}");
         out["base"]["warning"] = json!(warning);
     }
-    if let (Some(job), Some((state_dir, spec, spec_sha256))) = (&args.job, job_probe) {
-        let task_acceptance = if initial_intake.is_some() {
+    out
+}
+
+fn build_and_finalize_start(
+    req: &StartRequest<'_>,
+    actors: &StartActors,
+    pre: &PreClaimContext,
+    init: &InitialBaseContext<'_>,
+    state: &LockedLaneState,
+    params: &StartOutputParams<'_>,
+) -> Result<Value> {
+    let mut out = build_start_output(init, state, pre.cloud, params);
+    if let (Some(job), Some((job_state_dir, spec, spec_sha256))) = (&req.args.job, &pre.job_probe) {
+        let task_acceptance = if pre.initial_intake.is_some() {
             None
         } else {
-            crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body))
+            crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(params.body))
         };
-        let created_job = if let Some(job) = verified_job {
+        let created_job = if let Some(job) = req.verified_job {
             json!({"job": {"id": job["id"]}})
         } else {
-            client::rpc(
-                &state_dir,
-                "job_new",
-                json!({"job": job.id, "pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
-                       "title": front.title, "issue": front.id,
-                       "repo": root, "base_ref": lane_base_sha,
-                       "task_worktree": wt_name, "task_branch": branch,
-                       "task_base_sha": lane_base_sha,
-                       "task_assignee": job.assignee,
-                       "task_acceptance": task_acceptance}),
-            )?
+            let mut payload = json!({
+                "pm": job.pm,
+                "spec": spec,
+                "spec_sha256": spec_sha256,
+                "title": params.front.title,
+                "issue": params.front.id,
+                "repo": init.root,
+                "base_ref": state.lane_base_sha,
+                "task_worktree": params.task_worktree,
+                "task_branch": state.branch,
+                "task_base_sha": state.lane_base_sha,
+                "task_assignee": job.assignee,
+                "task_acceptance": task_acceptance,
+            });
+            if params.include_job_id_field {
+                payload["job"] = json!(job.id);
+            }
+            client::rpc(job_state_dir, "job_new", payload)?
         };
         let job_id = created_job["job"]["id"]
             .as_str()
@@ -1127,9 +1184,17 @@ pub(super) fn run_with_verified_job(
         // `job_new` mints exactly one task — `<job>-t1` — scoped above.
         out["task"] = json!(format!("{job_id}-t1"));
     }
-    if let Some(note) = cwd_override {
+    if let Some(note) = &pre.cwd_override {
         // The override is part of the issue's record, not just output.
-        write::add_comment(pm, id, &note, None, Some("dispatch"), None, actor)?;
+        write::add_comment(
+            req.pm,
+            req.id,
+            note,
+            None,
+            Some("dispatch"),
+            None,
+            req.actor,
+        )?;
         out["cwd_override"] = json!(note);
     }
     // CAD-378: advisory path leases — the ticket's planned paths
@@ -1137,17 +1202,119 @@ pub(super) fn run_with_verified_job(
     // refuses: the warnings ride the output, and a start that minted
     // the lane records them on the issue as a `lease` comment (the
     // event). A failure to record is reported, not raised.
-    let mut leases =
-        crate::issue::areas::check_start(&pm.dir, state_dir, &project.key, &front, &requester);
+    let mut leases = crate::issue::areas::check_start(
+        &req.pm.dir,
+        req.state_dir,
+        &pre.project.key,
+        params.front,
+        &actors.requester,
+    );
     let lines = crate::issue::areas::warning_lines(&leases);
-    if created && !lines.is_empty() {
+    if params.record_lease_warnings && !lines.is_empty() {
         let text = format!("Lease warnings at start:\n- {}", lines.join("\n- "));
-        if let Err(e) = write::add_comment(pm, id, &text, None, Some("lease"), None, actor) {
+        if let Err(e) =
+            write::add_comment(req.pm, req.id, &text, None, Some("lease"), None, req.actor)
+        {
             leases["record_error"] = json!(e.to_string());
         }
     }
     out["leases"] = leases;
     Ok(out)
+}
+
+pub(super) fn run_with_verified_job(
+    pm: &Pm,
+    id: &str,
+    args: &StartArgs,
+    actor: &str,
+    state_dir: &Path,
+    verified_draft: Option<(&Value, &Value)>,
+) -> Result<Value> {
+    let req = StartRequest {
+        pm,
+        id,
+        args,
+        actor,
+        state_dir,
+        verified_job: verified_draft.map(|(job, _)| job),
+    };
+    let pre = validate_pre_claim(&req)?;
+    let init = resolve_initial_base(args, &pre, verified_draft)?;
+
+    // CAD-383: who is asking, and the owner this start would record.
+    if let Some(by) = &args.by {
+        claim::check_alias(by, "--by")?;
+    }
+    let actors = StartActors {
+        requester: write::actor_who(
+            actor,
+            args.by
+                .as_deref()
+                .or(args.job.as_ref().map(|j| j.pm.as_str())),
+        ),
+        new_owner: args
+            .owner
+            .clone()
+            .or_else(|| args.job.as_ref().and_then(|j| j.assignee.clone())),
+    };
+
+    let locked = acquire_and_record_claim(&req, &actors, &pre, &init)?;
+
+    if pre.cloud {
+        // A cloud agent owns no host worktree. The remote runner clones the
+        // project repo. Record only the branch lane; the job carries the
+        // host repo path and branch/base for the daemon-side runner.
+        let root_str = init.root.to_string_lossy();
+        let params = StartOutputParams {
+            front: &locked.front,
+            body: &locked.body,
+            worktree_path: &init.root,
+            task_worktree: &root_str,
+            created: true,
+            target_dir: None,
+            slot_env: Value::Null,
+            include_job_id_field: false,
+            record_lease_warnings: true,
+        };
+        return build_and_finalize_start(&req, &actors, &pre, &init, &locked, &params);
+    }
+
+    let outcome = match setup_worktree_lane(&init, &locked) {
+        Ok(done) => done,
+        Err(e) => {
+            rollback_failed_claim(&req, &actors, &pre.dir, &locked)?;
+            return Err(e);
+        }
+    };
+
+    let (front, body) = verify_and_record_lane_refs(&req, &actors, &pre, &init, &locked, &outcome)?;
+
+    // CAD-113: the worktree's slot environment — a write failure is
+    // reported, never silently swallowed.
+    let slot_env = match write_slot_env(&locked.wt_dir, &pm.dir) {
+        Ok(path) => json!({"path": path}),
+        Err(e) => {
+            let _ = worktree::lifecycle::transition(
+                &init.root,
+                &locked.wt_dir,
+                "setup-failed",
+                Some(&e.to_string()),
+            );
+            json!({"error": e.to_string(), "recovery": format!("retry issue start to reapply setup: {e}")})
+        }
+    };
+    let params = StartOutputParams {
+        front: &front,
+        body: &body,
+        worktree_path: &locked.wt_dir,
+        task_worktree: &locked.wt_name,
+        created: outcome.created,
+        target_dir: outcome.cargo_target.as_ref(),
+        slot_env,
+        include_job_id_field: true,
+        record_lease_warnings: outcome.created,
+    };
+    build_and_finalize_start(&req, &actors, &pre, &init, &locked, &params)
 }
 
 /// CAD-113: the worktree's build-slot environment — `CARGO_BUILD_JOBS`
