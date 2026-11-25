@@ -1,15 +1,12 @@
 /**
- * How one wiki blob opens (CAD-581). Images, video and PDFs get a preview;
- * everything else downloads. SVG and HTML never render inline — an
- * uploaded file must not be able to run script in the board's origin,
- * whatever MIME the server sniffed (CAD-580 serves them as attachments).
+ * Attachment previews. HTML gets only the reader's sanitized static view;
+ * uploaded HTML and SVG bytes never render as a document in the board origin.
  */
 
-export type PreviewKind = "image" | "video" | "pdf" | "download";
+export type PreviewKind = "image" | "video" | "pdf" | "html" | "download";
 
 const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"]);
 const VIDEO_EXT = new Set(["mp4", "webm", "ogv", "mov", "m4v"]);
-const PDF_EXT = new Set(["pdf"]);
 /** Types that must never render in a page, only download. */
 const NEVER_INLINE_EXT = new Set(["svg", "svgz", "html", "htm", "xhtml", "xml", "mhtml"]);
 
@@ -21,13 +18,14 @@ export function extOf(name: string): string {
 
 export function previewKind(name: string, mime?: string | null): PreviewKind {
   const ext = extOf(name);
-  const type = (mime ?? "").toLowerCase();
+  const type = (mime ?? "").split(";", 1)[0].trim().toLowerCase();
+  if ((ext === "html" || ext === "htm") && type === "text/html") return "html";
   const never =
     NEVER_INLINE_EXT.has(ext) || type.includes("svg") || type.includes("html") || type.includes("xml");
   if (never) return "download";
   if (IMAGE_EXT.has(ext) || type.startsWith("image/")) return "image";
   if (VIDEO_EXT.has(ext) || type.startsWith("video/")) return "video";
-  if (PDF_EXT.has(ext) || type === "application/pdf") return "pdf";
+  if (type === "application/pdf") return "pdf";
   return "download";
 }
 

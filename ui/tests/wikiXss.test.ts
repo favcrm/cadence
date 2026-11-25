@@ -61,10 +61,10 @@ equal(linkedImage.includes('class="md-image"'), false, "a linked image gets no n
 const data = render("[x](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)");
 equal(/data:text\/html/i.test(data), false, "a data:text/html link is stripped too");
 
-// Probe 4 — defence in depth: an uploaded SVG or HTML never previews
-// inline, whatever MIME the server sniffed (the preview pane downloads).
+// HTML gets the static sanitizing preview only when the stored type and extension agree.
 equal(previewKind("evil.svg", "image/svg+xml"), "download", "an uploaded svg downloads");
-equal(previewKind("evil.html", "text/html"), "download", "an uploaded html downloads");
+equal(previewKind("quotation.html", "text/html"), "html", "a verified HTML attachment takes the static preview path");
+equal(previewKind("quotation.html", "application/octet-stream"), "download", "a filename alone cannot select the HTML preview");
 equal(previewKind("evil.xhtml", null), "download", "an uploaded xhtml downloads");
 
 // And the safe cases still render as themselves.
@@ -124,6 +124,7 @@ async function blobTransportChecks() {
   Object.defineProperty(globalThis, "FileReader", { value: TestReader, configurable: true });
   const files: Record<string, string> = {
     "movie.mp4": "video/mp4", "notes.pdf": "application/pdf", "photo.png": "image/png",
+    "changed.pdf": "application/pdf",
     "unsafe.mp4": "text/html", "unsafe.html": "text/html", "late.pdf": "application/pdf",
   };
   const calls: { url: string; init?: RequestInit }[] = [];
@@ -138,7 +139,9 @@ async function blobTransportChecks() {
       return new Response(JSON.stringify({ path, kind: path ? "file" : "dir", entries: path ? entries.filter((entry) => entry.path === path) : entries }), { headers: { "Content-Type": "application/json" } });
     }
     if (url.pathname === "/api/wiki/file") {
-      const response = new Response("private file bytes", { headers: { "Content-Type": files[path] } });
+      const body = path === "unsafe.html" ? '<h1>Sample HTML</h1><a href="https://example.test">External address</a><form></form>' : "private file bytes";
+      const type = path === "changed.pdf" ? "application/octet-stream" : files[path];
+      const response = new Response(body, { headers: { "Content-Type": type } });
       if (path === "late.pdf") response.blob = () => new Promise<Blob>((resolve) => { releaseBody = resolve; });
       return response;
     }
@@ -169,22 +172,29 @@ async function blobTransportChecks() {
 
     await renderWiki("notes.pdf");
     equal(revoked.includes(videoUrl), true, "changing files revokes the old preview");
-    equal(host.querySelector("iframe"), null, "a PDF is never framed (Chrome's viewer cannot run in a sandboxed frame)");
-    const open = host.querySelector<HTMLAnchorElement>("a[target=_blank]")!;
-    equal(open.getAttribute("href")?.startsWith("blob:"), true, "PDF opens from a local blob");
-    equal(open.getAttribute("rel"), "noopener noreferrer", "the PDF tab cannot reach the board window");
-    const pdfUrl = open.getAttribute("href")!;
+    equal(host.querySelector("iframe, a[target=_blank]"), null, "a PDF is never framed or opened directly as a document URL");
+    const pdfUrl = host.querySelector<HTMLAnchorElement>("a[download]")!.getAttribute("href")!;
+    equal(objects.get(pdfUrl)?.type, "application/octet-stream", "the original PDF stays an inert download");
     await React.act(async () => pausePrivateReads());
     equal(revoked.includes(pdfUrl), true, "pausing reads revokes the PDF immediately");
-    equal(host.querySelector("a[target=_blank]"), null, "paused private content disappears without another fetch");
+    equal(host.querySelector("a[download], .wk-document-page"), null, "paused private PDF bytes disappear without another fetch");
     allowPrivateReads();
+
+    await renderWiki("changed.pdf");
+    equal(host.querySelector<HTMLAnchorElement>("a[download]")?.download, "changed.pdf", "a stale PDF listing still offers the original");
+    equal(host.querySelector(".wk-download") !== null, true, "a response no longer served as PDF goes directly to download");
 
     await renderWiki("unsafe.mp4");
     equal(host.querySelector("video"), null, "a misleading video extension cannot inline active MIME");
     equal(host.querySelector("iframe"), null, "unapproved content cannot become a frame");
     equal(host.querySelector<HTMLAnchorElement>("a[download]")?.download, "unsafe.mp4", "unsupported MIME still downloads safely");
     await renderWiki("unsafe.html");
-    equal(host.querySelector("iframe,video,img"), null, "HTML remains download-only");
+    const html = host.querySelector<HTMLIFrameElement>("iframe")!;
+    equal(html.getAttribute("sandbox"), "", "HTML uses a fully sandboxed frame");
+    equal(html.srcdoc.includes("Sample HTML"), true, "the static document remains readable");
+    equal(/href=|<form/i.test(html.srcdoc), false, "HTML preview strips navigation and forms");
+    const htmlUrl = host.querySelector<HTMLAnchorElement>("a[download]")!.getAttribute("href")!;
+    equal(objects.get(htmlUrl)?.type, "application/octet-stream", "the original HTML stays an inert download");
 
     await renderWiki("photo.png");
     const reader = readers[readers.length - 1];

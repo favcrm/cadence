@@ -1719,6 +1719,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             noWiki={!wikiAvailable(meta)}
             hosted={hosted}
             viewerSub={viewerSub}
+            operator={meta?.operator ?? null}
             readOnly={readOnly}
             readOnlyReason={block}
             actor={actor}

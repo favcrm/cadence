@@ -36,6 +36,8 @@ import {
 } from "./shared";
 import FileExplorer from "./FileExplorer";
 import PagePane from "./PagePane";
+import DocumentPreview from "./DocumentPreview";
+import { CopyWikiLink, ReaderTrash, wikiReaderHref } from "./ReaderActions";
 import { statusText, whoLabel } from "./hosted";
 import EditorPane from "./EditorPane";
 import FolderPane, { type DeleteReceipt } from "./FolderPane";
@@ -203,7 +205,7 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
     // comes from the file route.
     const openEntry = async (entry: WikiEntry): Promise<Open> =>
       entry.kind === "page"
-        ? { path, kind: "file", page: await wiki.file(path) }
+        ? { path, kind: "file", page: { ...await wiki.file(path), removable: entry.removable } }
         : { path, kind: "file", page: blobPage(entry) };
     const listing = async (): Promise<Open> => {
       let ls: WikiListing;
@@ -229,6 +231,7 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
             mtime: ls.mtime,
             status: ls.status,
             status_reason: ls.status_reason,
+            removable: ls.removable,
           },
         );
       }
@@ -379,7 +382,9 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
               readOnlyReason={readOnlyReason}
               hosted={hosted}
               viewerSub={viewerSub}
+              operator={operator}
               trashHref={trashHref}
+              at={route.at}
               section={route.section}
               page={route.page}
               managedFiles={managedFiles}
@@ -449,7 +454,9 @@ function BrowsePane({
   readOnlyReason,
   hosted,
   viewerSub,
+  operator,
   trashHref,
+  at,
   section,
   page: citedPage,
   managedFiles,
@@ -468,8 +475,10 @@ function BrowsePane({
   readOnlyReason?: string | null;
   hosted?: boolean;
   viewerSub?: string | null;
+  operator?: boolean | null;
   /** The operator's Trash screen, absent for a non-operator or a context. */
   trashHref: string | null;
+  at?: string;
   section?: string;
   page?: number;
   managedFiles?: boolean;
@@ -645,6 +654,7 @@ function BrowsePane({
           onReceipt={(next) => setReceipt({ ...next, folder: path })}
           navHref={navHref}
           readOnly={writeBlocked}
+          requireRemovalPermission={hosted !== false}
           trashHref={trashHref}
           onRefresh={onRefresh}
           onToast={onToast}
@@ -656,26 +666,51 @@ function BrowsePane({
   }
 
   const page = open.page;
-  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} hosted={hosted} viewerSub={viewerSub} section={section} citedPage={citedPage} />;
-  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} hosted={hosted} viewerSub={viewerSub} />;
+  const link = wikiReaderHref(page.path, at, section, citedPage);
+  // Native boards do not send the hosted permission bit. Only a proven
+  // operator gets that fallback, and profile/memory are read-only views.
+  const removable = page.removable === true || (page.removable === undefined &&
+    hosted === false && operator === true &&
+    !/^agents\/[^/]+\/(?:profile|memory)(?:\/|$)/.test(page.path));
+  const actions = <>
+    <CopyWikiLink key={link} href={link} />
+    {!readOnly && at === undefined && !page.historical && removable && (
+      <ReaderTrash key={page.path} path={page.path}
+        onRemoved={(landing) => {
+          onToast("ok", `${baseName(page.path)} moved to ${landing}`);
+          onRefresh();
+          navigate(navHref({ screen: "wiki", mode: "browse", path: parentPath(page.path), query: null }));
+        }}
+        onUnconfirmed={() => {
+          onToast("warn", t("Move to Trash was not confirmed. Check the folder and Trash before trying again."));
+          onRefresh();
+        }}
+        onFail={(failure) => onFail(failure, "Move to Trash")}
+      />
+    )}
+  </>;
+  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} hosted={hosted} viewerSub={viewerSub} section={section} citedPage={citedPage} actions={actions} />;
+  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} hosted={hosted} viewerSub={viewerSub} actions={actions} />;
 }
 
-function BlobPane({ page, blob, navHref, hosted, viewerSub }: {
+function BlobPane({ page, blob, navHref, hosted, viewerSub, actions }: {
   page: WikiPage;
   blob: PreviewKind;
   navHref: (route: Route) => string;
   hosted?: boolean;
   viewerSub?: string | null;
+  actions?: React.ReactNode;
 }) {
   const t = useTranslate();
-  const { src, download, error, loading } = useWikiBlobSource(page.path, blob, true);
+  const { src, download, bytes, error, loading } = useWikiBlobSource(page.path, blob, true);
   const name = baseName(page.path);
   const status = statusText(page.status);
   return (
     <>
       <WikiToolbar path={page.path} navHref={navHref} actions={<>
         <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
-        {download ? <a className="btn" href={download} download={name}>{t("Download")}</a> : <Button disabled>{t("Download")}</Button>}
+        {actions}
+        {download ? <a className="btn" href={download} download={name}>{t("Download original")}</a> : <Button disabled>{t("Download original")}</Button>}
       </>} />
       {error && <Failure what="could not open this file" error={error} />}
       <div className="wk-pstage">
@@ -685,14 +720,8 @@ function BlobPane({ page, blob, navHref, hosted, viewerSub }: {
           <video className="wk-video" src={src} controls preload="metadata">
             <track kind="captions" />
           </video>
-        ) : blob === "pdf" && src ? (
-          // Chrome's PDF viewer will not run in a fully sandboxed frame, and the sandbox stays:
-          // the blob opens in its own tab, where the browser's isolated viewer renders it.
-          <div className="wk-download">
-            <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
-            <div className="wk-etitle">{name}</div>
-            <a className="btn btn-primary" href={src} target="_blank" rel="noopener noreferrer">{t("Open PDF")}</a>
-          </div>
+        ) : bytes && (blob === "html" || blob === "pdf") ? (
+          <DocumentPreview key={page.path} bytes={bytes} name={name} kind={blob} />
         ) : (
           <div className="wk-download">
             <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
@@ -700,9 +729,6 @@ function BlobPane({ page, blob, navHref, hosted, viewerSub }: {
             <div className="wk-ebody">
               {t("this type has no inline preview — download it, or open it with the tool it belongs to.")}
             </div>
-            {download && <a className="btn btn-primary" href={download} download={name}>
-              {t("Download")}
-            </a>}
           </div>
         )}
       </div>

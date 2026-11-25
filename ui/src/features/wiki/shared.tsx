@@ -103,11 +103,9 @@ export function EmptyCard({
 
 /**
  * Credentialed wiki bytes never go straight into an element's URL. Raster
- * images use data: (the image CSP excludes blob:); PDF and allowlisted video
- * use local blob: previews. Downloads use an inert octet-stream blob, even
- * for uploaded HTML/SVG. The board CSP must explicitly admit blob: frames
- * and media; PDF callers must keep their iframe sandboxed.
- *
+ * images use data: and allowlisted video uses a local blob: preview.
+ * Downloads always use an inert octet-stream blob, including HTML and SVG.
+ * Bytes for document previews remain in memory, never in an executable URL.
  * Abort fetch/encoding and revoke every owned URL on path/session changes,
  * paused private reads, or unmount. Fence both decoding and rendering with
  * the identity generation, including a reset that reuses the same tab key.
@@ -117,7 +115,7 @@ export function useWikiBlobSource(path: string, kind: PreviewKind, withDownload 
   const generation = privateSessionGeneration();
   const [loaded, setLoaded] = useState<{
     path: string; key: string | null; generation: number; kind: PreviewKind; withDownload: boolean;
-    src: string | null; download: string | null; error: string | null;
+    src: string | null; download: string | null; bytes: Blob | null; error: string | null;
   } | null>(null);
   useEffect(() => {
     const abort = new AbortController();
@@ -142,8 +140,8 @@ export function useWikiBlobSource(path: string, kind: PreviewKind, withDownload 
       .then((blob) => {
         if (!current()) return;
         const download = withDownload ? localUrl(blob.slice(0, blob.size, "application/octet-stream")) : null;
-        const publish = (src: string | null) => {
-          if (current()) setLoaded({ path, key, generation, kind, withDownload, src, download, error: null });
+        const publish = (src: string | null, bytes: Blob | null = null) => {
+          if (current()) setLoaded({ path, key, generation, kind, withDownload, src, download, bytes, error: null });
         };
         if (kind === "image") {
           const owned = new FileReader();
@@ -152,18 +150,21 @@ export function useWikiBlobSource(path: string, kind: PreviewKind, withDownload 
             if (typeof owned.result === "string") publish(owned.result);
           };
           owned.onerror = () => {
-            if (current()) setLoaded({ path, key, generation, kind, withDownload, src: null, download, error: "Could not decode this image" });
+            if (current()) setLoaded({ path, key, generation, kind, withDownload, src: null, download, bytes: null, error: "Could not decode this image" });
           };
           owned.readAsDataURL(blob);
         } else {
           const mime = blob.type.split(";")[0].trim().toLowerCase();
           const video = ["video/mp4", "video/webm", "video/ogg", "video/quicktime", "video/x-m4v"].includes(mime);
-          const preview = (kind === "pdf" && mime === "application/pdf") || (kind === "video" && video);
-          publish(preview ? localUrl(blob.slice(0, blob.size, mime)) : null);
+          const preview = kind === "video" && video;
+          // Only the fetched PDF MIME admits PDF.js. HTML is served as an
+          // attachment and is admitted separately by the static sanitizer.
+          const document = withDownload && (kind === "html" || (kind === "pdf" && mime === "application/pdf"));
+          publish(preview ? localUrl(blob.slice(0, blob.size, mime)) : null, document ? blob : null);
         }
       })
       .catch((error: unknown) => {
-        if (current()) setLoaded({ path, key, generation, kind, withDownload, src: null, download: null, error: error instanceof Error ? error.message : String(error) });
+        if (current()) setLoaded({ path, key, generation, kind, withDownload, src: null, download: null, bytes: null, error: error instanceof Error ? error.message : String(error) });
       });
     return () => {
       stop();
@@ -173,7 +174,7 @@ export function useWikiBlobSource(path: string, kind: PreviewKind, withDownload 
   const result = loaded && loaded.path === path && loaded.key === key
     && loaded.generation === generation && loaded.kind === kind && loaded.withDownload === withDownload
     && privateReadsAllowed() ? loaded : null;
-  return { src: result?.src ?? null, download: result?.download ?? null, error: result?.error ?? null, loading: result === null };
+  return { src: result?.src ?? null, download: result?.download ?? null, bytes: result?.bytes ?? null, error: result?.error ?? null, loading: result === null };
 }
 
 /** Markdown and file previews share the same fenced, CSP-compatible image path. */

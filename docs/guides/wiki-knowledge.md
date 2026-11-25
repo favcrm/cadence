@@ -69,6 +69,21 @@ live progress feed; an unconfirmed result does not establish that extraction
 has finished. Hosted history identifies your edits as yours and uses a neutral
 contributor label for other, unresolved subjects.
 
+**Copy link** in the reader copies the current Wiki item or its pinned
+revision. The recipient still needs access to the same workspace and path.
+An older `MOVED` pointer offers **Open document** when it names a Wiki path.
+
+PDF attachments served as `application/pdf` preview one page at a time,
+without running document actions. Rendered pages have a maximum of 2048
+pixels on either side and a 10 MiB image limit. HTML preview requires valid
+UTF-8 and at most 1 MiB. It keeps supported static content and simple inline
+styling; scripts, forms, remote assets, and navigation are disabled.
+Use **Download original** for unsupported files and preview failures.
+
+On hosted boards, only a verified workspace owner may move shared Wiki
+content to Trash. Existing private-folder and private-project permissions
+remain in force. Only a workspace owner may restore a trashed entry.
+
 Removing an item returns its exact `.trash/...` landing. An operator can open
 Trash in the board, inspect the recorded entries, and restore to the original
 path or another available destination. Trash is not visible to members or
@@ -76,7 +91,8 @@ agents. The browser does not guess a restore source when a native landing's
 original path cannot be proved from its tracker history; it reports when its
 bounded history search stops before finding proof. Keep the original receipt:
 an operator can restore that exact source with
-`cadence wiki mv <landing> <destination>` after the server's safety checks.
+`cadence wiki mv <landing> <destination>` on a native workspace; on hosted
+workspaces use the Board’s Trash screen.
 Older servers may not support the trash browser.
 
 Hosted restores with more than 200 distinct stored attachments are refused
@@ -97,6 +113,9 @@ text could not be indexed.
 
 On hosted boards, editable Markdown and TXT uploads are limited to 256 KiB;
 larger text uploads are refused before storage rather than becoming attachments.
+For a hosted HTML original, use
+`cadence --org <org> wiki upload <file.html> <wiki/path.html>`.
+`wiki put` still writes text regardless of the extension.
 
 An operator can use the CLI:
 

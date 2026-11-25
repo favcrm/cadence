@@ -444,6 +444,25 @@
   overflow-wrap: anywhere;
 }
 
+.wk-reader-trash {
+  margin: auto;
+  padding: 20px;
+  width: min(30rem, calc(100% - 2rem));
+  color: var(--color-ink-100);
+  background: var(--color-ink-850);
+  overscroll-behavior: contain;
+}
+
+.wk-reader-trash::backdrop {
+  background: var(--color-scrim);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+.wk-reader-trash p {
+  margin-top: 8px;
+}
+
 .wk-dialog-hint {
   font-size: var(--text-label);
   color: var(--color-ink-500);

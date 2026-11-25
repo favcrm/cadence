@@ -88,12 +88,14 @@ function renderWithNavigation(children: React.ReactNode) {
 }
 const props = { project: "cadence", readOnly: false, actor: "master", onToast: () => {}, navHref: () => "/" };
 const flush = async () => { await new Promise((resolve) => setTimeout(resolve, 10)); };
-async function render(extra: Partial<typeof props> = {}) { await React.act(async () => { renderWithNavigation(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
+async function render(extra: Partial<React.ComponentProps<typeof Context>> = {}) { await React.act(async () => { renderWithNavigation(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
 async function go(href: string) { await React.act(async () => { navigate(href); await flush(); }); await React.act(flush); }
 async function run() {
-  await render();
+  await render({ hosted: false, operator: true });
   assert(location.search.includes("file=README.md"), "Context opens the project README first");
   assert(host.textContent?.includes("Notes for projects/cadence/README.md"), "raw daemon text renders as Markdown");
+  assert(host.querySelector("button[aria-label='File actions']"), "a proven native operator can act on the open Context document");
+  assert(!Array.from(host.querySelectorAll("a")).some((link) => link.textContent?.trim() === "Trash"), "workspace Trash stays out of project Context");
   assert(requests.every((url) => !url.endsWith("path=") && !url.includes("path=projects&")), "tree never requests global parents");
   assert(Array.from(host.querySelectorAll("a")).some((link) => link.textContent === "Edit" && link.href.includes("/context?") && link.href.includes("mode=edit")), "Edit stays in the Context tab");
   assert(!host.textContent?.includes("Repository references") && !host.querySelector(".context-references"), "Context contains only the shared Wiki workspace");
@@ -301,7 +303,7 @@ async function run() {
   transferModule.importFile = originalImport;
 
   const folderErrors: string[] = [];
-  const folderProps = { receipt: null, onReceipt: () => {}, entries: [{ name: "README.md", path: pagePath, kind: "page" as const }], navHref: () => "/", readOnly: false, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
+  const folderProps = { receipt: null, onReceipt: () => {}, entries: [{ name: "README.md", path: pagePath, kind: "page" as const, removable: false }], navHref: () => "/", readOnly: false, requireRemovalPermission: true, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
   const renderFolder = async (readOnly = false) => {
     await React.act(() => renderWithNavigation(React.createElement(WikiScopeContext, { value: { root: "projects/cadence", label: "Cadence" } }, React.createElement(FolderPane, { ...folderProps, readOnly }))));
   };
@@ -315,6 +317,7 @@ async function run() {
   assert(!host.querySelector(".wk-fmenu") && document.activeElement === actions, "Escape closes file actions and returns focus to the trigger");
   await React.act(() => actions.click());
   const rename = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Rename");
+  assert(!Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Move to Trash"), "hosted pages without removal permission do not offer Trash");
   assert(rename, "Rename is offered for a page");
   await React.act(() => rename.click());
   const name = host.querySelector<HTMLInputElement>("input[name='name']");
