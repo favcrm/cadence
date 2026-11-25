@@ -13,6 +13,7 @@ import { AppGlyph } from "../features/explorer/shared";
 import { useLocale } from "../lib/locale";
 import { useAssistantUnread } from "../features/app-shell/chat/assistantUnread";
 import { useWhatsAppUnread } from "../features/app-shell/whatsappUnread";
+import { useChannelsUnread } from "../features/threads/channelsUnread";
 
 const prefetchApp = (app: Pick<AppNavEntry, "installId" | "kind">) => {
   if (app.kind === "social-content") prefetchWorkspaceApp(app.installId);
@@ -92,6 +93,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
   // CAD-1700: a quiet dot where an assistant reply waits unseen.
   const assistantUnread = useAssistantUnread();
   const whatsappUnread = useWhatsAppUnread();
+  const channelsUnread = useChannelsUnread();
   const apps = appMenu?.apps ?? [];
   const currentApp = apps.find((a) => a.current) ?? null;
   const totalWaUnread = apps.reduce((sum, app) => {
@@ -104,7 +106,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
         const here = navMatches(screen, item.screen);
         const railLabel = item.screen === "home"
           ? [t(item.label), homeCount > 0 ? `${homeCount} ${t("waiting for you")}` : "", assistantUnread.has("home") ? t("New assistant reply") : ""].filter(Boolean).join(" · ")
-          : t(item.label);
+          : item.screen === "threads"
+            ? [t(item.label), channelsUnread > 0 ? `${channelsUnread} ${t("Unread channel messages")}` : ""].filter(Boolean).join(" · ")
+            : t(item.label);
         if (item.screen !== "apps" || apps.length === 0) {
           return (
             <Fragment key={item.screen}>
@@ -125,6 +129,14 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 )}
                 {item.screen === "home" && assistantUnread.has("home") && (
                   <span className="navdot" role="img" aria-label={t("New assistant reply")} />
+                )}
+                {item.screen === "threads" && channelsUnread > 0 && (
+                  <span
+                    className="navbadge navbadge-accent num"
+                    aria-label={`${channelsUnread} ${t("Unread channel messages")}`}
+                  >
+                    {channelsUnread > 99 ? "99+" : channelsUnread}
+                  </span>
                 )}
               </Link>
               {item.screen === "apps" && appMenu?.notice && <AppNotice notice={appMenu.notice} rail={rail} />}

@@ -3295,6 +3295,15 @@ Object.assign(zhTW, {
   "Browser alerts are on for this device.": "已為此裝置開啟瀏覽器提示。",
   "Browser alerts are off for this device.": "已為此裝置關閉瀏覽器提示。",
   "This device was not enrolled.": "此裝置尚未啟用提示。",
+  "Group channel": "群組頻道",
+  "Mention": "提及",
+  "1 new message": "1 則新訊息",
+  "{count} new messages": "{count} 則新訊息",
+  "Unread channel messages": "未讀頻道訊息",
+  "Alert me while this tab is in the background.": "此分頁在背景時發出桌面通知。",
+  "On for open tabs in the background.": "已為開啟中的背景分頁啟用。",
+  "Blocked in your browser settings. In-app unread still works.": "已在瀏覽器設定中封鎖，頁面內的未讀提示仍可正常運作。",
+  "Clears the inbox badge without marking channel history read.": "僅清除通知數量標記，不會將頻道對話標為已讀。",
 });
 
 // CAD-2286: the Documents screen. ("Documents", "Active", "All", "In review",

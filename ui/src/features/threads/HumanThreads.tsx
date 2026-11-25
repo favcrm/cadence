@@ -3,6 +3,7 @@ import { ApiError } from "../../lib/api";
 import { fmtTime } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
+import { IconArrowDown } from "../../ui/icons";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import Composer from "../app-shell/chat/Composer";
@@ -635,6 +636,7 @@ export function HumanRoomTimeline({
 
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const pinnedToTailRef = useRef(true);
+  const [pendingNewCount, setPendingNewCount] = useState(0);
   const tailPostRef = useRef<{ room: string; id: string | null; initialized: boolean }>({
     room: "",
     id: null,
@@ -643,12 +645,15 @@ export function HumanRoomTimeline({
   useEffect(() => {
     pinnedToTailRef.current = true;
     tailPostRef.current = { room: id, id: null, initialized: false };
+    setPendingNewCount(0);
   }, [id]);
   useEffect(() => {
     const root = messagesRef.current;
     if (!root) return;
     const onScroll = () => {
-      pinnedToTailRef.current = root.scrollHeight - root.scrollTop - root.clientHeight <= 48;
+      const pinned = root.scrollHeight - root.scrollTop - root.clientHeight <= 48;
+      pinnedToTailRef.current = pinned;
+      if (pinned) setPendingNewCount(0);
     };
     root.addEventListener("scroll", onScroll, { passive: true });
     return () => root.removeEventListener("scroll", onScroll);
@@ -656,14 +661,30 @@ export function HumanRoomTimeline({
   useEffect(() => {
     const root = messagesRef.current;
     if (!root || !currentPage || currentPage.room !== id) return;
-    const lastId = currentPage.posts[currentPage.posts.length - 1]?.id ?? null;
+    const posts = currentPage.posts;
+    const lastId = posts[posts.length - 1]?.id ?? null;
     const prev = tailPostRef.current;
     if (prev.initialized && prev.room === id && prev.id === lastId) return;
     tailPostRef.current = { room: id, id: lastId, initialized: true };
     if (pinnedToTailRef.current) {
       root.scrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+      setPendingNewCount(0);
+      return;
     }
-  }, [id, currentPage]);
+    if (prev.initialized && prev.room === id) {
+      const prevIdx = prev.id === null ? -1 : posts.findIndex((p) => p.id === prev.id);
+      const added = prevIdx >= 0 ? posts.slice(prevIdx + 1) : posts;
+      const incoming = added.filter((p) => p.sender.id !== me.id).length;
+      if (incoming > 0) setPendingNewCount((count) => count + incoming);
+    }
+  }, [id, currentPage, me.id]);
+  const jumpToLatest = () => {
+    const root = messagesRef.current;
+    pinnedToTailRef.current = true;
+    setPendingNewCount(0);
+    if (!root) return;
+    root.scrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+  };
   useEffect(() => {
     const changed = () => setDocumentVisible(document.visibilityState === "visible");
     document.addEventListener("visibilitychange", changed);
@@ -979,6 +1000,18 @@ export function HumanRoomTimeline({
         )}
       </div>
       <div className="threads-composer-dock">
+        {pendingNewCount > 0 && (
+          <div className="threads-jump-wrap">
+            <button type="button" className="threads-jump-pill" onClick={jumpToLatest}>
+              <IconArrowDown size={13} />
+              <span>
+                {pendingNewCount === 1
+                  ? t("1 new message")
+                  : t("{count} new messages").replace("{count}", String(pendingNewCount))}
+              </span>
+            </button>
+          </div>
+        )}
         {brakePaused && (
           <div className="threads-brake-banner" role="status">
             {t("Channel paused after consecutive agent turns — send a message to continue.")}
@@ -1007,6 +1040,8 @@ export function HumanRoomTimeline({
                 await postHumanRoom(id, envelope.current.id, body, isSilent);
                 envelope.current = null;
                 setSilentNote(false);
+                pinnedToTailRef.current = true;
+                setPendingNewCount(0);
                 await load();
               } catch (e) {
                 setSendError(messageOf(e));

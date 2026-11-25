@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { useTranslate } from "../../lib/locale";
 import { privateReadsAllowed } from "../../lib/privateSession";
 import { useNotificationToast } from "../threads/NotificationToast";
+import { useChannelsUnread } from "../threads/channelsUnread";
 import type { VerifiedApp } from "./appNav";
 import { useDocumentVisible } from "./chat/chatVisibility";
 import {
@@ -26,7 +27,8 @@ function stripTitleCount(title: string): string {
 
 function WhatsAppTitleBadge() {
   const unread = useWhatsAppUnread();
-  const total = totalWhatsAppUnread(unread);
+  const channelsUnread = useChannelsUnread();
+  const total = totalWhatsAppUnread(unread) + channelsUnread;
   const baseTitleRef = useRef<string | null>(null);
 
   useEffect(() => {

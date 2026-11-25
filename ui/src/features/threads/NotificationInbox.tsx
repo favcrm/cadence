@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import "./notifications.css";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
-import { IconCheck, IconClose, IconSettings, IconThreads } from "../../ui/icons";
+import { IconBell, IconCheck, IconClose, IconSettings } from "../../ui/icons";
+import { fmtTime } from "../../lib/fmt";
+import { onPrivateReadsPaused, onPrivateSessionReset } from "../../lib/privateSession";
 import { navigate, useHref } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
 import { ApiError } from "../../lib/api";
@@ -33,9 +35,128 @@ import {
   subscribeHumanThreadsStream,
 } from "./humanThreadsStream";
 import { useNotificationToast } from "./NotificationToast";
+import { setChannelsUnread } from "./channelsUnread";
+import { playNotificationChime } from "./notificationSound";
 
 /** The newest eligible unread alert intent already observed per room. */
 const announced = new Map<string, number>();
+
+/** Open background-tab desktop notifications keyed by room id. */
+const desktopAlerts = new Map<string, Notification>();
+
+const ANNOUNCED_PREFIX = "cadence.notif.announced.v1:";
+const ANNOUNCED_CAP = 200;
+const DESKTOP_ALERTS_KEY = "cadence.desktop_alerts.v1";
+
+function hashStorageKey(value: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5 ^ 0x9e3779b9;
+  for (let i = 0; i < value.length; i += 1) {
+    const c = value.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ (c + 1), 0x01000193);
+  }
+  return `${(h1 >>> 0).toString(16).padStart(8, "0")}${(h2 >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function readStoredAnnounced(humanId: string): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(`${ANNOUNCED_PREFIX}${hashStorageKey(humanId)}`);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === "number" && Number.isSafeInteger(v) && v > 0) out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredAnnounced(humanId: string, record: Record<string, number>): void {
+  try {
+    const entries = Object.entries(record);
+    const bounded = entries.length > ANNOUNCED_CAP ? Object.fromEntries(entries.slice(-ANNOUNCED_CAP)) : record;
+    localStorage.setItem(`${ANNOUNCED_PREFIX}${hashStorageKey(humanId)}`, JSON.stringify(bounded));
+  } catch {
+    // Ignore storage quota or restricted storage errors.
+  }
+}
+
+function clearStoredAnnounced(humanId?: string | null): void {
+  try {
+    if (humanId) {
+      localStorage.removeItem(`${ANNOUNCED_PREFIX}${hashStorageKey(humanId)}`);
+      return;
+    }
+    const remove: string[] = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(ANNOUNCED_PREFIX)) remove.push(key);
+    }
+    for (const key of remove) localStorage.removeItem(key);
+  } catch {
+    // Ignore storage access errors.
+  }
+}
+
+function closeDesktopNotifications(room?: string): void {
+  if (room !== undefined) {
+    const existing = desktopAlerts.get(room);
+    if (existing) {
+      try { existing.close(); } catch { /* ignore */ }
+      desktopAlerts.delete(room);
+    }
+    return;
+  }
+  for (const n of desktopAlerts.values()) {
+    try { n.close(); } catch { /* ignore */ }
+  }
+  desktopAlerts.clear();
+}
+
+function desktopAlertsSupported(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    "Notification" in window &&
+    typeof window.Notification?.requestPermission === "function"
+  );
+}
+
+function desktopAlertsActive(): boolean {
+  if (!desktopAlertsSupported()) return false;
+  if (window.Notification.permission !== "granted") return false;
+  try {
+    return localStorage.getItem(DESKTOP_ALERTS_KEY) === "on";
+  } catch {
+    return false;
+  }
+}
+
+function formatSenderPreview(
+  sender: string | null | undefined,
+  senderKind: "human" | "agent" | null | undefined,
+  preview: string | null | undefined,
+): string | null {
+  const cleanPreview = preview?.trim();
+  if (!cleanPreview) return null;
+  const cleanSender = sender?.trim();
+  if (!cleanSender) return cleanPreview;
+  const label = senderKind === "agent" ? `@${cleanSender.replace(/^@+/, "")}` : cleanSender;
+  return `${label}: ${cleanPreview}`;
+}
+
+onPrivateReadsPaused(() => {
+  closeDesktopNotifications();
+});
+
+onPrivateSessionReset(() => {
+  closeDesktopNotifications();
+  clearStoredAnnounced();
+  announced.clear();
+});
 
 /** Private inbox poll: authorized, private state only. Never shared SSE. */
 const INBOX_POLL_MS = 15000;
@@ -115,6 +236,7 @@ export default function NotificationInbox({
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deviceId, setDeviceId] = useState<string | null>(() => localStorage.getItem(DEVICE_KEY));
+  const [desktopEnabled, setDesktopEnabled] = useState<boolean>(() => desktopAlertsActive());
   const generation = useRef(0);
   const latestPreferenceSave = useRef(0);
   const hydratedAssignments = useRef(false);
@@ -130,14 +252,31 @@ export default function NotificationInbox({
 
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {
-      if (event.storageArea === localStorage && event.key === DEVICE_KEY) {
+      if (event.storageArea !== localStorage) return;
+      if (event.key === DEVICE_KEY) {
         setDeviceId(event.newValue);
+        setBrowserAlertNotice(null);
+      } else if (event.key === DESKTOP_ALERTS_KEY) {
+        setDesktopEnabled(desktopAlertsActive());
         setBrowserAlertNotice(null);
       }
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, []);
+
+  // Auto-clear lingering toast cards and desktop notifications once the viewer focuses that thread.
+  useEffect(() => {
+    const clearVisible = () => {
+      const room = activeRoom();
+      if (!room) return;
+      toast.clear(room);
+      closeDesktopNotifications(room);
+    };
+    clearVisible();
+    document.addEventListener("visibilitychange", clearVisible);
+    return () => document.removeEventListener("visibilitychange", clearVisible);
+  }, [href, toast]);
 
   // Click from the service worker: only our registered push worker, and only a
   // same-origin thread path, may route the board. Room authorization still applies.
@@ -165,7 +304,9 @@ export default function NotificationInbox({
     hydratedAssignments.current = false;
     seenAssignmentKeys.current.clear();
     setReadAssignmentKeys(new Set());
+    closeDesktopNotifications();
     toast.clear();
+    setChannelsUnread(0);
     setInbox(null);
     setNotice(null);
     setPreferenceNotice(null);
@@ -263,7 +404,10 @@ export default function NotificationInbox({
             hydratedAssignments.current = false;
             seenAssignmentKeys.current.clear();
             setReadAssignmentKeys(new Set());
+            clearStoredAnnounced(known.current);
+            closeDesktopNotifications();
             toast.clear();
+            setChannelsUnread(0);
             setInbox(null);
             setNotice(null);
             setPreferenceNotice(null);
@@ -280,6 +424,7 @@ export default function NotificationInbox({
           if (!active || sent !== latest || generation.current !== started) return;
           known.current = next.human.id;
           setInbox(next);
+          setChannelsUnread(next.unread_total);
           surfaceNew(next, toast, tRef.current);
           ensureStream();
         })
@@ -290,6 +435,11 @@ export default function NotificationInbox({
             // threads at all (CAD-1704): clear everything and stop. The next
             // auth epoch retries.
             stop();
+            announced.clear();
+            clearStoredAnnounced(known.current);
+            closeDesktopNotifications();
+            toast.clear();
+            setChannelsUnread(0);
             setSettingsOpen(false);
             setPopoverOpen(false);
             popover.current?.close();
@@ -307,6 +457,8 @@ export default function NotificationInbox({
     return () => {
       active = false;
       generation.current++;
+      closeDesktopNotifications();
+      setChannelsUnread(0);
       stop();
     };
   }, [authEpoch, toast]);
@@ -458,7 +610,20 @@ export default function NotificationInbox({
       .then(async () => {
         if (generation.current !== mine) return;
         const next = await humanNotifications();
-        if (generation.current === mine) setInbox(next);
+        if (generation.current === mine) {
+          setInbox(next);
+          setChannelsUnread(next.unread_total);
+          for (const g of next.groups) {
+            if (g.unread === 0) {
+              toast.clear(g.room);
+              closeDesktopNotifications(g.room);
+            }
+          }
+          if (next.unread_total === 0) {
+            toast.clear();
+            closeDesktopNotifications();
+          }
+        }
       })
       .catch(() => {
         if (generation.current === mine) setNotice("Could not mark notifications read.");
@@ -502,7 +667,10 @@ export default function NotificationInbox({
       .then(async () => {
         if (generation.current !== mine) return;
         const next = await humanNotifications();
-        if (generation.current === mine) setInbox(next);
+        if (generation.current === mine) {
+          setInbox(next);
+          setChannelsUnread(next.unread_total);
+        }
       })
       .catch(() => {
         if (generation.current === mine) setNotice("Could not change this thread's mute.");
@@ -545,6 +713,49 @@ export default function NotificationInbox({
       });
   };
 
+  const enableDesktop = async () => {
+    if (!desktopAlertsSupported()) {
+      setBrowserAlertNotice("Browser alerts unavailable");
+      return;
+    }
+    const mine = generation.current;
+    try {
+      const permission =
+        window.Notification.permission === "granted"
+          ? "granted"
+          : await window.Notification.requestPermission();
+      if (generation.current !== mine) return;
+      if (permission === "granted") {
+        try {
+          localStorage.setItem(DESKTOP_ALERTS_KEY, "on");
+        } catch {
+          // ignore storage quota errors
+        }
+        setDesktopEnabled(true);
+        setBrowserAlertNotice("On for open tabs in the background.");
+      } else if (permission === "denied") {
+        setDesktopEnabled(false);
+        setBrowserAlertNotice("Blocked in your browser settings. In-app unread still works.");
+      } else {
+        setDesktopEnabled(false);
+        setBrowserAlertNotice(null);
+      }
+    } catch {
+      if (generation.current === mine) setBrowserAlertNotice("Could not turn on browser alerts.");
+    }
+  };
+
+  const disableDesktop = () => {
+    try {
+      localStorage.setItem(DESKTOP_ALERTS_KEY, "off");
+    } catch {
+      // ignore storage quota errors
+    }
+    closeDesktopNotifications();
+    setDesktopEnabled(false);
+    setBrowserAlertNotice(null);
+  };
+
   return (
     <div className="notification-anchor">
       <button
@@ -558,7 +769,7 @@ export default function NotificationInbox({
           : t("Open notifications")}
         onClick={toggle}
       >
-        <IconThreads size={16} />
+        <IconBell size={16} />
         {total > 0 && <span className="notification-count num" aria-hidden="true">{total}</span>}
       </button>
 
@@ -584,7 +795,15 @@ export default function NotificationInbox({
             <button type="button" className={`filter ${filter === "unread" ? "selected" : ""}`} aria-pressed={filter === "unread"} onClick={() => setFilter("unread")}>{t("Unread")} <span className="notification-unread-count">{total}</span></button>
             <button type="button" className={`filter ${filter === "all" ? "selected" : ""}`} aria-pressed={filter === "all"} onClick={() => setFilter("all")}>{t("All")}</button>
           </div>
-          <button type="button" className="lnk" disabled={total === 0} onClick={markAll}>{t("Mark all read")}</button>
+          <button
+            type="button"
+            className="lnk"
+            disabled={total === 0}
+            title={t("Clears the inbox badge without marking channel history read.")}
+            onClick={markAll}
+          >
+            {t("Mark all read")}
+          </button>
         </div>
         {notice !== null && <p className="settings-note" role="status">{t(notice)}</p>}
         <div className="notification-list">
@@ -610,21 +829,31 @@ export default function NotificationInbox({
               </button>
             </div>
           ))}
-          {groups.map((g) => (
-            <div key={g.room} className="notification-row">
-              <button
-                type="button"
-                className="notification-copy"
-                onClick={() => openGroup(g)}
-                aria-label={t("Open {title}, {count} unread").replace("{title}", () => g.title).replace("{count}", String(g.unread))}
-              >
-                <span className="chip">{g.kind === "dm" ? t("Direct message") : t("Group")}</span>
-                <strong>{g.title}</strong>
-                <small>{t("{count} unread").replace("{count}", String(g.unread))}{g.muted ? ` · ${t("muted")}` : ""}</small>
-              </button>
-              <button type="button" className="lnk" onClick={() => toggleMute(g)}>{g.muted ? t("Unmute") : t("Mute")}</button>
-            </div>
-          ))}
+          {groups.map((g) => {
+            const snippet = inbox.preferences.preview
+              ? formatSenderPreview(g.latest_sender, g.latest_sender_kind, g.latest_preview)
+              : null;
+            return (
+              <div key={g.room} className="notification-row">
+                <button
+                  type="button"
+                  className="notification-copy"
+                  onClick={() => openGroup(g)}
+                  aria-label={t("Open {title}, {count} unread").replace("{title}", () => g.title).replace("{count}", String(g.unread))}
+                >
+                  <div className="notification-meta-row">
+                    <span className="chip">{g.kind === "dm" ? t("Direct message") : t("Group channel")}</span>
+                    {g.mention && <span className="chip chip-mention">@{t("Mention")}</span>}
+                    {g.latest_at ? <time className="notification-time num">{fmtTime(g.latest_at)}</time> : null}
+                  </div>
+                  <strong>{g.title}</strong>
+                  {snippet !== null && <span className="notification-preview">{snippet}</span>}
+                  <small>{t("{count} unread").replace("{count}", String(g.unread))}{g.muted ? ` · ${t("muted")}` : ""}</small>
+                </button>
+                <button type="button" className="lnk" onClick={() => toggleMute(g)}>{g.muted ? t("Unmute") : t("Mute")}</button>
+              </div>
+            );
+          })}
         </div>
       </dialog>
 
@@ -642,12 +871,28 @@ export default function NotificationInbox({
         <div className="notification-setting notification-browser-alerts">
           <span>
             <strong>{t("Browser alerts")}</strong>
-            {!browserAlertsAvailable && <small>{t("Browser alerts unavailable")}</small>}
+            {!browserAlertsAvailable && desktopAlertsSupported() ? (
+              <small>
+                {window.Notification.permission === "denied"
+                  ? t("Blocked in your browser settings. In-app unread still works.")
+                  : desktopEnabled
+                    ? t("On for open tabs in the background.")
+                    : t("Alert me while this tab is in the background.")}
+              </small>
+            ) : !browserAlertsAvailable ? (
+              <small>{t("Browser alerts unavailable")}</small>
+            ) : null}
           </span>
           {deviceId !== null ? (
             <button type="button" className="lnk" onClick={() => disable(deviceId)}>{t("Turn off browser alerts")}</button>
           ) : browserAlertsAvailable ? (
             <button type="button" className="lnk" onClick={enable}>{t("Enable browser alerts")}</button>
+          ) : desktopAlertsSupported() && window.Notification.permission !== "denied" ? (
+            desktopEnabled ? (
+              <button type="button" className="lnk" onClick={disableDesktop}>{t("Turn off browser alerts")}</button>
+            ) : (
+              <button type="button" className="lnk" onClick={() => void enableDesktop()}>{t("Enable browser alerts")}</button>
+            )
           ) : null}
         </div>
         {browserAlertNotice !== null && <p className="settings-note" role="status">{t(browserAlertNotice)}</p>}
@@ -709,18 +954,63 @@ function browserZone(): string {
  * cursor before interruption preferences so quiet/muted/visible alerts do not
  * reappear later; ordinary group posts never inherit an old mention.
  */
-function surfaceNew(next: Inbox, toast: { show: (title: string, room: string) => void }, t: (english: string) => string): void {
+function surfaceNew(
+  next: Inbox,
+  toast: { show: (title: string, room: string, target?: { href: string; note: string; translateNote?: boolean }) => void },
+  t: (english: string) => string,
+): void {
   const active = activeRoom();
+  const stored = readStoredAnnounced(next.human.id);
+  let dirty = false;
+  let playSound = false;
   for (const g of next.groups) {
-    const seen = announced.get(g.room) ?? 0;
-    if (g.alert_seq <= seen) continue;
+    const hash = hashStorageKey(g.room);
+    const seen = Math.max(announced.get(g.room) ?? 0, stored[hash] ?? 0);
+    if (g.alert_seq <= seen) {
+      if ((announced.get(g.room) ?? 0) < seen) announced.set(g.room, seen);
+      continue;
+    }
     announced.set(g.room, g.alert_seq);
+    delete stored[hash];
+    stored[hash] = g.alert_seq;
+    dirty = true;
     const isDm = g.kind === "dm";
     if (g.room === active || g.muted || (!isDm && !g.mention)) continue;
     if (isQuietNow(next.preferences)) continue;
     if (isDm ? !next.preferences.dm : !next.preferences.mention) continue;
-    toast.show(t(isDm ? "New direct message in {title}" : "New mention in {title}").replace("{title}", () => g.title), g.room);
+    const title = t(isDm ? "New direct message in {title}" : "New mention in {title}").replace("{title}", () => g.title);
+    const snippet = next.preferences.preview
+      ? formatSenderPreview(g.latest_sender, g.latest_sender_kind, g.latest_preview)
+      : null;
+    if (snippet !== null) {
+      toast.show(title, g.room, { href: threadHref(g.room), note: snippet, translateNote: false });
+    } else {
+      toast.show(title, g.room);
+    }
+    if (next.preferences.sound) playSound = true;
+    if (!next.push.available && desktopAlertsActive() && typeof document !== "undefined" && document.visibilityState !== "visible") {
+      try {
+        closeDesktopNotifications(g.room);
+        const desktop = new window.Notification(title, {
+          body: snippet ?? t("Unread channel messages"),
+          tag: `cadence-thread-${hash}`,
+        });
+        desktop.onclick = () => {
+          try { window.focus(); } catch { /* ignore */ }
+          navigate(threadHref(g.room));
+          closeDesktopNotifications(g.room);
+        };
+        desktop.onclose = () => {
+          if (desktopAlerts.get(g.room) === desktop) desktopAlerts.delete(g.room);
+        };
+        desktopAlerts.set(g.room, desktop);
+      } catch {
+        // Ignore restricted desktop Notification errors.
+      }
+    }
   }
+  if (dirty) writeStoredAnnounced(next.human.id, stored);
+  if (playSound) playNotificationChime();
 }
 
 /** Invalid IANA zones fail closed, matching push delivery's quiet-hours policy. */
