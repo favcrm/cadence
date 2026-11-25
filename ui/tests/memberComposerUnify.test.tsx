@@ -4,11 +4,12 @@ declare function require<T = unknown>(name: string): T;
 import type * as ReactModule from "react";
 import type { Root } from "react-dom/client";
 import type * as AssistantComposerModule from "../src/features/app-shell/chat/AssistantComposer";
+import type * as AssistantModelStateModule from "../src/features/app-shell/chat/assistantModelState";
 import type * as MemberChatModule from "../src/features/home/MemberChat";
 import type * as MemberThreadModule from "../src/features/home/memberThread";
 import type * as LocaleModule from "../src/lib/locale";
 import type * as PrivateSessionModule from "../src/lib/privateSession";
-import type { MasterModels } from "../src/lib/types";
+import type { MasterModels, MasterState } from "../src/lib/types";
 
 function assert(value: unknown, why: string): asserts value {
   if (!value) throw new Error(why);
@@ -85,6 +86,11 @@ async function main(): Promise<void> {
   };
   let masterStateStatus = 200;
   let sendStatus = 200;
+  let conversationId = "tc_member_home_1";
+  let historyEntries: Array<Record<string, unknown>> = [];
+  let holdMasterState: (() => void) | null = null;
+  let masterStateGate: Promise<void> | null = null;
+  const streamControllers: Array<ReadableStreamDefaultController<Uint8Array>> = [];
   const requests: Array<{ method: string; url: string; body?: unknown }> = [];
 
   const serverModelsPayload: MasterModels = {
@@ -119,13 +125,13 @@ async function main(): Promise<void> {
       if (url.pathname === "/api/member-assistant/state") {
         return new Response(
           JSON.stringify({
-            conversation_id: "tc_member_home_1",
+            conversation_id: conversationId,
             assistant: {
               org: "org_1",
               sub: "user_member",
               assistant_id: "asst_1",
               alias: "assistant",
-              conversation_id: "tc_member_home_1",
+              conversation_id: conversationId,
               state: "active",
               bootstrap_state: "complete",
               identity: { name: "Nova", tone: null, look: "robot", revision: 1 },
@@ -137,10 +143,10 @@ async function main(): Promise<void> {
       if (url.pathname === "/api/member-assistant/history") {
         return new Response(
           JSON.stringify({
-            conversation: { id: "tc_member_home_1", alias: "assistant" },
-            entries: [],
-            cursor: null,
-            before_cursor: null,
+            conversation: { id: conversationId, alias: "assistant" },
+            entries: historyEntries,
+            cursor: historyEntries.length > 0 ? "csc1_cur1" : null,
+            before_cursor: historyEntries.length > 0 ? "csc1_bef1" : null,
             more_before: false,
             more_after: false,
           }),
@@ -161,6 +167,7 @@ async function main(): Promise<void> {
         });
       }
       if (url.pathname === "/api/master/state") {
+        if (masterStateGate) await masterStateGate;
         return new Response(JSON.stringify(masterStatePayload), {
           status: masterStateStatus,
           headers: { "content-type": "application/json" },
@@ -205,6 +212,7 @@ async function main(): Promise<void> {
       if (url.pathname === "/api/threads/master/stream") {
         const body = new ReadableStream<Uint8Array>({
           start(controller) {
+            streamControllers.push(controller);
             controller.enqueue(new TextEncoder().encode("event: open\ndata: {}\n\n"));
           },
         });
@@ -226,11 +234,65 @@ async function main(): Promise<void> {
   const AssistantComposer = require<typeof AssistantComposerModule>(
     "../src/features/app-shell/chat/AssistantComposer",
   ).default;
+  const { isBareMasterStreamSnapshot, mergeMasterStreamSnapshot } = require<typeof AssistantModelStateModule>(
+    "../src/features/app-shell/chat/assistantModelState",
+  );
   const { memberThreadStore, sendToAssistant } = require<typeof MemberThreadModule>(
     "../src/features/home/memberThread",
   );
 
   allowPrivateReads();
+
+  // 0. Pure stream-merge contract checks (CAD-2817).
+  const canonical: MasterState = {
+    alias: "master",
+    provider: "cadence",
+    endpoint_kind: "durable_object",
+    live: true,
+    identity: { name: "Nova", tone: null, look: "robot", revision: "1" },
+    model: "thinkingmachines/inkling-2-mini",
+    model_label: "Inkling 2 Mini",
+    effort: "low",
+    commands: ["stop", "model", "effort"],
+    session: { id: "tc_member_home_1" },
+    turn: null,
+    queue: [],
+  };
+  const bareSse: MasterState = {
+    alias: "master",
+    provider: "cadence",
+    endpoint_kind: "durable_object",
+    live: true,
+    identity: { name: "Nova", tone: null, look: "robot", revision: "1" },
+    model: "thinkingmachines/inkling-2-mini",
+    model_label: "thinkingmachines/inkling-2-mini",
+    effort: null,
+    commands: ["new", "stop"],
+    session: { id: "tc_member_home_1" },
+    turn: { state: "working", message: "m-1", conversation: "tc_member_home_1", position: null },
+    queue: [],
+  };
+  assert(isBareMasterStreamSnapshot(bareSse), "bare DO SSE frame detected via missing model/effort commands");
+  assert(!isBareMasterStreamSnapshot(canonical), "canonical frame with model/effort is not bare");
+  const mergedBare = mergeMasterStreamSnapshot(canonical, bareSse);
+  assert(
+    JSON.stringify(mergedBare.commands) === JSON.stringify(["stop", "model", "effort"]) &&
+      mergedBare.effort === "low" &&
+      mergedBare.model_label === "Inkling 2 Mini" &&
+      mergedBare.turn?.message === "m-1",
+    "mergeMasterStreamSnapshot preserves commands, effort, and label on bare DO frame",
+  );
+  const enrichedClear = mergeMasterStreamSnapshot(canonical, {
+    ...canonical,
+    model: "deepseek/deepseek-v4.1-flash-1017",
+    model_label: "deepseek/deepseek-v4.1-flash-1017",
+    effort: null,
+    commands: ["stop", "model", "effort"],
+  });
+  assert(
+    enrichedClear.effort === null && enrichedClear.model === "deepseek/deepseek-v4.1-flash-1017",
+    "mergeMasterStreamSnapshot applies authoritative reset from enriched SSE frame",
+  );
 
   // 1. Test `sendToAssistant` sends optional attachments and preserves them on pending row.
   const scope = "sess_1:user_member";
@@ -314,9 +376,174 @@ async function main(): Promise<void> {
     "MemberChat picking effort sends conversation-scoped /api/master/command",
   );
 
+  // 2b. Live regression: a bare DO SSE `event: master` frame MUST NOT wipe out model or effort pills.
+  const memberStream = streamControllers.at(-1);
+  assert(memberStream !== undefined, "MemberChat opened SSE stream");
+  historyEntries = [
+    { id: "csrid_live_1", role: "operator", kind: "message", text: "Working task", message: "m_live_1", created: new Date().toISOString() },
+  ];
+  await React.act(async () => {
+    memberStream.enqueue(
+      new TextEncoder().encode(
+        `event: master\ndata: ${JSON.stringify({
+          alias: "master",
+          provider: "cadence",
+          endpoint_kind: "durable_object",
+          live: true,
+          model: "thinkingmachines/inkling-2-mini",
+          model_label: "thinkingmachines/inkling-2-mini",
+          effort: null,
+          commands: ["new", "stop"],
+          session: { id: "tc_member_home_1" },
+          turn: { state: "working", message: "m_live_1", conversation: "tc_member_home_1", position: null },
+          queue: [],
+        })}\n\n`,
+      ),
+    );
+  });
+  await flush();
+  await flush();
+  assert(
+    host.querySelector("[data-composer-model]") !== null &&
+      host.querySelector("[data-composer-effort]") !== null &&
+      host.querySelector("[data-composer-effort]")?.textContent?.includes("Med"),
+    "bare DO SSE master frame keeps model & effort pills mounted with preserved Med effort",
+  );
+
+  // 2c. Unified Member UX: Stop button works on running turn, /effort command submits, and /new is refused locally.
+  const stopBtn = host.querySelector('button[aria-label*="Stop"], button[title*="Stop"]') as HTMLButtonElement | null;
+  assert(stopBtn !== null, "MemberChat renders Stop button during running turn");
+  await React.act(async () => {
+    stopBtn.click();
+  });
+  await flush();
+  assert(
+    requests.some(
+      (r) =>
+        r.method === "POST" &&
+        r.url === "/api/master/command?conversation=tc_member_home_1" &&
+        JSON.stringify(r.body) === JSON.stringify({ command: "stop", message: "m_live_1" }),
+    ),
+    "MemberChat Stop button sends conversation-scoped stop command",
+  );
+
+  const textarea = host.querySelector("textarea") as HTMLTextAreaElement;
+  const form = host.querySelector("form[data-composer]") as HTMLFormElement;
+  const setTextarea = (val: string) => {
+    const setter = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(textarea, val);
+    textarea.dispatchEvent(new win.Event("input", { bubbles: true }));
+  };
+  await React.act(async () => {
+    setTextarea("/effort high");
+  });
+  await flush();
+  await React.act(async () => {
+    form.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true }));
+  });
+  await flush();
+  assert(
+    requests.some(
+      (r) =>
+        r.method === "POST" &&
+        r.url === "/api/master/command?conversation=tc_member_home_1" &&
+        JSON.stringify(r.body) === JSON.stringify({ command: "effort", arg: "high" }),
+    ),
+    "MemberChat slash /effort command hits conversation-scoped /api/master/command",
+  );
+
+  const cmdCountBeforeNew = requests.filter((r) => r.url.startsWith("/api/master/command")).length;
+  await React.act(async () => {
+    setTextarea("/new");
+  });
+  await flush();
+  await React.act(async () => {
+    form.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true }));
+  });
+  await flush();
+  assert(
+    requests.filter((r) => r.url.startsWith("/api/master/command")).length === cmdCountBeforeNew,
+    "MemberChat blocks /new slash command locally without calling backend",
+  );
+
+  // 2d. Race condition: bare SSE master frame arrives BEFORE GET /api/master/state resolves.
+  await React.act(async () => {
+    root.unmount();
+  });
+  conversationId = "tc_member_race_1";
+  historyEntries = [];
+  masterStatePayload = {
+    ...masterStatePayload,
+    effort: "low",
+    commands: ["stop", "model", "effort"],
+    session: { id: "tc_member_race_1" },
+    turn: null,
+  };
+  masterStateGate = new Promise<void>((resolve) => {
+    holdMasterState = resolve;
+  });
+  const hostRace: Element = win.document.createElement("div");
+  win.document.body.appendChild(hostRace);
+  const rootRace = createRoot(hostRace);
+  await React.act(async () => {
+    rootRace.render(
+      React.createElement(
+        LocaleProvider,
+        null,
+        React.createElement(MemberChat, {
+          scope: "sess_race:user_member",
+          readOnly: false,
+          onOpenIssue: () => undefined,
+        }),
+      ),
+    );
+  });
+  await flush();
+  const raceStream = streamControllers.at(-1);
+  assert(raceStream !== undefined, "race test opened SSE stream");
+  await React.act(async () => {
+    raceStream.enqueue(
+      new TextEncoder().encode(
+        `event: master\ndata: ${JSON.stringify({
+          alias: "master",
+          provider: "cadence",
+          endpoint_kind: "durable_object",
+          live: true,
+          model: "thinkingmachines/inkling-2-mini",
+          model_label: "thinkingmachines/inkling-2-mini",
+          effort: null,
+          commands: ["new", "stop"],
+          session: { id: "tc_member_race_1" },
+          turn: null,
+          queue: [],
+        })}\n\n`,
+      ),
+    );
+  });
+  await flush();
+  await React.act(async () => {
+    holdMasterState?.();
+    masterStateGate = null;
+  });
+  await flush();
+  await flush();
+  assert(
+    hostRace.querySelector("[data-composer-model]") !== null &&
+      hostRace.querySelector("[data-composer-effort]") !== null,
+    "race condition resolved: model and effort pills mount once canonical /api/master/state lands",
+  );
+  await React.act(async () => {
+    rootRace.unmount();
+  });
+
   // 3. Graceful fallback when older server returns commands without model/effort.
+  conversationId = "tc_member_legacy_1";
   masterStateStatus = 200;
-  masterStatePayload = { ...masterStatePayload, commands: ["new", "stop"] };
+  masterStatePayload = {
+    ...masterStatePayload,
+    commands: ["new", "stop"],
+    session: { id: "tc_member_legacy_1" },
+  };
   const hostLegacy: Element = win.document.createElement("div");
   win.document.body.appendChild(hostLegacy);
   const rootLegacy = createRoot(hostLegacy);
@@ -384,7 +611,6 @@ async function main(): Promise<void> {
   );
 
   await React.act(async () => {
-    root.unmount();
     rootLegacy.unmount();
     rootUnified.unmount();
   });

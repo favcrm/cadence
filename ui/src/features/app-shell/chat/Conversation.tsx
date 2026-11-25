@@ -23,7 +23,8 @@ import { resources, threadReader } from "../../../lib/resources";
 import { useQuery, useResource } from "../../../lib/useResource";
 import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
-import { MASTER, offeredCommands } from "../../home/master";
+import { MASTER } from "../../home/master";
+import { useAssistantModelState } from "./assistantModelState";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
 import { appendComposerDraft, ComposerFillContext } from "../../home/composerFill";
 import { PdfPageTarget } from "../../home/PdfPageAction";
@@ -712,14 +713,15 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   );
   // Hosted turn state belongs to the selected session, just like identity.
   // Native retains the install-wide coordinator queue.
-  const masterSource = hosted && convId !== null ? resources.masterConversation(convId) : resources.masterState;
-  const masterState = useQuery(masterSource);
-  const offered = useMemo(
-    () => offeredCommands(hosted, masterState.data?.commands),
-    [hosted, masterState.data?.commands],
-  );
-  const canPickModel = masterState.data !== null && offered.some((c) => c.name === "model");
-  const canPickEffort = masterState.data !== null && offered.some((c) => c.name === "effort");
+  const modelState = useAssistantModelState({
+    hosted,
+    conversationId: hosted && convId !== null ? convId : undefined,
+    readOnly: false,
+    compact: true,
+    requireLoaded: true,
+  });
+  const masterSource = modelState.source;
+  const masterState = modelState.state;
   const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
@@ -2457,13 +2459,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         placeholder={composerLabels.placeholder}
         className="app-chat-form"
         modelPicker={{
-          master: masterState.data,
-          conversation: hosted && convId !== null ? convId : undefined,
+          ...modelState.modelPicker,
           readOnly: !canSend || binding.error !== null,
-          canPickModel,
-          canPickEffort,
-          compact: true,
-          onRefreshState: () => void masterSource.refresh(),
         }}
       />
     </div>

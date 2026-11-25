@@ -1,4 +1,4 @@
-import type { Agent, AgentsPayload, MasterState } from "../../lib/types";
+import type { Agent, AgentsPayload, MasterCommandResult, MasterModels, MasterState } from "../../lib/types";
 
 /** The master's alias — `cadence master start` registers it (CAD-339). */
 export const MASTER = "master";
@@ -122,6 +122,31 @@ export function parseSlash(draft: string): { name: string; arg: string } | null 
 /** Verbs whose name starts with `prefix` — the autocomplete rows. */
 export function slashMatches(prefix: string, commands: readonly SlashCommand[] = SLASH_COMMANDS): SlashCommand[] {
   return commands.filter((c) => c.name.startsWith(prefix));
+}
+
+/** `/help` — the catalog rendered as a GFM table. */
+export function helpText(commands: readonly SlashCommand[]): string {
+  const rows = commands.filter((c) => c.name !== "help").map(
+    (c) => `| \`/${c.name}${c.arg ? ` ${c.arg}` : ""}\` | ${c.blurb} |`,
+  );
+  // A board that runs nothing else has no table worth showing.
+  if (rows.length === 0) return "Just type your message. `/help` is the only command in this workspace right now.";
+  return `**Commands**\n\n| command | what it does |\n|---|---|\n${rows.join("\n")}`;
+}
+
+/** Concise one-line command catalog for status notices (Member Home). */
+export function helpSummary(commands: readonly SlashCommand[]): string {
+  const names = commands.map((c) => `/${c.name}${c.arg ? ` ${c.arg}` : ""}`);
+  return names.length > 0 ? names.join(" · ") : "/help";
+}
+
+/** What a `masterCommand` answer shows: a string result is text; a JSON payload
+ *  is `value`; null is a bare ack. */
+export function fmtCommandResult(r: MasterCommandResult): { text?: string; value?: unknown } {
+  const v = r.result;
+  if (typeof v === "string") return { text: v };
+  if (v == null) return { text: r.ok ? "done" : "no result" };
+  return { value: v };
 }
 
 // ---- Command results as fields (CAD-551 r2) ----
@@ -286,8 +311,6 @@ export function restingStatus(state: string): "Available" | "Working" | null {
 }
 
 // ---- CAD-574: the model/effort dropdowns ----
-
-import type { MasterModels } from "../../lib/types";
 
 /** One row of the model dropdown: the id `master_command model` takes,
  *  the display label, and the catalog's cost tier. */
