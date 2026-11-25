@@ -274,6 +274,60 @@ fn run_inner_with(
     )
 }
 
+fn is_in_flight(status: &str) -> bool {
+    matches!(status, "doing" | "review")
+}
+
+struct ReconcileScope<'a> {
+    project: Option<&'a str>,
+    dry_run: bool,
+    actor: &'a str,
+    state_dir: Option<&'a Path>,
+    limit: usize,
+    cursor: Option<&'a str>,
+    selected: Option<&'a str>,
+}
+
+struct ReconcileDeps<'a> {
+    pr_list: PrLookup<'a>,
+    pr_view: PrView<'a>,
+    close_lock_deadline: Option<Instant>,
+    clock: &'a dyn write::WaitClock,
+    history: HistoryLoad<'a>,
+}
+
+struct LoadedBoard {
+    jobs: board::JobState,
+    views: Vec<board::View>,
+    children: HashSet<String>,
+    times: Option<LineTimes>,
+    history_state: Value,
+}
+
+#[derive(Default)]
+struct ClassifySummary {
+    done: Vec<String>,
+    held: Vec<String>,
+    stalled: Vec<String>,
+    errors: Vec<String>,
+    deferred: Vec<String>,
+    classified: usize,
+    last_classified: Option<String>,
+}
+
+struct CloseEvidence {
+    how: &'static str,
+    branch: String,
+    pr: Option<u64>,
+    merged_at: Option<i64>,
+}
+
+enum CloseTransition {
+    Closed,
+    Failed,
+    Unchanged,
+}
+
 /// [`run_inner_with`] plus the `--issue` selector (CAD-1377):
 /// `selected` narrows the sweep — after views and the children set
 /// are derived — to exactly that issue and gates its cleanup half on
@@ -294,7 +348,56 @@ fn run_inner_with_selected(
     clock: &dyn write::WaitClock,
     history: HistoryLoad<'_>,
 ) -> Result<Value> {
-    let issues = board::load_all(&pm.dir, project)?;
+    let scope = ReconcileScope {
+        project,
+        dry_run,
+        actor,
+        state_dir,
+        limit,
+        cursor,
+        selected,
+    };
+    let deps = ReconcileDeps {
+        pr_list,
+        pr_view,
+        close_lock_deadline,
+        clock,
+        history,
+    };
+    run_reconcile_selected(pm, &scope, &deps)
+}
+
+fn run_reconcile_selected(
+    pm: &Pm,
+    scope: &ReconcileScope<'_>,
+    deps: &ReconcileDeps<'_>,
+) -> Result<Value> {
+    let mut board = load_reconcile_board(pm, scope, deps.history)?;
+    let mut rows = Vec::new();
+    let mut selected_has_lanes = false;
+    if let Some(sel) = scope.selected {
+        selected_has_lanes =
+            narrow_selected_issue(&mut board.views, &board.children, sel, &mut rows)?;
+    }
+    let summary = classify_candidates(pm, scope, deps, &board, &mut rows);
+    let (finish, cleanup_deferred) =
+        run_cleanup_sweep(pm, scope, &board.views, &rows, selected_has_lanes)?;
+    Ok(build_reconcile_report(
+        scope,
+        &board,
+        summary,
+        rows,
+        cleanup_deferred,
+        finish,
+    ))
+}
+
+fn load_reconcile_board(
+    pm: &Pm,
+    scope: &ReconcileScope<'_>,
+    history: HistoryLoad<'_>,
+) -> Result<LoadedBoard> {
+    let issues = board::load_all(&pm.dir, scope.project)?;
     // Candidacy follows the derived status, not only the file field:
     // a verdict note no longer fakes `done` (CAD-823), so a ticket
     // whose file was never moved off backlog/ready — but whose notes
@@ -305,7 +408,8 @@ fn run_inner_with_selected(
     // cannot widen), which is the safe direction — but the report
     // names it, so a stranded ticket is diagnosable instead of
     // silent. A tracker-only caller keeps pre-job derivation.
-    let jobs = state_dir
+    let jobs = scope
+        .state_dir
         .map(board::fetch_job_state)
         .unwrap_or_else(board::JobState::tracker_only);
     let mut views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
@@ -316,7 +420,7 @@ fn run_inner_with_selected(
     // over the rotated list never revisits a candidate in the same
     // tick. A cursor id that no longer exists lands on its natural
     // successor; a cursor at or past the end wraps to the start.
-    if let Some(c) = cursor {
+    if let Some(c) = scope.cursor {
         let key = board::natural_key(c);
         let start = views
             .iter()
@@ -347,6 +451,21 @@ fn run_inner_with_selected(
         .iter()
         .filter_map(|v| v.issue.front.parent.clone())
         .collect();
+    Ok(LoadedBoard {
+        jobs,
+        views,
+        children,
+        times,
+        history_state,
+    })
+}
+
+fn narrow_selected_issue(
+    views: &mut Vec<board::View>,
+    children: &HashSet<String>,
+    sel: &str,
+    rows: &mut Vec<Value>,
+) -> Result<bool> {
     // CAD-1377: `--issue` selects one ticket. The full board is
     // derived first so parent/container relationships stay correct,
     // THEN the view list narrows to the selected id — every other
@@ -355,67 +474,59 @@ fn run_inner_with_selected(
     // git: worktree roots and repo identity). An already-done selected
     // ticket is no status candidate, but its lanes are still reported
     // to the cleanup half — `done` is not delete proof.
-    let mut rows = Vec::new();
-    let mut selected_has_lanes = false;
-    if let Some(sel) = selected {
-        eprintln!("reconcile: scoping to {sel}");
-        let Some(i) = views.iter().position(|v| v.issue.front.id == sel) else {
-            return Err(Error::rejected(format!(
-                "Unknown issue '{sel}' — `cadence issue ls` lists what exists"
-            )));
-        };
-        let view = views.swap_remove(i);
-        let f = &view.issue.front;
-        let in_flight = |s: &str| matches!(s, "doing" | "review");
-        let has_children = children.contains(f.id.as_str());
-        let mut candidate = !has_children && model::item_type(f, has_children) != "epic";
-        if candidate
-            && !in_flight(&f.status)
-            && !(in_flight(&view.status) && matches!(view.status_source, "job" | "notes"))
-        {
-            // Terminal or never-in-flight — the row says why the
-            // close phase skipped it. Only a file status of `done`
-            // earns the cleanup shortcut: a parked `ready`/`backlog`
-            // or a `dropped` ticket has no merge evidence behind it,
-            // so its lanes defer rather than sweep on a label.
-            let mut row = json!({"issue": f.id, "status": f.status});
-            row["detail"] = json!({});
-            row["outcome"] = json!("skipped");
-            row["reason"] = json!(if f.status == "done" {
-                "already-done"
-            } else {
-                "not-in-flight"
-            });
-            rows.push(row);
-            candidate = false;
-        }
-        selected_has_lanes = !start::open_worktrees(f).is_empty();
-        views = if candidate { vec![view] } else { Vec::new() };
+    eprintln!("reconcile: scoping to {sel}");
+    let Some(i) = views.iter().position(|v| v.issue.front.id == sel) else {
+        return Err(Error::rejected(format!(
+            "Unknown issue '{sel}' — `cadence issue ls` lists what exists"
+        )));
+    };
+    let view = views.swap_remove(i);
+    let f = &view.issue.front;
+    let has_children = children.contains(f.id.as_str());
+    let mut candidate = !has_children && model::item_type(f, has_children) != "epic";
+    if candidate
+        && !is_in_flight(&f.status)
+        && !(is_in_flight(&view.status) && matches!(view.status_source, "job" | "notes"))
+    {
+        // Terminal or never-in-flight — the row says why the
+        // close phase skipped it. Only a file status of `done`
+        // earns the cleanup shortcut: a parked `ready`/`backlog`
+        // or a `dropped` ticket has no merge evidence behind it,
+        // so its lanes defer rather than sweep on a label.
+        let mut row = json!({"issue": f.id, "status": f.status});
+        row["detail"] = json!({});
+        row["outcome"] = json!("skipped");
+        row["reason"] = json!(if f.status == "done" {
+            "already-done"
+        } else {
+            "not-in-flight"
+        });
+        rows.push(row);
+        candidate = false;
     }
-    let mut done = Vec::new();
-    let mut held = Vec::new();
-    let mut stalled = Vec::new();
-    let mut errors = Vec::new();
-    let mut deferred = Vec::new();
-    let mut cleanup_deferred = Vec::new();
-    let mut classified = 0usize;
-    // The id of the last evidence-bearing candidate this run examined
-    // — advanced on every classify outcome (closed, held, stalled,
-    // open, skipped alike) so the next bounded tick resumes strictly
-    // after it instead of repeating the prefix.
-    let mut last_classified: Option<String> = None;
+    let selected_has_lanes = !start::open_worktrees(f).is_empty();
+    *views = if candidate { vec![view] } else { Vec::new() };
+    Ok(selected_has_lanes)
+}
 
-    for v in &views {
+fn classify_candidates(
+    pm: &Pm,
+    scope: &ReconcileScope<'_>,
+    deps: &ReconcileDeps<'_>,
+    board: &LoadedBoard,
+    rows: &mut Vec<Value>,
+) -> ClassifySummary {
+    let mut summary = ClassifySummary::default();
+    for v in &board.views {
         let f = &v.issue.front;
-        let in_flight = |s: &str| matches!(s, "doing" | "review");
-        if !in_flight(&f.status)
-            && !(in_flight(&v.status)
+        if !is_in_flight(&f.status)
+            && !(is_in_flight(&v.status)
                 && (v.status_source == "job"
-                    || (v.status_source == "notes" && note_fresh(times.as_ref(), v))))
+                    || (v.status_source == "notes" && note_fresh(board.times.as_ref(), v))))
         {
             continue;
         }
-        let is_parent = children.contains(f.id.as_str());
+        let is_parent = board.children.contains(f.id.as_str());
         if is_parent || model::item_type(f, is_parent) == "epic" {
             continue;
         }
@@ -428,16 +539,19 @@ fn run_inner_with_selected(
             .refs
             .iter()
             .any(|r| matches!(r.kind.as_str(), "worktree" | "branch" | "pr"));
-        if evidence_bearing && limit > 0 && classified >= limit {
-            deferred.push(f.id.clone());
+        if evidence_bearing && scope.limit > 0 && summary.classified >= scope.limit {
+            summary.deferred.push(f.id.clone());
             continue;
         }
         let p = probe(&v.issue);
         if evidence_bearing {
-            classified += 1;
-            last_classified = Some(p.id.clone());
+            summary.classified += 1;
+            // The id of the last evidence-bearing candidate this run examined
+            // — advanced on every classify outcome so the next bounded tick
+            // resumes strictly after it instead of repeating the prefix.
+            summary.last_classified = Some(p.id.clone());
         }
-        let (verdict, detail) = classify(&p, pr_list, pr_view);
+        let (verdict, detail) = classify(&p, deps.pr_list, deps.pr_view);
         let mut row = json!({"issue": p.id, "status": p.status});
         row["detail"] = detail;
         match verdict {
@@ -452,12 +566,12 @@ fn run_inner_with_selected(
             Verdict::Stalled => {
                 row["outcome"] = json!("stalled");
                 row["reason"] = json!("pr-closed-unmerged");
-                stalled.push(p.id.clone());
+                summary.stalled.push(p.id.clone());
             }
             Verdict::Held(why) => {
                 row["outcome"] = json!("held");
                 row["reason"] = json!(why);
-                held.push(p.id.clone());
+                summary.held.push(p.id.clone());
             }
             Verdict::Close {
                 how,
@@ -465,50 +579,103 @@ fn run_inner_with_selected(
                 pr,
                 merged_at,
             } => {
-                let why = match (pr, merged_at) {
-                    (Some(n), Some(at)) => format!(
-                        "reconcile: {branch} merged ({how}, PR #{n}, {})",
-                        time::iso(at)
-                    ),
-                    (Some(n), None) => format!("reconcile: {branch} merged ({how}, PR #{n})"),
-                    _ => format!("reconcile: {branch} merged ({how})"),
+                let ev = CloseEvidence {
+                    how,
+                    branch,
+                    pr,
+                    merged_at,
                 };
-                row["merged_by"] = json!(how);
-                row["evidence"] = json!(why);
-                if dry_run {
-                    row["outcome"] = json!("would-close");
-                } else {
-                    match write::mark_done_on_merge_waiting_with(
-                        pm,
-                        &p.id,
-                        &why,
-                        actor,
-                        Some(&p.status),
-                        close_lock_deadline
-                            .map(|d| d.saturating_duration_since(clock.now()))
-                            .unwrap_or(Duration::ZERO),
-                        clock,
-                    ) {
-                        Ok(None) => {
-                            row["outcome"] = json!("closed");
-                            done.push(p.id.clone());
-                        }
-                        Ok(Some(now)) => {
-                            row["outcome"] = json!("skipped");
-                            row["reason"] = json!(format!("status moved to {now} mid-sweep"));
-                        }
-                        Err(e) => {
-                            row["outcome"] = json!("error");
-                            row["reason"] = json!(e.to_string());
-                            errors.push(p.id.clone());
-                        }
-                    }
+                match apply_close_verdict(pm, scope, deps, &p, ev, &mut row) {
+                    CloseTransition::Closed => summary.done.push(p.id.clone()),
+                    CloseTransition::Failed => summary.errors.push(p.id.clone()),
+                    CloseTransition::Unchanged => {}
                 }
             }
         }
         rows.push(row);
     }
+    summary
+}
 
+fn apply_close_verdict(
+    pm: &Pm,
+    scope: &ReconcileScope<'_>,
+    deps: &ReconcileDeps<'_>,
+    p: &probe::Probe,
+    ev: CloseEvidence,
+    row: &mut Value,
+) -> CloseTransition {
+    let why = match (ev.pr, ev.merged_at) {
+        (Some(n), Some(at)) => format!(
+            "reconcile: {} merged ({}, PR #{n}, {})",
+            ev.branch,
+            ev.how,
+            time::iso(at)
+        ),
+        (Some(n), None) => format!("reconcile: {} merged ({}, PR #{n})", ev.branch, ev.how),
+        _ => format!("reconcile: {} merged ({})", ev.branch, ev.how),
+    };
+    row["merged_by"] = json!(ev.how);
+    row["evidence"] = json!(why);
+    if scope.dry_run {
+        row["outcome"] = json!("would-close");
+        return CloseTransition::Unchanged;
+    }
+    match write::mark_done_on_merge_waiting_with(
+        pm,
+        &p.id,
+        &why,
+        scope.actor,
+        Some(&p.status),
+        deps.close_lock_deadline
+            .map(|d| d.saturating_duration_since(deps.clock.now()))
+            .unwrap_or(Duration::ZERO),
+        deps.clock,
+    ) {
+        Ok(None) => {
+            row["outcome"] = json!("closed");
+            CloseTransition::Closed
+        }
+        Ok(Some(now)) => {
+            row["outcome"] = json!("skipped");
+            row["reason"] = json!(format!("status moved to {now} mid-sweep"));
+            CloseTransition::Unchanged
+        }
+        Err(e) => {
+            row["outcome"] = json!("error");
+            row["reason"] = json!(e.to_string());
+            CloseTransition::Failed
+        }
+    }
+}
+
+fn sweep_selected_or_empty(
+    pm: &Pm,
+    scope: &ReconcileScope<'_>,
+    state_dir: &Path,
+    cleanup_ids: &[String],
+) -> Result<Value> {
+    if cleanup_ids.is_empty() {
+        Ok(json!({"rows": [], "refused": 0, "dry_run": scope.dry_run}))
+    } else {
+        finish::sweep_selected(
+            pm,
+            &cleanup_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            false,
+            scope.dry_run,
+            scope.actor,
+            state_dir,
+        )
+    }
+}
+
+fn run_cleanup_sweep(
+    pm: &Pm,
+    scope: &ReconcileScope<'_>,
+    views: &[board::View],
+    rows: &[Value],
+    selected_has_lanes: bool,
+) -> Result<(Option<Value>, Vec<String>)> {
     // The worktree half: after status flips, sweep the merged open
     // worktree refs in scope — the same merge evidence, one row each.
     // Skipped entirely under the daemon (state_dir None). CAD-1377:
@@ -520,7 +687,8 @@ fn run_inner_with_selected(
     // nothing behind the verdict's back. A `limit 0`, no-selector run
     // keeps the full project sweep as deliberate maintenance.
     let mut cleanup_ids: Vec<String> = Vec::new();
-    if let Some(sel) = selected {
+    let mut cleanup_deferred: Vec<String> = Vec::new();
+    if let Some(sel) = scope.selected {
         if selected_has_lanes {
             let safe = rows.iter().any(|r| {
                 r["issue"].as_str() == Some(sel)
@@ -535,32 +703,23 @@ fn run_inner_with_selected(
             }
         }
     }
-    let finish = match state_dir {
-        Some(d) if selected.is_some() => {
-            if cleanup_ids.is_empty() {
-                Some(json!({"rows": [], "refused": 0, "dry_run": dry_run}))
-            } else {
+    let finish = match scope.state_dir {
+        Some(d) if scope.selected.is_some() => {
+            if !cleanup_ids.is_empty() {
                 eprintln!(
                     "reconcile: cleanup pass over {} issue(s) with recorded lanes",
                     cleanup_ids.len()
                 );
-                Some(finish::sweep_selected(
-                    pm,
-                    &cleanup_ids.iter().map(String::as_str).collect::<Vec<_>>(),
-                    false,
-                    dry_run,
-                    actor,
-                    d,
-                )?)
             }
+            Some(sweep_selected_or_empty(pm, scope, d, &cleanup_ids)?)
         }
-        Some(d) if limit > 0 => {
+        Some(d) if scope.limit > 0 => {
             // Only a verdict-safe ticket's lanes face cleanup: closed,
             // or would-close under dry run. Held, stalled, open and
             // failed-close rows keep their lanes and are deferred —
             // bounded classification must not silently become
             // unbounded cleanup, and a live verdict never sweeps.
-            for r in &rows {
+            for r in rows {
                 let Some(id) = r["issue"].as_str() else {
                     continue;
                 };
@@ -582,49 +741,55 @@ fn run_inner_with_selected(
                 cleanup_ids.len(),
                 cleanup_deferred.len()
             );
-            if cleanup_ids.is_empty() {
-                Some(json!({"rows": [], "refused": 0, "dry_run": dry_run}))
-            } else {
-                Some(finish::sweep_selected(
-                    pm,
-                    &cleanup_ids.iter().map(String::as_str).collect::<Vec<_>>(),
-                    false,
-                    dry_run,
-                    actor,
-                    d,
-                )?)
-            }
+            Some(sweep_selected_or_empty(pm, scope, d, &cleanup_ids)?)
         }
-        Some(d) => Some(finish::sweep(pm, project, false, dry_run, actor, d)?),
+        Some(d) => Some(finish::sweep(
+            pm,
+            scope.project,
+            false,
+            scope.dry_run,
+            scope.actor,
+            d,
+        )?),
         None => None,
     };
+    Ok((finish, cleanup_deferred))
+}
+
+fn build_reconcile_report(
+    scope: &ReconcileScope<'_>,
+    board: &LoadedBoard,
+    summary: ClassifySummary,
+    rows: Vec<Value>,
+    cleanup_deferred: Vec<String>,
+    finish: Option<Value>,
+) -> Value {
     let finish_refused = finish
         .as_ref()
         .and_then(|f| f["refused"].as_u64())
         .unwrap_or(0);
-
-    Ok(json!({
-        "dry_run": dry_run,
-        "project": project,
-        "scope": selected,
-        "classified": classified,
-        "deferred": deferred,
+    json!({
+        "dry_run": scope.dry_run,
+        "project": scope.project,
+        "scope": scope.selected,
+        "classified": summary.classified,
+        "deferred": summary.deferred,
         "cleanup_deferred": cleanup_deferred,
-        "cursor": last_classified,
-        "history": history_state,
-        "jobs": jobs.json(),
+        "cursor": summary.last_classified,
+        "history": board.history_state,
+        "jobs": board.jobs.json(),
         "rows": rows,
-        "done": done,
-        "held": held,
-        "stalled": stalled,
-        "errors": errors,
+        "done": summary.done,
+        "held": summary.held,
+        "stalled": summary.stalled,
+        "errors": summary.errors,
         "finish": finish,
         "finish_refused": finish_refused,
-        "partial": !deferred.is_empty()
+        "partial": !summary.deferred.is_empty()
             || !cleanup_deferred.is_empty()
-            || !errors.is_empty()
+            || !summary.errors.is_empty()
             || finish_refused > 0,
-    }))
+    })
 }
 
 #[cfg(test)]
