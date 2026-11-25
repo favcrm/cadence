@@ -266,7 +266,7 @@ async function main() {
   await type("/");
   assert(menu().length === 11, `a native menu keeps every verb (got ${menu().length})`);
   assert(menu().some((row) => row.includes("/permissions")), "native menu includes /permissions");
-  assert(host.querySelector<HTMLButtonElement>(".master-chips .chip-btn")?.disabled === false, "a native model chip stays a picker");
+  assert(host.querySelector<HTMLButtonElement>("[data-composer-model]")?.disabled === false, "a native model picker stays enabled");
 
   // CAD-2319: `offeredCommands` excludes `permissions` whenever hosted !== false,
   // even when `/api/meta` is unresolved (null) or a hosted board advertises it.

@@ -194,11 +194,9 @@ async function main() {
   await settle();
   assert(!Array.from(host.querySelectorAll("[data-turn-bar] button")).some((button) => button.textContent === "Retry"), "read-only Home cannot retry a stored failure");
 
-  // CAD-1859: a send that has not reached the daemon yet still shows the
-  // inline typing bubble. `submitting` carries no message id, so the bubble
-  // rides the operator's own row rather than a stored entry of this turn.
+  // CAD-2792: keyboard hint removed in favor of clean composer footer with model & effort pills.
   await render(false);
-  assert(host.querySelector("[data-composer-hint]") !== null, "the full composer carries the keyboard hint");
+  assert(host.querySelector("[data-composer-hint]") === null, "the full composer omits the keyboard hint");
   await React.act(async () => {
     resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
     resources.masterThread.write((state) => ({

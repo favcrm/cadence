@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
 import type { SlashCommand } from "./master";
@@ -35,6 +36,7 @@ export default function Composer({
   allowNote,
   onDraftChange,
   beforeSend,
+  modelControls,
 }: {
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
@@ -53,6 +55,7 @@ export default function Composer({
   allowNote?: boolean;
   onDraftChange?: (draft: string) => void;
   beforeSend?: (body: string) => boolean;
+  modelControls?: ReactNode;
 }) {
   const { placeholder, ariaLabel } = useAssistantComposerLabels();
   return (
@@ -75,6 +78,7 @@ export default function Composer({
       allowNote={allowNote}
       onDraftChange={onDraftChange}
       beforeSend={beforeSend}
+      modelControls={modelControls}
       attach={{
         enabled: attachEnabled,
         reason: attachReason,

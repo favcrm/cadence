@@ -294,6 +294,14 @@ import type { MasterModels } from "../../lib/types";
 export interface ModelOption {
   id: string;
   label: string;
+  /** Whether this route is the workspace default. */
+  isDefault: boolean;
+  /** Supported reasoning efforts for this model; empty when non-configurable. */
+  efforts: string[];
+  /** True when the backend explicitly supplied per-model `efforts`. */
+  hasEffortList?: boolean;
+  /** Default reasoning effort when omitted, or null. */
+  defaultEffort: string | null;
   /** `cost_tier` verbatim — Free / Low cost / Paid / unknown. */
   cost: string;
   /** Roles the model may serve (`allowed_for`); empty when unlisted. */
@@ -325,6 +333,10 @@ export function masterModelsOptions(m: MasterModels | null | undefined): MasterM
     models.push({
       id,
       label: str(e.label) ?? id,
+      isDefault: e.is_default === true,
+      efforts: Array.isArray(e.efforts) ? e.efforts.filter((r): r is string => !!str(r)) : [],
+      hasEffortList: Array.isArray(e.efforts),
+      defaultEffort: str(e.default_effort),
       cost: str(e.cost_tier) ?? "unknown",
       roles: Array.isArray(e.allowed_for) ? e.allowed_for.filter((r): r is string => !!str(r)) : [],
     });
@@ -336,6 +348,53 @@ export function masterModelsOptions(m: MasterModels | null | undefined): MasterM
     model: str(m?.current?.model),
     effort: str(m?.current?.effort),
   };
+}
+
+/** Filter model options by trimmed case-insensitive substring match against label or id. */
+export function filterModelOptions(models: readonly ModelOption[], query: string): ModelOption[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return [...models];
+  return models.filter(
+    (m) => m.label.toLowerCase().includes(q) || m.id.toLowerCase().includes(q),
+  );
+}
+
+/** Map an effort level string to the 3-bar level meter count (0–3). */
+export function effortMeterBars(effort: string | null | undefined): 0 | 1 | 2 | 3 {
+  switch (effort) {
+    case "none":
+      return 0;
+    case "minimal":
+    case "low":
+      return 1;
+    case "medium":
+      return 2;
+    case "high":
+    case "max":
+      return 3;
+    default:
+      return 1;
+  }
+}
+
+/** Short UI label for an effort level without any "Effort:" prefix. */
+export function effortShortLabel(effort: string): string {
+  switch (effort) {
+    case "none":
+      return "Off";
+    case "minimal":
+      return "Min";
+    case "low":
+      return "Low";
+    case "medium":
+      return "Med";
+    case "high":
+      return "High";
+    case "max":
+      return "Max";
+    default:
+      return effort ? effort.charAt(0).toUpperCase() + effort.slice(1) : "";
+  }
 }
 
 /**

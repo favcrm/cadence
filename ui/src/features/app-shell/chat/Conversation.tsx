@@ -23,7 +23,8 @@ import { resources, threadReader } from "../../../lib/resources";
 import { useQuery, useResource } from "../../../lib/useResource";
 import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
-import { MASTER } from "../../home/master";
+import { MASTER, offeredCommands } from "../../home/master";
+import ComposerModelControls from "./ComposerModelControls";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
 import { appendComposerDraft, ComposerFillContext } from "../../home/composerFill";
 import { PdfPageTarget } from "../../home/PdfPageAction";
@@ -713,6 +714,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // Native retains the install-wide coordinator queue.
   const masterSource = hosted && convId !== null ? resources.masterConversation(convId) : resources.masterState;
   const masterState = useQuery(masterSource);
+  const offered = useMemo(
+    () => offeredCommands(hosted, masterState.data?.commands),
+    [hosted, masterState.data?.commands],
+  );
+  const canPickModel = masterState.data !== null && offered.some((c) => c.name === "model");
+  const canPickEffort = masterState.data !== null && offered.some((c) => c.name === "effort");
   const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
@@ -2448,6 +2455,17 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         ariaLabel={composerLabels.ariaLabel}
         placeholder={composerLabels.placeholder}
         className="app-chat-form"
+        modelControls={
+          <ComposerModelControls
+            master={masterState.data}
+            conversation={hosted && convId !== null ? convId : undefined}
+            readOnly={!canSend || binding.error !== null}
+            canPickModel={canPickModel}
+            canPickEffort={canPickEffort}
+            compact
+            onRefreshState={() => void masterSource.refresh()}
+          />
+        }
       />
     </div>
     </PdfPageTarget.Provider>
