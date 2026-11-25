@@ -641,7 +641,7 @@ export default function MemberChat({
     templateList != null ||
     agents.length > 0;
   const handledNoRailActionRef = useRef<string | null>(null);
-  const rosterSettled = roster.data !== undefined || roster.status === "failed";
+  const rosterSettled = roster.data !== null || roster.status === "failed";
   useEffect(() => {
     if (!deepLinkActionId) {
       handledNoRailActionRef.current = null;
