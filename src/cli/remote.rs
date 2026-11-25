@@ -578,6 +578,56 @@ fn verb_for(
         }
         Commands::Issue {
             action:
+                cadence_agent::issue::cli::IssueAction::RequestReview {
+                    id,
+                    project,
+                    pr,
+                    head,
+                    repo,
+                },
+        } => {
+            use cadence_agent::delivery::hosted_gate::{valid_project_key, valid_repo};
+
+            if !valid_project_key(project) || project.ends_with('-') {
+                return Err(Error::rejected(
+                    "--project must be a lowercase project key without leading or trailing hyphens — nothing was sent",
+                ));
+            }
+            if *pr == 0 {
+                return Err(Error::rejected("--pr must be positive — nothing was sent"));
+            }
+            if head.len() != 40
+                || !head
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(Error::rejected(
+                    "--head must be a full 40-character lowercase hex SHA — nothing was sent",
+                ));
+            }
+            let repo = match repo {
+                Some(repo) => repo.clone(),
+                None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(|| {
+                    Error::rejected(
+                        "no github.com origin remote in the cwd — pass --repo owner/name; nothing was sent",
+                    )
+                })?,
+            };
+            if !valid_repo(&repo) {
+                return Err(Error::rejected(
+                    "--repo must be owner/name — nothing was sent",
+                ));
+            }
+            args.insert("project".into(), json!(project));
+            args.insert("issue".into(), json!(id));
+            args.insert("repo".into(), json!(repo));
+            args.insert("pr".into(), json!(pr));
+            args.insert("head".into(), json!(head));
+            args.insert("action".into(), json!("dispatch"));
+            "review_assignments_write"
+        }
+        Commands::Issue {
+            action:
                 cadence_agent::issue::cli::IssueAction::Say {
                     id,
                     to,
@@ -5567,6 +5617,44 @@ mod read_contract_tests {
         assert!(
             bad(review("hosted:drafts.md", digest, "pass", None)).contains("one of -m or --file")
         );
+    }
+
+    #[test]
+    fn issue_request_review_dispatches_exact_binding_and_refuses_invalid_values() {
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        let request = |project: &str, repo: &str, pr: u64, head: &str| Commands::Issue {
+            action: IssueAction::RequestReview {
+                id: "CAD-1".into(),
+                project: project.into(),
+                pr,
+                head: head.into(),
+                repo: Some(repo.into()),
+            },
+        };
+        let (verb, args) = outcome(&request("cadence", "favcrm/cadence", 42, head)).unwrap();
+        assert_eq!(verb, "review_assignments_write");
+        assert_eq!(
+            args,
+            json!({
+                "project": "cadence",
+                "issue": "CAD-1",
+                "repo": "favcrm/cadence",
+                "pr": 42,
+                "head": head,
+                "action": "dispatch",
+            })
+        );
+        let bad = |project, repo, pr, head| outcome(&request(project, repo, pr, head)).unwrap_err();
+        let upper = head.to_uppercase();
+        assert!(bad("cadence", "favcrm/cadence", 42, "abc").contains("--head"));
+        assert!(bad("cadence", "favcrm/cadence", 42, &upper).contains("--head"));
+        assert!(bad("cadence", "favcrm/cadence", 0, head).contains("--pr"));
+        for project in ["", "-cadence", "cadence-", "Cadence"] {
+            assert!(bad(project, "favcrm/cadence", 42, head).contains("--project"));
+        }
+        for repo in ["", "cadence", "owner/name/extra"] {
+            assert!(bad("cadence", repo, 42, head).contains("--repo"));
+        }
     }
 
     #[test]

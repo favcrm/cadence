@@ -594,6 +594,21 @@ pub enum IssueAction {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Ask the hosted workspace to mint and dispatch an assigned review for
+    /// this exact PR head. The server checks the caller's project write
+    /// authority and dispatches one run per required slot; nothing is minted
+    /// locally.
+    RequestReview {
+        id: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        pr: u64,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Leave a message for a role on a ticket (hosted orgs). It is stored for
     /// whoever holds that role to read: nothing wakes a session or proves a read.
     Say {
@@ -1128,6 +1143,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         | IssueAction::Attach { .. }
         | IssueAction::Artifact { .. }
         | IssueAction::Review { .. }
+        | IssueAction::RequestReview { .. }
         | IssueAction::Say { .. }
         | IssueAction::Messages { .. }
         | IssueAction::MessagesRead { .. } => links::run(action, state_dir),
