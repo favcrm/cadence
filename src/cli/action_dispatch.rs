@@ -452,18 +452,17 @@ fn tracker_pin() -> Result<Option<PathBuf>> {
         .transpose()
 }
 
-pub(super) fn run_cli(cli: Cli) -> Result<i32> {
-    // CAD-1922: the home resolver treats `--state-dir` at a legacy root as
-    // the same evidence as an exported `CADENCE_STATE_DIR`; record it before
-    // anything resolves a path.
-    cadence_agent::home::note_state_dir_flag(cli.state_dir.as_deref());
-    // Offline syntax discovery: no org, state, tracker, login, or daemon.
-    if matches!(
-        cli.command,
-        Commands::Search { .. } | Commands::Schema { .. }
-    ) {
-        return discovery::run(&cli.command);
-    }
+struct RegisterArgs<'a> {
+    name: Option<&'a str>,
+    slug: Option<&'a str>,
+    issuer: Option<&'a str>,
+    use_: bool,
+    no_open: bool,
+    json: bool,
+    auth_dir: Option<&'a Path>,
+}
+
+fn bind_cli_caller_actor(cli: &Cli) -> Result<()> {
     // CAD-2747: resolve unmanaged harness/actor override cleanly. Managed
     // daemon callers (`CADENCE_ALIAS` / `CADENCE_GRANT_TOKEN`) remain pinned to
     // their assignment session and cannot pass `--agent` or `--as-human`.
@@ -484,7 +483,10 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             cadence_agent::remote_cli::detect_unmanaged_actor(cli.agent.as_deref(), cli.as_human)?;
         cadence_agent::remote_cli::bind_cli_actor(actor);
     }
-    let client_only = client_update::client_only_mode()?;
+    Ok(())
+}
+
+fn try_run_pre_auth_command(cli: &Cli, client_only: bool) -> Result<Option<i32>> {
     // CAD-2111: plain doctor on a hosted org checks that connection from this
     // machine, on any installation, before any local state exists. `route`
     // reads the registry without a lock or a state dir, and its refusals (an
@@ -502,7 +504,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         if let org::Routed::Remote(target) =
             org::route(cli.org.as_deref(), cli.state_dir.clone(), tracker_pin()?)?
         {
-            return Ok(doctor::run_remote(
+            return Ok(Some(doctor::run_remote(
                 &target,
                 *json,
                 *offline,
@@ -510,7 +512,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 client_only,
                 agent.as_deref().map(|agent| (agent, skill.as_deref())),
                 cli.wake_timeout,
-            ));
+            )));
         }
     }
     // CAD-1437: a valid client-only receipt selects the public updater before
@@ -524,11 +526,12 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     {
         if client_only {
             return client_update::run(
-                &cli,
+                cli,
                 *check,
                 version.as_deref(),
                 target.release_source.as_deref(),
-            );
+            )
+            .map(Some);
         }
         if version.is_some() {
             return Err(client_update::client_only_required());
@@ -546,8 +549,116 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 "Offline results do not select daemon state; use --outbox-dir",
             ));
         }
-        return remote_result::run(action);
+        return remote_result::run(action).map(Some);
     }
+    Ok(None)
+}
+
+fn run_register_command(args: RegisterArgs<'_>) -> Result<i32> {
+    if args.use_ {
+        org::refuse_managed_default_change()
+            .inspect_err(|error| report_register_error(error, args.json))?;
+    }
+    let dir = cadence_agent::remote_auth::auth_dir(args.auth_dir)?;
+    let issuer = args
+        .issuer
+        .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
+    let grant = cadence_agent::remote_enrollment::register_portal(
+        issuer,
+        args.name,
+        args.slug,
+        &dir,
+        |url, code| show_register_code(url, code, args.no_open),
+    )
+    .inspect_err(|error| report_register_error(error, args.json))?;
+    let stored = org::record_remote(
+        &grant.slug,
+        &grant.endpoint,
+        &grant.organization_id,
+        args.use_,
+        || grant.save_credential(&dir),
+    )
+    .map_err(|error| issued_session_persistence_error(&grant.organization_id, &dir, error))
+    .inspect_err(|error| report_register_error(error, args.json))?;
+    if args.json {
+        print_json(&serde_json::json!({
+            "registered": true,
+            "authenticated": true,
+            "slug": grant.slug,
+            "endpoint": grant.endpoint,
+            "organization_id": grant.organization_id,
+            "expires_at": grant.expires_at,
+            "credential_stored": true
+        }));
+    } else {
+        cadence_agent::output::print_format_line(format_args!(
+            "Registered and signed in to {} ({})",
+            grant.slug, grant.endpoint
+        ));
+        show_workspace_handover(&grant.slug, &stored, args.auth_dir.is_some());
+    }
+    Ok(0)
+}
+
+fn run_connect_command(action: &commands::ConnectAction) -> Result<i32> {
+    let commands::ConnectAction::Github {
+        issuer,
+        no_open,
+        wait,
+    } = action;
+    let issuer = issuer
+        .as_deref()
+        .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
+    // The saved login is what binds the code to the workspace this CLI
+    // already belongs to. Without one the flow stays anonymous and the
+    // owner chooses explicitly in the browser.
+    let token = org::saved_login_token(None)?;
+    let poll = cadence_agent::github_connect::connect(
+        issuer,
+        token.as_deref(),
+        std::time::Duration::from_secs(*wait),
+        |url, code| {
+            let _ = show_login_code(url, code, *no_open);
+        },
+    )?;
+    let line = cadence_agent::github_connect::outcome_line(&poll)
+        .unwrap_or_else(|| "The connection did not settle in time.".to_string());
+    // The outcome line precedes a possible exit 1: a closed stderr
+    // must not panic the verdict into success.
+    eprint_line(&line);
+    Ok(match poll {
+        cadence_agent::github_connect::Poll::Connected(_) => 0,
+        _ => 1,
+    })
+}
+
+fn run_auth_command(action: &AuthAction) -> Result<i32> {
+    match action {
+        AuthAction::Status {
+            issuer,
+            org,
+            auth_dir,
+        } => org::auth_status(auth_dir.as_deref(), issuer.as_deref(), org.as_deref()),
+        AuthAction::Logout { auth_dir, org } => {
+            if let Some(org) = org {
+                let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
+                match org::resolve(Some(org), None, None)? {
+                    org::Resolved::Remote(target) => {
+                        cadence_agent::remote_cli::logout(&dir, &target)
+                    }
+                    org::Resolved::Local(_) => Err(Error::rejected(
+                        "auth logout --org requires a registered remote workspace",
+                    )),
+                }
+            } else {
+                let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
+                cadence_agent::remote_auth::logout(&dir)
+            }
+        }
+    }
+}
+
+fn try_run_auth_or_enrollment(cli: &Cli) -> Result<Option<i32>> {
     // Remote credentials are independent of local daemon state and sandbox adoption.
     match &cli.command {
         Commands::Register {
@@ -558,82 +669,17 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             no_open,
             json,
             auth_dir,
-        } => {
-            if *use_ {
-                org::refuse_managed_default_change()
-                    .inspect_err(|error| report_register_error(error, *json))?;
-            }
-            let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-            let issuer = issuer
-                .as_deref()
-                .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = cadence_agent::remote_enrollment::register_portal(
-                issuer,
-                name.as_deref(),
-                slug.as_deref(),
-                &dir,
-                |url, code| show_register_code(url, code, *no_open),
-            )
-            .inspect_err(|error| report_register_error(error, *json))?;
-            let stored = org::record_remote(
-                &grant.slug,
-                &grant.endpoint,
-                &grant.organization_id,
-                *use_,
-                || grant.save_credential(&dir),
-            )
-            .map_err(|error| issued_session_persistence_error(&grant.organization_id, &dir, error))
-            .inspect_err(|error| report_register_error(error, *json))?;
-            if *json {
-                print_json(&serde_json::json!({
-                    "registered": true,
-                    "authenticated": true,
-                    "slug": grant.slug,
-                    "endpoint": grant.endpoint,
-                    "organization_id": grant.organization_id,
-                    "expires_at": grant.expires_at,
-                    "credential_stored": true
-                }));
-            } else {
-                cadence_agent::output::print_format_line(format_args!(
-                    "Registered and signed in to {} ({})",
-                    grant.slug, grant.endpoint
-                ));
-                show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
-            }
-            return Ok(0);
-        }
-        Commands::Connect { action } => {
-            let commands::ConnectAction::Github {
-                issuer,
-                no_open,
-                wait,
-            } = action;
-            let issuer = issuer
-                .as_deref()
-                .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            // The saved login is what binds the code to the workspace this CLI
-            // already belongs to. Without one the flow stays anonymous and the
-            // owner chooses explicitly in the browser.
-            let token = org::saved_login_token(None)?;
-            let poll = cadence_agent::github_connect::connect(
-                issuer,
-                token.as_deref(),
-                std::time::Duration::from_secs(*wait),
-                |url, code| {
-                    let _ = show_login_code(url, code, *no_open);
-                },
-            )?;
-            let line = cadence_agent::github_connect::outcome_line(&poll)
-                .unwrap_or_else(|| "The connection did not settle in time.".to_string());
-            // The outcome line precedes a possible exit 1: a closed stderr
-            // must not panic the verdict into success.
-            eprint_line(&line);
-            return Ok(match poll {
-                cadence_agent::github_connect::Poll::Connected(_) => 0,
-                _ => 1,
-            });
-        }
+        } => run_register_command(RegisterArgs {
+            name: name.as_deref(),
+            slug: slug.as_deref(),
+            issuer: issuer.as_deref(),
+            use_: *use_,
+            no_open: *no_open,
+            json: *json,
+            auth_dir: auth_dir.as_deref(),
+        })
+        .map(Some),
+        Commands::Connect { action } => run_connect_command(action).map(Some),
         Commands::Login {
             hint,
             issuer,
@@ -649,24 +695,23 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             audit_approve,
             full_access,
             as_assistant,
-        } => {
-            return run_hosted_login(
-                hint.as_deref(),
-                issuer.as_deref(),
-                org.as_deref(),
-                slug.as_deref(),
-                *use_,
-                *token_stdin,
-                *no_open,
-                auth_dir.as_deref(),
-                *web,
-                *settings,
-                *cloud_agent,
-                *audit_approve,
-                *full_access,
-                *as_assistant,
-            );
-        }
+        } => run_hosted_login(
+            hint.as_deref(),
+            issuer.as_deref(),
+            org.as_deref(),
+            slug.as_deref(),
+            *use_,
+            *token_stdin,
+            *no_open,
+            auth_dir.as_deref(),
+            *web,
+            *settings,
+            *cloud_agent,
+            *audit_approve,
+            *full_access,
+            *as_assistant,
+        )
+        .map(Some),
         Commands::Org {
             action:
                 org::OrgAction::Login {
@@ -678,51 +723,40 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     auth_dir,
                     as_assistant,
                 },
-        } => {
-            return run_hosted_login(
-                hint.as_deref(),
-                issuer.as_deref(),
-                None,
-                slug.as_deref(),
-                *use_,
-                false,
-                *no_open,
-                auth_dir.as_deref(),
-                false,
-                false,
-                false,
-                false,
-                false,
-                *as_assistant,
-            );
-        }
-        Commands::Auth { action } => {
-            return match action {
-                AuthAction::Status {
-                    issuer,
-                    org,
-                    auth_dir,
-                } => org::auth_status(auth_dir.as_deref(), issuer.as_deref(), org.as_deref()),
-                AuthAction::Logout { auth_dir, org } => {
-                    if let Some(org) = org {
-                        let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-                        match org::resolve(Some(org), None, None)? {
-                            org::Resolved::Remote(target) => {
-                                cadence_agent::remote_cli::logout(&dir, &target)
-                            }
-                            org::Resolved::Local(_) => Err(Error::rejected(
-                                "auth logout --org requires a registered remote workspace",
-                            )),
-                        }
-                    } else {
-                        let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-                        cadence_agent::remote_auth::logout(&dir)
-                    }
-                }
-            }
-        }
-        _ => {}
+        } => run_hosted_login(
+            hint.as_deref(),
+            issuer.as_deref(),
+            None,
+            slug.as_deref(),
+            *use_,
+            false,
+            *no_open,
+            auth_dir.as_deref(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            *as_assistant,
+        )
+        .map(Some),
+        Commands::Auth { action } => run_auth_command(action).map(Some),
+        _ => Ok(None),
     }
+}
+
+fn resolve_remote_for_command(
+    cli: &Cli,
+    tracker: Option<PathBuf>,
+    local_error: &str,
+) -> Result<cadence_agent::remote_cli::RemoteTarget> {
+    match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
+        org::Resolved::Remote(target) => Ok(target),
+        org::Resolved::Local(_) => Err(Error::usage(local_error)),
+    }
+}
+
+fn try_run_hosted_only_command(cli: Cli) -> Result<std::result::Result<i32, Cli>> {
     // CAD-1946 / CAD-1981: `audit verdicts` routes through the shared selector
     // as every other verb does, so this invocation's `--org`/`CADENCE_ORG`
     // selects the destination here too — the registry's selected row alone
@@ -772,14 +806,16 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 repo.as_deref(),
                 project.as_deref(),
                 notes_dir.as_deref(),
-            ),
+            )
+            .map(Ok),
             org::Routed::Remote(target) => remote::run(
                 target,
                 cli.command,
                 cli.wake_timeout,
                 cli.state_dir,
                 cli.command_path,
-            ),
+            )
+            .map(Ok),
         };
     }
     // Hosted metadata never needs local sandbox adoption, permission replay,
@@ -792,43 +828,38 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             action: AgentAction::Directory { .. } | AgentAction::Notify { .. },
         }
     ) {
-        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), None)? {
-            org::Resolved::Remote(target) => target,
-            org::Resolved::Local(_) => {
-                return Err(Error::usage(
-                    "agent directory/notify require a selected hosted org; pass --org <logged-in-workspace>. Nothing was sent and no daemon was started",
-                ));
-            }
-        };
+        let target = resolve_remote_for_command(
+            &cli,
+            None,
+            "agent directory/notify require a selected hosted org; pass --org <logged-in-workspace>. Nothing was sent and no daemon was started",
+        )?;
         return remote::run(
             target,
             cli.command,
             cli.wake_timeout,
             cli.state_dir,
             cli.command_path,
-        );
+        )
+        .map(Ok);
     }
     // Hosted app actions must not fall through to a local daemon.
     if matches!(
         &cli.command,
         Commands::App { action } if action.is_hosted_action()
     ) {
-        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker_pin()?)?
-        {
-            org::Resolved::Remote(target) => target,
-            org::Resolved::Local(_) => {
-                return Err(Error::usage(
-                    "app describe/call/skill/pending require a hosted workspace; pass --org <workspace>. Nothing was sent and no daemon was started",
-                ));
-            }
-        };
+        let target = resolve_remote_for_command(
+            &cli,
+            tracker_pin()?,
+            "app describe/call/skill/pending require a hosted workspace; pass --org <workspace>. Nothing was sent and no daemon was started",
+        )?;
         return remote::run(
             target,
             cli.command,
             cli.wake_timeout,
             cli.state_dir,
             cli.command_path,
-        );
+        )
+        .map(Ok);
     }
     // Published app lifecycle is hosted-only and must refuse before local
     // state/daemon startup, including on a client-only installation.
@@ -846,19 +877,19 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             }
         }
     ) {
-        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), None)? {
-            org::Resolved::Remote(target) => target,
-            org::Resolved::Local(_) => return Err(Error::usage(
-                "published app lifecycle requires --org <logged-in-workspace>; no local daemon or hosted request was started",
-            )),
-        };
+        let target = resolve_remote_for_command(
+            &cli,
+            None,
+            "published app lifecycle requires --org <logged-in-workspace>; no local daemon or hosted request was started",
+        )?;
         return remote::run(
             target,
             cli.command,
             cli.wake_timeout,
             cli.state_dir,
             cli.command_path,
-        );
+        )
+        .map(Ok);
     }
     // Hosted human team administration. A managed agent is refused before
     // org resolution, so a saved human login is never loaded. A local org
@@ -872,21 +903,19 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         }
         cadence_agent::remote_cli::refuse_non_human_actor(None, "team")?;
         let tracker = tracker_pin()?;
-        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
-            org::Resolved::Remote(target) => target,
-            org::Resolved::Local(_) => {
-                return Err(Error::usage(
-                    "team requires a hosted org: pass --org <org> for a logged-in workspace, or switch back from `--org local`. Nothing was sent",
-                ));
-            }
-        };
+        let target = resolve_remote_for_command(
+            &cli,
+            tracker,
+            "team requires a hosted org: pass --org <org> for a logged-in workspace, or switch back from `--org local`. Nothing was sent",
+        )?;
         return remote::run(
             target,
             cli.command,
             cli.wake_timeout,
             cli.state_dir,
             cli.command_path,
-        );
+        )
+        .map(Ok);
     }
     // Hosted channels (`ls | read | post`) work for both human logins and
     // agents, and must not fall through to a local daemon when invoked locally.
@@ -894,7 +923,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         let tracker = tracker_pin()?;
         let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
             org::Resolved::Remote(target) => target,
-            org::Resolved::Local(_) => return channel::run_local(),
+            org::Resolved::Local(_) => return channel::run_local().map(Ok),
         };
         return remote::run(
             target,
@@ -902,7 +931,8 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             cli.wake_timeout,
             cli.state_dir,
             cli.command_path,
-        );
+        )
+        .map(Ok);
     }
     // CAD-1429: every `web` action is a hosted operation against one pinned
     // remote workspace. Resolve it once here; a local or unselected org
@@ -922,20 +952,12 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             Some(dir) => dir,
             None => cadence_agent::client::state_dir()?,
         };
-        return web::run(&local_state, action, &target, cli.wake_timeout);
+        return web::run(&local_state, action, &target, cli.wake_timeout).map(Ok);
     }
-    // CAD-2758: hosted CLI enrollment acts on an unmanaged standalone CLI login;
-    // refuse managed daemon callers before client-only routing, sandbox adoption,
-    // or org resolution can load or renew the host's saved login.
-    agent_enroll::refuse_managed_env_caller(&cli.command)?;
-    // CAD-1425: a client-only installation runs local commands never; it
-    // routes only through an actual remote org, before any local action.
-    if client_only {
-        if let Commands::Org { action } = cli.command {
-            return client_update::client_org(action);
-        }
-        return client_update::route_client_only(cli);
-    }
+    Ok(Err(cli))
+}
+
+fn try_run_offline_local_command(cli: &Cli) -> Result<Option<i32>> {
     // ADR 0007 T1: dispatch before any state-dir resolution or sandbox
     // adoption — under sudo those would resolve root's home and could
     // write beneath it. The agent-uid lane is its own host surface.
@@ -950,7 +972,8 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 cadence_agent::agent_uid::audit::cli(*json, operator)
             }
             AgentUidAction::Runbook => cadence_agent::agent_uid::runbook::cli(),
-        };
+        }
+        .map(Some);
     }
     // CAD-647: trusted source development never resolves production state
     // or adopts its sandbox profile. The harness has no daemon/PM contract.
@@ -969,7 +992,8 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             bundle.as_deref(),
             parent_origin,
             *integrity_only,
-        );
+        )
+        .map(Some);
     }
     if let Commands::App {
         action:
@@ -980,7 +1004,8 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             },
     } = &cli.command
     {
-        return cadence_agent::app_preview_export::write_fixtures(bundle, *json, *integrity_only);
+        return cadence_agent::app_preview_export::write_fixtures(bundle, *json, *integrity_only)
+            .map(Some);
     }
     if let Commands::App {
         action:
@@ -1001,7 +1026,8 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             *port,
             host,
             allow_host,
-        );
+        )
+        .map(Some);
     }
     // CAD-1270: `app check` is the offline byte validator — it resolves
     // no org or state dir, adopts no sandbox profile and never reaches
@@ -1010,29 +1036,32 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         action: app::AppAction::Check { source, json },
     } = &cli.command
     {
-        return app::run_check(source, *json);
+        return app::run_check(source, *json).map(Some);
     }
     if let Commands::App {
         action: app::AppAction::Inspect { source, json },
     } = &cli.command
     {
-        return app::run_inspect(source, *json);
+        return app::run_inspect(source, *json).map(Some);
     }
-    let tracker = tracker_pin()?;
+    Ok(None)
+}
+
+fn resolve_cli_org(cli: &Cli, tracker: Option<PathBuf>) -> Result<org::Resolved> {
     // Local maintenance and read-only skill discovery ignore a saved remote
     // default. Deliberate remote selectors refuse before transport; `dev`,
     // `setup` and skill reads also refuse a remote environment selector beside a pin.
     // Managed callers keep their original resolver and permission checks.
-    let resolved = if matches!(cli.command, Commands::Update { .. }) {
-        org::resolve_update(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+    if matches!(cli.command, Commands::Update { .. }) {
+        org::resolve_update(cli.org.as_deref(), cli.state_dir.clone(), tracker)
     } else if matches!(cli.command, Commands::Dev { .. }) {
-        org::resolve_dev(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+        org::resolve_dev(cli.org.as_deref(), cli.state_dir.clone(), tracker)
     } else if matches!(cli.command, Commands::Setup { .. }) {
         // CAD-1922: `setup` installs on this machine. The local-maintenance
         // selector keeps a saved local connection's state/tracker pair,
         // never routes a saved remote default over the allowlist, and
         // refuses a remote `--org`/`CADENCE_ORG` instead of ignoring it.
-        org::resolve_setup(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+        org::resolve_setup(cli.org.as_deref(), cli.state_dir.clone(), tracker)
     } else if std::env::var_os("CADENCE_ALIAS").is_none()
         && std::env::var_os("CADENCE_GRANT_TOKEN").is_none()
         && matches!(
@@ -1042,10 +1071,53 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             }
         )
     {
-        org::resolve_skill_read(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+        org::resolve_skill_read(cli.org.as_deref(), cli.state_dir.clone(), tracker)
     } else {
-        org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+        org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)
+    }
+}
+
+pub(super) fn run_cli(cli: Cli) -> Result<i32> {
+    // CAD-1922: the home resolver treats `--state-dir` at a legacy root as
+    // the same evidence as an exported `CADENCE_STATE_DIR`; record it before
+    // anything resolves a path.
+    cadence_agent::home::note_state_dir_flag(cli.state_dir.as_deref());
+    // Offline syntax discovery: no org, state, tracker, login, or daemon.
+    if matches!(
+        cli.command,
+        Commands::Search { .. } | Commands::Schema { .. }
+    ) {
+        return discovery::run(&cli.command);
+    }
+    bind_cli_caller_actor(&cli)?;
+    let client_only = client_update::client_only_mode()?;
+    if let Some(code) = try_run_pre_auth_command(&cli, client_only)? {
+        return Ok(code);
+    }
+    if let Some(code) = try_run_auth_or_enrollment(&cli)? {
+        return Ok(code);
+    }
+    let cli = match try_run_hosted_only_command(cli)? {
+        Ok(code) => return Ok(code),
+        Err(cli) => cli,
     };
+    // CAD-2758: hosted CLI enrollment acts on an unmanaged standalone CLI login;
+    // refuse managed daemon callers before client-only routing, sandbox adoption,
+    // or org resolution can load or renew the host's saved login.
+    agent_enroll::refuse_managed_env_caller(&cli.command)?;
+    // CAD-1425: a client-only installation runs local commands never; it
+    // routes only through an actual remote org, before any local action.
+    if client_only {
+        if let Commands::Org { action } = cli.command {
+            return client_update::client_org(action);
+        }
+        return client_update::route_client_only(cli);
+    }
+    if let Some(code) = try_run_offline_local_command(&cli)? {
+        return Ok(code);
+    }
+    let tracker = tracker_pin()?;
+    let resolved = resolve_cli_org(&cli, tracker)?;
     let state_dir = match resolved {
         org::Resolved::Local(state_dir) => state_dir,
         org::Resolved::Remote(target) => {
