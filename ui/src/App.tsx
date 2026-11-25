@@ -284,6 +284,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     [],
   );
   const goRoute = useCallback((r: Route) => update((c) => goTo(c, r)), []);
+  const clearDeepLinkAction = useCallback(
+    () =>
+      update(
+        (c) =>
+          c.route.screen === "home" && c.route.actionId
+            ? { ...c, route: { screen: "home", ...(c.route.privateChat ? { privateChat: true } : {}) } }
+            : c,
+        { replace: true },
+      ),
+    [],
+  );
   const [query, setQuery] = useState("");
   // Per-resource state (lib/cache.ts): loading, failed and empty stay
   // distinct, and a failed refresh keeps the last good payload as stale.
@@ -1473,6 +1484,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             canLocalDispatch={meta?.settings_sections?.includes("daemons") === true}
             onToast={(text) => say("ok", text)}
             privateChat={route.screen === "home" && route.privateChat === true}
+            deepLinkActionId={route.screen === "home" ? route.actionId ?? null : null}
+            onClearDeepLinkAction={clearDeepLinkAction}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             supportWorkspaceId={
               meta?.hosted === true &&

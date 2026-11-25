@@ -74,7 +74,7 @@ export type ConnectionPage =
   | { kind: "detail"; id: string };
 
 export type Route =
-  | { screen: "home"; privateChat?: true }
+  | { screen: "home"; privateChat?: true; actionId?: string }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "issue"; project: string; id: string; tab: IssueTab }
   | { screen: "apps"; project: string | null; name: string | null }
@@ -478,7 +478,18 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   if (route.screen === "projects" && route.section === "overview" && q.has("view")) {
     route = { ...route, section: "issues" };
   }
-  if (route.screen === "home" && q.get("chat") === "assistant") route = { ...route, privateChat: true };
+  if (route.screen === "home") {
+    const privateChat = q.get("chat") === "assistant";
+    const rawAction = q.get("action")?.trim();
+    const actionId = rawAction ? rawAction : undefined;
+    if (privateChat || actionId) {
+      route = {
+        ...route,
+        ...(privateChat ? { privateChat: true } : {}),
+        ...(actionId ? { actionId } : {}),
+      };
+    }
+  }
   if (route.screen === "agents") {
     const tab = parseAgentTab(q.get("tab"));
     const detail = route.alias !== null || route.profileId !== undefined;
@@ -553,7 +564,7 @@ function deleteAppRouteParams(q: URLSearchParams): void {
 /** Query keys owned by host screens so an app key matching one is never stripped as app state. */
 const HOST_QUERY_KEYS = new Set<string>([
   "tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page",
-  "recruit", "ask", "h", "dm", "chat", "file", "mode", "q",
+  "recruit", "ask", "h", "dm", "chat", "action", "file", "mode", "q",
   "c", "kind", "agent", "system",
   "item", "outbox_q", "outbox_project",
   ...MY_WORK_URL_KEYS,
@@ -622,7 +633,7 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   // must carry it across the delete below. Only a Threads → Threads move
   // keeps it: another screen's `?project=` is that screen's filter.
   const threadsProject = from?.screen === "threads" && loc.route.screen === "threads" ? q.get("project") : null;
-  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask", "file", "version", "routineAgent"]) q.delete(key);
+  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask", "action", "file", "version", "routineAgent"]) q.delete(key);
   // CAD-1703: My work's view belongs to its own route.
   for (const key of MY_WORK_URL_KEYS) q.delete(key);
   writeFilters(q, NO_FILTERS);
@@ -648,7 +659,10 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
     const issueSearch = q.toString();
     return routePath(route) + (issueSearch ? `?${issueSearch}` : "");
   }
-  if (route.screen === "home" && route.privateChat) q.set("chat", "assistant");
+  if (route.screen === "home") {
+    if (route.privateChat) q.set("chat", "assistant");
+    if (route.actionId) q.set("action", route.actionId);
+  }
   if (route.screen === "agents") {
     const detail = route.alias !== null || route.profileId !== undefined;
     if (detail && route.tab) q.set("tab", route.tab);
