@@ -168,6 +168,429 @@ fn put_payload(id: &str, fields: &[(&str, Option<Value>)]) -> Map<String, Value>
     payload
 }
 
+type PlannedRequest = (String, Option<String>, Map<String, Value>);
+
+fn planned(
+    operation: &str,
+    expected: Option<String>,
+    payload: Map<String, Value>,
+) -> PlannedRequest {
+    (operation.to_string(), expected, payload)
+}
+
+fn tri_bool(enable: bool, disable: bool) -> Option<Value> {
+    if enable {
+        Some(json!(true))
+    } else if disable {
+        Some(json!(false))
+    } else {
+        None
+    }
+}
+
+fn plan_apply(
+    state_dir: Option<&Path>,
+    file: Option<&Path>,
+    expected_revision: &str,
+    digest: Option<&str>,
+) -> Result<PlannedRequest> {
+    let text = read_payload_file(state_dir, file)?;
+    let config: Value = serde_json::from_str(&text).map_err(|err| {
+        Error::invalid(
+            "invalid_config",
+            format!("settings file is not JSON: {err}"),
+        )
+    })?;
+    if !config.is_object() {
+        return Err(Error::invalid(
+            "invalid_config",
+            "settings file must be a JSON object — the `config` object `show` prints",
+        ));
+    }
+    let mut payload = Map::new();
+    payload.insert("config".to_string(), config);
+    bind_digest(&mut payload, digest)?;
+    Ok(planned(
+        "apply",
+        Some(expected_revision.to_string()),
+        payload,
+    ))
+}
+
+fn plan_harness(action: &HarnessAction) -> PlannedRequest {
+    match action {
+        HarnessAction::List => planned("harness.list", None, Map::new()),
+        HarnessAction::Show { id } => planned("harness.show", None, id_payload(id)),
+        HarnessAction::Put {
+            id,
+            label,
+            cli,
+            note,
+            mutation,
+        } => planned(
+            "harness.put",
+            Some(mutation.expected_revision.clone()),
+            put_payload(
+                id,
+                &[
+                    ("label", label.clone().map(Value::String)),
+                    ("cli", cli.clone().map(Value::String)),
+                    ("note", note.clone().map(Value::String)),
+                ],
+            ),
+        ),
+        HarnessAction::Remove { id, mutation } => planned(
+            "harness.remove",
+            Some(mutation.expected_revision.clone()),
+            id_payload(id),
+        ),
+    }
+}
+
+fn plan_provider(action: &ProviderAction) -> PlannedRequest {
+    match action {
+        ProviderAction::List => planned("provider.list", None, Map::new()),
+        ProviderAction::Show { id } => planned("provider.show", None, id_payload(id)),
+        ProviderAction::Put {
+            id,
+            label,
+            kind,
+            pin,
+            gate,
+            no_gate,
+            paid,
+            free,
+            note,
+            mutation,
+        } => planned(
+            "provider.put",
+            Some(mutation.expected_revision.clone()),
+            put_payload(
+                id,
+                &[
+                    ("label", label.clone().map(Value::String)),
+                    ("kind", kind.map(ProviderKindArg::as_str).map(|k| json!(k))),
+                    ("pin", pin.clone().map(Value::String)),
+                    ("gate", tri_bool(*gate, *no_gate)),
+                    ("paid", tri_bool(*paid, *free)),
+                    ("note", note.clone().map(Value::String)),
+                ],
+            ),
+        ),
+        ProviderAction::Remove { id, mutation } => planned(
+            "provider.remove",
+            Some(mutation.expected_revision.clone()),
+            id_payload(id),
+        ),
+    }
+}
+
+fn plan_model(action: &ModelAction) -> PlannedRequest {
+    match action {
+        ModelAction::List => planned("model.list", None, Map::new()),
+        ModelAction::Show { id } => planned("model.show", None, id_payload(id)),
+        ModelAction::Put {
+            id,
+            provider,
+            ctx,
+            out,
+            thinking,
+            no_thinking,
+            images,
+            no_images,
+            scope,
+            mutation,
+        } => planned(
+            "model.put",
+            Some(mutation.expected_revision.clone()),
+            put_payload(
+                id,
+                &[
+                    ("provider", provider.clone().map(Value::String)),
+                    ("ctx", ctx.clone().map(Value::String)),
+                    ("out", out.clone().map(Value::String)),
+                    ("thinking", tri_bool(*thinking, *no_thinking)),
+                    ("images", tri_bool(*images, *no_images)),
+                    ("scope", scope.map(|s| json!(s.as_str()))),
+                ],
+            ),
+        ),
+        ModelAction::Rename { id, to, mutation } => {
+            let mut payload = id_payload(id);
+            payload.insert("to".to_string(), json!(to));
+            planned(
+                "model.rename",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            )
+        }
+        ModelAction::Remove { id, mutation } => planned(
+            "model.remove",
+            Some(mutation.expected_revision.clone()),
+            id_payload(id),
+        ),
+        ModelAction::Scope {
+            id,
+            scope,
+            mutation,
+        } => {
+            let mut payload = id_payload(id);
+            payload.insert("scope".to_string(), json!(scope.as_str()));
+            planned(
+                "model.scope",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            )
+        }
+    }
+}
+
+fn plan_catalog(action: &CatalogAction) -> PlannedRequest {
+    match action {
+        CatalogAction::Refresh { provider } => {
+            let mut payload = Map::new();
+            payload.insert("provider".to_string(), json!(provider));
+            planned("catalog.refresh", None, payload)
+        }
+        CatalogAction::Import {
+            provider,
+            models,
+            all_new,
+            mutation,
+        } => {
+            let mut payload = Map::new();
+            payload.insert("provider".to_string(), json!(provider));
+            payload.insert(
+                "models".to_string(),
+                if *all_new {
+                    json!("all-new")
+                } else {
+                    json!(models)
+                },
+            );
+            planned(
+                "catalog.import",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            )
+        }
+    }
+}
+
+fn plan_role(action: &RoleAction) -> PlannedRequest {
+    match action {
+        RoleAction::List => planned("role.list", None, Map::new()),
+        RoleAction::Set {
+            role,
+            model,
+            mutation,
+        } => {
+            let mut payload = Map::new();
+            payload.insert("role".to_string(), json!(role.as_str()));
+            payload.insert("model".to_string(), json!(model));
+            planned(
+                "role.set",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            )
+        }
+        RoleAction::Clear { role, mutation } => {
+            let mut payload = Map::new();
+            payload.insert("role".to_string(), json!(role.as_str()));
+            planned(
+                "role.clear",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            )
+        }
+    }
+}
+
+fn plan_profile(state_dir: Option<&Path>, action: &ProfileAction) -> Result<PlannedRequest> {
+    match action {
+        ProfileAction::List => Ok(planned("profile.list", None, Map::new())),
+        ProfileAction::Show { id } => Ok(planned("profile.show", None, id_payload(id))),
+        ProfileAction::Put {
+            id,
+            role,
+            model,
+            job,
+            job_file,
+            digest,
+            mutation,
+        } => {
+            // `--job` wins; `--job-file` reads only when given — an
+            // omitted job is "keep" on an edit, never a stdin read.
+            let job_text = match (job, job_file) {
+                (Some(text), _) => Some(text.clone()),
+                (None, file) => file
+                    .as_deref()
+                    .map(|f| read_payload_file(state_dir, Some(f)))
+                    .transpose()?,
+            };
+            let mut payload = put_payload(
+                id,
+                &[
+                    ("role", role.map(RoleArg::as_str).map(|r| json!(r))),
+                    ("model", model.clone().map(Value::String)),
+                    ("job", job_text.map(Value::String)),
+                ],
+            );
+            bind_digest(&mut payload, digest.as_deref())?;
+            Ok(planned(
+                "profile.put",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            ))
+        }
+        ProfileAction::Rename { id, to, mutation } => {
+            let mut payload = id_payload(id);
+            payload.insert("to".to_string(), json!(to));
+            Ok(planned(
+                "profile.rename",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            ))
+        }
+        ProfileAction::Remove { id, mutation } => Ok(planned(
+            "profile.remove",
+            Some(mutation.expected_revision.clone()),
+            id_payload(id),
+        )),
+        ProfileAction::Sync {
+            profile,
+            all: _,
+            mutation,
+        } => {
+            let mut payload = Map::new();
+            payload.insert(
+                "profile".to_string(),
+                profile.clone().map(Value::String).unwrap_or(Value::Null),
+            );
+            Ok(planned(
+                "profile.sync",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            ))
+        }
+        ProfileAction::Preview {
+            profile,
+            harness,
+            mutation,
+        } => {
+            let mut payload = Map::new();
+            payload.insert("profile".to_string(), json!(profile));
+            payload.insert("harness".to_string(), json!(harness));
+            Ok(planned(
+                "profile.preview",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            ))
+        }
+    }
+}
+
+fn plan_pin(action: &PinAction) -> PlannedRequest {
+    match action {
+        PinAction::List => planned("pin.list", None, Map::new()),
+        PinAction::Put {
+            pkg,
+            pinned,
+            mutation,
+        } => {
+            let mut payload = Map::new();
+            payload.insert("pkg".to_string(), json!(pkg));
+            payload.insert("pinned".to_string(), json!(pinned));
+            planned("pin.put", Some(mutation.expected_revision.clone()), payload)
+        }
+        PinAction::Remove { pkg, mutation } => {
+            let mut payload = Map::new();
+            payload.insert("pkg".to_string(), json!(pkg));
+            planned(
+                "pin.remove",
+                Some(mutation.expected_revision.clone()),
+                payload,
+            )
+        }
+    }
+}
+
+fn plan_grant(state_dir: Option<&Path>, action: &GrantAction) -> Result<PlannedRequest> {
+    match action {
+        GrantAction::Request {
+            operation,
+            payload,
+            payload_file,
+            expected_revision,
+            reason,
+        } => {
+            let text = match (payload, payload_file) {
+                (Some(text), _) => text.clone(),
+                (None, file) => file
+                    .as_deref()
+                    .map(|f| read_payload_file(state_dir, Some(f)))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        Error::usage(
+                            "grant request needs --payload or --payload-file — the exact operation payload the grant must bind",
+                        )
+                    })?,
+            };
+            let intended: Value = serde_json::from_str(&text).map_err(|err| {
+                Error::invalid("invalid_request", format!("--payload is not JSON: {err}"))
+            })?;
+            if !intended.is_object() {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "--payload must be a JSON object — the exact operation payload",
+                ));
+            }
+            let mut p = Map::new();
+            p.insert("operation".to_string(), json!(operation));
+            p.insert(
+                "expected_revision".to_string(),
+                expected_revision
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            p.insert("payload".to_string(), intended);
+            p.insert("reason".to_string(), json!(reason));
+            Ok(planned("grant.request", None, p))
+        }
+        GrantAction::List => Ok(planned("grant.list", None, Map::new())),
+        GrantAction::Allow {
+            request_id,
+            expected_revision,
+        } => {
+            let mut payload = Map::new();
+            payload.insert("request_id".to_string(), json!(request_id));
+            Ok(planned(
+                "grant.allow",
+                Some(expected_revision.clone()),
+                payload,
+            ))
+        }
+        GrantAction::Reject {
+            request_id,
+            expected_revision,
+        } => {
+            let mut payload = Map::new();
+            payload.insert("request_id".to_string(), json!(request_id));
+            Ok(planned(
+                "grant.reject",
+                Some(expected_revision.clone()),
+                payload,
+            ))
+        }
+        GrantAction::Revoke { grant_id } => {
+            let mut payload = Map::new();
+            payload.insert("grant_id".to_string(), json!(grant_id));
+            Ok(planned("grant.revoke", None, payload))
+        }
+    }
+}
+
 /// Assemble `{operation, expected_revision, payload}` for one action.
 /// `state_dir` is `None` on the remote path (file reads are still local).
 /// `put` payloads carry only the fields the command line actually gave —
@@ -177,424 +600,35 @@ fn request(
     state_dir: Option<&Path>,
     action: &AgentsAction,
     grant: &Option<String>,
-) -> Result<(String, Option<String>, Map<String, Value>)> {
-    let params = |operation: &str,
-                  expected: Option<String>,
-                  payload: Map<String, Value>|
-     -> Result<(String, Option<String>, Map<String, Value>)> {
-        Ok((operation.to_string(), expected, payload))
-    };
-    let mut planned = match action {
-        AgentsAction::Show => params("snapshot", None, Map::new())?,
-        AgentsAction::Fleet => params("fleet.check", None, Map::new())?,
+) -> Result<PlannedRequest> {
+    let mut planned_req = match action {
+        AgentsAction::Show => planned("snapshot", None, Map::new()),
+        AgentsAction::Fleet => planned("fleet.check", None, Map::new()),
         AgentsAction::Apply {
             file,
             mutation,
             digest,
-        } => {
-            let text = read_payload_file(state_dir, file.as_deref())?;
-            let config: Value = serde_json::from_str(&text).map_err(|err| {
-                Error::invalid(
-                    "invalid_config",
-                    format!("settings file is not JSON: {err}"),
-                )
-            })?;
-            if !config.is_object() {
-                return Err(Error::invalid(
-                    "invalid_config",
-                    "settings file must be a JSON object — the `config` object `show` prints",
-                ));
-            }
-            let mut payload = Map::new();
-            payload.insert("config".to_string(), config);
-            bind_digest(&mut payload, digest.as_deref())?;
-            params("apply", Some(mutation.expected_revision.clone()), payload)?
-        }
-        AgentsAction::Harness { action } => match action {
-            HarnessAction::List => params("harness.list", None, Map::new())?,
-            HarnessAction::Show { id } => params("harness.show", None, id_payload(id))?,
-            HarnessAction::Put {
-                id,
-                label,
-                cli,
-                note,
-                mutation,
-            } => params(
-                "harness.put",
-                Some(mutation.expected_revision.clone()),
-                put_payload(
-                    id,
-                    &[
-                        ("label", label.clone().map(Value::String)),
-                        ("cli", cli.clone().map(Value::String)),
-                        ("note", note.clone().map(Value::String)),
-                    ],
-                ),
-            )?,
-            HarnessAction::Remove { id, mutation } => params(
-                "harness.remove",
-                Some(mutation.expected_revision.clone()),
-                id_payload(id),
-            )?,
-        },
-        AgentsAction::Provider { action } => match action {
-            ProviderAction::List => params("provider.list", None, Map::new())?,
-            ProviderAction::Show { id } => params("provider.show", None, id_payload(id))?,
-            ProviderAction::Put {
-                id,
-                label,
-                kind,
-                pin,
-                gate,
-                no_gate,
-                paid,
-                free,
-                note,
-                mutation,
-            } => params(
-                "provider.put",
-                Some(mutation.expected_revision.clone()),
-                put_payload(
-                    id,
-                    &[
-                        ("label", label.clone().map(Value::String)),
-                        ("kind", kind.map(ProviderKindArg::as_str).map(|k| json!(k))),
-                        ("pin", pin.clone().map(Value::String)),
-                        (
-                            "gate",
-                            if *gate {
-                                Some(json!(true))
-                            } else if *no_gate {
-                                Some(json!(false))
-                            } else {
-                                None
-                            },
-                        ),
-                        (
-                            "paid",
-                            if *paid {
-                                Some(json!(true))
-                            } else if *free {
-                                Some(json!(false))
-                            } else {
-                                None
-                            },
-                        ),
-                        ("note", note.clone().map(Value::String)),
-                    ],
-                ),
-            )?,
-            ProviderAction::Remove { id, mutation } => params(
-                "provider.remove",
-                Some(mutation.expected_revision.clone()),
-                id_payload(id),
-            )?,
-        },
-        AgentsAction::Model { action } => match action {
-            ModelAction::List => params("model.list", None, Map::new())?,
-            ModelAction::Show { id } => params("model.show", None, id_payload(id))?,
-            ModelAction::Put {
-                id,
-                provider,
-                ctx,
-                out,
-                thinking,
-                no_thinking,
-                images,
-                no_images,
-                scope,
-                mutation,
-            } => params(
-                "model.put",
-                Some(mutation.expected_revision.clone()),
-                put_payload(
-                    id,
-                    &[
-                        ("provider", provider.clone().map(Value::String)),
-                        ("ctx", ctx.clone().map(Value::String)),
-                        ("out", out.clone().map(Value::String)),
-                        (
-                            "thinking",
-                            if *thinking {
-                                Some(json!(true))
-                            } else if *no_thinking {
-                                Some(json!(false))
-                            } else {
-                                None
-                            },
-                        ),
-                        (
-                            "images",
-                            if *images {
-                                Some(json!(true))
-                            } else if *no_images {
-                                Some(json!(false))
-                            } else {
-                                None
-                            },
-                        ),
-                        ("scope", scope.map(|s| json!(s.as_str()))),
-                    ],
-                ),
-            )?,
-            ModelAction::Rename { id, to, mutation } => {
-                let mut payload = id_payload(id);
-                payload.insert("to".to_string(), json!(to));
-                params(
-                    "model.rename",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-            ModelAction::Remove { id, mutation } => params(
-                "model.remove",
-                Some(mutation.expected_revision.clone()),
-                id_payload(id),
-            )?,
-            ModelAction::Scope {
-                id,
-                scope,
-                mutation,
-            } => {
-                let mut payload = id_payload(id);
-                payload.insert("scope".to_string(), json!(scope.as_str()));
-                params(
-                    "model.scope",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-        },
-        AgentsAction::Catalog { action } => match action {
-            CatalogAction::Refresh { provider } => {
-                let mut payload = Map::new();
-                payload.insert("provider".to_string(), json!(provider));
-                params("catalog.refresh", None, payload)?
-            }
-            CatalogAction::Import {
-                provider,
-                models,
-                all_new,
-                mutation,
-            } => {
-                let mut payload = Map::new();
-                payload.insert("provider".to_string(), json!(provider));
-                payload.insert(
-                    "models".to_string(),
-                    if *all_new {
-                        json!("all-new")
-                    } else {
-                        json!(models)
-                    },
-                );
-                params(
-                    "catalog.import",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-        },
-        AgentsAction::Role { action } => match action {
-            RoleAction::List => params("role.list", None, Map::new())?,
-            RoleAction::Set {
-                role,
-                model,
-                mutation,
-            } => {
-                let mut payload = Map::new();
-                payload.insert("role".to_string(), json!(role.as_str()));
-                payload.insert("model".to_string(), json!(model));
-                params(
-                    "role.set",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-            RoleAction::Clear { role, mutation } => {
-                let mut payload = Map::new();
-                payload.insert("role".to_string(), json!(role.as_str()));
-                params(
-                    "role.clear",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-        },
-        AgentsAction::Profile { action } => match action {
-            ProfileAction::List => params("profile.list", None, Map::new())?,
-            ProfileAction::Show { id } => params("profile.show", None, id_payload(id))?,
-            ProfileAction::Put {
-                id,
-                role,
-                model,
-                job,
-                job_file,
-                digest,
-                mutation,
-            } => {
-                // `--job` wins; `--job-file` reads only when given — an
-                // omitted job is "keep" on an edit, never a stdin read.
-                let job_text = match (job, job_file) {
-                    (Some(text), _) => Some(text.clone()),
-                    (None, file) => file
-                        .as_deref()
-                        .map(|f| read_payload_file(state_dir, Some(f)))
-                        .transpose()?,
-                };
-                let mut payload = put_payload(
-                    id,
-                    &[
-                        ("role", role.map(RoleArg::as_str).map(|r| json!(r))),
-                        ("model", model.clone().map(Value::String)),
-                        ("job", job_text.map(Value::String)),
-                    ],
-                );
-                bind_digest(&mut payload, digest.as_deref())?;
-                params(
-                    "profile.put",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-            ProfileAction::Rename { id, to, mutation } => {
-                let mut payload = id_payload(id);
-                payload.insert("to".to_string(), json!(to));
-                params(
-                    "profile.rename",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-            ProfileAction::Remove { id, mutation } => params(
-                "profile.remove",
-                Some(mutation.expected_revision.clone()),
-                id_payload(id),
-            )?,
-            ProfileAction::Sync {
-                profile,
-                all: _,
-                mutation,
-            } => {
-                let mut payload = Map::new();
-                payload.insert(
-                    "profile".to_string(),
-                    profile.clone().map(Value::String).unwrap_or(Value::Null),
-                );
-                params(
-                    "profile.sync",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-            ProfileAction::Preview {
-                profile,
-                harness,
-                mutation,
-            } => {
-                let mut payload = Map::new();
-                payload.insert("profile".to_string(), json!(profile));
-                payload.insert("harness".to_string(), json!(harness));
-                params(
-                    "profile.preview",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-        },
-        AgentsAction::Pin { action } => match action {
-            PinAction::List => params("pin.list", None, Map::new())?,
-            PinAction::Put {
-                pkg,
-                pinned,
-                mutation,
-            } => {
-                let mut payload = Map::new();
-                payload.insert("pkg".to_string(), json!(pkg));
-                payload.insert("pinned".to_string(), json!(pinned));
-                params("pin.put", Some(mutation.expected_revision.clone()), payload)?
-            }
-            PinAction::Remove { pkg, mutation } => {
-                let mut payload = Map::new();
-                payload.insert("pkg".to_string(), json!(pkg));
-                params(
-                    "pin.remove",
-                    Some(mutation.expected_revision.clone()),
-                    payload,
-                )?
-            }
-        },
-        AgentsAction::History => params("history", None, Map::new())?,
-        AgentsAction::Grant { action } => match action {
-            GrantAction::Request {
-                operation,
-                payload,
-                payload_file,
-                expected_revision,
-                reason,
-            } => {
-                let text = match (payload, payload_file) {
-                    (Some(text), _) => text.clone(),
-                    (None, file) => file
-                        .as_deref()
-                        .map(|f| read_payload_file(state_dir, Some(f)))
-                        .transpose()?
-                        .ok_or_else(|| {
-                            Error::usage(
-                                "grant request needs --payload or --payload-file — the exact operation payload the grant must bind",
-                            )
-                        })?,
-                };
-                let intended: Value = serde_json::from_str(&text).map_err(|err| {
-                    Error::invalid("invalid_request", format!("--payload is not JSON: {err}"))
-                })?;
-                if !intended.is_object() {
-                    return Err(Error::invalid(
-                        "invalid_request",
-                        "--payload must be a JSON object — the exact operation payload",
-                    ));
-                }
-                let mut p = Map::new();
-                p.insert("operation".to_string(), json!(operation));
-                p.insert(
-                    "expected_revision".to_string(),
-                    expected_revision
-                        .clone()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null),
-                );
-                p.insert("payload".to_string(), intended);
-                p.insert("reason".to_string(), json!(reason));
-                params("grant.request", None, p)?
-            }
-            GrantAction::List => params("grant.list", None, Map::new())?,
-            GrantAction::Allow {
-                request_id,
-                expected_revision,
-            } => {
-                let mut payload = Map::new();
-                payload.insert("request_id".to_string(), json!(request_id));
-                params("grant.allow", Some(expected_revision.clone()), payload)?
-            }
-            GrantAction::Reject {
-                request_id,
-                expected_revision,
-            } => {
-                let mut payload = Map::new();
-                payload.insert("request_id".to_string(), json!(request_id));
-                params("grant.reject", Some(expected_revision.clone()), payload)?
-            }
-            GrantAction::Revoke { grant_id } => {
-                let mut payload = Map::new();
-                payload.insert("grant_id".to_string(), json!(grant_id));
-                params("grant.revoke", None, payload)?
-            }
-        },
+        } => plan_apply(
+            state_dir,
+            file.as_deref(),
+            &mutation.expected_revision,
+            digest.as_deref(),
+        )?,
+        AgentsAction::Harness { action } => plan_harness(action),
+        AgentsAction::Provider { action } => plan_provider(action),
+        AgentsAction::Model { action } => plan_model(action),
+        AgentsAction::Catalog { action } => plan_catalog(action),
+        AgentsAction::Role { action } => plan_role(action),
+        AgentsAction::Profile { action } => plan_profile(state_dir, action)?,
+        AgentsAction::Pin { action } => plan_pin(action),
+        AgentsAction::History => planned("history", None, Map::new()),
+        AgentsAction::Grant { action } => plan_grant(state_dir, action)?,
     };
     // A grant binds an operation — never the grant surface itself.
-    if !planned.0.starts_with("grant.") {
-        bind_grant(&mut planned.2, grant);
+    if !planned_req.0.starts_with("grant.") {
+        bind_grant(&mut planned_req.2, grant);
     }
-    Ok(planned)
+    Ok(planned_req)
 }
 
 /// Wrap one planned request into the `agent_settings_command` params.
