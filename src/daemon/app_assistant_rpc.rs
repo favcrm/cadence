@@ -192,6 +192,343 @@ pub(super) fn public_operation(mut op: Value) -> Value {
     op
 }
 
+struct AgentAssistantCall<'a> {
+    records: &'a RecordStore,
+    scoped: &'a super::app_content_rpc::ScopedChat,
+    descriptor_digest: &'a str,
+    params: &'a Value,
+    peer_pid: u32,
+}
+
+struct InvokeAction<'a> {
+    operation_id: &'a str,
+    action_id: &'a str,
+    input: &'a Value,
+}
+
+fn allowed_agent_assistant_fields(method: &str) -> Result<&'static [&'static str]> {
+    match method {
+        "app_assistant_actions" => Ok(&["install_id", "context_id", "message", "token"]),
+        "app_assistant_invoke" => Ok(&[
+            "install_id",
+            "context_id",
+            "message",
+            "token",
+            "action_id",
+            "operation_id",
+            "input",
+        ]),
+        "app_assistant_operation_show" => Ok(&[
+            "install_id",
+            "context_id",
+            "message",
+            "token",
+            "operation_id",
+        ]),
+        _ => Err(Error::rejected("unknown assistant agent method")),
+    }
+}
+
+fn show_agent_assistant_operation(
+    records: &RecordStore,
+    scoped: &super::app_content_rpc::ScopedChat,
+    params: &Value,
+) -> Result<Value> {
+    let op = records
+        .app_assistant_operation_get(required_str(params, "operation_id")?, &scoped.context)?;
+    // CAD-1636: a WhatsApp operation's stored output reads back only
+    // in that conversation's own subject chat; a row without a
+    // stored conversation id refuses.
+    if op["action_id"]
+        .as_str()
+        .is_none_or(|action| action.starts_with("whatsapp."))
+    {
+        let conversation = op["_input"]["conversation_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("WhatsApp assistant operation names no conversation"))?;
+        scoped.require_whatsapp(conversation)?;
+    }
+    let op = normalize_interrupted_operation(records, &scoped.context, op)?;
+    Ok(json!({"operation": op}))
+}
+
+fn record_agent_operation_failure(
+    records: &RecordStore,
+    context: &str,
+    operation_id: &str,
+    error: &Error,
+) {
+    let definite_refusal = assistant_error_is_definite_refusal(error);
+    let (status, summary, detail) = if definite_refusal {
+        (
+            "failed",
+            "Action was refused",
+            "Action was refused without a recorded change",
+        )
+    } else {
+        (
+            "unknown",
+            "Action outcome is uncertain; operator review required",
+            "Outcome may be uncertain; do not retry automatically",
+        )
+    };
+    let _ = records.app_assistant_operation_set(AssistantOperationUpdate {
+        operation_id,
+        context,
+        expected_revision: 1,
+        status,
+        summary,
+        result: &Value::Null,
+        resource_refs: &Value::Array(vec![]),
+        permission_request: &Value::Null,
+        error: Some(detail),
+    });
+}
+
+fn build_segment_save_params(
+    scoped: &super::app_content_rpc::ScopedChat,
+    params: &Value,
+    input: &Value,
+    static_segment: bool,
+) -> Result<Value> {
+    let mut segment_params = json!({
+        "install_id": &scoped.install,
+        "context_id": &scoped.context,
+        "segment_id": required_str(input, "segment_id")?,
+        "name": super::app_audiences_rpc::audience_name(input)?,
+        "message": required_str(params, "message")?,
+        "token": required_str(params, "token")?,
+    });
+    if static_segment {
+        segment_params["segment_type"] = json!("static");
+        segment_params["member_ids"] = input
+            .get("member_ids")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+    } else {
+        segment_params["predicates"] = input.get("predicates").cloned().unwrap_or(Value::Null);
+    }
+    if let Some(expected_revision) = input.get("expected_revision") {
+        segment_params["expected_revision"] = expected_revision.clone();
+    }
+    Ok(segment_params)
+}
+
+fn execute_customer_action(
+    records: &RecordStore,
+    scoped: &super::app_content_rpc::ScopedChat,
+    invoke: &InvokeAction<'_>,
+) -> Result<Value> {
+    let input = invoke.input;
+    match invoke.action_id {
+        "customers.search" => records.app_record_list_paged(
+            &scoped.context,
+            input.get("query").and_then(Value::as_str),
+            input
+                .get("limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(20)
+                .clamp(1, 20),
+            input.get("cursor").and_then(Value::as_str),
+        ),
+        "customers.show" => {
+            records.app_record_show(&scoped.context, required_str(input, "customer_id")?)
+        }
+        "customers.notes.list" => records.app_note_list(
+            &scoped.context,
+            required_str(input, "customer_id")?,
+            input
+                .get("limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(crate::store::app_records::NOTE_PAGE_MAX),
+        ),
+        "customers.notes.create" => records.app_note_create(
+            &scoped.context,
+            required_str(input, "customer_id")?,
+            required_str(input, "note_id")?,
+            required_str(input, "body")?,
+            &format!("agent:{}", scoped.caller),
+        ),
+        "customers.notes.delete" => records.app_note_delete(
+            &scoped.context,
+            required_str(input, "customer_id")?,
+            required_str(input, "note_id")?,
+            &format!("agent:{}", scoped.caller),
+        ),
+        _ => Err(Error::rejected("unknown assistant action")),
+    }
+}
+
+fn execute_campaign_and_send_action(
+    records: &RecordStore,
+    scoped: &super::app_content_rpc::ScopedChat,
+    invoke: &InvokeAction<'_>,
+) -> Result<Value> {
+    let input = invoke.input;
+    match invoke.action_id {
+        "campaigns.list" => records.app_content_list(&scoped.context),
+        "campaigns.show" => {
+            records.app_content_show(&scoped.context, required_str(input, "campaign_id")?)
+        }
+        "campaigns.create_draft" => {
+            if let Some(segment) = input.get("segment_id").and_then(Value::as_str) {
+                records.app_segment_show(&scoped.context, segment)?;
+            }
+            let campaign = required_str(input, "campaign_id")?;
+            let name = required_str(input, "name")?;
+            let subject = "Campaign draft";
+            let block = json!({"type":"paragraph","text":"Draft content — review and edit before applying."});
+            let mut draft = crate::store::app_content::Draft::parse(subject, "", &[block])?;
+            draft.name = Some(name.to_string());
+            records.app_content_create_assistant(
+                &scoped.context,
+                campaign,
+                &scoped.caller,
+                invoke.operation_id,
+                &draft,
+                input.get("segment_id").and_then(Value::as_str),
+            )
+        }
+        "campaigns.apply" => {
+            let proposal = required_str(input, "proposal_id")?;
+            let shown = records.app_content_proposal_show(&scoped.context, proposal)?;
+            if let Some(campaign) = shown
+                .pointer("/proposal/campaign_id")
+                .and_then(Value::as_str)
+            {
+                scoped.require_campaign(campaign)?;
+            }
+            records.app_content_proposal_apply(
+                &scoped.context,
+                proposal,
+                input.get("expected_revision").and_then(Value::as_i64),
+            )
+        }
+        "campaigns.discard" => {
+            let proposal = required_str(input, "proposal_id")?;
+            let shown = records.app_content_proposal_show(&scoped.context, proposal)?;
+            if let Some(campaign) = shown
+                .pointer("/proposal/campaign_id")
+                .and_then(Value::as_str)
+            {
+                scoped.require_campaign(campaign)?;
+            }
+            records.app_content_proposal_discard(&scoped.context, proposal)
+        }
+        "campaigns.approve" => records.app_content_approve(
+            &scoped.context,
+            required_str(input, "campaign_id")?,
+            input
+                .get("expected_revision")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| Error::rejected("expected content revision is required"))?,
+        ),
+        "audiences.prepare" => {
+            let base = AudienceBase::parse(
+                input
+                    .get("base")
+                    .ok_or_else(|| Error::rejected("audience base is required"))?,
+            )
+            .map_err(|_| Error::rejected("audience base exceeds its supported grammar"))?;
+            records.app_audience_prepare(
+                &scoped.context,
+                required_str(input, "freeze_id")?,
+                &base,
+                input.get("exclusion_list_id").and_then(Value::as_str),
+                input
+                    .get("max_recipients")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::rejected("audience maximum recipients is required"))?,
+            )
+        }
+        "audiences.show" => {
+            records.app_audience_show(&scoped.context, required_str(input, "freeze_id")?)
+        }
+        "sends.list" => {
+            let requested = input.get("campaign_id").and_then(Value::as_str);
+            if let Some(campaign) = requested {
+                scoped.require_campaign(campaign)?;
+            }
+            // A campaign-scoped conversation defaults to its own
+            // campaign; only a General chat may list the context.
+            // Any other subject kind fails closed.
+            let campaign = campaign_scope(requested, scoped.subject.as_deref())?;
+            let sends = records.app_campaign_sends(&scoped.context, campaign)?;
+            let mut out = Vec::with_capacity(sends.len());
+            for send in &sends {
+                let counts =
+                    records.app_campaign_delivery_counts(&scoped.context, &send.send_id)?;
+                out.push(json!({
+                    "send_id": send.send_id,
+                    "campaign_id": send.campaign_id,
+                    "state": send.state,
+                    "send_digest": send.send_digest,
+                    "created": send.created,
+                    "approved_at": send.approved_at,
+                    "counts": counts,
+                    "delivery_claim": "smtp-acceptance-only",
+                }));
+            }
+            Ok(json!({"sends": out}))
+        }
+        "sends.show" => {
+            let send_id = required_str(input, "send_id")?;
+            let send = records
+                .app_campaign_send(&scoped.context, send_id)?
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "campaign send is unavailable for this installation and context",
+                    )
+                })?;
+            scoped.require_campaign(&send.campaign_id)?;
+            let deliveries = records.app_campaign_deliveries(&scoped.context, send_id)?;
+            let counts = records.app_campaign_delivery_counts(&scoped.context, send_id)?;
+            Ok(send_view(
+                &scoped.install,
+                &scoped.context,
+                &send,
+                &deliveries,
+                counts,
+            ))
+        }
+        "email.draft" => {
+            let draft_value = input
+                .get("draft")
+                .filter(|value| value.is_object())
+                .ok_or_else(|| Error::rejected("structured email draft is required"))?;
+            let draft_fields = draft_value.as_object().unwrap();
+            if draft_fields
+                .keys()
+                .any(|key| !matches!(key.as_str(), "subject" | "preheader" | "blocks"))
+            {
+                return Err(Error::rejected("email draft has unsupported fields"));
+            }
+            let subject = draft_value
+                .get("subject")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::rejected("email draft subject is required"))?;
+            let preheader = draft_value
+                .get("preheader")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let blocks = draft_value
+                .get("blocks")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Error::rejected("email draft blocks are required"))?;
+            let draft = crate::store::app_content::Draft::parse(subject, preheader, blocks)?;
+            records.app_content_assistant_draft(
+                &scoped.context,
+                required_str(input, "campaign_id")?,
+                required_str(input, "proposal_id")?,
+                &draft,
+                &scoped.caller,
+                &scoped.message_id,
+            )
+        }
+        _ => Err(Error::rejected("unknown assistant action")),
+    }
+}
+
 impl Shared {
     /// CAD-1700: the agent assistant entry. The master push revision is
     /// bumped AFTER the call, on success and failure alike, so a watcher
@@ -215,27 +552,7 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        let allowed: &[&str] = match method {
-            "app_assistant_actions" => &["install_id", "context_id", "message", "token"],
-            "app_assistant_invoke" => &[
-                "install_id",
-                "context_id",
-                "message",
-                "token",
-                "action_id",
-                "operation_id",
-                "input",
-            ],
-            "app_assistant_operation_show" => &[
-                "install_id",
-                "context_id",
-                "message",
-                "token",
-                "operation_id",
-            ],
-            _ => return Err(Error::rejected("unknown assistant agent method")),
-        };
-        exact(params, allowed)?;
+        exact(params, allowed_agent_assistant_fields(method)?)?;
         let _assistant_guard = if matches!(
             method,
             "app_assistant_invoke" | "app_assistant_operation_show"
@@ -253,70 +570,78 @@ impl Shared {
             self.scoped_chat_assistant(params, peer_pid, method, "app assistant action")?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         if method == "app_assistant_operation_show" {
-            let op = records.app_assistant_operation_get(
-                required_str(params, "operation_id")?,
-                &scoped.context,
-            )?;
-            // CAD-1636: a WhatsApp operation's stored output reads back only
-            // in that conversation's own subject chat; a row without a
-            // stored conversation id refuses.
-            if op["action_id"]
-                .as_str()
-                .is_none_or(|action| action.starts_with("whatsapp."))
-            {
-                let conversation = op["_input"]["conversation_id"].as_str().ok_or_else(|| {
-                    Error::rejected("WhatsApp assistant operation names no conversation")
-                })?;
-                scoped.require_whatsapp(conversation)?;
-            }
-            let op = normalize_interrupted_operation(&records, &scoped.context, op)?;
-            return Ok(json!({"operation":op}));
+            return show_agent_assistant_operation(&records, &scoped, params);
         }
         // The consented descriptor is the allow-list (CAD-1518): only the
         // registered actions it declares are listed or invoked.
         let (descriptor_digest, descriptor) = install_descriptor(self, &scoped.install)?;
         if method == "app_assistant_actions" {
-            let declared = descriptor
-                .get("actions")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::rejected("assistant descriptor actions are invalid"))?;
-            let mut actions = Vec::new();
-            let full = self.store.crm_autonomy_is_full()?;
-            for row in declared {
-                let Some(id) = row.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(meta) = crate::app_assistant::registered_action(id) else {
-                    continue;
-                };
-                let confirmation = if full && id == "customer.tags.update" {
-                    "none"
-                } else {
-                    meta.confirmation
-                };
-                actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":confirmation,"availability":"available"}));
-            }
-            actions.extend(super::app_record_actions_rpc::declared_record_actions(
-                self,
-                &scoped.install,
-            )?);
-            return Ok(
-                json!({"contract":crate::issue::app_assistant::CONTRACT,"actions":actions,"descriptor_digest":descriptor_digest}),
-            );
+            return self.list_agent_assistant_actions(&scoped, &descriptor_digest, &descriptor);
         }
-        let action_id = required_str(params, "action_id")?;
-        let input = params
+        let call = AgentAssistantCall {
+            records: &records,
+            scoped: &scoped,
+            descriptor_digest: &descriptor_digest,
+            params,
+            peer_pid,
+        };
+        self.invoke_agent_assistant_action(&call, &descriptor)
+    }
+
+    fn list_agent_assistant_actions(
+        &self,
+        scoped: &super::app_content_rpc::ScopedChat,
+        descriptor_digest: &str,
+        descriptor: &Value,
+    ) -> Result<Value> {
+        let declared = descriptor
+            .get("actions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::rejected("assistant descriptor actions are invalid"))?;
+        let mut actions = Vec::new();
+        let full = self.store.crm_autonomy_is_full()?;
+        for row in declared {
+            let Some(id) = row.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(meta) = crate::app_assistant::registered_action(id) else {
+                continue;
+            };
+            let confirmation = if full && id == "customer.tags.update" {
+                "none"
+            } else {
+                meta.confirmation
+            };
+            actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":confirmation,"availability":"available"}));
+        }
+        actions.extend(super::app_record_actions_rpc::declared_record_actions(
+            self,
+            &scoped.install,
+        )?);
+        Ok(
+            json!({"contract":crate::issue::app_assistant::CONTRACT,"actions":actions,"descriptor_digest":descriptor_digest}),
+        )
+    }
+
+    fn invoke_agent_assistant_action(
+        self: &Arc<Self>,
+        call: &AgentAssistantCall<'_>,
+        descriptor: &Value,
+    ) -> Result<Value> {
+        let action_id = required_str(call.params, "action_id")?;
+        let input = call
+            .params
             .get("input")
             .filter(|v| v.is_object())
             .ok_or_else(|| Error::rejected("assistant action input must be an object"))?;
         // CAD-1415: a package-declared record action (not a host-registry id)
         // parks its own pending operation; the host registry is unchanged.
         if crate::app_assistant::registered_action(action_id).is_none() {
-            let operation_id = required_str(params, "operation_id")?;
+            let operation_id = required_str(call.params, "operation_id")?;
             return super::app_record_actions_rpc::invoke_record_action(
                 self,
-                &records,
-                &scoped,
+                call.records,
+                call.scoped,
                 operation_id,
                 action_id,
                 input,
@@ -333,6 +658,64 @@ impl Shared {
             ));
         }
         crate::app_assistant::validate_input(&meta.input_schema, input)?;
+        self.enforce_agent_action_subject_scope(call.scoped, action_id, input)?;
+        let operation_id = required_str(call.params, "operation_id")?;
+        let semantic = crate::store::app_runs::material_digest(
+            &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action_id,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":call.descriptor_digest,"input":input}),
+        );
+        let (op, is_new) = call.records.app_assistant_operation_create(
+            operation_id,
+            &call.scoped.context,
+            action_id,
+            &semantic,
+            input,
+        )?;
+        if !is_new {
+            let op = normalize_interrupted_operation(call.records, &call.scoped.context, op)?;
+            if action_id == "media.refine.prepare" && op["result"]["run_id"].as_str().is_some() {
+                // Normalization strips `_input` for the wire. Resume reloads
+                // the stored private record and keeps that same run.
+                let private = call
+                    .records
+                    .app_assistant_operation_get(operation_id, &call.scoped.context)?;
+                return self.refine_resume(
+                    call.records,
+                    &call.scoped.install,
+                    &call.scoped.context,
+                    &call.scoped.message_id,
+                    &private,
+                );
+            }
+            return Ok(json!({"operation": op}));
+        }
+        if op.get("status").and_then(Value::as_str) != Some("running") {
+            return Ok(json!({"operation": public_operation(op)}));
+        }
+        let invoke = InvokeAction {
+            operation_id,
+            action_id,
+            input,
+        };
+        match self.execute_agent_assistant_action(call, &invoke, &meta) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                record_agent_operation_failure(
+                    call.records,
+                    &call.scoped.context,
+                    operation_id,
+                    &error,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn enforce_agent_action_subject_scope(
+        &self,
+        scoped: &super::app_content_rpc::ScopedChat,
+        action_id: &str,
+        input: &Value,
+    ) -> Result<()> {
         if matches!(
             action_id,
             "campaigns.show" | "campaigns.create_draft" | "campaigns.approve" | "email.draft"
@@ -348,510 +731,300 @@ impl Shared {
             self.whatsapp_door()?;
             scoped.require_whatsapp(required_str(input, "conversation_id")?)?;
         }
-        let operation_id = required_str(params, "operation_id")?;
-        let semantic = crate::store::app_runs::material_digest(
-            &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action_id,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest,"input":input}),
-        );
-        let (mut op, is_new) = records.app_assistant_operation_create(
-            operation_id,
-            &scoped.context,
-            action_id,
-            &semantic,
-            input,
-        )?;
-        if !is_new {
-            let op = normalize_interrupted_operation(&records, &scoped.context, op)?;
-            if action_id == "media.refine.prepare" && op["result"]["run_id"].as_str().is_some() {
-                // Normalization strips `_input` for the wire. Resume reloads
-                // the stored private record and keeps that same run.
-                let private = records.app_assistant_operation_get(operation_id, &scoped.context)?;
-                return self.refine_resume(
-                    &records,
-                    &scoped.install,
-                    &scoped.context,
-                    &scoped.message_id,
-                    &private,
-                );
-            }
-            return Ok(json!({"operation":op}));
+        Ok(())
+    }
+
+    fn execute_agent_assistant_action(
+        self: &Arc<Self>,
+        call: &AgentAssistantCall<'_>,
+        invoke: &InvokeAction<'_>,
+        meta: &crate::app_assistant::RegisteredAction,
+    ) -> Result<Value> {
+        if invoke.action_id == "media.refine.prepare" {
+            return self.refine_request_permission(
+                call.records,
+                &call.scoped.install,
+                &call.scoped.context,
+                &call.scoped.message_id,
+                invoke.operation_id,
+                invoke.input,
+            );
         }
-        if op.get("status").and_then(Value::as_str) != Some("running") {
-            return Ok(json!({"operation":public_operation(op)}));
+        if is_paid_social(invoke.action_id) {
+            return self.social_request_permission(
+                call.records,
+                &call.scoped.install,
+                &call.scoped.context,
+                invoke.operation_id,
+                invoke.action_id,
+                invoke.input,
+            );
         }
-        let execution = (|| -> Result<Value> {
-            if action_id == "media.refine.prepare" {
-                return self.refine_request_permission(
-                    &records,
-                    &scoped.install,
-                    &scoped.context,
-                    &scoped.message_id,
-                    operation_id,
-                    input,
-                );
-            }
-            if is_paid_social(action_id) {
-                return self.social_request_permission(
-                    &records,
-                    &scoped.install,
-                    &scoped.context,
-                    operation_id,
-                    action_id,
-                    input,
-                );
-            }
-            if action_id == "customer.tags.update" {
-                let customer = required_str(input, "customer_id")?;
-                // Exact customer scope and current revision are checked before
-                // presenting permission. No profile field except tags is stored.
-                let old = records.app_record_show(&scoped.context, customer)?;
-                let old_revision = old
-                    .pointer("/record/revision")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| Error::rejected("customer record revision unavailable"))?;
-                if input.get("expected_revision").and_then(Value::as_i64) != Some(old_revision) {
-                    return Err(Error::rejected("customer record revision is stale"));
-                }
-                if records
-                    .app_assistant_permission_find(&scoped.context, action_id, customer, "deny")?
-                    .is_some_and(|p| p["state"].as_str() == Some("active"))
-                {
-                    return Err(Error::rejected("this action is blocked for this customer"));
-                }
-                if self.store.crm_autonomy_is_full()? {
-                    let mut profile = crate::store::app_records::CustomerProfile::parse(
-                        &old["record"]["profile"],
-                    )
-                    .map_err(|_| Error::rejected("customer profile cannot be safely updated"))?;
-                    profile.tags = serde_json::from_value(input["tags"].clone())
-                        .map_err(|_| Error::rejected("customer tags are invalid"))?;
-                    let updated = records.app_record_update_as_actor(
-                        &scoped.context,
-                        customer,
-                        old_revision,
-                        &profile,
-                        None,
-                        &format!("agent:{}", scoped.caller),
-                        None,
-                    )?;
-                    let op = records.app_assistant_operation_set(AssistantOperationUpdate {
-                        operation_id,
-                        context: &scoped.context,
-                        expected_revision: 1,
-                        status: "succeeded",
-                        summary: "Updated tags on one customer",
-                        result: &json!({
-                            "customer_id": customer,
-                            "tags": updated.pointer("/record/profile/tags").cloned().unwrap_or(json!([])),
-                            "revision": updated.pointer("/record/revision"),
-                        }),
-                        resource_refs: &json!([{
-                            "kind": "customer",
-                            "id": customer,
-                            "label": old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer"),
-                        }]),
-                        permission_request: &Value::Null,
-                        error: None,
-                    })?;
-                    return Ok(json!({"operation": op}));
-                }
-                let mut refs = vec![
-                    json!({"kind":"customer","id":customer,"label":old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer")}),
-                ];
-                let before_tags = old
-                    .pointer("/record/profile/tags")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .ok_or_else(|| Error::rejected("customer tags are unavailable"))?;
-                let after_tags = input
-                    .get("tags")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .ok_or_else(|| Error::rejected("customer tags are invalid"))?;
-                let preview = json!({"customer_label":old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer"),"before_tags":before_tags,"after_tags":after_tags,"expected_revision":old_revision});
-                let pinned = grant_digest(action_id, &meta, &descriptor_digest);
-                if records
-                    .app_assistant_permission_find(&scoped.context, action_id, customer, "deny")?
-                    .is_some_and(|p| p["state"].as_str() == Some("active"))
-                {
-                    op = records.app_assistant_operation_set(AssistantOperationUpdate {
-                        operation_id,
-                        context: &scoped.context,
-                        expected_revision: 1,
-                        status: "denied",
-                        summary: "This action is blocked for this customer",
-                        result: &Value::Null,
-                        resource_refs: &Value::Array(vec![]),
-                        permission_request: &Value::Null,
-                        error: None,
-                    })?;
-                    return Ok(json!({"operation":op}));
-                }
-                if let Some(grant) = records
-                    .app_assistant_permission_find(&scoped.context, action_id, customer, "allow")?
-                    .filter(|p| p["state"].as_str() == Some("active"))
-                {
-                    if grant["semantics_digest"].as_str() != Some(pinned.as_str()) {
-                        op = records.app_assistant_operation_set(AssistantOperationUpdate {
-                            operation_id,
-                            context: &scoped.context,
-                            expected_revision: 1,
-                            status: "failed",
-                            summary: "Permission semantics changed; review and grant again",
-                            result: &Value::Null,
-                            resource_refs: &Value::Array(vec![]),
-                            permission_request: &Value::Null,
-                            error: Some("permission semantics changed"),
-                        })?;
-                        return Ok(json!({"operation":op}));
-                    }
-                    let mut profile = crate::store::app_records::CustomerProfile::parse(
-                        &old["record"]["profile"],
-                    )
-                    .map_err(|_| Error::rejected("customer profile cannot be safely updated"))?;
-                    profile.tags = serde_json::from_value(input["tags"].clone())
-                        .map_err(|_| Error::rejected("customer tags are invalid"))?;
-                    let updated = records.app_record_update(
-                        &scoped.context,
-                        customer,
-                        old_revision,
-                        &profile,
-                        None,
-                    )?;
-                    op = records.app_assistant_operation_set(AssistantOperationUpdate {
-                        operation_id,
-                        context: &scoped.context,
-                        expected_revision: 1,
-                        status: "succeeded",
-                        summary: "Updated tags on one customer",
-                        result: &json!({"customer_id":customer,"tags":updated.pointer("/record/profile/tags").cloned().unwrap_or(json!([])),"revision":updated.pointer("/record/revision")}),
-                        resource_refs: &json!([{"kind":"customer","id":customer,"label":preview["customer_label"]}]),
-                        permission_request: &Value::Null,
-                        error: None,
-                    })?;
-                    return Ok(json!({"operation":op}));
-                }
-                op = records.app_assistant_operation_set(AssistantOperationUpdate {
-                    operation_id,
-                    context: &scoped.context,
-                    expected_revision: 1,
-                    status: "pending_permission",
-                    summary: "Review this tags-only customer change",
-                    result: &json!({"preview":preview}),
-                    resource_refs: &Value::Array(std::mem::take(&mut refs)),
-                    permission_request: &json!({"reason":"Change tags on one customer","scope":{"install_id":scoped.install,"context_id":scoped.context,"action_id":action_id,"resource_id":customer},"allow_always":true,"preview":preview}),
-                    error: None,
-                })?;
-                return Ok(json!({"operation":op}));
-            }
-            let result = match action_id {
-                "customers.search" => records.app_record_list_paged(
-                    &scoped.context,
-                    input.get("query").and_then(Value::as_str),
-                    input
-                        .get("limit")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(20)
-                        .clamp(1, 20),
-                    input.get("cursor").and_then(Value::as_str),
-                ),
-                "customers.show" => {
-                    records.app_record_show(&scoped.context, required_str(input, "customer_id")?)
-                }
-                "customers.notes.list" => records.app_note_list(
-                    &scoped.context,
-                    required_str(input, "customer_id")?,
-                    input
-                        .get("limit")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(crate::store::app_records::NOTE_PAGE_MAX),
-                ),
-                "customers.notes.create" => records.app_note_create(
-                    &scoped.context,
-                    required_str(input, "customer_id")?,
-                    required_str(input, "note_id")?,
-                    required_str(input, "body")?,
-                    &format!("agent:{}", scoped.caller),
-                ),
-                "customers.notes.delete" => records.app_note_delete(
-                    &scoped.context,
-                    required_str(input, "customer_id")?,
-                    required_str(input, "note_id")?,
-                    &format!("agent:{}", scoped.caller),
-                ),
-                "segments.list" => records.app_segment_list(&scoped.context),
-                "segments.show" => {
-                    records.app_segment_show(&scoped.context, required_str(input, "segment_id")?)
-                }
-                "segments.preview" => {
-                    records.app_segment_preview(&scoped.context, required_str(input, "segment_id")?)
-                }
-                "segments.save" => {
-                    let mut segment_params = json!({
-                        "install_id": &scoped.install,
-                        "context_id": &scoped.context,
-                        "segment_id": required_str(input, "segment_id")?,
-                        "name": super::app_audiences_rpc::audience_name(input)?,
-                        "predicates": input.get("predicates").cloned().unwrap_or(Value::Null),
-                        "message": required_str(params, "message")?,
-                        "token": required_str(params, "token")?,
-                    });
-                    if let Some(expected_revision) = input.get("expected_revision") {
-                        segment_params["expected_revision"] = expected_revision.clone();
-                    }
-                    self.rpc_app_segment_assistant_save(&segment_params, peer_pid)
-                }
-                "segments.save_static" => {
-                    let mut segment_params = json!({
-                        "install_id": &scoped.install,
-                        "context_id": &scoped.context,
-                        "segment_id": required_str(input, "segment_id")?,
-                        "name": super::app_audiences_rpc::audience_name(input)?,
-                        "segment_type": "static",
-                        "member_ids": input.get("member_ids").cloned().unwrap_or_else(|| json!([])),
-                        "message": required_str(params, "message")?,
-                        "token": required_str(params, "token")?,
-                    });
-                    if let Some(expected_revision) = input.get("expected_revision") {
-                        segment_params["expected_revision"] = expected_revision.clone();
-                    }
-                    self.rpc_app_segment_assistant_save(&segment_params, peer_pid)
-                }
-                "segments.delete" => {
-                    records.app_segment_delete(&scoped.context, required_str(input, "segment_id")?)
-                }
-                "social.draft.compose" => self.social_compose(
-                    &records,
-                    &scoped.install,
-                    &scoped.context,
-                    operation_id,
-                    &scoped.caller,
-                    input,
-                ),
-                "social.drafts.attach_image" => self.social_drafts_attach_image(
-                    &records,
-                    &scoped.install,
-                    &scoped.context,
-                    operation_id,
-                    &scoped.caller,
-                    input,
-                ),
-                "social.drafts.status" => self.social_status(&records, &scoped.context),
-                "campaigns.list" => records.app_content_list(&scoped.context),
-                "campaigns.show" => {
-                    records.app_content_show(&scoped.context, required_str(input, "campaign_id")?)
-                }
-                "campaigns.create_draft" => {
-                    if let Some(segment) = input.get("segment_id").and_then(Value::as_str) {
-                        records.app_segment_show(&scoped.context, segment)?;
-                    }
-                    let campaign = required_str(input, "campaign_id")?;
-                    let name = required_str(input, "name")?;
-                    let subject = "Campaign draft";
-                    let block = json!({"type":"paragraph","text":"Draft content — review and edit before applying."});
-                    let mut draft = crate::store::app_content::Draft::parse(subject, "", &[block])?;
-                    draft.name = Some(name.to_string());
-                    records.app_content_create_assistant(
-                        &scoped.context,
-                        campaign,
-                        &scoped.caller,
-                        operation_id,
-                        &draft,
-                        input.get("segment_id").and_then(Value::as_str),
-                    )
-                }
-                "campaigns.apply" => {
-                    let proposal = required_str(input, "proposal_id")?;
-                    let shown = records.app_content_proposal_show(&scoped.context, proposal)?;
-                    if let Some(campaign) = shown
-                        .pointer("/proposal/campaign_id")
-                        .and_then(Value::as_str)
-                    {
-                        scoped.require_campaign(campaign)?;
-                    }
-                    records.app_content_proposal_apply(
-                        &scoped.context,
-                        proposal,
-                        input.get("expected_revision").and_then(Value::as_i64),
-                    )
-                }
-                "campaigns.discard" => {
-                    let proposal = required_str(input, "proposal_id")?;
-                    let shown = records.app_content_proposal_show(&scoped.context, proposal)?;
-                    if let Some(campaign) = shown
-                        .pointer("/proposal/campaign_id")
-                        .and_then(Value::as_str)
-                    {
-                        scoped.require_campaign(campaign)?;
-                    }
-                    records.app_content_proposal_discard(&scoped.context, proposal)
-                }
-                "campaigns.approve" => records.app_content_approve(
-                    &scoped.context,
-                    required_str(input, "campaign_id")?,
-                    input
-                        .get("expected_revision")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| Error::rejected("expected content revision is required"))?,
-                ),
-                "audiences.prepare" => {
-                    let base = AudienceBase::parse(
-                        input
-                            .get("base")
-                            .ok_or_else(|| Error::rejected("audience base is required"))?,
-                    )
-                    .map_err(|_| Error::rejected("audience base exceeds its supported grammar"))?;
-                    records.app_audience_prepare(
-                        &scoped.context,
-                        required_str(input, "freeze_id")?,
-                        &base,
-                        input.get("exclusion_list_id").and_then(Value::as_str),
-                        input
-                            .get("max_recipients")
-                            .and_then(Value::as_i64)
-                            .ok_or_else(|| {
-                                Error::rejected("audience maximum recipients is required")
-                            })?,
-                    )
-                }
-                "audiences.show" => {
-                    records.app_audience_show(&scoped.context, required_str(input, "freeze_id")?)
-                }
-                "sends.list" => {
-                    let requested = input.get("campaign_id").and_then(Value::as_str);
-                    if let Some(campaign) = requested {
-                        scoped.require_campaign(campaign)?;
-                    }
-                    // A campaign-scoped conversation defaults to its own
-                    // campaign; only a General chat may list the context.
-                    // Any other subject kind fails closed.
-                    let campaign = campaign_scope(requested, scoped.subject.as_deref())?;
-                    let sends = records.app_campaign_sends(&scoped.context, campaign)?;
-                    let mut out = Vec::with_capacity(sends.len());
-                    for send in &sends {
-                        let counts =
-                            records.app_campaign_delivery_counts(&scoped.context, &send.send_id)?;
-                        out.push(json!({
-                            "send_id": send.send_id,
-                            "campaign_id": send.campaign_id,
-                            "state": send.state,
-                            "send_digest": send.send_digest,
-                            "created": send.created,
-                            "approved_at": send.approved_at,
-                            "counts": counts,
-                            "delivery_claim": "smtp-acceptance-only",
-                        }));
-                    }
-                    Ok(json!({"sends": out}))
-                }
-                "sends.show" => {
-                    let send_id = required_str(input, "send_id")?;
-                    let send = records
-                        .app_campaign_send(&scoped.context, send_id)?
-                        .ok_or_else(|| {
-                            Error::rejected(
-                                "campaign send is unavailable for this installation and context",
-                            )
-                        })?;
-                    scoped.require_campaign(&send.campaign_id)?;
-                    let deliveries = records.app_campaign_deliveries(&scoped.context, send_id)?;
-                    let counts = records.app_campaign_delivery_counts(&scoped.context, send_id)?;
-                    Ok(send_view(
-                        &scoped.install,
-                        &scoped.context,
-                        &send,
-                        &deliveries,
-                        counts,
-                    ))
-                }
-                "email.draft" => {
-                    let draft_value = input
-                        .get("draft")
-                        .filter(|value| value.is_object())
-                        .ok_or_else(|| Error::rejected("structured email draft is required"))?;
-                    let draft_fields = draft_value.as_object().unwrap();
-                    if draft_fields
-                        .keys()
-                        .any(|key| !matches!(key.as_str(), "subject" | "preheader" | "blocks"))
-                    {
-                        return Err(Error::rejected("email draft has unsupported fields"));
-                    }
-                    let subject = draft_value
-                        .get("subject")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| Error::rejected("email draft subject is required"))?;
-                    let preheader = draft_value
-                        .get("preheader")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let blocks = draft_value
-                        .get("blocks")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| Error::rejected("email draft blocks are required"))?;
-                    let draft =
-                        crate::store::app_content::Draft::parse(subject, preheader, blocks)?;
-                    records.app_content_assistant_draft(
-                        &scoped.context,
-                        required_str(input, "campaign_id")?,
-                        required_str(input, "proposal_id")?,
-                        &draft,
-                        &scoped.caller,
-                        &scoped.message_id,
-                    )
-                }
-                "whatsapp.conversation.context" => self.whatsapp_copilot_context(
-                    &scoped.install,
-                    &scoped.context,
-                    required_str(input, "conversation_id")?,
-                ),
-                "whatsapp.reply.draft" => {
-                    self.whatsapp_copilot_draft(&scoped.install, &scoped.context, input)
-                }
-                _ => Err(Error::rejected("unknown assistant action")),
-            }?;
-            let resource_refs = resource_refs(action_id, &result);
-            op = records.app_assistant_operation_set(AssistantOperationUpdate {
-                operation_id,
-                context: &scoped.context,
+        if invoke.action_id == "customer.tags.update" {
+            return self.execute_customer_tags_update(call, invoke, meta);
+        }
+        let result = self.dispatch_registered_action(call, invoke)?;
+        let refs = resource_refs(invoke.action_id, &result);
+        let op = call
+            .records
+            .app_assistant_operation_set(AssistantOperationUpdate {
+                operation_id: invoke.operation_id,
+                context: &call.scoped.context,
                 expected_revision: 1,
                 status: "succeeded",
                 summary: "Action completed",
                 result: &result,
-                resource_refs: &resource_refs,
+                resource_refs: &refs,
                 permission_request: &Value::Null,
                 error: None,
             })?;
-            Ok(json!({"operation":op}))
-        })();
-        match execution {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                let definite_refusal = assistant_error_is_definite_refusal(&error);
-                let (status, summary, detail) = if definite_refusal {
-                    (
-                        "failed",
-                        "Action was refused",
-                        "Action was refused without a recorded change",
-                    )
-                } else {
-                    (
-                        "unknown",
-                        "Action outcome is uncertain; operator review required",
-                        "Outcome may be uncertain; do not retry automatically",
-                    )
-                };
-                let _ = records.app_assistant_operation_set(AssistantOperationUpdate {
-                    operation_id,
+        Ok(json!({"operation": op}))
+    }
+
+    fn execute_customer_tags_update(
+        &self,
+        call: &AgentAssistantCall<'_>,
+        invoke: &InvokeAction<'_>,
+        meta: &crate::app_assistant::RegisteredAction,
+    ) -> Result<Value> {
+        let records = call.records;
+        let scoped = call.scoped;
+        let customer = required_str(invoke.input, "customer_id")?;
+        // Exact customer scope and current revision are checked before
+        // presenting permission. No profile field except tags is stored.
+        let old = records.app_record_show(&scoped.context, customer)?;
+        let old_revision = old
+            .pointer("/record/revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Error::rejected("customer record revision unavailable"))?;
+        if invoke
+            .input
+            .get("expected_revision")
+            .and_then(Value::as_i64)
+            != Some(old_revision)
+        {
+            return Err(Error::rejected("customer record revision is stale"));
+        }
+        if records
+            .app_assistant_permission_find(&scoped.context, invoke.action_id, customer, "deny")?
+            .is_some_and(|p| p["state"].as_str() == Some("active"))
+        {
+            return Err(Error::rejected("this action is blocked for this customer"));
+        }
+        if self.store.crm_autonomy_is_full()? {
+            let mut profile =
+                crate::store::app_records::CustomerProfile::parse(&old["record"]["profile"])
+                    .map_err(|_| Error::rejected("customer profile cannot be safely updated"))?;
+            profile.tags = serde_json::from_value(invoke.input["tags"].clone())
+                .map_err(|_| Error::rejected("customer tags are invalid"))?;
+            let updated = records.app_record_update_as_actor(
+                &scoped.context,
+                customer,
+                old_revision,
+                &profile,
+                None,
+                &format!("agent:{}", scoped.caller),
+                None,
+            )?;
+            let op = records.app_assistant_operation_set(AssistantOperationUpdate {
+                operation_id: invoke.operation_id,
+                context: &scoped.context,
+                expected_revision: 1,
+                status: "succeeded",
+                summary: "Updated tags on one customer",
+                result: &json!({
+                    "customer_id": customer,
+                    "tags": updated.pointer("/record/profile/tags").cloned().unwrap_or(json!([])),
+                    "revision": updated.pointer("/record/revision"),
+                }),
+                resource_refs: &json!([{
+                    "kind": "customer",
+                    "id": customer,
+                    "label": old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer"),
+                }]),
+                permission_request: &Value::Null,
+                error: None,
+            })?;
+            return Ok(json!({"operation": op}));
+        }
+        let mut refs = vec![
+            json!({"kind":"customer","id":customer,"label":old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer")}),
+        ];
+        let before_tags = old
+            .pointer("/record/profile/tags")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| Error::rejected("customer tags are unavailable"))?;
+        let after_tags = invoke
+            .input
+            .get("tags")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| Error::rejected("customer tags are invalid"))?;
+        let preview = json!({"customer_label":old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer"),"before_tags":before_tags,"after_tags":after_tags,"expected_revision":old_revision});
+        let pinned = grant_digest(invoke.action_id, meta, call.descriptor_digest);
+        if records
+            .app_assistant_permission_find(&scoped.context, invoke.action_id, customer, "deny")?
+            .is_some_and(|p| p["state"].as_str() == Some("active"))
+        {
+            let op = records.app_assistant_operation_set(AssistantOperationUpdate {
+                operation_id: invoke.operation_id,
+                context: &scoped.context,
+                expected_revision: 1,
+                status: "denied",
+                summary: "This action is blocked for this customer",
+                result: &Value::Null,
+                resource_refs: &Value::Array(vec![]),
+                permission_request: &Value::Null,
+                error: None,
+            })?;
+            return Ok(json!({"operation": op}));
+        }
+        if let Some(grant) = records
+            .app_assistant_permission_find(&scoped.context, invoke.action_id, customer, "allow")?
+            .filter(|p| p["state"].as_str() == Some("active"))
+        {
+            if grant["semantics_digest"].as_str() != Some(pinned.as_str()) {
+                let op = records.app_assistant_operation_set(AssistantOperationUpdate {
+                    operation_id: invoke.operation_id,
                     context: &scoped.context,
                     expected_revision: 1,
-                    status,
-                    summary,
+                    status: "failed",
+                    summary: "Permission semantics changed; review and grant again",
                     result: &Value::Null,
                     resource_refs: &Value::Array(vec![]),
                     permission_request: &Value::Null,
-                    error: Some(detail),
-                });
-                Err(error)
+                    error: Some("permission semantics changed"),
+                })?;
+                return Ok(json!({"operation": op}));
             }
+            let mut profile =
+                crate::store::app_records::CustomerProfile::parse(&old["record"]["profile"])
+                    .map_err(|_| Error::rejected("customer profile cannot be safely updated"))?;
+            profile.tags = serde_json::from_value(invoke.input["tags"].clone())
+                .map_err(|_| Error::rejected("customer tags are invalid"))?;
+            let updated = records.app_record_update(
+                &scoped.context,
+                customer,
+                old_revision,
+                &profile,
+                None,
+            )?;
+            let op = records.app_assistant_operation_set(AssistantOperationUpdate {
+                operation_id: invoke.operation_id,
+                context: &scoped.context,
+                expected_revision: 1,
+                status: "succeeded",
+                summary: "Updated tags on one customer",
+                result: &json!({"customer_id":customer,"tags":updated.pointer("/record/profile/tags").cloned().unwrap_or(json!([])),"revision":updated.pointer("/record/revision")}),
+                resource_refs: &json!([{"kind":"customer","id":customer,"label":preview["customer_label"]}]),
+                permission_request: &Value::Null,
+                error: None,
+            })?;
+            return Ok(json!({"operation": op}));
+        }
+        let op = records.app_assistant_operation_set(AssistantOperationUpdate {
+            operation_id: invoke.operation_id,
+            context: &scoped.context,
+            expected_revision: 1,
+            status: "pending_permission",
+            summary: "Review this tags-only customer change",
+            result: &json!({"preview": preview}),
+            resource_refs: &Value::Array(std::mem::take(&mut refs)),
+            permission_request: &json!({"reason":"Change tags on one customer","scope":{"install_id":scoped.install,"context_id":scoped.context,"action_id":invoke.action_id,"resource_id":customer},"allow_always":true,"preview":preview}),
+            error: None,
+        })?;
+        Ok(json!({"operation": op}))
+    }
+
+    fn dispatch_registered_action(
+        self: &Arc<Self>,
+        call: &AgentAssistantCall<'_>,
+        invoke: &InvokeAction<'_>,
+    ) -> Result<Value> {
+        let records = call.records;
+        let scoped = call.scoped;
+        let input = invoke.input;
+        match invoke.action_id {
+            "customers.search"
+            | "customers.show"
+            | "customers.notes.list"
+            | "customers.notes.create"
+            | "customers.notes.delete" => execute_customer_action(records, scoped, invoke),
+            "segments.list"
+            | "segments.show"
+            | "segments.preview"
+            | "segments.save"
+            | "segments.save_static"
+            | "segments.delete" => self.execute_segment_action(call, invoke),
+            "social.draft.compose" => self.social_compose(
+                records,
+                &scoped.install,
+                &scoped.context,
+                invoke.operation_id,
+                &scoped.caller,
+                input,
+            ),
+            "social.drafts.attach_image" => self.social_drafts_attach_image(
+                records,
+                &scoped.install,
+                &scoped.context,
+                invoke.operation_id,
+                &scoped.caller,
+                input,
+            ),
+            "social.drafts.status" => self.social_status(records, &scoped.context),
+            "campaigns.list"
+            | "campaigns.show"
+            | "campaigns.create_draft"
+            | "campaigns.apply"
+            | "campaigns.discard"
+            | "campaigns.approve"
+            | "audiences.prepare"
+            | "audiences.show"
+            | "sends.list"
+            | "sends.show"
+            | "email.draft" => execute_campaign_and_send_action(records, scoped, invoke),
+            "whatsapp.conversation.context" => self.whatsapp_copilot_context(
+                &scoped.install,
+                &scoped.context,
+                required_str(input, "conversation_id")?,
+            ),
+            "whatsapp.reply.draft" => {
+                self.whatsapp_copilot_draft(&scoped.install, &scoped.context, input)
+            }
+            _ => Err(Error::rejected("unknown assistant action")),
+        }
+    }
+
+    fn execute_segment_action(
+        self: &Arc<Self>,
+        call: &AgentAssistantCall<'_>,
+        invoke: &InvokeAction<'_>,
+    ) -> Result<Value> {
+        let records = call.records;
+        let scoped = call.scoped;
+        let input = invoke.input;
+        match invoke.action_id {
+            "segments.list" => records.app_segment_list(&scoped.context),
+            "segments.show" => {
+                records.app_segment_show(&scoped.context, required_str(input, "segment_id")?)
+            }
+            "segments.preview" => {
+                records.app_segment_preview(&scoped.context, required_str(input, "segment_id")?)
+            }
+            "segments.save" => {
+                let segment_params = build_segment_save_params(scoped, call.params, input, false)?;
+                self.rpc_app_segment_assistant_save(&segment_params, call.peer_pid)
+            }
+            "segments.save_static" => {
+                let segment_params = build_segment_save_params(scoped, call.params, input, true)?;
+                self.rpc_app_segment_assistant_save(&segment_params, call.peer_pid)
+            }
+            "segments.delete" => {
+                records.app_segment_delete(&scoped.context, required_str(input, "segment_id")?)
+            }
+            _ => Err(Error::rejected("unknown assistant action")),
         }
     }
 
