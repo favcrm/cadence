@@ -567,6 +567,33 @@ async function main(): Promise<void> {
       hostLegacy.querySelector("[data-composer-effort]") === null,
     "older commands: ['new','stop'] cleanly hides model & effort pills",
   );
+  // Even when the server payload lists "new" in commands, MemberChat excludes /new from autocomplete and refuses it locally.
+  const legacyTextarea = hostLegacy.querySelector("textarea") as HTMLTextAreaElement;
+  const legacyForm = hostLegacy.querySelector("form[data-composer]") as HTMLFormElement;
+  const setLegacyTextarea = (val: string) => {
+    const setter = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(legacyTextarea, val);
+    legacyTextarea.dispatchEvent(new win.Event("input", { bubbles: true }));
+  };
+  await React.act(async () => {
+    setLegacyTextarea("/");
+  });
+  await flush();
+  const legacySlashMenuText = hostLegacy.querySelector('[role="listbox"]')?.textContent ?? "";
+  assert(!legacySlashMenuText.includes("/new"), "MemberChat excludes /new from slash autocomplete even if server advertises new");
+  const legacyCmdCountBeforeNew = requests.filter((r) => r.url.startsWith("/api/master/command")).length;
+  await React.act(async () => {
+    setLegacyTextarea("/new");
+  });
+  await flush();
+  await React.act(async () => {
+    legacyForm.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true }));
+  });
+  await flush();
+  assert(
+    requests.filter((r) => r.url.startsWith("/api/master/command")).length === legacyCmdCountBeforeNew,
+    "MemberChat refuses /new locally even when server advertises commands: ['new', 'stop']",
+  );
 
   // 4. Unified AssistantComposer renders consistently in standalone compact & full capability modes.
   const hostUnified: Element = win.document.createElement("div");

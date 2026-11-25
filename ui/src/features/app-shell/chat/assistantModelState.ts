@@ -53,6 +53,23 @@ export function mergeMasterStreamSnapshot(
   };
 }
 
+/**
+ * Merge an `event: master` frame into `source` and trigger canonical
+ * `GET /api/master/state` revalidation when `source` had no loaded snapshot or
+ * the frame lacked picker capability commands.
+ */
+export function writeMasterStreamSnapshot(
+  source: CoreResource<MasterState>,
+  snapshot: MasterState,
+  { invalidateIfBare = true }: { invalidateIfBare?: boolean } = {},
+): void {
+  const hadData = source.get().data !== null;
+  source.write((prev) => mergeMasterStreamSnapshot(prev, snapshot));
+  if (invalidateIfBare && (!hadData || isBareMasterStreamSnapshot(snapshot))) {
+    void source.invalidate();
+  }
+}
+
 export interface UseAssistantModelStateOptions {
   hosted: boolean | null | undefined;
   /** Pass `string | null` for conversation-scoped surfaces (Member Home, hosted App Chat), or omit for global Home. */
@@ -68,6 +85,8 @@ export interface UseAssistantModelStateOptions {
   requireLoaded?: boolean;
   /** Require a non-null `conversationId` before showing model/effort pills. */
   requireConversation?: boolean;
+  /** Commands to omit regardless of server advertisement (e.g., `["new"]` on member surfaces). */
+  excludeCommands?: readonly string[];
 }
 
 export interface AssistantModelStateController {
@@ -96,6 +115,7 @@ export function useAssistantModelState({
   compact = false,
   requireLoaded = false,
   requireConversation = false,
+  excludeCommands,
 }: UseAssistantModelStateOptions): AssistantModelStateController {
   const scopedMode = conversationId !== undefined;
   const activeConversation = scopedMode && enabled && conversationId !== null ? conversationId : null;
@@ -114,10 +134,13 @@ export function useAssistantModelState({
   }, [scopedMode, activeConversation, enabled, source, scopeKey]);
 
   const master = scopedMode && activeConversation === null ? null : state.data;
-  const offered = useMemo(
-    () => offeredCommands(hosted, master?.commands),
-    [hosted, master?.commands],
-  );
+  const excludedKey = excludeCommands?.join(",") ?? "";
+  const offered = useMemo(() => {
+    const base = offeredCommands(hosted, master?.commands);
+    if (!excludedKey) return base;
+    const excluded = new Set(excludedKey.split(","));
+    return base.filter((c) => !excluded.has(c.name));
+  }, [hosted, master?.commands, excludedKey]);
   const readyForControls =
     (!requireLoaded || master !== null) && (!requireConversation || activeConversation !== null);
   const canPickModel = readyForControls && offered.some((c) => c.name === "model");
@@ -132,11 +155,7 @@ export function useAssistantModelState({
   const applyStreamSnapshot = useCallback(
     (snapshot: MasterState) => {
       if (scopedMode && activeConversation === null) return;
-      const hadData = source.get().data !== null;
-      source.write((prev) => mergeMasterStreamSnapshot(prev, snapshot));
-      if (!hadData || isBareMasterStreamSnapshot(snapshot)) {
-        void source.invalidate();
-      }
+      writeMasterStreamSnapshot(source, snapshot);
     },
     [scopedMode, activeConversation, source],
   );

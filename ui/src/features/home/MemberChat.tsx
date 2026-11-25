@@ -21,7 +21,7 @@ import Conversation from "../app-shell/chat/Conversation";
 import { appendComposerDraft } from "./composerFill";
 import ConversationIdCopy from "./ConversationIdCopy";
 import { tailTop } from "./dock";
-import { fmtCommandResult, helpSummary } from "./master";
+import { fmtCommandResult, helpSummary, SLASH_COMMANDS } from "./master";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
@@ -329,6 +329,7 @@ export default function MemberChat({
     readOnly,
     requireLoaded: true,
     requireConversation: true,
+    excludeCommands: ["new"],
   });
 
   const attachDestination: AttachDestination | undefined =
@@ -770,6 +771,15 @@ export default function MemberChat({
                   setSendNote(t("Choose a skill from the /skills menu."));
                   return false;
                 }
+                if (name === "new") {
+                  setSendNote(t("This command isn't available in this workspace. `/help` lists what is."));
+                  return arg ? false : undefined;
+                }
+                const knownSlash = SLASH_COMMANDS.find((c) => c.name === name);
+                if (!knownSlash) {
+                  setSendNote(t("Unknown command — `/help` lists what is available."));
+                  return false;
+                }
                 const known = memberCommands.find((c) => c.name === name);
                 if (!known) {
                   setSendNote(t("This command isn't available in this workspace. `/help` lists what is."));
@@ -787,7 +797,8 @@ export default function MemberChat({
                   .masterCommand(name, arg || undefined, undefined, undefined, conversationId)
                   .then((r) => {
                     refreshMemberModelState();
-                    setSendNote(fmtCommandResult(r).text ?? t("Done"));
+                    const formatted = fmtCommandResult(r);
+                    setSendNote(formatted.text ?? (formatted.value !== undefined ? JSON.stringify(formatted.value) : t("Done")));
                   })
                   .catch((e: unknown) => {
                     setSendNote(e instanceof ApiError ? e.message : String(e));

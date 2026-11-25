@@ -6,7 +6,7 @@ import type { MasterState } from "../../../lib/types";
 import { privateSessionGeneration } from "../../../lib/privateSession";
 import { EMPTY_THREAD, applyEarlier, fetchEarlier, reduceFrame, resumeSeq, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
 import { applyPreviewFrame, setConversationPreview } from "./conversationPreview";
-import { isBareMasterStreamSnapshot, mergeMasterStreamSnapshot } from "./assistantModelState";
+import { writeMasterStreamSnapshot } from "./assistantModelState";
 
 /**
  * The one conversation thread engine Home and every app pane share
@@ -161,14 +161,10 @@ export function useThreadStream(
               // schedules the trailing read that observes this turn change.
               void resources.masterConversation(conversation).invalidate();
               if (resources.masterThread.get().data?.conversation === conversation) {
-                const hadData = resources.masterState.get().data !== null;
-                resources.masterState.write((prev) => mergeMasterStreamSnapshot(prev, snapshot));
-                if (!hadData || isBareMasterStreamSnapshot(snapshot)) {
-                  void resources.masterState.invalidate();
-                }
+                writeMasterStreamSnapshot(resources.masterState, snapshot);
               }
             } else {
-              resources.masterState.write((prev) => mergeMasterStreamSnapshot(prev, snapshot));
+              writeMasterStreamSnapshot(resources.masterState, snapshot, { invalidateIfBare: false });
             }
             onSnapshot?.();
             settled = true;
