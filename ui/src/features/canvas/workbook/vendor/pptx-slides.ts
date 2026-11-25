@@ -23,7 +23,7 @@ import { readTable } from "./pptx-slide-table";
 import {
   readListStyle, readParagraphs, readTextFrame, uniformListStyle, type ListStyle, type TextContext,
 } from "./pptx-slide-text";
-import { attribute, childAt, childElements, firstChild, firstDescendant, type XmlElement } from "./xml";
+import { attribute, childAt, childElements, firstChild, firstDescendant, XmlError, type XmlElement } from "./xml";
 import { ZipError, openZip, type ZipArchive } from "./zip";
 import { lookupTable } from "./lookup-table";
 
@@ -55,6 +55,7 @@ export async function readPptxSlides(bytes: Uint8Array, options: { readonly maxS
   const zip = openZip(bytes);
   const mainPart = await findMainPart(zip, "ppt/presentation.xml");
   const presentation = await readPart(zip, mainPart);
+  if (presentation?.name !== "p:presentation") throw new XmlError("malformed", "Invalid PowerPoint presentation root");
   const relationships = await readRelationships(zip, mainPart);
   const tableStylesPart = findRelationship(relationships, "tableStyles")?.target;
   const reader = new DeckReader(

@@ -75,8 +75,8 @@ export function parsePart(text: string): XmlElement {
 }
 
 /** Streams a part's elements at `depth` (the root is 0) one subtree at a time. */
-export function streamPart(text: string, depth: number): Generator<XmlElement> {
-  return streamElements(text, depth, PARSE_OPTIONS);
+export function streamPart(text: string, depth: number, expectedRoot?: string): Generator<XmlElement> {
+  return streamElements(text, depth, PARSE_OPTIONS, expectedRoot);
 }
 
 /** Reads and parses a part, or returns undefined when the package has no such part. */

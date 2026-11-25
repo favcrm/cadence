@@ -282,7 +282,7 @@ export async function readDocxDocument(bytes: Uint8Array, options: { readonly ma
   };
 
   // Depth 2 is w:document > w:body > each block.
-  for (const element of streamPart(bodyText, 2)) {
+  for (const element of streamPart(bodyText, 2, "w:document")) {
     if (element.name === "w:sectPr") {
       endSection(element);
       continue;

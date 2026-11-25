@@ -66,13 +66,18 @@ export function parseXml(text: string, options: XmlOptions): XmlElement {
  * Yields each element at `depth` (the root is depth 0) as a complete subtree, so a large part such
  * as a document body can be converted while holding only one block of it in memory at a time.
  */
-export function* streamElements(text: string, depth: number, options: XmlOptions): Generator<XmlElement> {
+export function* streamElements(text: string, depth: number, options: XmlOptions, expectedRoot?: string): Generator<XmlElement> {
   const tokenizer = new XmlTokenizer(text, options);
+  let rootSeen = false;
   for (let token = tokenizer.next(); token; token = tokenizer.next()) {
-    if (token.kind === "open" && token.depth === depth) {
-      yield* replaced(buildElement(tokenizer, token, options), options);
+    if (token.kind !== "open") continue;
+    if (expectedRoot !== undefined && token.depth === 0) {
+      if (rootSeen || token.name !== expectedRoot) throw new XmlError("malformed", `Expected ${expectedRoot} as the document root`);
+      rootSeen = true;
     }
+    if (token.depth === depth) yield* replaced(buildElement(tokenizer, token, options), options);
   }
+  if (expectedRoot !== undefined && !rootSeen) throw new XmlError("malformed", "Document has no root element");
 }
 
 function replaced(element: XmlElement, options: XmlOptions): XmlElement[] {
