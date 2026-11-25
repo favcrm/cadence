@@ -115,6 +115,7 @@ export default function MemberChat({
   templateRail,
   templateCount,
   templateList,
+  streamDegraded = false,
 }: {
   /** The session-scoped store/draft key — `${sessionId}:${sub}`. */
   scope: string;
@@ -125,6 +126,7 @@ export default function MemberChat({
   templateRail?: HostedTemplateRail;
   templateCount?: number;
   templateList?: HostedTemplateList;
+  streamDegraded?: boolean;
 }) {
   const t = useTranslate();
   const roster = useQuery(resources.agents);
@@ -761,7 +763,14 @@ export default function MemberChat({
             templateCount={templateCount}
             templateList={templateList}
             hasLiveAgents={hasLiveAgents}
+            streamDegraded={streamDegraded}
             onOpenIssue={onOpenIssue}
+            onAskFeedItem={!readOnly ? (item) => {
+              const text = `Check in with ${item.alias}${item.ticket_id ? ` on ${item.ticket_id}` : ""}. Latest update (${item.state_label}): ${item.latest_action}. What is the current progress, and does anything need my input?`;
+              const composerKey = `member-assist:${scope}`;
+              setComposerDraft(composerKey, appendComposerDraft(composerDraftState(composerKey).text, text));
+              requestComposerFocus(composerKey);
+            } : undefined}
             onAskAgent={!readOnly ? (agent, update) => {
               const issues = agentOn(agent);
               const text = `Check in with ${agent.alias}${issues.length ? ` on ${issues.join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`;

@@ -815,11 +815,65 @@ export interface PersonalAssistantRow {
   conversation_id?: string | null;
 }
 
+export type AgentFeedState =
+  | "action_required"
+  | "working"
+  | "monitoring"
+  | "unverifiable"
+  | "blocked"
+  | "completed"
+  | "failed";
+
+export type AgentFeedCategory = "working" | "uploaded" | "completed" | "external";
+
+export interface AgentFeedStep {
+  label: string;
+  status: "done" | "active" | "wait" | "fail";
+}
+
+export interface AgentFeedGate {
+  name: string;
+  status: string;
+  ok: boolean;
+}
+
+export interface AgentFeedOperatorAction {
+  kind: "delivery_enqueue" | "retry_assignment" | "review_gate";
+  title: string;
+  guard: "operator_only_terminal";
+  command: string;
+  head_sha?: string | null;
+  gates?: AgentFeedGate[];
+}
+
+export interface AgentFeedItem {
+  id: string;
+  alias: string;
+  look?: string | null;
+  role: string;
+  state: AgentFeedState;
+  state_label: string;
+  ticket_id?: string | null;
+  pr_ref?: string | null;
+  head_sha?: string | null;
+  task_title: string;
+  action_verb: string;
+  latest_action: string;
+  updated_at: string;
+  started_at?: string | null;
+  runner_label?: string | null;
+  steps?: AgentFeedStep[];
+  operator_action?: AgentFeedOperatorAction | null;
+  category: AgentFeedCategory;
+}
+
 /** `GET /api/agents` (the roster beside its snapshot's freshness). */
 export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & {
   agents: Agent[];
   /** CAD-2353: the caller's own assistant; hosted only, absent on an older API. */
   personal_assistant?: PersonalAssistantRow | null;
+  /** AOS-759 / CAD-2786: compact live feed items for Home's right-panel Feed tab. */
+  feed_items?: AgentFeedItem[];
 };
 
 /** One profile of `GET /api/agents` (CAD-1989): who an agent is, with the

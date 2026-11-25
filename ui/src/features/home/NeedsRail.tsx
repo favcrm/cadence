@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
-import type { Agent, AgentsPayload, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
+import type { Agent, AgentFeedItem, AgentsPayload, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
 import { ageWords, kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
 import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf } from "../decisions/stagedWrite";
@@ -41,7 +41,7 @@ export { NeedMenu } from "./NeedMenu";
 export type DocumentFollowUpState = DocumentFollowUps | { status: "loading" };
 
 const EMPTY_AGENT_FEED: AgentFeedState = {
-  counts: { all: 0, working: 0, uploaded: 0, completed: 0, external: 0 },
+  counts: { all: 0, action: 0, working: 0, uploaded: 0, completed: 0, external: 0 },
   liveCount: 0,
   hasAny: false,
 };
@@ -52,6 +52,7 @@ function mergeFeedCounts(
 ): Record<FeedCategory, number> {
   return {
     all: a.all + b.all,
+    action: a.action + b.action,
     working: a.working + b.working,
     uploaded: a.uploaded + b.uploaded,
     completed: a.completed + b.completed,
@@ -75,12 +76,14 @@ export default function NeedsRail({
   onAsk,
   onOpenDecision,
   onAskAgent,
+  onAskFeedItem,
   onSent,
   decisions: decisionsOn = false,
   templateRail,
   templateCount,
   templateList,
   hasLiveAgents = false,
+  streamDegraded = false,
 }: {
   /** Only Master Home supplies the existing operator overview. */
   overview?: ResourceState<Overview>;
@@ -95,6 +98,7 @@ export default function NeedsRail({
   /** Open a reading item in the shared detail (App owns the one mount). */
   onOpenDecision?: (open: HomeDecisionOpen) => void;
   onAskAgent?: (agent: Agent, update?: AgentUpdate) => void;
+  onAskFeedItem?: (item: AgentFeedItem) => void;
   /** A "Fix it" reached Master: Home pins the chat to the sent message. */
   onSent?: () => void;
   /** CAD-2186: also read the owner's staged decisions (`/api/assist/actions`) and
@@ -105,6 +109,8 @@ export default function NeedsRail({
   templateList?: HostedTemplateList;
   /** Live running agents known from parent workspace roster (drives green tab dot on both tabs). */
   hasLiveAgents?: boolean;
+  /** True when the live event stream is degraded to 15s polling. */
+  streamDegraded?: boolean;
 }) {
   const [tab, setTab] = useState<"todo" | "feed">("todo");
   const [todoFilter, setTodoFilter] = useState<TodoCategory>("all");
@@ -676,6 +682,9 @@ export default function NeedsRail({
             onClick={() => setFeedFilter(entry.key)}
           >
             {t(entry.label)}
+            {entry.key === "action" && feedCounts.action > 0 ? (
+              <span className="seg-n num">{feedCounts.action}</span>
+            ) : null}
           </button>
         ))}
       </div>
@@ -691,7 +700,12 @@ export default function NeedsRail({
           closeDrawerImmediate();
           onAskAgent(agent, update);
         } : undefined}
+        onAskFeedItem={onAskFeedItem ? (item) => {
+          closeDrawerImmediate();
+          onAskFeedItem(item);
+        } : undefined}
         onOpenAgent={openFeedDetail}
+        onOpenFeedItem={(item, opener) => openFeedDetail({ kind: "feed_item", item }, opener)}
         onAgentFeedState={setAgentFeedState}
       />
 
@@ -824,6 +838,11 @@ export default function NeedsRail({
           <span className="dx-dot" role="img" aria-label={t("A write was approved but did not apply")} />
         )}
       </button>
+      {tab === "feed" && (
+        <span className={`rail-stream-pill${streamDegraded ? " warn" : ""}`} aria-live="polite">
+          {streamDegraded ? t("Poll 15s") : t("Live")}
+        </span>
+      )}
     </div>
   );
 
@@ -888,6 +907,10 @@ export default function NeedsRail({
         onAskAgent={onAskAgent ? (agent, update) => {
           closeDrawerImmediate();
           onAskAgent(agent, update);
+        } : undefined}
+        onAskFeedItem={onAskFeedItem ? (item) => {
+          closeDrawerImmediate();
+          onAskFeedItem(item);
         } : undefined}
         onAskNeed={onAsk ? (need) => ask(need) : undefined}
         onOpenIssue={openIssue}

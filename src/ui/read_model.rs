@@ -1086,11 +1086,16 @@ impl Model {
         if snap.agents_down || lock(&self.daemon).daemon_down {
             payload.daemon = DaemonReach::Unreachable;
         }
-        serde_json::to_value(AgentsResponse {
+        let feed_items = project_native_agent_feed(&payload.agents);
+        let mut val = serde_json::to_value(AgentsResponse {
             payload,
             freshness: self.freshness(snap),
         })
-        .expect("agents serialize")
+        .expect("agents serialize");
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert("feed_items".to_string(), Value::Array(feed_items));
+        }
+        val
     }
 
     /// Age, staleness and refresh error of `snap` as it is served, beside
@@ -1682,6 +1687,7 @@ impl Model {
                 &json!({
                     "daemon": served["daemon"], "totals": served["totals"],
                     "by_issue": served["by_issue"], "profiles": profiles,
+                    "feed_items": served["feed_items"],
                     "snapshot_age_secs": served["snapshot_age_secs"],
                     "stale": served["stale"], "refresh_error": served["refresh_error"],
                 }),
@@ -1728,6 +1734,217 @@ fn agent_rows(snap: &DaemonSnap) -> Entities {
             Some((row.alias.clone(), (value_fp(&stable_row(&r)), r)))
         })
         .collect()
+}
+
+const NATIVE_FEED_STALE_HEARTBEAT_SECS: f64 = 240.0;
+
+fn unix_secs_to_iso(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    // Howard Hinnant civil-from-days algorithm in pure integer arithmetic.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yr = y + i64::from(mo <= 2);
+    format!("{yr:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn now_utc_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    unix_secs_to_iso(secs)
+}
+
+fn native_iso_from_value(val: Option<&Value>) -> Option<String> {
+    let v = val?;
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        if trimmed.len() >= 19 && trimmed.contains('T') {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(secs) = v.as_f64() {
+        if secs.is_finite() && secs > 0.0 {
+            return Some(unix_secs_to_iso(secs.floor() as i64));
+        }
+    }
+    None
+}
+
+fn truncate_single_line(raw: &str, max_chars: usize) -> String {
+    let single = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = single.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        trimmed.to_string()
+    } else {
+        let mut out: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Additive Home right-rail Feed projection derived from daemon `AgentRow`s.
+/// Never carries operator CLI commands across the shared stream frame.
+fn project_native_agent_feed(agents: &[cadence_core::board_api::AgentRow]) -> Vec<Value> {
+    let now_iso = now_utc_iso();
+    let mut ranked: Vec<(u8, String, Value)> = Vec::new();
+
+    for agent in agents {
+        if agent.alias == "master" || agent.inbox == Some(true) {
+            continue;
+        }
+        let has_signal = agent.running > 0
+            || agent.queued > 0
+            || agent.fenced
+            || !agent.on.is_empty()
+            || !agent.tasks.is_empty()
+            || agent.last_activity.is_some();
+        if !has_signal {
+            continue;
+        }
+
+        let silent_secs = agent
+            .silent_secs
+            .as_ref()
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let is_stale = agent.running > 0
+            && (agent.stalled.as_ref().and_then(Value::as_bool) == Some(true)
+                || silent_secs >= NATIVE_FEED_STALE_HEARTBEAT_SECS);
+
+        let (state, state_label, action_verb, rank): (&str, String, &str, u8) = if agent.fenced {
+            ("blocked", "Needs attention".to_string(), "BLOCKED", 1)
+        } else if is_stale {
+            ("unverifiable", "Unverifiable".to_string(), "STALE", 3)
+        } else if agent.running > 0 {
+            ("working", "Working".to_string(), "WORKING", 4)
+        } else if agent.queued > 0 {
+            ("monitoring", "Queued".to_string(), "QUEUED", 5)
+        } else {
+            let lbl = agent
+                .state_label
+                .as_ref()
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Idle");
+            ("completed", lbl.to_string(), "IDLE", 6)
+        };
+
+        let active_task = agent
+            .tasks
+            .iter()
+            .find(|t| t.task_state == "running" || t.task_state == "queued")
+            .or_else(|| agent.tasks.first());
+
+        let ticket_id = agent
+            .on
+            .first()
+            .cloned()
+            .or_else(|| active_task.map(|t| t.issue.clone()));
+
+        let task_title = active_task
+            .and_then(|t| t.title.clone().or_else(|| t.job_title.clone()))
+            .unwrap_or_else(|| match &ticket_id {
+                Some(id) => format!("Assigned work on {id}"),
+                None => format!("{} activity", agent.alias),
+            });
+
+        let summary_opt = agent
+            .message
+            .get("summary")
+            .and_then(Value::as_str)
+            .or_else(|| active_task.and_then(|t| t.message.get("summary").and_then(Value::as_str)))
+            .map(|s| truncate_single_line(s, 180))
+            .filter(|s| !s.is_empty());
+
+        let latest_action = if let Some(summary) = summary_opt {
+            summary
+        } else if state == "blocked" {
+            agent
+                .recovery
+                .as_ref()
+                .and_then(|o| o.as_deref())
+                .map(|s| truncate_single_line(s, 180))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Agent is fenced and needs operator input.".to_string())
+        } else if state == "unverifiable" {
+            "No recent daemon heartbeat past threshold; execution liveness unconfirmed.".to_string()
+        } else {
+            format!(
+                "{state_label} on {}",
+                ticket_id.as_deref().unwrap_or(&agent.alias)
+            )
+        };
+
+        let updated_at =
+            native_iso_from_value(agent.last_activity.as_ref()).unwrap_or_else(|| now_iso.clone());
+        let started_at = if agent.running > 0 && !is_stale {
+            native_iso_from_value(agent.message.get("created"))
+                .map(Value::String)
+                .unwrap_or_else(|| Value::String(updated_at.clone()))
+        } else {
+            Value::Null
+        };
+
+        let role = agent
+            .role
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or(agent.provider.as_deref())
+            .unwrap_or("Worker");
+
+        let runner_label = match (agent.provider.as_deref(), agent.endpoint_kind.as_deref()) {
+            (Some(p), Some(e)) => Value::String(format!("{p} · {e}")),
+            (Some(p), None) => Value::String(p.to_string()),
+            _ => Value::Null,
+        };
+
+        let look = agent
+            .look
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(|s| Value::String(s.to_string()))
+            .unwrap_or(Value::Null);
+
+        let category = if state == "completed" {
+            "completed"
+        } else {
+            "working"
+        };
+
+        let item = json!({
+            "id": format!("agent:{}", agent.alias),
+            "alias": agent.alias,
+            "look": look,
+            "role": role,
+            "state": state,
+            "state_label": state_label,
+            "ticket_id": ticket_id,
+            "task_title": task_title,
+            "action_verb": action_verb,
+            "latest_action": latest_action,
+            "updated_at": updated_at,
+            "started_at": started_at,
+            "runner_label": runner_label,
+            "category": category,
+        });
+        ranked.push((rank, updated_at, item));
+    }
+
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    ranked.into_iter().take(16).map(|(_, _, v)| v).collect()
 }
 
 #[cfg(test)]
@@ -2928,5 +3145,163 @@ mod tests {
                 "event: issue\ndata: {\"id\":\"CAD-9\",\"op\":\"delete\"}\n\n",
             ]
         );
+    }
+
+    #[test]
+    fn project_native_agent_feed_orders_attention_stale_and_working() {
+        use cadence_core::board_api::AgentRow;
+
+        let mk = |alias: &str| AgentRow {
+            alias: alias.into(),
+            provider: Some("codex".into()),
+            endpoint_kind: Some("cli".into()),
+            role: json!("implementer"),
+            ..Default::default()
+        };
+
+        let mut working = mk("atlas");
+        working.running = 1;
+        working.on = vec!["CAD-2786".into()];
+        working.last_activity = Some(json!("2026-11-25T00:10:00Z"));
+        working.message = json!({"summary": "Running UI vitest suite", "created": 1_764_029_200.0});
+
+        let mut stale = mk("lumen");
+        stale.running = 1;
+        stale.silent_secs = Some(json!(300.0));
+        stale.on = vec!["CAD-2780".into()];
+        stale.last_activity = Some(json!("2026-11-25T00:05:00Z"));
+
+        let mut fenced = mk("nova");
+        fenced.fenced = true;
+        fenced.on = vec!["CAD-2781".into()];
+        fenced.last_activity = Some(json!("2026-11-25T00:08:00Z"));
+
+        let mut master = mk("master");
+        master.running = 1;
+
+        let feed = project_native_agent_feed(&[working, stale, fenced, master]);
+        assert_eq!(feed.len(), 3, "master must be filtered from feed_items");
+        assert_eq!(feed[0]["alias"], json!("nova"));
+        assert_eq!(feed[0]["state"], json!("blocked"));
+        assert_eq!(feed[1]["alias"], json!("lumen"));
+        assert_eq!(feed[1]["state"], json!("unverifiable"));
+        assert_eq!(feed[2]["alias"], json!("atlas"));
+        assert_eq!(feed[2]["state"], json!("working"));
+        assert_eq!(feed[2]["latest_action"], json!("Running UI vitest suite"));
+        assert!(feed[0].get("operator_action").is_none());
+    }
+
+    #[test]
+    fn project_native_agent_feed_matches_aos759_shared_fixture_contract() {
+        use cadence_core::board_api::AgentRow;
+
+        const REQUIRED_KEYS: [&str; 10] = [
+            "id",
+            "alias",
+            "role",
+            "state",
+            "state_label",
+            "task_title",
+            "action_verb",
+            "latest_action",
+            "updated_at",
+            "category",
+        ];
+        const VALID_STATES: [&str; 7] = [
+            "action_required",
+            "working",
+            "monitoring",
+            "unverifiable",
+            "blocked",
+            "completed",
+            "failed",
+        ];
+        const VALID_CATEGORIES: [&str; 4] = ["working", "uploaded", "completed", "external"];
+
+        let fixture_raw = include_str!("../../ui/tests/fixtures/aos759-agent-feed.fixture.json");
+        let fixture_items: Vec<Value> =
+            serde_json::from_str(fixture_raw).expect("valid AOS-759 shared fixture JSON");
+        assert!(
+            fixture_items.len() >= 4,
+            "shared fixture covers full state spectrum"
+        );
+
+        let mut saw_unverifiable = false;
+        let mut saw_operator_action = false;
+        for item in &fixture_items {
+            for key in REQUIRED_KEYS {
+                assert!(
+                    item.get(key).is_some_and(|v| !v.is_null()),
+                    "fixture item missing {key}: {item}"
+                );
+            }
+            let st = item["state"].as_str().unwrap();
+            let cat = item["category"].as_str().unwrap();
+            assert!(VALID_STATES.contains(&st), "unexpected fixture state {st}");
+            assert!(
+                VALID_CATEGORIES.contains(&cat),
+                "unexpected fixture category {cat}"
+            );
+            if st == "unverifiable" {
+                saw_unverifiable = true;
+            }
+            if let Some(op) = item.get("operator_action").filter(|v| !v.is_null()) {
+                saw_operator_action = true;
+                assert_eq!(op["kind"], json!("delivery_enqueue"));
+                assert_eq!(op["guard"], json!("operator_only_terminal"));
+                assert!(op["title"].as_str().is_some_and(|s| !s.is_empty()));
+                assert!(op["command"].as_str().is_some_and(|s| !s.is_empty()));
+                let sha = op["head_sha"].as_str().unwrap_or_default();
+                assert_eq!(sha.len(), 40, "head_sha must be 40-hex");
+                assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+                let gates = op["gates"].as_array().expect("gates array");
+                assert!(!gates.is_empty());
+                for g in gates {
+                    assert!(g["name"].as_str().is_some_and(|s| !s.is_empty()));
+                    assert!(g["status"].as_str().is_some_and(|s| !s.is_empty()));
+                    assert!(g["ok"].is_boolean());
+                }
+            }
+        }
+        assert!(saw_unverifiable, "fixture includes unverifiable state");
+        assert!(
+            saw_operator_action,
+            "fixture includes read-only operator_action shape"
+        );
+
+        // Native projection emits the same shared core contract fields without leaking operator_action.
+        let mut worker = AgentRow {
+            alias: "codex-runner-1".into(),
+            provider: Some("codex".into()),
+            endpoint_kind: Some("cli".into()),
+            role: json!("Backend Engineer"),
+            running: 1,
+            on: vec!["AOS-759".into()],
+            last_activity: Some(json!("2026-11-24T18:55:10Z")),
+            message: json!({"summary": "Projecting /api/agents feed_items", "created": 1_764_010_200.0}),
+            ..Default::default()
+        };
+        let mut stale = worker.clone();
+        stale.alias = "local-omp-2".into();
+        stale.silent_secs = Some(json!(300.0));
+        worker.stalled = Some(json!(false));
+
+        let projected = project_native_agent_feed(&[worker, stale]);
+        assert_eq!(projected.len(), 2);
+        for item in &projected {
+            for key in REQUIRED_KEYS {
+                assert!(
+                    item.get(key).is_some_and(|v| !v.is_null()),
+                    "native item missing {key}: {item}"
+                );
+            }
+            let st = item["state"].as_str().unwrap();
+            let cat = item["category"].as_str().unwrap();
+            assert!(VALID_STATES.contains(&st));
+            assert!(VALID_CATEGORIES.contains(&cat));
+            assert!(item.get("operator_action").is_none());
+        }
+        assert_eq!(projected[0]["alias"], json!("local-omp-2"));
+        assert_eq!(projected[0]["state"], json!("unverifiable"));
     }
 }

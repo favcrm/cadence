@@ -1,0 +1,100 @@
+[
+  {
+    "id": "hla:hla_00000000-0000-4000-8000-000000000001",
+    "alias": "release-steward",
+    "look": "guard",
+    "role": "Release Steward",
+    "state": "action_required",
+    "state_label": "Action required",
+    "ticket_id": "CAD-2777",
+    "pr_ref": "favcrm/cadence#2157",
+    "head_sha": "cef3044644d54db270c34cb924a2aefde026e402",
+    "task_title": "Hosted Issue UI Cancel/Retry/Resume controls & daemon lane resume",
+    "action_verb": "GATE",
+    "latest_action": "CI and hosted OIDC reviews passed; awaiting operator exact-head approval & enqueue.",
+    "updated_at": "2026-11-24T18:53:00Z",
+    "started_at": null,
+    "runner_label": "hosted · OIDC gate",
+    "steps": [
+      { "label": "ci/fmt + build", "status": "done" },
+      { "label": "OIDC reviews 2/2", "status": "done" },
+      { "label": "Operator enqueue", "status": "wait" }
+    ],
+    "operator_action": {
+      "kind": "delivery_enqueue",
+      "title": "Exact-head approval & enqueue required for PR #2157",
+      "guard": "operator_only_terminal",
+      "command": "cadence --org fav-limited delivery enqueue \\\n  --project cadence \\\n  --issue CAD-2777 \\\n  --repo favcrm/cadence \\\n  --pr 2157 \\\n  --head cef3044644d54db270c34cb924a2aefde026e402 \\\n  --approve \"<who, where>\"",
+      "head_sha": "cef3044644d54db270c34cb924a2aefde026e402",
+      "gates": [
+        { "name": "ci/build", "status": "PASS", "ok": true },
+        { "name": "standards (OIDC)", "status": "PASS", "ok": true },
+        { "name": "spec-security", "status": "PASS", "ok": true }
+      ]
+    },
+    "category": "working"
+  },
+  {
+    "id": "hla:hla_00000000-0000-4000-8000-000000000002",
+    "alias": "codex-runner-1",
+    "look": "builder",
+    "role": "Backend Engineer",
+    "state": "working",
+    "state_label": "Working",
+    "ticket_id": "AOS-759",
+    "pr_ref": "agenticos-v2 (staging)",
+    "head_sha": "7b7c3047cc6e3c0877bd78306bedb848a9c672f3",
+    "task_title": "Hosted live agent feed projection & SSE delta push",
+    "action_verb": "EDIT",
+    "latest_action": "Projecting /api/agents feed_items with owner-scoped operator_action descriptors.",
+    "updated_at": "2026-11-24T18:55:10Z",
+    "started_at": "2026-11-24T18:50:00Z",
+    "runner_label": "local · omp",
+    "steps": [
+      { "label": "Contract", "status": "done" },
+      { "label": "API wiring", "status": "active" },
+      { "label": "Tests", "status": "wait" }
+    ],
+    "category": "working"
+  },
+  {
+    "id": "hla:hla_00000000-0000-4000-8000-000000000003",
+    "alias": "local-omp-2",
+    "look": "robot",
+    "role": "Local Worker",
+    "state": "unverifiable",
+    "state_label": "Unverifiable",
+    "ticket_id": "CAD-2781",
+    "task_title": "Add daemon heartbeat expiry test under interrupted PTY state",
+    "action_verb": "STALE",
+    "latest_action": "No recent daemon heartbeat reported past threshold; execution liveness unconfirmed.",
+    "updated_at": "2026-11-24T18:45:00Z",
+    "started_at": null,
+    "runner_label": "local · omp",
+    "steps": [
+      { "label": "Lane active", "status": "done" },
+      { "label": "Heartbeat gap", "status": "wait" }
+    ],
+    "category": "working"
+  },
+  {
+    "id": "hla:hla_00000000-0000-4000-8000-000000000004",
+    "alias": "qa-tester",
+    "look": "tester",
+    "role": "Browser QA",
+    "state": "completed",
+    "state_label": "Completed",
+    "ticket_id": "CAD-2786",
+    "task_title": "Verify Home right-panel Feed clean/hover/expanded states",
+    "action_verb": "REPORTED",
+    "latest_action": "Desktop & Mobile captures verified with zero console errors.",
+    "updated_at": "2026-11-24T18:30:00Z",
+    "started_at": null,
+    "runner_label": "local · agent-browser",
+    "steps": [
+      { "label": "Executed", "status": "done" },
+      { "label": "Reported", "status": "done" }
+    ],
+    "category": "completed"
+  }
+]

@@ -795,6 +795,7 @@ export default function Home({
   credentialRequestsEnabled = true,
   templateReviewEnabled = false,
   templateReviewCanApprove = false,
+  streamDegraded = false,
   workspaceEmpty = false,
 }: {
   readOnly: boolean;
@@ -803,6 +804,7 @@ export default function Home({
   credentialRequestsEnabled?: boolean;
   templateReviewEnabled?: boolean;
   templateReviewCanApprove?: boolean;
+  streamDegraded?: boolean;
   /** CAD-1817: the verified session proves operator authority, the only
    *  viewer that may edit the workspace coordinator's identity. `null`
    *  is unproven, never an operator. */
@@ -880,6 +882,7 @@ export default function Home({
           templateRail={review.rail}
           templateCount={review.pendingCount}
           templateList={review.templateList}
+          streamDegraded={streamDegraded}
         />
         {review.drawer}
       </>
@@ -903,6 +906,7 @@ export default function Home({
         templateRail={review.rail}
         templateCount={review.pendingCount}
         templateList={review.templateList}
+        streamDegraded={streamDegraded}
         workspaceEmpty={workspaceEmpty}
       />
       {review.drawer}
@@ -968,6 +972,7 @@ function MasterHome({
   templateRail,
   templateCount,
   templateList,
+  streamDegraded = false,
   workspaceEmpty = false,
 }: {
   readOnly: boolean;
@@ -976,6 +981,7 @@ function MasterHome({
   templateRail?: HostedTemplateRail;
   templateCount?: number;
   templateList?: HostedTemplateList;
+  streamDegraded?: boolean;
   operator?: boolean | null;
   overview: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
@@ -1712,6 +1718,11 @@ function MasterHome({
           onAsk={onAsk}
           onOpenDecision={onOpenDecision}
           decisions={decisions}
+          streamDegraded={streamDegraded}
+          onAskFeedItem={!effectiveReadOnly ? (item) => setSeed((s) => ({
+            text: `Check in with ${item.alias}${item.ticket_id ? ` on ${item.ticket_id}` : ""}. Latest update (${item.state_label}): ${item.latest_action}. What is the current progress, and does anything need my input?`,
+            refs: [], n: s.n + 1,
+          })) : undefined}
           onAskAgent={(agent, update) => setSeed((s) => ({
             text: `Check in with ${agent.alias}${agentOn(agent).length ? ` on ${agentOn(agent).join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,
