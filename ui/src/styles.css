@@ -3324,6 +3324,11 @@ button.refchip:hover {
   z-index: 20;
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
+/* Lift the dock above the narrow-viewport floating To-do button (.needbtn, z-index: 45)
+   while a slash menu or skill picker is open, staying below board drawers (z-index: 60). */
+.chatdock:has(.slashmenu) {
+  z-index: 46;
+}
 .chatdock > [data-composer] {
   border-color: var(--color-edge);
   box-shadow: var(--board-composer-shadow);
