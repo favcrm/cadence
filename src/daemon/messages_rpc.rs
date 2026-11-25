@@ -19,6 +19,31 @@ pub(super) enum SendBinding<'a> {
     ChannelMention(crate::store::human_threads::ChannelPostRequestBinding<'a>),
 }
 
+struct SteerAuthCheck<'a> {
+    alias: &'a str,
+    target: Option<&'a store::Agent>,
+    params: &'a Value,
+    is_steering: bool,
+    nudge: bool,
+}
+
+struct NudgeAdmitCheck<'a> {
+    alias: &'a str,
+    text: &'a str,
+    target: Option<&'a store::Agent>,
+    params: &'a Value,
+    is_steering: bool,
+}
+
+struct NativeNudgeDelivery<'a> {
+    target: Option<&'a store::Agent>,
+    adapter: &'a Arc<dyn ProviderAdapter>,
+    text: &'a str,
+    message: &'a str,
+    sender: &'a store::Sender,
+    steer: &'a store::Steer<'a>,
+}
+
 /// CAD-565: the largest window one `message read` returns — Unicode
 /// scalars, matching the pty paste ceiling so a single page can carry
 /// anything a pane could.
@@ -527,22 +552,7 @@ impl Shared {
             .map(store::Priority::parse)
             .transpose()?
             .unwrap_or_default();
-        let supersedes: Vec<String> = match params.get("supersedes") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(ids)) => ids
-                .iter()
-                .map(|id| {
-                    id.as_str().map(str::to_string).ok_or_else(|| {
-                        Error::rejected("supersedes must be an array of message ids")
-                    })
-                })
-                .collect::<Result<_>>()?,
-            Some(_) => {
-                return Err(Error::rejected(
-                    "supersedes must be an array of message ids",
-                ));
-            }
-        };
+        let supersedes = Self::parse_send_supersedes(params)?;
         // CAD-250: `--nudge` — turnless steering for a live pty pane. The
         // flag is the only way in: a caller-supplied `source: "nudge"`
         // takes the same checks rather than bypassing them.
@@ -556,184 +566,43 @@ impl Shared {
             supersedes: &supersedes,
             ..store::Steer::NONE
         };
-        // CAD-520 r3: a nudge steers a live pane mid-turn — the same
-        // queue mutation as --priority/--supersedes — so it takes the
-        // same caller rule, derived from the connection, never a field.
-        let steering_caller = if steer.is_steering() || nudge {
-            let verb = if steer.is_steering() {
-                "send --priority/--supersedes"
-            } else {
-                "send --nudge"
-            };
-            reject_identity_fields(params, verb)?;
-            let target = target
-                .as_ref()
-                .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
-            let caller = steer_caller(verb)?;
-            let pm = self.effective_pm(target)?;
-            super::caller_rule::may_mutate_agent(
-                &caller,
-                &alias,
-                pm.as_deref(),
-                AgentMutation::Steer,
-                verb,
-            )
-            .map_err(Error::rejected)?;
-            Some(caller)
-        } else {
-            None
-        };
+        let steering_caller = self.authorize_send_steering(
+            &SteerAuthCheck {
+                alias: &alias,
+                target: target.as_ref(),
+                params,
+                is_steering: steer.is_steering(),
+                nudge,
+            },
+            steer_caller,
+        )?;
         if let Some(caller) = &steering_caller {
             (steer.by, steer.by_kind) = caller.audit();
         }
-        // CAD-467 wrote `issue`/`worktree` on the message row at send,
-        // steer-gated — but the steer gate checks caller-versus-target,
-        // never the values, so a PM could mark a send to its own worker
-        // with a forged lane (CAD-378 R6). Now only daemon-derived paths
-        // write the tags: `dispatch_send` sets them from the lane the
-        // daemon itself resolves, `task_dispatch` from the job's rows,
-        // `send_issue_followup` from the lane's latest dispatch tag
-        // through the typed `bound_lane` argument. A caller field is
-        // refused outright — silently dropping it would let a retry
-        // pass as untagged and mis-suppress the reported-kickoff
-        // duplicate check, and would hide the forgery attempt.
-        if optional_str(params, "issue").is_some() || optional_str(params, "worktree").is_some() {
-            let verb = "send --issue/--worktree";
-            reject_identity_fields(params, verb)?;
-            return Err(Error::rejected(format!(
-                "{verb} refused: only a dispatch sets a message's lane tags — \
-                 `cadence dispatch` records the issue and lane worktree from \
-                 the daemon's own resolution; plain sends carry none"
-            )));
-        }
-        // CAD-565: `turn_id` is the daemon's running-turn token — a
-        // nudge binds to the turn that is running when the daemon
-        // claims it, checked atomically; a caller field could only ever
-        // be a forged reference, so it is refused whole rather than
-        // silently ignored.
-        if params.get("turn_id").is_some() {
-            return Err(Error::rejected(
-                "send refused: `turn_id` is not a request field — the daemon \
-                 binds turns at delivery; forged turn references are refused",
-            ));
-        }
-        // CAD-1591: `expected_recipient_uid` is a typed derivation —
-        // `thread_send` parses, validates and strips it before reaching
-        // this body, so a request still carrying it can only be a
-        // caller-supplied field on another verb. It is refused whole
-        // rather than silently ignored: an agent could otherwise name
-        // the constraint and believe a fence ran that never did.
-        if params.get("expected_recipient_uid").is_some() {
-            return Err(Error::rejected(
-                "send refused: `expected_recipient_uid` is not a request \
-                 field — the recipient constraint is a daemon-typed \
-                 derivation of `thread_send` alone",
-            ));
-        }
+        Self::reject_forbidden_send_fields(params)?;
         // A pty endpoint pastes literally and fails a body with control
         // characters at delivery; refuse it here so `send` never answers
         // `queued` for a message that cannot be delivered (CAD-218).
         let pty = target.as_ref().is_some_and(|a| a.endpoint_kind == "pty");
-        let mut native_adapter = None;
-        if nudge {
-            for field in [
-                "sender",
-                "from",
-                "sender_alias",
-                "session_id",
-                "thread_id",
-                "generation",
-                "expectedTurnId",
-                "expected_turn_id",
-                "endpoint",
-            ] {
-                if params.get(field).is_some() {
-                    return Err(Error::rejected(format!(
-                        "send --nudge: '{field}' is not accepted; sender and runtime binding are daemon-derived"
-                    )));
-                }
-            }
-            if steer.is_steering() {
-                return Err(Error::rejected(
-                    "--nudge is pasted at once and never queued — it takes no \
-                     --priority or --supersedes",
-                ));
-            }
-            if optional_str(params, "task").is_some() {
-                return Err(Error::rejected(
-                    "--nudge is steering, not task work — it takes no --task",
-                ));
-            }
-            if text.chars().count() > NUDGE_MAX_CHARS {
-                return Err(Error::rejected(format!(
-                    "a nudge is at most {NUDGE_MAX_CHARS} characters — send longer \
-                     guidance as a normal message or a file path"
-                )));
-            }
-            if let Some(agent) = target.as_ref().filter(|a| a.endpoint_kind != "pty") {
-                let supported = registry::spec_opt(&agent.provider, &agent.endpoint_kind)
-                    .is_some_and(|spec| spec.supports_native_turn_steering());
-                if !supported {
-                    return Err(Error::rejected(format!(
-                        "--nudge requires a pty or a verified native exact-turn guard — '{alias}' is {}/{}; send a normal queued message instead",
-                        agent.provider, agent.endpoint_kind
-                    )));
-                }
-                let adapter = self.adapter_for(&alias)?;
-                if !adapter.native_turn_steering() {
-                    return Err(Error::rejected(
-                        "this live runtime has no verified native exact-turn input guard",
-                    ));
-                }
-                if text.trim().is_empty() {
-                    return Err(Error::rejected("native guidance must not be blank"));
-                }
-                native_adapter = Some(adapter);
-            }
-            if optional_str(params, "reply_to").is_some() {
-                return Err(Error::rejected(
-                    "--nudge owes no report, so it takes no reply_to",
-                ));
-            }
-            // N1: a nudge is for an endpoint that exists now — never queued
-            // for a stopped or fenced agent to receive later. The endpoint is
-            // a pty pane or a verified native adapter.
-            let live = self.lifecycle.lock().unwrap().agents.contains_key(&alias)
-                && target.as_ref().is_some_and(|a| {
-                    (a.endpoint.is_some() || native_adapter.is_some())
-                        && matches!(a.state.as_str(), "idle" | "busy")
-                });
-            if !live {
-                return Err(Error::rejected(format!(
-                    "agent {alias} has no live endpoint (pty pane or verified native guard)"
-                )));
-            }
-        }
+        let native_adapter = if nudge {
+            self.admit_nudge_send(&NudgeAdmitCheck {
+                alias: &alias,
+                text,
+                target: target.as_ref(),
+                params,
+                is_steering: steer.is_steering(),
+            })?
+        } else {
+            None
+        };
         if pty && crate::adapter::pty::has_control_chars(text) {
             return Err(Error::rejected(
                 "PTY messages must be a single line without control characters \
                  — put a long body in a file and send its path",
             ));
         }
-        // `send --task` attaches the delivery to a task — ad-hoc
-        // PM↔worker follow-up inside a job's delivery record. CAD-160:
-        // an open task's message is composed to restate its objective
-        // and outstanding criteria, fitted to the endpoint's ceiling.
         let task = optional_str(params, "task");
-        let composed = match task {
-            Some(task) => {
-                let ceiling = if pty {
-                    crate::adapter::pty::MAX_BODY
-                } else {
-                    store::ENQUEUE_BYTES
-                };
-                Some(
-                    self.store
-                        .compose_task_message(task, &alias, text, ceiling)?,
-                )
-            }
-            None => None,
-        };
+        let composed = self.compose_send_task_body(&alias, text, task, pty)?;
         let text = composed.as_deref().unwrap_or(text);
         // An explicit reply_to always wins; absent one, a worker joined
         // to a group (params.upstream) reports results to its PM by
@@ -764,50 +633,7 @@ impl Shared {
             None | Some(Value::Null) => None,
             Some(v) => Some(thread_refs(v)?),
         };
-        // CAD-802: `thread_send`'s App binding arrives already
-        // server-verified (threads_rpc proved it against the store);
-        // re-prove here so `agent_send`/`send` can never carry one.
-        let app = match params.get("app") {
-            None | Some(Value::Null) => None,
-            Some(v) => {
-                let normalized = thread_app(v, &self.store)?;
-                // An installation-only binding is proven by the catalog.
-                if normalized.get("context_id").is_none() {
-                    self.known_install(normalized["install_id"].as_str().unwrap_or_default())?;
-                }
-                Some(normalized)
-            }
-        };
-        // CAD-1098: `conversation` only selects among the conversations
-        // of the verified App binding's installation. It is checked
-        // here (exists, unarchived, same installation, subject still
-        // verifies) and again inside the enqueue transaction; it never
-        // decides scope, subject or installation.
-        let conversation = match params.get("conversation") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(id)) => {
-                proto::identifier(id, "conversation ID")?;
-                Some(id.as_str())
-            }
-            Some(_) => return Err(Error::rejected("conversation must be a string id")),
-        };
-        let (app, home_conversation) = match (app, conversation) {
-            (Some(mut app), Some(id)) => {
-                self.verify_conversation_selector(&alias, &app, id)?;
-                app["conversation"] = json!(id);
-                (Some(app), None)
-            }
-            (None, Some(id)) => {
-                if !crate::master::is_master(&alias) {
-                    return Err(Error::rejected(
-                        "only the Master can select a Home conversation",
-                    ));
-                }
-                self.prove_home_conversation(Some(id))?;
-                (None, Some(id.to_string()))
-            }
-            (app, None) => (app, None),
-        };
+        let (app, home_conversation) = self.resolve_send_app_and_conversation(&alias, params)?;
         // CAD-1168: `thread_send`'s `attachments` — retained-file ids
         // resolved to their stored metadata rows (existence + size
         // re-checked server-side, scope bound to the verified app
@@ -821,45 +647,13 @@ impl Shared {
                  needs rows; `cadence send` and `agent_send` carry none",
             ));
         }
-        let (attachments, attachment_visual_bytes) = match params.get("attachments") {
-            None | Some(Value::Null) => (None, 0u64),
-            Some(_) if sender != store::Sender::OperatorChat => {
-                return Err(Error::rejected(
-                    "attachments is a thread_send field — only the operator's chat \
-                     attaches retained files; `cadence send` and `agent_send` carry none",
-                ));
-            }
-            Some(_) if !crate::master::is_master(&alias) => {
-                return Err(Error::rejected(
-                    "attachments go only to the master (home or app conversation turns) — \
-                     other agents cannot read retained chat files",
-                ));
-            }
-            Some(v) => {
-                let account_id = params
-                    .get("session")
-                    .map(|proof| self.chat_upload_session_account(proof))
-                    .transpose()?
-                    .flatten();
-                let home_thread = if app.is_none() {
-                    Some(match home_conversation.as_deref() {
-                        Some(selected) => selected.to_string(),
-                        None => self.prove_home_conversation(None)?,
-                    })
-                } else {
-                    None
-                };
-                let (value, visual_bytes) = thread_attachments(
-                    self,
-                    v,
-                    app.as_ref(),
-                    account_id.as_deref(),
-                    params.get("session").is_some(),
-                    home_thread.as_deref().unwrap_or_default(),
-                )?;
-                (Some(value), visual_bytes)
-            }
-        };
+        let (attachments, attachment_visual_bytes) = self.resolve_send_attachments(
+            &alias,
+            params,
+            &sender,
+            app.as_ref(),
+            home_conversation.as_deref(),
+        )?;
         let media_refs = match params.get("media_refs") {
             None | Some(Value::Null) => None,
             Some(_) if sender != store::Sender::OperatorChat => {
@@ -875,90 +669,27 @@ impl Shared {
                  library image; send a normal queued message",
             ));
         }
-        // Visual delivery is proved before a fresh send receives a receipt:
-        // bounded conversion (an SVG is screened, then rendered), the selected
-        // live runtime/model's image support, and the combined turn-image
-        // bound. Delivery re-proves scope, digest and the model for queued
-        // changes.
-        let pinned_bytes = match &media_refs {
-            Some(pin) => self.pinned_image_size(pin)?,
-            None => 0,
-        };
-        let visual_total = attachment_visual_bytes
-            .checked_add(pinned_bytes)
-            .ok_or_else(|| Error::rejected("native image sizes overflow"))?;
-        if visual_total > crate::attachment_image::TURN_IMAGE_TOTAL_MAX as u64 {
-            return Err(Error::rejected(format!(
-                "the turn carries {visual_total} bytes of native images — over the \
-                 {}-byte cap; remove or downscale an attachment",
-                crate::attachment_image::TURN_IMAGE_TOTAL_MAX
-            )));
-        }
-        if visual_total > 0 && !self.store.message_exists(&message)? {
-            // No live adapter means the selected model's image support cannot
-            // be proved now. Refuse the fresh send rather than accept a queued
-            // turn that provably fails later; a retry of an already-enqueued
-            // message is not a new receipt.
-            let adapter = self.adapter_for(&alias)?;
-            adapter.preflight_turn_images()?;
-        }
-        // CAD-1098: app conversations are the master's. Another agent has
-        // no per-conversation session, so an app binding to it is refused.
-        if home_conversation.is_some() && sender != store::Sender::OperatorChat {
-            return Err(Error::rejected(
-                "Home conversation is a thread_send-only selector",
-            ));
-        }
-        if app.is_some() && !crate::master::is_master(&alias) {
-            return Err(Error::rejected(
-                "an app binding is only for the master's chat — other agents \
-                 have no per-app conversations",
-            ));
-        }
-        if app.is_some() && sender != store::Sender::OperatorChat {
-            return Err(Error::rejected(
-                "app is a thread_send field — only the operator's chat carries \
-                 a verified App binding; `cadence send` and `agent_send` carry none",
-            ));
-        }
+        self.validate_send_visual_budget(
+            &alias,
+            &message,
+            attachment_visual_bytes,
+            media_refs.as_ref(),
+        )?;
+        Self::validate_send_operator_chat_fields(
+            &alias,
+            &sender,
+            home_conversation.as_deref(),
+            app.as_ref(),
+        )?;
         if let Some(adapter) = native_adapter {
-            let target = target
-                .as_ref()
-                .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
-            // Direct submission through the concurrent-control seam: the actor
-            // is still waiting for its original kickoff's provider result.
-            // The store atomically binds/claims this turnless row, so it cannot
-            // be replayed by the normal actor queue or a concurrent duplicate.
-            let (duplicate, _, bound) = self
-                .store
-                .begin_native_nudge(target, text, &message, &sender, &steer)?;
-            if !duplicate {
-                if let Some(turn) = bound.as_deref() {
-                    let (disposition, reason) = match adapter.steer_turn(turn, text, &message) {
-                        Ok(crate::adapter::SteerOutcome::Queued) => ("queued", None),
-                        Ok(crate::adapter::SteerOutcome::NotRunning) => ("skipped_inactive", None),
-                        Err(
-                            Error::Rejected(reason)
-                            | Error::Provider(reason)
-                            | Error::PreWrite(reason),
-                        ) => ("rejected", Some(reason)),
-                        // Without a definitive refusal, acceptance may have
-                        // happened. Preserve uncertainty, never requeue.
-                        Err(error) => ("unknown", Some(error.to_string())),
-                    };
-                    self.store
-                        .finish_native_nudge(&message, disposition, reason.as_deref())?;
-                }
-            }
-            let stored = self
-                .store
-                .message(&message)?
-                .ok_or_else(|| Error::internal("Native steering row vanished"))?;
-            self.wake();
-            return Ok(
-                json!({"message": message, "state": stored.state, "duplicate": duplicate,
-                "turn_id": stored.turn_id, "delivery": "native_turn_steering", "disposition": stored.result}),
-            );
+            return self.deliver_native_nudge(&NativeNudgeDelivery {
+                target: target.as_ref(),
+                adapter: &adapter,
+                text,
+                message: &message,
+                sender: &sender,
+                steer: &steer,
+            });
         }
         // CAD-1586: a fresh send to a master whose stored launch
         // configuration provably refuses every launch is refused
@@ -1011,6 +742,421 @@ impl Shared {
             receipt["warning"] = json!(warning);
         }
         Ok(receipt)
+    }
+
+    fn parse_send_supersedes(params: &Value) -> Result<Vec<String>> {
+        match params.get("supersedes") {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(ids)) => ids
+                .iter()
+                .map(|id| {
+                    id.as_str().map(str::to_string).ok_or_else(|| {
+                        Error::rejected("supersedes must be an array of message ids")
+                    })
+                })
+                .collect(),
+            Some(_) => Err(Error::rejected(
+                "supersedes must be an array of message ids",
+            )),
+        }
+    }
+
+    fn authorize_send_steering(
+        &self,
+        check: &SteerAuthCheck<'_>,
+        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+    ) -> Result<Option<AgentCaller>> {
+        // CAD-520 r3: a nudge steers a live pane mid-turn — the same
+        // queue mutation as --priority/--supersedes — so it takes the
+        // same caller rule, derived from the connection, never a field.
+        if !check.is_steering && !check.nudge {
+            return Ok(None);
+        }
+        let verb = if check.is_steering {
+            "send --priority/--supersedes"
+        } else {
+            "send --nudge"
+        };
+        reject_identity_fields(check.params, verb)?;
+        let target = check
+            .target
+            .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
+        let caller = steer_caller(verb)?;
+        let pm = self.effective_pm(target)?;
+        super::caller_rule::may_mutate_agent(
+            &caller,
+            check.alias,
+            pm.as_deref(),
+            AgentMutation::Steer,
+            verb,
+        )
+        .map_err(Error::rejected)?;
+        Ok(Some(caller))
+    }
+
+    fn reject_forbidden_send_fields(params: &Value) -> Result<()> {
+        // CAD-467 wrote `issue`/`worktree` on the message row at send,
+        // steer-gated — but the steer gate checks caller-versus-target,
+        // never the values, so a PM could mark a send to its own worker
+        // with a forged lane (CAD-378 R6). Now only daemon-derived paths
+        // write the tags: `dispatch_send` sets them from the lane the
+        // daemon itself resolves, `task_dispatch` from the job's rows,
+        // `send_issue_followup` from the lane's latest dispatch tag
+        // through the typed `bound_lane` argument. A caller field is
+        // refused outright — silently dropping it would let a retry
+        // pass as untagged and mis-suppress the reported-kickoff
+        // duplicate check, and would hide the forgery attempt.
+        if optional_str(params, "issue").is_some() || optional_str(params, "worktree").is_some() {
+            let verb = "send --issue/--worktree";
+            reject_identity_fields(params, verb)?;
+            return Err(Error::rejected(format!(
+                "{verb} refused: only a dispatch sets a message's lane tags — \
+                 `cadence dispatch` records the issue and lane worktree from \
+                 the daemon's own resolution; plain sends carry none"
+            )));
+        }
+        // CAD-565: `turn_id` is the daemon's running-turn token — a
+        // nudge binds to the turn that is running when the daemon
+        // claims it, checked atomically; a caller field could only ever
+        // be a forged reference, so it is refused whole rather than
+        // silently ignored.
+        if params.get("turn_id").is_some() {
+            return Err(Error::rejected(
+                "send refused: `turn_id` is not a request field — the daemon \
+                 binds turns at delivery; forged turn references are refused",
+            ));
+        }
+        // CAD-1591: `expected_recipient_uid` is a typed derivation —
+        // `thread_send` parses, validates and strips it before reaching
+        // this body, so a request still carrying it can only be a
+        // caller-supplied field on another verb. It is refused whole
+        // rather than silently ignored: an agent could otherwise name
+        // the constraint and believe a fence ran that never did.
+        if params.get("expected_recipient_uid").is_some() {
+            return Err(Error::rejected(
+                "send refused: `expected_recipient_uid` is not a request \
+                 field — the recipient constraint is a daemon-typed \
+                 derivation of `thread_send` alone",
+            ));
+        }
+        Ok(())
+    }
+
+    fn admit_nudge_send(
+        &self,
+        check: &NudgeAdmitCheck<'_>,
+    ) -> Result<Option<Arc<dyn ProviderAdapter>>> {
+        for field in [
+            "sender",
+            "from",
+            "sender_alias",
+            "session_id",
+            "thread_id",
+            "generation",
+            "expectedTurnId",
+            "expected_turn_id",
+            "endpoint",
+        ] {
+            if check.params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "send --nudge: '{field}' is not accepted; sender and runtime binding are daemon-derived"
+                )));
+            }
+        }
+        if check.is_steering {
+            return Err(Error::rejected(
+                "--nudge is pasted at once and never queued — it takes no \
+                 --priority or --supersedes",
+            ));
+        }
+        if optional_str(check.params, "task").is_some() {
+            return Err(Error::rejected(
+                "--nudge is steering, not task work — it takes no --task",
+            ));
+        }
+        if check.text.chars().count() > NUDGE_MAX_CHARS {
+            return Err(Error::rejected(format!(
+                "a nudge is at most {NUDGE_MAX_CHARS} characters — send longer \
+                 guidance as a normal message or a file path"
+            )));
+        }
+        let mut native_adapter = None;
+        if let Some(agent) = check.target.filter(|a| a.endpoint_kind != "pty") {
+            let supported = registry::spec_opt(&agent.provider, &agent.endpoint_kind)
+                .is_some_and(|spec| spec.supports_native_turn_steering());
+            if !supported {
+                return Err(Error::rejected(format!(
+                    "--nudge requires a pty or a verified native exact-turn guard — '{}' is {}/{}; send a normal queued message instead",
+                    check.alias, agent.provider, agent.endpoint_kind
+                )));
+            }
+            let adapter = self.adapter_for(check.alias)?;
+            if !adapter.native_turn_steering() {
+                return Err(Error::rejected(
+                    "this live runtime has no verified native exact-turn input guard",
+                ));
+            }
+            if check.text.trim().is_empty() {
+                return Err(Error::rejected("native guidance must not be blank"));
+            }
+            native_adapter = Some(adapter);
+        }
+        if optional_str(check.params, "reply_to").is_some() {
+            return Err(Error::rejected(
+                "--nudge owes no report, so it takes no reply_to",
+            ));
+        }
+        // N1: a nudge is for an endpoint that exists now — never queued
+        // for a stopped or fenced agent to receive later. The endpoint is
+        // a pty pane or a verified native adapter.
+        let live = self
+            .lifecycle
+            .lock()
+            .unwrap()
+            .agents
+            .contains_key(check.alias)
+            && check.target.is_some_and(|a| {
+                (a.endpoint.is_some() || native_adapter.is_some())
+                    && matches!(a.state.as_str(), "idle" | "busy")
+            });
+        if !live {
+            return Err(Error::rejected(format!(
+                "agent {} has no live endpoint (pty pane or verified native guard)",
+                check.alias
+            )));
+        }
+        Ok(native_adapter)
+    }
+
+    fn compose_send_task_body(
+        &self,
+        alias: &str,
+        text: &str,
+        task: Option<&str>,
+        pty: bool,
+    ) -> Result<Option<String>> {
+        // `send --task` attaches the delivery to a task — ad-hoc
+        // PM↔worker follow-up inside a job's delivery record. CAD-160:
+        // an open task's message is composed to restate its objective
+        // and outstanding criteria, fitted to the endpoint's ceiling.
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        let ceiling = if pty {
+            crate::adapter::pty::MAX_BODY
+        } else {
+            store::ENQUEUE_BYTES
+        };
+        Ok(Some(
+            self.store
+                .compose_task_message(task, alias, text, ceiling)?,
+        ))
+    }
+
+    fn resolve_send_app_and_conversation(
+        &self,
+        alias: &str,
+        params: &Value,
+    ) -> Result<(Option<Value>, Option<String>)> {
+        // CAD-802: `thread_send`'s App binding arrives already
+        // server-verified (threads_rpc proved it against the store);
+        // re-prove here so `agent_send`/`send` can never carry one.
+        let app = match params.get("app") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let normalized = thread_app(v, &self.store)?;
+                // An installation-only binding is proven by the catalog.
+                if normalized.get("context_id").is_none() {
+                    self.known_install(normalized["install_id"].as_str().unwrap_or_default())?;
+                }
+                Some(normalized)
+            }
+        };
+        // CAD-1098: `conversation` only selects among the conversations
+        // of the verified App binding's installation. It is checked
+        // here (exists, unarchived, same installation, subject still
+        // verifies) and again inside the enqueue transaction; it never
+        // decides scope, subject or installation.
+        let conversation = match params.get("conversation") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => {
+                proto::identifier(id, "conversation ID")?;
+                Some(id.as_str())
+            }
+            Some(_) => return Err(Error::rejected("conversation must be a string id")),
+        };
+        match (app, conversation) {
+            (Some(mut app), Some(id)) => {
+                self.verify_conversation_selector(alias, &app, id)?;
+                app["conversation"] = json!(id);
+                Ok((Some(app), None))
+            }
+            (None, Some(id)) => {
+                if !crate::master::is_master(alias) {
+                    return Err(Error::rejected(
+                        "only the Master can select a Home conversation",
+                    ));
+                }
+                self.prove_home_conversation(Some(id))?;
+                Ok((None, Some(id.to_string())))
+            }
+            (app, None) => Ok((app, None)),
+        }
+    }
+
+    fn resolve_send_attachments(
+        &self,
+        alias: &str,
+        params: &Value,
+        sender: &store::Sender,
+        app: Option<&Value>,
+        home_conversation: Option<&str>,
+    ) -> Result<(Option<Value>, u64)> {
+        match params.get("attachments") {
+            None | Some(Value::Null) => Ok((None, 0u64)),
+            Some(_) if *sender != store::Sender::OperatorChat => Err(Error::rejected(
+                "attachments is a thread_send field — only the operator's chat \
+                 attaches retained files; `cadence send` and `agent_send` carry none",
+            )),
+            Some(_) if !crate::master::is_master(alias) => Err(Error::rejected(
+                "attachments go only to the master (home or app conversation turns) — \
+                 other agents cannot read retained chat files",
+            )),
+            Some(v) => {
+                let account_id = params
+                    .get("session")
+                    .map(|proof| self.chat_upload_session_account(proof))
+                    .transpose()?
+                    .flatten();
+                let home_thread = if app.is_none() {
+                    Some(match home_conversation {
+                        Some(selected) => selected.to_string(),
+                        None => self.prove_home_conversation(None)?,
+                    })
+                } else {
+                    None
+                };
+                let (value, visual_bytes) = thread_attachments(
+                    self,
+                    v,
+                    app,
+                    account_id.as_deref(),
+                    params.get("session").is_some(),
+                    home_thread.as_deref().unwrap_or_default(),
+                )?;
+                Ok((Some(value), visual_bytes))
+            }
+        }
+    }
+
+    fn validate_send_visual_budget(
+        &self,
+        alias: &str,
+        message: &str,
+        attachment_visual_bytes: u64,
+        media_refs: Option<&Value>,
+    ) -> Result<()> {
+        // Visual delivery is proved before a fresh send receives a receipt:
+        // bounded conversion (an SVG is screened, then rendered), the selected
+        // live runtime/model's image support, and the combined turn-image
+        // bound. Delivery re-proves scope, digest and the model for queued
+        // changes.
+        let pinned_bytes = match media_refs {
+            Some(pin) => self.pinned_image_size(pin)?,
+            None => 0,
+        };
+        let visual_total = attachment_visual_bytes
+            .checked_add(pinned_bytes)
+            .ok_or_else(|| Error::rejected("native image sizes overflow"))?;
+        if visual_total > crate::attachment_image::TURN_IMAGE_TOTAL_MAX as u64 {
+            return Err(Error::rejected(format!(
+                "the turn carries {visual_total} bytes of native images — over the \
+                 {}-byte cap; remove or downscale an attachment",
+                crate::attachment_image::TURN_IMAGE_TOTAL_MAX
+            )));
+        }
+        if visual_total > 0 && !self.store.message_exists(message)? {
+            // No live adapter means the selected model's image support cannot
+            // be proved now. Refuse the fresh send rather than accept a queued
+            // turn that provably fails later; a retry of an already-enqueued
+            // message is not a new receipt.
+            let adapter = self.adapter_for(alias)?;
+            adapter.preflight_turn_images()?;
+        }
+        Ok(())
+    }
+
+    fn validate_send_operator_chat_fields(
+        alias: &str,
+        sender: &store::Sender,
+        home_conversation: Option<&str>,
+        app: Option<&Value>,
+    ) -> Result<()> {
+        // CAD-1098: app conversations are the master's. Another agent has
+        // no per-conversation session, so an app binding to it is refused.
+        if home_conversation.is_some() && *sender != store::Sender::OperatorChat {
+            return Err(Error::rejected(
+                "Home conversation is a thread_send-only selector",
+            ));
+        }
+        if app.is_some() && !crate::master::is_master(alias) {
+            return Err(Error::rejected(
+                "an app binding is only for the master's chat — other agents \
+                 have no per-app conversations",
+            ));
+        }
+        if app.is_some() && *sender != store::Sender::OperatorChat {
+            return Err(Error::rejected(
+                "app is a thread_send field — only the operator's chat carries \
+                 a verified App binding; `cadence send` and `agent_send` carry none",
+            ));
+        }
+        Ok(())
+    }
+
+    fn deliver_native_nudge(&self, req: &NativeNudgeDelivery<'_>) -> Result<Value> {
+        let target = req
+            .target
+            .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
+        // Direct submission through the concurrent-control seam: the actor
+        // is still waiting for its original kickoff's provider result.
+        // The store atomically binds/claims this turnless row, so it cannot
+        // be replayed by the normal actor queue or a concurrent duplicate.
+        let (duplicate, _, bound) =
+            self.store
+                .begin_native_nudge(target, req.text, req.message, req.sender, req.steer)?;
+        if !duplicate {
+            if let Some(turn) = bound.as_deref() {
+                let (disposition, reason) =
+                    match req.adapter.steer_turn(turn, req.text, req.message) {
+                        Ok(crate::adapter::SteerOutcome::Queued) => ("queued", None),
+                        Ok(crate::adapter::SteerOutcome::NotRunning) => ("skipped_inactive", None),
+                        Err(
+                            Error::Rejected(reason)
+                            | Error::Provider(reason)
+                            | Error::PreWrite(reason),
+                        ) => ("rejected", Some(reason)),
+                        // Without a definitive refusal, acceptance may have
+                        // happened. Preserve uncertainty, never requeue.
+                        Err(error) => ("unknown", Some(error.to_string())),
+                    };
+                self.store
+                    .finish_native_nudge(req.message, disposition, reason.as_deref())?;
+            }
+        }
+        let stored = self
+            .store
+            .message(req.message)?
+            .ok_or_else(|| Error::internal("Native steering row vanished"))?;
+        self.wake();
+        Ok(json!({
+            "message": req.message,
+            "state": stored.state,
+            "duplicate": duplicate,
+            "turn_id": stored.turn_id,
+            "delivery": "native_turn_steering",
+            "disposition": stored.result,
+        }))
     }
 
     /// `message read` — the pull half of CAD-565's push/pull delivery:
