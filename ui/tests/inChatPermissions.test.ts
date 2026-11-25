@@ -370,7 +370,7 @@ async function main() {
   await fireKey("r");
   assert(reviewCalls === reviewBefore + 1, "r key calls Review");
 
-  // Regression: SSE moving TurnBar to idle while Reject & reply POST is in flight must still run onRejectAndReply
+  // A hidden Sending row and the following idle state must keep an in-flight Reject & reply callback.
   rejectReplyReq = null;
   let releaseReject!: () => void;
   const origFetch = globalThis.fetch;
@@ -392,6 +392,15 @@ async function main() {
   });
   await render(
     React.createElement(TurnBar, {
+      state: { kind: "sending" },
+      hideSending: true,
+      reconnecting: false,
+      actions: { onReview: () => undefined },
+    }),
+  );
+  assert(host.querySelector("[data-turn-bar]") === null, "a hidden Sending state renders no dock row");
+  await render(
+    React.createElement(TurnBar, {
       state: { kind: "idle" },
       reconnecting: false,
       actions: { onReview: () => undefined },
@@ -403,7 +412,7 @@ async function main() {
   globalThis.fetch = origFetch;
   assert(
     rejectReplyReq === "git push origin feat",
-    "Reject & reply still seeds composer when stream moves TurnBar to idle before POST resolves",
+    "Reject & reply still seeds the composer after Sending and idle hide the row",
   );
 
   // Guard checks: readOnly, WriteGate, reconnecting must withhold decision buttons and ignore hotkeys
