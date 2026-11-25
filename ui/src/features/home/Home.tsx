@@ -777,6 +777,7 @@ const ThreadList = memo(function ThreadList({
  */
 export default function Home({
   readOnly,
+  canLocalDispatch = false,
   privateChat = false,
   hosted = null,
   viewerSub = null,
@@ -785,6 +786,7 @@ export default function Home({
   overview,
   documentFollowUps,
   onOpenIssue,
+  onToast,
   onOpenDecision,
   decisions = false,
   permissionsHref,
@@ -798,6 +800,7 @@ export default function Home({
   workspaceEmpty = false,
 }: {
   readOnly: boolean;
+  canLocalDispatch?: boolean;
   privateChat?: boolean;
   hosted?: boolean | null;
   credentialRequestsEnabled?: boolean;
@@ -824,6 +827,7 @@ export default function Home({
   overview: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
+  onToast?: (msg: string) => void;
   /** Open a reading item in the shared work-item detail (App owns the mount). */
   onOpenDecision: (open: HomeDecisionOpen) => void;
   /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
@@ -891,10 +895,12 @@ export default function Home({
     <>
       <MasterHome
         readOnly={readOnly}
+        canLocalDispatch={canLocalDispatch}
         hosted={hosted}
         overview={overview}
         documentFollowUps={documentFollowUps}
         onOpenIssue={onOpenIssue}
+        onToast={onToast}
         onOpenDecision={onOpenDecision}
         decisions={decisions}
         permissionsHref={permissionsHref}
@@ -957,10 +963,12 @@ function ConversationIdCopy({ id }: { id: string }) {
  *  actor. The outer Home chooses the layout without changing recipients. */
 function MasterHome({
   readOnly,
+  canLocalDispatch = false,
   hosted = null,
   overview,
   documentFollowUps,
   onOpenIssue,
+  onToast,
   onOpenDecision,
   decisions = false,
   permissionsHref,
@@ -975,6 +983,7 @@ function MasterHome({
   workspaceEmpty = false,
 }: {
   readOnly: boolean;
+  canLocalDispatch?: boolean;
   hosted?: boolean | null;
   credentialRequestsEnabled?: boolean;
   templateRail?: HostedTemplateRail;
@@ -985,6 +994,7 @@ function MasterHome({
   overview: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
+  onToast?: (msg: string) => void;
   onOpenDecision: (open: HomeDecisionOpen) => void;
   /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
   decisions?: boolean;
@@ -1709,11 +1719,18 @@ function MasterHome({
           templateRail={templateRail}
           templateCount={templateCount}
           templateList={templateList}
-          hasLiveAgents={(agents.data?.agents ?? []).some((a) => a.running > 0)}
+          hasLiveAgents={
+            (agents.data?.agents ?? []).some((a) => a.running > 0) ||
+            (agents.data?.feed_items ?? []).some(
+              (item) => item.state === "working" || item.state === "monitoring",
+            )
+          }
           readOnly={readOnly}
+          canLocalDispatch={canLocalDispatch}
           scopedHost={hosted !== false}
           hostedRoster={hosted === false ? undefined : agents.data ?? null}
           onOpenIssue={onOpenIssue}
+          onToast={onToast}
           permissionsHref={permissionsHref}
           onAsk={onAsk}
           onOpenDecision={onOpenDecision}

@@ -1345,7 +1345,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
 
           <HeaderSearch noWiki={!wikiAvailable(meta)} issues={issuesState} route={route} navHref={hrefFor} />
 
-          {humanThreadsAvailable(meta) && <NotificationInbox authEpoch={authEpoch} />}
+          {humanThreadsAvailable(meta) && (
+            <NotificationInbox
+              authEpoch={authEpoch}
+              localAssignmentTodos={privateAssistantView ? undefined : overviewState.data?.local_assignment_todos}
+              onOpenIssue={openHomeWork}
+            />
+          )}
           <div className="app-header-utilities ml-auto flex items-center gap-1 shrink-0">
             <StatusChips
               variant="header"
@@ -1463,6 +1469,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {screen === "home" && (
           <Home
             readOnly={readOnly}
+            canLocalDispatch={meta?.settings_sections?.includes("daemons") === true}
+            onToast={(text) => say("ok", text)}
             privateChat={route.screen === "home" && route.privateChat === true}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             credentialRequestsEnabled={credentialRequestsOn}

@@ -2,7 +2,14 @@ import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { resources } from "../../lib/resources";
-import type { AgentsPayload, DocumentFollowUp, Routine, RoutineRun, StagedRoutineProposal } from "../../lib/types";
+import type {
+  AgentsPayload,
+  DocumentFollowUp,
+  HostedLocalAssignmentTodo,
+  Routine,
+  RoutineRun,
+  StagedRoutineProposal,
+} from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import SafeLink from "../../ui/SafeLink";
@@ -11,6 +18,7 @@ import DrawerShell, { type DrawerMenuItem } from "../app-shell/shared/DrawerShel
 import { useAssistantActor } from "../assistant/AssistantIdentity";
 import { displayName } from "../assistant/identity";
 import { routinesApi } from "../agents/routinesApi";
+import HostedLocalAssignmentCard from "../issues/HostedLocalAssignmentCard";
 import AnswerForm, { READ_ONLY_COPY, useAnswer } from "./AnswerForm";
 import PermissionCard from "./PermissionCard";
 import { sendToMaster } from "./send";
@@ -28,8 +36,8 @@ import {
   type HomeNeed,
   type UnfenceChoice,
 } from "./needs";
-import { todoPresentation, waitingRoutineReason } from "./railModel";
-import { marksFor, sendingTodo, settleTodo, useTodoLocal } from "./todoLocal";
+import { localAssignmentPresentation, todoPresentation, waitingRoutineReason } from "./railModel";
+import { markLocalAssignmentReviewed, marksFor, sendingTodo, settleTodo, useTodoLocal } from "./todoLocal";
 import { privateSessionGeneration } from "../../lib/privateSession";
 
 export type RailTodoTarget =
@@ -37,7 +45,8 @@ export type RailTodoTarget =
   | { kind: "routine_step_hold"; run: RoutineRun }
   | { kind: "routine_proposal"; proposal: StagedRoutineProposal }
   | { kind: "waiting_routine"; routine: Routine }
-  | { kind: "document"; doc: DocumentFollowUp };
+  | { kind: "document"; doc: DocumentFollowUp }
+  | { kind: "local_assignment"; item: HostedLocalAssignmentTodo };
 
 const SNOOZE_24H = 86_400;
 const SNOOZE_7D = 604_800;
@@ -479,9 +488,11 @@ export default function RailTodoDrawer({
   target,
   needs,
   readOnly,
+  canLocalDispatch = false,
   scopedHost,
   hostedRoster,
   onOpenIssue,
+  onToast,
   onAsk,
   onDone,
   onHide,
@@ -492,9 +503,11 @@ export default function RailTodoDrawer({
   target: RailTodoTarget | null;
   needs: readonly HomeNeed[];
   readOnly: boolean;
+  canLocalDispatch?: boolean;
   scopedHost: boolean;
   hostedRoster?: AgentsPayload | null;
   onOpenIssue?: (id: string) => void;
+  onToast?: (msg: string) => void;
   onAsk?: (need: HomeNeed) => void;
   onDone: (need: HomeNeed, text: string) => void;
   onHide: (need: HomeNeed) => void;
@@ -695,6 +708,115 @@ export default function RailTodoDrawer({
           id: "detail",
           label: t("Details"),
           panel: <div className="dx-panel"><p className="text-secondary text-ink-300">{reason}</p></div>,
+        }]}
+        onClose={onClose}
+      />
+    );
+  }
+
+  if (target.kind === "local_assignment") {
+    const { item } = target;
+    const { assignment } = item;
+    const pres = localAssignmentPresentation(item);
+    const runnerId = assignment.spawn?.runner_id ?? assignment.resume?.runner_id ?? null;
+    const model = assignment.spawn?.model ?? assignment.resume?.model ?? null;
+    const kvRows: Array<[string, string | null | undefined]> = [
+      [t("Assignment"), assignment.assignment_id],
+      [t("State"), assignment.state],
+      [t("Runner"), pres.sourceLabel],
+      [t("Runner ID"), runnerId],
+      [t("Model"), model],
+      [t("Generation"), typeof assignment.generation === "number" ? `g${assignment.generation}` : null],
+      [t("Commit"), assignment.reported_head_sha],
+      [t("Deliverable"), assignment.deliverable ? `${assignment.deliverable.type}: ${assignment.deliverable.ref}` : null],
+    ];
+    return (
+      <DrawerShell
+        kind="todo-detail"
+        label={t(pres.statusLabel)}
+        kicker={t("To do")}
+        scrim="board"
+        modal
+        trapFocus
+        title={`${item.issue_id} · ${item.issue_title}`}
+        subtitle={pres.metaLabel}
+        pills={
+          <>
+            <span className="s-status-pill" data-tone={pres.tone === "fail" ? "warn" : pres.tone}>
+              {t(pres.statusLabel)}
+            </span>
+            <span className="s-status-pill num">{item.issue_id}</span>
+          </>
+        }
+        warning={block ? t(READ_ONLY_COPY) : undefined}
+        secondary={
+          item.category === "reviews" && !block ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                markLocalAssignmentReviewed(item);
+                onToast?.(`${item.issue_id} ${t("marked reviewed")}`);
+                onClose();
+              }}
+            >
+              {t("Mark reviewed")}
+            </Button>
+          ) : (
+            <Button size="sm" variant="ghost" onClick={() => onClose()}>{t("Close")}</Button>
+          )
+        }
+        primary={
+          onOpenIssue ? (
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => {
+                onOpenIssue(item.issue_id);
+                onClose(false);
+              }}
+            >
+              {item.issue_id} ↗
+            </Button>
+          ) : undefined
+        }
+        tabs={[{
+          id: "detail",
+          label: t("Details"),
+          panel: (
+            <div className="dx-panel">
+              <dl className="dx-kv-card">
+                {kvRows
+                  .filter((entry): entry is [string, string] => Boolean(entry[1]))
+                  .map(([label, value]) => (
+                    <div key={label} className="dx-kv-line">
+                      <dt>{label}</dt>
+                      <dd className="font-mono text-micro break-all">{value}</dd>
+                    </div>
+                  ))}
+              </dl>
+              {assignment.text && (
+                <div className={`rounded border p-3 ${item.category === "blocked" ? "border-fail/40 bg-fail/10" : "border-ink-700 bg-ink-900"}`}>
+                  <pre className="whitespace-pre-wrap break-words text-micro text-ink-200 font-mono">
+                    {assignment.text}
+                  </pre>
+                </div>
+              )}
+              <HostedLocalAssignmentCard
+                issueId={item.issue_id}
+                assignment={assignment}
+                canLocalDispatch={canLocalDispatch}
+                readOnly={readOnly}
+                onMutated={() => {
+                  void resources.overview.refresh();
+                  void resources.agents.refresh();
+                  void resources.issue(item.issue_id).refresh();
+                  onClose(false);
+                }}
+                onToast={onToast}
+              />
+            </div>
+          ),
         }]}
         onClose={onClose}
       />

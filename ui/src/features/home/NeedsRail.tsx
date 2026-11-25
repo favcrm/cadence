@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
-import type { Agent, AgentFeedItem, AgentsPayload, DocumentFollowUp, DocumentFollowUps, Overview } from "../../lib/types";
+import type { Agent, AgentFeedItem, AgentsPayload, DocumentFollowUp, DocumentFollowUps, HostedLocalAssignmentTodo, Overview } from "../../lib/types";
 import { ageWords, kindSpec, metaLine, stagedNeed, todoSplit, updateTitle, withStaged, type HomeNeed } from "./needs";
 import StagedWriteDetail, { noticeText } from "../decisions/StagedWriteDetail";
 import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf } from "../decisions/stagedWrite";
@@ -20,6 +20,7 @@ import {
   FEED_CATEGORY_ORDER,
   feedCategoriesForDecidedWrite,
   feedCategoriesForInfoNeed,
+  localAssignmentPresentation,
   presentTodoCategories,
   sortUnifiedTodos,
   todoCategoryForNeed,
@@ -30,7 +31,17 @@ import {
   type UnifiedTodoItem,
 } from "./railModel";
 import { decisionReviewHead, nextDecisionToken, type HomeDecisionOpen } from "../../lib/workItems";
-import { beginTodoVisit, decideRoutine, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
+import {
+  beginTodoVisit,
+  decideRoutine,
+  doneTodo,
+  hideTodo,
+  isLocalAssignmentReviewed,
+  localAssignmentFingerprint,
+  marksFor,
+  reconcileLocalAssignments,
+  useTodoLocal,
+} from "./todoLocal";
 import { resources } from "../../lib/resources";
 import type { HostedTemplateList, HostedTemplateRail } from "../templates/HostedTemplateReview";
 import DrawerShell from "../app-shell/shared/DrawerShell";
@@ -69,9 +80,11 @@ export default function NeedsRail({
   overview,
   documentFollowUps,
   readOnly,
+  canLocalDispatch = false,
   scopedHost = false,
   hostedRoster,
   onOpenIssue,
+  onToast,
   permissionsHref,
   onAsk,
   onOpenDecision,
@@ -89,9 +102,11 @@ export default function NeedsRail({
   overview?: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
   readOnly: boolean;
+  canLocalDispatch?: boolean;
   scopedHost?: boolean;
   hostedRoster?: AgentsPayload | null;
   onOpenIssue?: (id: string) => void;
+  onToast?: (msg: string) => void;
   /** Settings → Master permissions, where the standing "Always" rules live. */
   permissionsHref?: string;
   onAsk?: (need: HomeNeed, lead?: string) => void;
@@ -240,11 +255,37 @@ export default function NeedsRail({
   const cards = useMemo(() => todo.filter((n) => !marksFor(local, n).hidden), [todo, local]);
   const isDone = (n: HomeNeed) => marksFor(local, n).doneText !== undefined;
 
+  const rawLocalAssignments = useMemo(
+    () => overviewData?.local_assignment_todos ?? [],
+    [overviewData?.local_assignment_todos],
+  );
+  const localAssignmentsSig = rawLocalAssignments
+    .map((item) => `${item.issue_id}\t${localAssignmentFingerprint(item)}`)
+    .join("\n");
+  useEffect(() => {
+    if (overviewData?.local_assignment_todos) reconcileLocalAssignments(overviewData.local_assignment_todos);
+  }, [localAssignmentsSig]);
+
+  const localAssignmentTodos = useMemo<HostedLocalAssignmentTodo[]>(
+    () => rawLocalAssignments.filter((item) => !isLocalAssignmentReviewed(local, item)),
+    [rawLocalAssignments, local],
+  );
+
   useEffect(() => {
     if (todoTarget?.kind === "need" && !cards.some((n) => n.key === todoTarget.key)) {
       setTodoTarget(null);
     }
-  }, [todoTarget, cards]);
+    if (
+      todoTarget?.kind === "local_assignment" &&
+      !localAssignmentTodos.some(
+        (item) =>
+          item.issue_id === todoTarget.item.issue_id &&
+          localAssignmentFingerprint(item) === localAssignmentFingerprint(todoTarget.item),
+      )
+    ) {
+      setTodoTarget(null);
+    }
+  }, [todoTarget, cards, localAssignmentTodos]);
 
   const pendingTemplates = useMemo(() => templateList?.pending ?? [], [templateList?.pending]);
   const approvedTemplates = useMemo(() => templateList?.approved ?? [], [templateList?.approved]);
@@ -287,9 +328,23 @@ export default function NeedsRail({
         category: "reviews",
         template,
       })),
+      ...localAssignmentTodos.map((item): UnifiedTodoItem => ({
+        kind: "local_assignment",
+        key: `hla:${item.issue_id}`,
+        category: item.category,
+        item,
+      })),
     ];
     return sortUnifiedTodos(raw);
-  }, [cards, routineStepHolds, routineProposals, waitingRoutines, pendingDocuments, pendingTemplates]);
+  }, [
+    cards,
+    routineStepHolds,
+    routineProposals,
+    waitingRoutines,
+    pendingDocuments,
+    pendingTemplates,
+    localAssignmentTodos,
+  ]);
 
   const todoCategories = useMemo(() => presentTodoCategories(unifiedTodos), [unifiedTodos]);
   useEffect(() => {
@@ -309,6 +364,7 @@ export default function NeedsRail({
     routineProposals.length +
     routineStepHolds.length +
     pendingDocuments.length +
+    localAssignmentTodos.length +
     (templateList ? templateList.pending.length : (templateCount ?? 0));
   const countKnown =
     (Boolean(overviewData) ||
@@ -485,6 +541,28 @@ export default function NeedsRail({
             meta={t("Approval requested")}
             cue={t("Review")}
             onOpen={(event) => openTodoDetail({ kind: "document", doc }, event.currentTarget)}
+          />
+        </li>
+      );
+    }
+    if (item.kind === "local_assignment") {
+      const entry = item.item;
+      const pres = localAssignmentPresentation(entry);
+      return (
+        <li key={item.key} className="needrow" data-local-assignment-issue={entry.issue_id}>
+          <RailCard
+            className="todo-card"
+            bodyClassName="todo-main min-w-0"
+            titleClassName="todo-hit"
+            metaClassName="todo-meta"
+            tone={pres.tone}
+            statusLabel={t(pres.statusLabel)}
+            source={pres.sourceLabel}
+            title={<span className="todo-title">{entry.issue_id} · {entry.issue_title}</span>}
+            summary={pres.summaryText}
+            meta={pres.metaLabel}
+            cue={t(pres.cueLabel)}
+            onOpen={(event) => openTodoDetail({ kind: "local_assignment", item: entry }, event.currentTarget)}
           />
         </li>
       );
@@ -888,9 +966,11 @@ export default function NeedsRail({
         target={todoTarget}
         needs={cards}
         readOnly={readOnly}
+        canLocalDispatch={canLocalDispatch}
         scopedHost={scopedHost}
         hostedRoster={hostedRoster}
         onOpenIssue={openIssue}
+        onToast={onToast}
         onAsk={onAsk ? (need) => ask(need) : undefined}
         onDone={doneTodo}
         onHide={hideTodo}

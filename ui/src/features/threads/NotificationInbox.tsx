@@ -6,6 +6,8 @@ import { IconCheck, IconClose, IconSettings, IconThreads } from "../../ui/icons"
 import { navigate, useHref } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
 import { ApiError } from "../../lib/api";
+import type { HostedLocalAssignmentTodo } from "../../lib/types";
+import { localAssignmentFingerprint } from "../home/todoLocal";
 import {
   humanNotifications,
   markNotificationsRead,
@@ -40,6 +42,35 @@ const INBOX_POLL_MS = 15000;
 const BROWSER_SYNC_ERROR = "Could not sync browser alerts. Your threads still load.";
 
 const DEVICE_KEY = "cadence.push.device";
+const LOCAL_ASSIGNMENT_ALERTS_PREFIX = "cadence.notifications.local_assignments.v1:";
+
+function readAssignmentAlertKeys(humanId: string | undefined): Set<string> {
+  if (!humanId) return new Set();
+  try {
+    if (typeof localStorage === "undefined") return new Set();
+    const raw = localStorage.getItem(`${LOCAL_ASSIGNMENT_ALERTS_PREFIX}${humanId}`);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed)
+      ? new Set(parsed.filter((item): item is string => typeof item === "string"))
+      : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function writeAssignmentAlertKeys(humanId: string | undefined, keys: ReadonlySet<string>): void {
+  if (!humanId) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(
+      `${LOCAL_ASSIGNMENT_ALERTS_PREFIX}${humanId}`,
+      JSON.stringify([...keys].slice(-64)),
+    );
+  } catch {
+    // Best-effort client persistence only.
+  }
+}
 
 /** The thread route the Threads page reads (`?h=<room>`). */
 export function threadHref(room: string): string {
@@ -61,13 +92,22 @@ export function activeRoom(): string | null {
  * state; every change starts a new generation that resets the cache, dialog,
  * toasts and dedupe, and drops responses from the previous generation.
  */
-export default function NotificationInbox({ authEpoch }: { authEpoch: string }) {
+export default function NotificationInbox({
+  authEpoch,
+  localAssignmentTodos,
+  onOpenIssue,
+}: {
+  authEpoch: string;
+  localAssignmentTodos?: readonly HostedLocalAssignmentTodo[];
+  onOpenIssue?: (id: string) => void;
+}) {
   const t = useTranslate();
   const tRef = useRef(t);
   useEffect(() => {
     tRef.current = t;
   }, [t]);
   const [inbox, setInbox] = useState<Inbox | null>(null);
+  const [readAssignmentKeys, setReadAssignmentKeys] = useState<Set<string>>(() => new Set());
   const [filter, setFilter] = useState<"unread" | "all">("unread");
   const [notice, setNotice] = useState<string | null>(null);
   const [preferenceNotice, setPreferenceNotice] = useState<string | null>(null);
@@ -77,6 +117,8 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   const [deviceId, setDeviceId] = useState<string | null>(() => localStorage.getItem(DEVICE_KEY));
   const generation = useRef(0);
   const latestPreferenceSave = useRef(0);
+  const hydratedAssignments = useRef(false);
+  const seenAssignmentKeys = useRef(new Set<string>());
   // Last verified human. Kept across auth epochs so a switch to another account is caught on its first valid feed.
   const known = useRef<string | null>(null);
   const popover = useRef<HTMLDialogElement | null>(null);
@@ -120,6 +162,9 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   useEffect(() => {
     ++generation.current;
     announced.clear();
+    hydratedAssignments.current = false;
+    seenAssignmentKeys.current.clear();
+    setReadAssignmentKeys(new Set());
     toast.clear();
     setInbox(null);
     setNotice(null);
@@ -215,6 +260,9 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             // in-flight actions from the old identity are dropped, not applied.
             generation.current++;
             announced.clear();
+            hydratedAssignments.current = false;
+            seenAssignmentKeys.current.clear();
+            setReadAssignmentKeys(new Set());
             toast.clear();
             setInbox(null);
             setNotice(null);
@@ -262,6 +310,41 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
       stop();
     };
   }, [authEpoch, toast]);
+
+  useEffect(() => {
+    if (!humanId) return;
+    setReadAssignmentKeys(readAssignmentAlertKeys(humanId));
+  }, [humanId]);
+
+  useEffect(() => {
+    if (!inbox || localAssignmentTodos === undefined) return;
+    if (!hydratedAssignments.current) {
+      hydratedAssignments.current = true;
+      for (const item of localAssignmentTodos) {
+        seenAssignmentKeys.current.add(localAssignmentFingerprint(item));
+      }
+      return;
+    }
+    const storedRead = readAssignmentAlertKeys(inbox.human.id);
+    const quiet = isQuietNow(inbox.preferences);
+    for (const item of localAssignmentTodos) {
+      const key = localAssignmentFingerprint(item);
+      if (seenAssignmentKeys.current.has(key)) continue;
+      seenAssignmentKeys.current.add(key);
+      if (storedRead.has(key) || quiet) continue;
+      const label =
+        item.assignment.state === "failed"
+          ? tRef.current("Failed")
+          : item.category === "blocked"
+            ? tRef.current("Blocked")
+            : tRef.current("Finished");
+      toast.show(`${label} · ${item.issue_id}`, `hla:${key}`, {
+        href: `/?issue=${encodeURIComponent(item.issue_id)}`,
+        note: item.assignment.text?.trim() || item.issue_title,
+        translateNote: false,
+      });
+    }
+  }, [inbox, localAssignmentTodos, toast]);
 
   // The delivery guard needs this device's view, not another tab's read marker.
   useEffect(() => {
@@ -321,7 +404,26 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
 
   if (inbox === null) return null;
   const browserAlertsAvailable = inbox.push.available && pushSupported();
-  const total = inbox.unread_total;
+  const assignmentAlerts = (localAssignmentTodos ?? []).map((item) => {
+    const key = localAssignmentFingerprint(item);
+    const chipLabel =
+      item.assignment.state === "failed"
+        ? t("Failed")
+        : item.category === "blocked"
+          ? t("Blocked")
+          : t("Finished");
+    return {
+      key,
+      issueId: item.issue_id,
+      title: `${item.issue_id} · ${item.issue_title}`,
+      chipLabel,
+      summary: item.assignment.text?.trim() || item.issue_title,
+      unread: !readAssignmentKeys.has(key),
+    };
+  });
+  const unreadAssignmentCount = assignmentAlerts.filter((a) => a.unread).length;
+  const visibleAssignmentAlerts = assignmentAlerts.filter((a) => filter === "all" || a.unread);
+  const total = inbox.unread_total + unreadAssignmentCount;
   const groups = inbox.groups.filter((g) => filter === "all" || g.unread > 0);
 
   const open = () => {
@@ -344,6 +446,13 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   };
 
   const markAll = () => {
+    if (assignmentAlerts.length > 0) {
+      const nextRead = new Set(readAssignmentKeys);
+      for (const alert of assignmentAlerts) nextRead.add(alert.key);
+      writeAssignmentAlertKeys(humanId, nextRead);
+      setReadAssignmentKeys(nextRead);
+    }
+    if (inbox.unread_total === 0) return;
     const mine = generation.current;
     void markNotificationsRead()
       .then(async () => {
@@ -354,6 +463,17 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
       .catch(() => {
         if (generation.current === mine) setNotice("Could not mark notifications read.");
       });
+  };
+
+  const openAssignmentAlert = (alert: (typeof assignmentAlerts)[number]) => {
+    const nextRead = new Set(readAssignmentKeys);
+    nextRead.add(alert.key);
+    writeAssignmentAlertKeys(humanId, nextRead);
+    setReadAssignmentKeys(nextRead);
+    toast.clear(`hla:${alert.key}`);
+    close(false);
+    if (onOpenIssue) onOpenIssue(alert.issueId);
+    else navigate(`/?issue=${encodeURIComponent(alert.issueId)}`);
   };
 
   const openGroup = (group: NotificationGroup) => {
@@ -468,7 +588,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
         </div>
         {notice !== null && <p className="settings-note" role="status">{t(notice)}</p>}
         <div className="notification-list">
-          {groups.length === 0 && (
+          {groups.length === 0 && visibleAssignmentAlerts.length === 0 && (
             <div className="notification-empty">
               <span className="notification-empty-icon"><IconCheck size={18} /></span>
               <div>
@@ -477,6 +597,19 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
               </div>
             </div>
           )}
+          {visibleAssignmentAlerts.map((alert) => (
+            <div key={alert.key} className="notification-row" data-local-assignment-alert={alert.issueId}>
+              <button
+                type="button"
+                className="notification-copy"
+                onClick={() => openAssignmentAlert(alert)}
+              >
+                <span className="chip">{alert.chipLabel}</span>
+                <strong>{alert.title}</strong>
+                <small>{alert.summary}{alert.unread ? "" : ` · ${t("read")}`}</small>
+              </button>
+            </div>
+          ))}
           {groups.map((g) => (
             <div key={g.room} className="notification-row">
               <button
