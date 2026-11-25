@@ -1,7 +1,7 @@
 import { parsePreview, parseStagedRow, type StagedWrite } from "../src/features/decisions/stagedWrite";
 import type { ThreadEntry } from "../src/features/home/thread";
 declare function require(name: string): any;
-import { SOURCES_SHOWN, STAGED_FIELDS_SHOWN, STAGED_VALUE_CHARS, attachmentNames, bodyNeedsClamp, outsideDomainRecipients, parseToolCall, shortId, stagedAccount, stagedFields, stagedInTurn, stagedStatus, turnSources } from "../src/features/home/turnCards";
+import { SOURCES_SHOWN, STAGED_FIELDS_SHOWN, STAGED_VALUE_CHARS, attachmentNames, bodyNeedsClamp, outsideDomainRecipients, parseToolCall, shortId, skillDraftsInTurn, stagedAccount, stagedFields, stagedInTurn, stagedStatus, turnSources } from "../src/features/home/turnCards";
 
 /**
  * CAD-2441 (card system phase 1, CAD-2437): a turn's sources and staged
@@ -279,5 +279,71 @@ check(parsePreview({ kind: "fields", fields: Array.from({ length: 20 }, (_, i) =
 check(!bodyNeedsClamp("Hi Mr Lee,\nsee you at 3pm."), "a short body does not clamp");
 check(bodyNeedsClamp("x\n".repeat(7)), "seven lines clamp");
 check(bodyNeedsClamp("x".repeat(401)), "a long single paragraph clamps");
+
+// Workspace skill drafts: only successful workspace_skill_draft results count.
+{
+  const toolCall = (text: string, id?: string): ThreadEntry => ({
+    seq: ++seq,
+    role: "agent",
+    kind: "tool_call",
+    text,
+    message: "m1",
+    payload: id ? { tool_use_id: id } : null,
+  });
+  const toolResult = (text: string, extra?: { id?: string; error?: boolean; refused?: boolean }): ThreadEntry => ({
+    seq: ++seq,
+    role: "agent",
+    kind: "tool_result",
+    text,
+    message: "m1",
+    payload: {
+      ...(extra?.id ? { tool_use_id: extra.id } : {}),
+      ...(extra?.error ? { is_error: true } : {}),
+      ...(extra?.refused ? { refused: true } : {}),
+    },
+  });
+  const okPayload = (name: string, rev: number, digest: string, created = true) =>
+    JSON.stringify({
+      created,
+      skill: { name, latest_revision: rev, latest_digest: digest, description: `Desc ${rev}`, approved_revision: null },
+      revision: { revision: rev, digest },
+    });
+
+  // Paired by tool_use_id and positionally, keeping latest revision per skill.
+  const drafts = skillDraftsInTurn([
+    toolCall('workspace_skill_draft {"name":"weekly-report"}', "t1"),
+    toolResult(okPayload("weekly-report", 1, "sha-1"), { id: "t1" }),
+    toolCall('workspace_skill_draft {"name":"release-check"}'),
+    toolResult(okPayload("release-check", 1, "sha-r1")),
+    toolCall('workspace_skill_draft {"name":"weekly-report"}', "t2"),
+    toolResult(okPayload("weekly-report", 2, "sha-2", false), { id: "t2" }),
+  ]);
+  check(
+    drafts.length === 2 &&
+      drafts[0]!.name === "weekly-report" &&
+      drafts[0]!.revision === 2 &&
+      drafts[0]!.digest === "sha-2" &&
+      drafts[1]!.name === "release-check",
+    `drafts deduplicate by name in first-appearance order: ${JSON.stringify(drafts)}`,
+  );
+
+  // Refusals, errors, other tools, prose, invalid tags, malformed JSON, and non-positive revisions are ignored.
+  const ignored = skillDraftsInTurn([
+    toolCall('workspace_skill_draft {"name":"weekly-report"}', "e1"),
+    toolResult(okPayload("weekly-report", 1, "sha-1"), { id: "e1", error: true }),
+    toolCall('workspace_skill_draft {"name":"weekly-report"}', "r1"),
+    toolResult(okPayload("weekly-report", 1, "sha-1"), { id: "r1", refused: true }),
+    toolCall('workspace_skill_show {"name":"weekly-report"}', "s1"),
+    toolResult(okPayload("weekly-report", 1, "sha-1"), { id: "s1" }),
+    toolCall('workspace_skill_draft {"name":"BadTag"}', "b1"),
+    toolResult(okPayload("BadTag", 1, "sha-1"), { id: "b1" }),
+    toolCall('workspace_skill_draft {"name":"zero-rev"}', "z1"),
+    toolResult(okPayload("zero-rev", 0, "sha-0"), { id: "z1" }),
+    toolCall('workspace_skill_draft {"name":"bad-json"}', "j1"),
+    toolResult("{not json", { id: "j1" }),
+    prose(okPayload("weekly-report", 1, "sha-1")),
+  ]);
+  check(ignored.length === 0, `invalid or non-draft entries produce no cards: ${JSON.stringify(ignored)}`);
+}
 
 console.log("turnCards: ok");

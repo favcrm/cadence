@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useId, useRef, useState, type FormEvent } from "react";
 import { useTranslate } from "../../lib/localeText";
 import { fmtBytes } from "../../lib/fmt";
+import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import Link from "../../ui/Link";
 import RowMenu from "../../ui/RowMenu";
@@ -9,12 +10,21 @@ import { navigate } from "../../lib/useLocation";
 import { routePath } from "../../lib/router";
 import type { WorkspaceSkillRead, WorkspaceSkillUser } from "../../lib/types";
 import {
+  SKILL_DESCRIPTION_MAX,
+  SKILL_PACKAGE_BYTES_MAX,
+  SKILL_REFERENCES_MAX,
   approvedWhen,
+  buildDraftFiles,
+  composeSkillMd,
   filterUsedBy,
+  parseUploadedSkillFiles,
   referenceFiles,
   stripFrontmatter,
   usedByCounts,
   usedBySummary,
+  utf8ByteLength,
+  validateSkillName,
+  type DraftReference,
   type UsedByFilter,
 } from "./workspaceSkills";
 
@@ -67,7 +77,7 @@ export function OverviewPanel({
   onSeeAll,
 }: {
   read: WorkspaceSkillRead;
-  assign: AssignView;
+  assign?: AssignView;
   profileId: string | null;
   onSeeAll: () => void;
 }) {
@@ -77,10 +87,10 @@ export function OverviewPanel({
   const users = skill.used_by;
   const summary = users ? usedBySummary(users, profileId) : null;
   const counts = users ? usedByCounts(users) : null;
-  const agent = assign.agentName;
+  const agent = assign?.agentName ?? "";
   return (
     <div className="ap-body">
-      {assign.on !== null && (
+      {assign && assign.on !== null && (
         <div className="sk-assign">
           <div>
             <b>{t("On for {agent}").replace("{agent}", () => agent)}</b>
@@ -194,7 +204,7 @@ export function UsedByPanel({
   scopedRoster: boolean;
   /** A stale or unconfirmed turn-off, with the way to read again. */
   notice: { text: string; reload: () => void } | null;
-  onTurnOff: (user: WorkspaceSkillUser) => void;
+  onTurnOff?: (user: WorkspaceSkillUser) => void;
 }) {
   const t = useTranslate();
   const [query, setQuery] = useState("");
@@ -223,7 +233,7 @@ export function UsedByPanel({
         {`${counts.active} ${t("active")}, ${counts.archived} ${t("archived")}`}
         {query.trim() !== "" && ` · ${t("{n} match").replace("{n}", String(shown.length))}`}
       </p>
-      {writable && users.length > 0 && (
+      {writable && onTurnOff !== undefined && users.length > 0 && (
         <p className="rc-note">{t("Use ⋯ on a row to turn the skill off for one agent. Revoke withdraws it from every agent.")}</p>
       )}
       {notice && (
@@ -241,6 +251,10 @@ export function UsedByPanel({
           {shown.map((user) => {
             const mine = user.profile_id === profileId;
             const archived = user.status === "archived";
+            const menuItems = [
+              ...(mine || archived ? [] : [{ key: "open", label: "Open agent", hint: t("Go to {agent}’s Skills tab").replace("{agent}", () => user.name), onSelect: () => navigate(agentHref(user, scopedRoster)) }]),
+              ...(onTurnOff !== undefined ? [{ key: "off", label: "Turn off for this agent", hint: t("{agent} stops getting this skill").replace("{agent}", () => user.name), danger: true, onSelect: () => onTurnOff(user) }] : []),
+            ];
             return (
               <li key={user.profile_id} className="sk-user">
                 <span className="sk-user-name">
@@ -253,13 +267,10 @@ export function UsedByPanel({
                   )}
                 </span>
                 <small>{[mine && t("this agent"), archived && t("archived")].filter(Boolean).join(" · ")}</small>
-                {writable && (
+                {writable && menuItems.length > 0 && (
                   <RowMenu
                     label={`${t("Actions for")} ${user.name}`}
-                    items={[
-                      ...(mine || archived ? [] : [{ key: "open", label: "Open agent", hint: t("Go to {agent}’s Skills tab").replace("{agent}", () => user.name), onSelect: () => navigate(agentHref(user, scopedRoster)) }]),
-                      { key: "off", label: "Turn off for this agent", hint: t("{agent} stops getting this skill").replace("{agent}", () => user.name), danger: true, onSelect: () => onTurnOff(user) },
-                    ]}
+                    items={menuItems}
                   />
                 )}
               </li>
@@ -293,5 +304,257 @@ export function FilesPanel({ files }: { files: Record<string, string> }) {
         </details>
       ))}
     </div>
+  );
+}
+
+/** Create or edit a draft workspace skill (`SKILL.md` + optional `references/`). */
+export function SkillDraftForm({
+  formId,
+  mode,
+  initialName = "",
+  initialDescription = "",
+  initialBody = "",
+  initialReferences = [],
+  busy,
+  serverError,
+  onSubmit,
+}: {
+  formId: string;
+  mode: "create" | "edit";
+  initialName?: string;
+  initialDescription?: string;
+  initialBody?: string;
+  initialReferences?: DraftReference[];
+  busy: boolean;
+  serverError: string | null;
+  onSubmit: (payload: { name: string; files: Record<string, string> }) => void;
+}) {
+  const t = useTranslate();
+  const baseId = useId();
+  const uploadInput = useRef<HTMLInputElement>(null);
+  const [name, setName] = useState(initialName);
+  const [description, setDescription] = useState(initialDescription);
+  const [body, setBody] = useState(initialBody);
+  const [references, setReferences] = useState<DraftReference[]>(initialReferences);
+  const [bodyView, setBodyView] = useState<"edit" | "preview">("edit");
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const skillBytes = utf8ByteLength(composeSkillMd(description, body));
+  const totalBytes = references.reduce((sum, ref) => sum + utf8ByteLength(ref.content), skillBytes);
+  const displayedError = localError ?? serverError;
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (busy) return;
+    setLocalError(null);
+    const targetName = mode === "create" ? name.trim() : initialName;
+    if (mode === "create") {
+      const nameError = validateSkillName(name);
+      if (nameError !== null) {
+        setLocalError(t(nameError));
+        return;
+      }
+    }
+    const built = buildDraftFiles({ description, body, references });
+    if (!built.ok) {
+      setLocalError(t(built.error));
+      return;
+    }
+    onSubmit({ name: targetName, files: built.files });
+  };
+
+  const handleFiles = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    setLocalError(null);
+    const uploads = await Promise.all(
+      Array.from(fileList).map(async (file) => ({
+        name: file.webkitRelativePath || file.name,
+        content: await file.text(),
+      })),
+    );
+    const parsed = parseUploadedSkillFiles(uploads);
+    if (parsed.description !== undefined) setDescription(parsed.description);
+    if (parsed.body !== undefined) setBody(parsed.body);
+    if (parsed.references.length > 0) {
+      setReferences((prev) => {
+        const next = [...prev];
+        for (const incoming of parsed.references) {
+          const at = next.findIndex((item) => item.name === incoming.name);
+          if (at >= 0) next[at] = incoming;
+          else if (next.length < SKILL_REFERENCES_MAX) next.push(incoming);
+        }
+        return next;
+      });
+    }
+    if (parsed.errors.length > 0) setLocalError(t(parsed.errors[0]!));
+    if (uploadInput.current) uploadInput.current.value = "";
+  };
+
+  return (
+    <form id={formId} className="sk-form" onSubmit={submit}>
+      {mode === "create" && (
+        <div className="sk-field">
+          <label htmlFor={`${baseId}-name`}>{t("Skill name")}</label>
+          <input
+            id={`${baseId}-name`}
+            type="text"
+            className="field num"
+            value={name}
+            maxLength={32}
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="weekly-report"
+            disabled={busy}
+            onChange={(e) => {
+              setName(e.target.value);
+              setLocalError(null);
+            }}
+          />
+          <small className="rc-note">{t("Lowercase letters, digits and hyphens, up to 32 characters.")}</small>
+        </div>
+      )}
+
+      <div className="sk-field">
+        <label htmlFor={`${baseId}-desc`}>{t("Description")}</label>
+        <input
+          id={`${baseId}-desc`}
+          type="text"
+          className="field"
+          value={description}
+          maxLength={SKILL_DESCRIPTION_MAX}
+          autoComplete="off"
+          placeholder={t("When an agent should use this skill")}
+          disabled={busy}
+          onChange={(e) => {
+            setDescription(e.target.value);
+            setLocalError(null);
+          }}
+        />
+      </div>
+
+      <div className="sk-field">
+        <div className="sk-form-bar">
+          <label htmlFor={`${baseId}-body`}>{t("Instructions (SKILL.md)")}</label>
+          <Segment
+            label={t("View as")}
+            value={bodyView}
+            options={[["edit", t("Edit")], ["preview", t("Preview")]]}
+            onChange={setBodyView}
+          />
+        </div>
+        {bodyView === "edit" ? (
+          <textarea
+            id={`${baseId}-body`}
+            className="field sk-textarea"
+            rows={10}
+            value={body}
+            placeholder={t("Write step-by-step guidance for the agent...")}
+            disabled={busy}
+            onChange={(e) => {
+              setBody(e.target.value);
+              setLocalError(null);
+            }}
+          />
+        ) : (
+          <div className="sk-doc">
+            <div className="sk-md" data-view="preview">
+              {body.trim() ? <Md text={body} /> : <p className="rc-note">{t("Nothing to preview yet.")}</p>}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="sk-field">
+        <div className="sk-form-bar">
+          <span className="slabel">{t("Reference files")} ({references.length}/{SKILL_REFERENCES_MAX})</span>
+          <div className="flex flex-wrap gap-2">
+            <input
+              ref={uploadInput}
+              type="file"
+              multiple
+              accept=".md,.txt,text/markdown,text/plain"
+              className="sk-upload-input"
+              aria-label={t("Upload skill files")}
+              disabled={busy}
+              onChange={(e) => void handleFiles(e.target.files)}
+            />
+            <Button size="sm" disabled={busy} onClick={() => uploadInput.current?.click()}>
+              {t("Upload files")}
+            </Button>
+            <Button
+              size="sm"
+              disabled={busy || references.length >= SKILL_REFERENCES_MAX}
+              onClick={() => {
+                setLocalError(null);
+                setReferences((prev) => [...prev, { name: "", content: "" }]);
+              }}
+            >
+              {t("Add reference")}
+            </Button>
+          </div>
+        </div>
+        {references.length === 0 ? (
+          <p className="rc-note">{t("Optional plain-text or Markdown files placed under references/.")}</p>
+        ) : (
+          <div className="sk-ref-list">
+            {references.map((ref, idx) => (
+              <div key={idx} className="sk-ref-card">
+                <div className="sk-ref-head">
+                  <span className="num text-label text-ink-500">references/</span>
+                  <input
+                    type="text"
+                    className="field num flex-1 min-w-0"
+                    aria-label={t("Reference filename")}
+                    placeholder="checklist.md"
+                    value={ref.name}
+                    disabled={busy}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setLocalError(null);
+                      setReferences((prev) => prev.map((item, i) => (i === idx ? { ...item, name: val } : item)));
+                    }}
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy}
+                    onClick={() => {
+                      setLocalError(null);
+                      setReferences((prev) => prev.filter((_, i) => i !== idx));
+                    }}
+                  >
+                    {t("Remove")}
+                  </Button>
+                </div>
+                <textarea
+                  rows={4}
+                  className="field sk-textarea"
+                  aria-label={t("Reference content")}
+                  placeholder={t("Reference text...")}
+                  value={ref.content}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setLocalError(null);
+                    setReferences((prev) => prev.map((item, i) => (i === idx ? { ...item, content: val } : item)));
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <p className="rc-note">
+        {t("Package size")}: <span className="num">{fmtBytes(totalBytes)}</span> / <span className="num">{fmtBytes(SKILL_PACKAGE_BYTES_MAX)}</span>.{" "}
+        {t("Saves as a draft. An owner must approve it before agents can read it.")}
+      </p>
+
+      {displayedError && (
+        <p className="text-label text-fail break-words" role="alert">
+          {displayedError}
+        </p>
+      )}
+    </form>
   );
 }

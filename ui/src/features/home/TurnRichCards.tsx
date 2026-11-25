@@ -1,5 +1,6 @@
-import { createContext, useContext, useState, useSyncExternalStore, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
+import type { WorkspaceSkillSummary } from "../../lib/types";
 import Link from "../../ui/Link";
 import SafeLink from "../../ui/SafeLink";
 import { StagedSourceContext, type StagedSource } from "../../ui/StagedChip";
@@ -11,7 +12,18 @@ import { stagedChipView } from "../decisions/stagedRef";
 import type { StagedOutcome, StagedWrite } from "../decisions/stagedWrite";
 import { openAttachmentInTab } from "./AttachmentMedia";
 import type { ThreadEntry } from "./thread";
-import { SOURCES_SHOWN, bodyNeedsClamp, outsideDomainRecipients, stagedAccount, stagedFields, stagedInTurn, stagedStatus, type TurnSource } from "./turnCards";
+import {
+  SOURCES_SHOWN,
+  bodyNeedsClamp,
+  outsideDomainRecipients,
+  skillDraftsInTurn,
+  stagedAccount,
+  stagedFields,
+  stagedInTurn,
+  stagedStatus,
+  type TurnSkillDraft,
+  type TurnSource,
+} from "./turnCards";
 
 /**
  * CAD-2441 (card system phase 1, CAD-2437): under a finished answer, what
@@ -281,6 +293,157 @@ function StagedCardsFor({ source, toolEntries, density }: { source: StagedSource
     <div className="turn-artifacts turn-staged" data-kind="staged-actions">
       {writes.map((write) => (
         <StagedActionCard key={write.id} write={write} source={source} density={density} />
+      ))}
+    </div>
+  );
+}
+
+export type SkillDraftLiveState = WorkspaceSkillSummary | "deleted" | undefined;
+
+export interface SkillDraftReviewSource {
+  /** Whether the current viewer may approve, edit, revoke or delete workspace skills. */
+  writable: boolean;
+  /** Open the shared SkillDrawer for a drafted skill. */
+  openSkill: (name: string, revision?: number, opener?: HTMLElement | null) => void;
+  /** Open the workspace skill library drawer (e.g. from `/skills` in the composer). */
+  openLibrary?: (opener?: HTMLElement | null) => void;
+  /** Subscribe to live updates from Home's skill store. */
+  subscribe: (listener: () => void) => () => void;
+  /** Snapshot map for useSyncExternalStore. */
+  getSnapshot: () => ReadonlyMap<string, SkillDraftLiveState>;
+  /** Trigger a one-time lazy list fetch on Home so older turns reflect current approval state. */
+  ensureLoaded?: () => void;
+}
+
+export const SkillDraftReviewContext = createContext<SkillDraftReviewSource | null>(null);
+
+function SkillDraftCard({
+  draft,
+  live,
+  source,
+  density,
+}: {
+  draft: TurnSkillDraft;
+  live: SkillDraftLiveState;
+  source: SkillDraftReviewSource;
+  density: CardDensity;
+}) {
+  const t = useTranslate();
+  const isDeleted = live === "deleted";
+  const approvedMatch =
+    !isDeleted &&
+    live?.approved != null &&
+    ((live.approved.revision === draft.revision && live.approved.digest === draft.digest) ||
+      live.approved.revision > draft.revision);
+  const latestRev = !isDeleted && live ? live.latest_revision : draft.revision;
+  const state = isDeleted
+    ? "deleted"
+    : approvedMatch
+      ? "approved"
+      : !isDeleted && live && live.latest_revision > draft.revision
+        ? "superseded"
+        : "draft";
+  const description = !isDeleted && live ? live.description : draft.description;
+
+  const status =
+    state === "deleted"
+      ? { text: t("Removed"), tone: "muted" as const }
+      : state === "approved" && !isDeleted && live?.approved
+        ? { text: t("Approved · rev {n}").replace("{n}", String(live.approved.revision)), tone: "ok" as const }
+        : { text: t("Draft · rev {n}").replace("{n}", String(latestRev)), tone: "warn" as const };
+
+  const note =
+    state === "deleted"
+      ? t("This skill was removed.")
+      : state === "approved" && !isDeleted && live?.approved
+        ? t("Approved revision {n} is what agents read.").replace("{n}", String(live.approved.revision))
+        : source.writable
+          ? t("Review the instructions before approving. Only an approved revision reaches an agent.")
+          : t("Saved as a draft. Ask a workspace owner to review and approve it.");
+
+  const targetRevision =
+    state === "approved" && !isDeleted && live?.approved ? live.approved.revision : latestRev;
+
+  return (
+    <TurnCard
+      kind="skill-draft"
+      density={density}
+      className="card turncard-skill"
+      data-kind="skill-draft"
+      data-skill-name={draft.name}
+      data-skill-revision={String(draft.revision)}
+      data-skill-state={state}
+      label={`${t("Workspace skill")}: ${draft.name}`}
+      icon={
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M3 2.5h10v11H3z" />
+          <path d="M5.5 6h5M5.5 8.5h5M5.5 11h3" />
+        </svg>
+      }
+      kindLabel={t("Workspace skill")}
+      status={status}
+      footer={
+        state === "deleted" ? undefined : state === "approved" ? (
+          <button
+            type="button"
+            className="btn btn-sm"
+            data-skill-review
+            onClick={(e) => source.openSkill(draft.name, targetRevision, e.currentTarget)}
+          >
+            {t("Inspect")}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className={source.writable ? "btn btn-sm btn-primary" : "btn btn-sm"}
+            data-skill-review
+            onClick={(e) => source.openSkill(draft.name, targetRevision, e.currentTarget)}
+          >
+            {source.writable ? t("Review") : t("View draft")}
+          </button>
+        )
+      }
+    >
+      <p className="turncard-title"><bdi>{draft.name}</bdi></p>
+      {description && <p className="text-secondary text-ink-300"><bdi>{description}</bdi></p>}
+      <p className="text-micro text-ink-500">{note}</p>
+    </TurnCard>
+  );
+}
+
+/** Workspace skill drafts saved by `workspace_skill_draft` in this turn. */
+export function TurnSkillDraftCards({ toolEntries, density }: { toolEntries: readonly ThreadEntry[]; density: CardDensity }) {
+  const source = useContext(SkillDraftReviewContext);
+  if (source === null) return null;
+  return <SkillDraftCardsFor source={source} toolEntries={toolEntries} density={density} />;
+}
+
+function SkillDraftCardsFor({
+  source,
+  toolEntries,
+  density,
+}: {
+  source: SkillDraftReviewSource;
+  toolEntries: readonly ThreadEntry[];
+  density: CardDensity;
+}) {
+  const drafts = skillDraftsInTurn(toolEntries);
+  const { ensureLoaded } = source;
+  useEffect(() => {
+    if (drafts.length > 0) ensureLoaded?.();
+  }, [drafts.length, ensureLoaded]);
+  const liveMap = useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot);
+  if (drafts.length === 0) return null;
+  return (
+    <div className="turn-artifacts turn-skill-drafts" data-kind="skill-drafts">
+      {drafts.map((draft) => (
+        <SkillDraftCard
+          key={draft.name}
+          draft={draft}
+          live={liveMap.get(draft.name)}
+          source={source}
+          density={density}
+        />
       ))}
     </div>
   );

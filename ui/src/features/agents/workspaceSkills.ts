@@ -1,7 +1,7 @@
 import { api } from "../../lib/api";
 import { fmtTime } from "../../lib/fmt";
 import { ApiError } from "../../lib/apiError";
-import type { WorkspaceSkillRead, WorkspaceSkillSummary, WorkspaceSkillUser } from "../../lib/types";
+import type { WorkspaceSkillDraftResult, WorkspaceSkillRead, WorkspaceSkillSummary, WorkspaceSkillUser } from "../../lib/types";
 import { BUNDLED_SKILLS } from "./agentTabModel";
 import { classifyFailure, profileBody, type DocDeps } from "./instructionsDoc";
 
@@ -15,6 +15,7 @@ import { classifyFailure, profileBody, type DocDeps } from "./instructionsDoc";
 export interface SkillDeps {
   list: () => Promise<WorkspaceSkillSummary[]>;
   read: (name: string, revision?: number) => Promise<WorkspaceSkillRead>;
+  draft?: (name: string, files: Record<string, string>, expectedRevision: number) => Promise<WorkspaceSkillDraftResult>;
   approve: (name: string, revision: number, digest: string) => Promise<WorkspaceSkillSummary>;
   revoke: (name: string, digest: string) => Promise<WorkspaceSkillSummary>;
   remove: (name: string, expectedRevision: number) => Promise<void>;
@@ -49,6 +50,10 @@ export const liveSkillDeps: SkillDeps = {
   read: async (name, revision) => {
     const read = await api.workspaceSkill(name, revision);
     return { ...read, skill: withUsedBy(read.skill) };
+  },
+  draft: async (name, files, expectedRevision) => {
+    const saved = await api.draftWorkspaceSkill(name, files, expectedRevision);
+    return { ...saved, skill: withUsedBy(saved.skill) };
   },
   approve: async (name, revision, digest) => (await api.approveWorkspaceSkill(name, revision, digest)).skill,
   revoke: async (name, digest) => (await api.revokeWorkspaceSkill(name, digest)).skill,
@@ -186,6 +191,8 @@ const REFUSALS: Record<string, string> = {
   revision_conflict: "This skill has a newer revision. Review it again, then try once more.",
   approved_limit: "The workspace already has as many approved skills as it can hold. Revoke one first.",
   approved_skill: "An approved skill can’t be deleted. Revoke it first.",
+  skill_limit: "The workspace already has as many skills as it can hold. Delete an unused skill first.",
+  skill_refused: "This skill package does not meet the workspace skill rules.",
   not_found: "This skill no longer exists.",
 };
 
@@ -208,4 +215,152 @@ export function skillFiles(files: Record<string, string>): [string, string][] {
 export function approvedWhen(at: number | undefined): string | null {
   if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return null;
   return fmtTime(new Date(at).toISOString());
+}
+
+export const SKILL_TAG_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+export const SKILL_REF_LEAF_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+export const SKILL_DESCRIPTION_MAX = 240;
+export const SKILL_FILE_BYTES_MAX = 16 * 1024;
+export const SKILL_PACKAGE_BYTES_MAX = 32 * 1024;
+export const SKILL_REFERENCES_MAX = 15;
+
+export interface DraftReference {
+  name: string;
+  content: string;
+}
+
+const utf8Encoder = new TextEncoder();
+export const utf8ByteLength = (text: string): number => utf8Encoder.encode(text).byteLength;
+
+function hasControlChar(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
+
+export function validateSkillName(raw: string): string | null {
+  const name = raw.trim();
+  if (name === "") return "Enter a skill name.";
+  if (!SKILL_TAG_RE.test(name)) return "Use lowercase letters, digits and hyphens (max 32 characters).";
+  return null;
+}
+
+/** Read the single-line `description:` from `SKILL.md` frontmatter (matching `app-skills.ts`). */
+export function extractDescription(skillMd: string): string {
+  const lines = skillMd.replace(/\r\n?/g, "\n").split("\n");
+  if (lines[0]?.trim() !== "---") return "";
+  const end = lines.indexOf("---", 1);
+  if (end < 0) return "";
+  const front = lines.slice(1, end);
+  const at = front.findIndex((line) => /^description\s*:/.test(line));
+  if (at < 0) return "";
+  let value = front[at]!.replace(/^description\s*:/, "").trim();
+  if (/^[>|][+-]?$/.test(value)) {
+    const folded: string[] = [];
+    for (const line of front.slice(at + 1)) {
+      if (line.length > 0 && !/^\s/.test(line)) break;
+      folded.push(line.trim());
+    }
+    value = folded.join(" ");
+  }
+  const quoted = /^(["'])(.*)\1$/.exec(value);
+  if (quoted) value = quoted[2]!;
+  return value.replace(/\s+/g, " ").trim();
+}
+
+export function composeSkillMd(description: string, body: string): string {
+  return `---\ndescription: ${description.trim()}\n---\n\n${body.trim()}\n`;
+}
+
+/** Reference members of a revision for editing (`references/<leaf>` only; excludes `SKILL.md` and `skill.json`). */
+export function editableReferences(files: Record<string, string>): DraftReference[] {
+  return Object.entries(files)
+    .filter(([path]) => path.startsWith("references/"))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([path, content]) => ({ name: path.slice("references/".length), content }));
+}
+
+export function buildDraftFiles(input: {
+  description: string;
+  body: string;
+  references: DraftReference[];
+}): { ok: true; files: Record<string, string>; bytes: number } | { ok: false; error: string } {
+  const description = input.description.trim();
+  if (description === "") return { ok: false, error: "Enter a one-line description." };
+  if (hasControlChar(description)) return { ok: false, error: "Description must be a single plain line." };
+  if (description.length > SKILL_DESCRIPTION_MAX) return { ok: false, error: "Description must be 240 characters or fewer." };
+  const body = input.body.trim();
+  if (body === "") return { ok: false, error: "Enter skill instructions." };
+  const skillMd = composeSkillMd(description, body);
+  const skillBytes = utf8ByteLength(skillMd);
+  if (skillBytes > SKILL_FILE_BYTES_MAX) return { ok: false, error: "SKILL.md exceeds the 16 KiB file limit." };
+  if (input.references.length > SKILL_REFERENCES_MAX) return { ok: false, error: "A skill can have at most 15 reference files." };
+
+  const files: Record<string, string> = { "SKILL.md": skillMd };
+  const seen = new Set<string>();
+  let totalBytes = skillBytes;
+  for (const ref of input.references) {
+    const leaf = ref.name.trim();
+    if (!SKILL_REF_LEAF_RE.test(leaf)) {
+      return { ok: false, error: "Reference names must be plain filenames (letters, digits, ., _, -)." };
+    }
+    if (seen.has(leaf)) {
+      return { ok: false, error: "Reference filenames must be unique." };
+    }
+    seen.add(leaf);
+    const refBytes = utf8ByteLength(ref.content);
+    if (refBytes > SKILL_FILE_BYTES_MAX) {
+      return { ok: false, error: "Each reference file must be 16 KiB or smaller." };
+    }
+    totalBytes += refBytes;
+    files[`references/${leaf}`] = ref.content;
+  }
+  if (totalBytes > SKILL_PACKAGE_BYTES_MAX) {
+    return { ok: false, error: "Total skill package exceeds the 32 KiB limit." };
+  }
+  return { ok: true, files, bytes: totalBytes };
+}
+
+export function parseUploadedSkillFiles(uploads: readonly { name: string; content: string }[]): {
+  description?: string;
+  body?: string;
+  references: DraftReference[];
+  errors: string[];
+} {
+  let description: string | undefined;
+  let body: string | undefined;
+  const references: DraftReference[] = [];
+  const errors: string[] = [];
+  for (const file of uploads) {
+    const normalized = file.name.replace(/\\/g, "/").replace(/^\/+/, "");
+    const parts = normalized.split("/").filter(Boolean);
+    const leaf = parts[parts.length - 1] ?? "";
+    if (parts.some((p) => p === "scripts")) {
+      errors.push("Workspace skills cannot include scripts.");
+      continue;
+    }
+    if (leaf.toLowerCase() === "skill.json") {
+      errors.push("skill.json is generated automatically and does not need to be uploaded.");
+      continue;
+    }
+    if (leaf.toLowerCase() === "skill.md") {
+      const desc = extractDescription(file.content);
+      if (desc !== "") description = desc;
+      body = stripFrontmatter(file.content).trim();
+      continue;
+    }
+    if (!SKILL_REF_LEAF_RE.test(leaf)) {
+      errors.push("Reference names must be plain filenames (letters, digits, ., _, -).");
+      continue;
+    }
+    references.push({ name: leaf, content: file.content });
+  }
+  return {
+    ...(description !== undefined ? { description } : {}),
+    ...(body !== undefined ? { body } : {}),
+    references,
+    errors,
+  };
 }

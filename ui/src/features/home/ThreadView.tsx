@@ -37,7 +37,7 @@ import {
 import { carriesSecret } from "../app-shell/chat/directive";
 import { useConversationPreview } from "../app-shell/chat/conversationPreview";
 import { fileKind } from "./fileKind";
-import { AttachmentNamesContext, TurnSources, TurnStagedCards } from "./TurnRichCards";
+import { AttachmentNamesContext, TurnSkillDraftCards, TurnSources, TurnStagedCards } from "./TurnRichCards";
 import { turnSources } from "./turnCards";
 
 /**
@@ -1366,6 +1366,7 @@ export function ThreadTurn({
         />
       )}
       {!streaming && <TurnStagedCards toolEntries={toolEntries} density={density} />}
+      {!streaming && <TurnSkillDraftCards toolEntries={toolEntries} density={density} />}
       {shownCards.length > 0 && (
         <div className="turn-artifacts">
           {shownCards.map((item) => {

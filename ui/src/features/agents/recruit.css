@@ -284,3 +284,12 @@ textarea.ap-doc-text { min-height: max(24rem, 55vh); font-family: var(--font-mon
 .sk-file-card summary small { color: var(--color-ink-500); font-size: var(--text-label); }
 .sk-file-card summary:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
 .sk-file-card .ap-code { border: 0; border-radius: 0; margin: 0; }
+.sk-form { display: grid; gap: 1rem; }
+.sk-field { display: grid; gap: 0.35rem; min-width: 0; }
+.sk-field label { color: var(--color-ink-200); font-size: var(--text-label); font-weight: 500; }
+.sk-form-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
+.sk-textarea { width: 100%; resize: vertical; font-family: var(--font-mono, ui-monospace, monospace); font-size: var(--text-label); }
+.sk-upload-input { display: none; }
+.sk-ref-list { display: grid; gap: 0.65rem; }
+.sk-ref-card { display: grid; gap: 0.5rem; padding: 0.65rem; border: 1px solid var(--color-ink-700); border-radius: 0.5rem; background: var(--color-ink-850); }
+.sk-ref-head { display: flex; align-items: center; gap: 0.4rem; min-width: 0; }

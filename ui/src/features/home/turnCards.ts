@@ -5,7 +5,7 @@
  * source or a write. No React, so the UI tests load it directly.
  */
 import type { StagedOutcome, StagedWrite } from "../decisions/stagedWrite";
-import type { ThreadEntry } from "./thread";
+import { toolSteps, type ThreadEntry } from "./thread";
 
 export type TurnSourceKind = "wiki" | "issue" | "attachment" | "artifact" | "web" | "app";
 
@@ -424,4 +424,66 @@ export function stagedStatus(write: StagedWrite, outcome: StagedOutcome, railWor
   if (outcome === "applied") return effect === "send" ? "Sent" : "Draft saved";
   if (outcome === "failed") return effect === "send" ? "Couldn't send" : "Couldn't save the draft";
   return railWord;
+}
+
+export interface TurnSkillDraft {
+  name: string;
+  revision: number;
+  digest: string;
+  description: string;
+  created: boolean;
+  approvedRevision: number | null;
+}
+
+const SKILL_TAG = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+function parseSkillDraftResult(entry: ThreadEntry): TurnSkillDraft | null {
+  for (const result of resultObjects(entry)) {
+    if (typeof result.created !== "boolean") continue;
+    const skill = result.skill;
+    const rev = result.revision;
+    if (!skill || typeof skill !== "object" || Array.isArray(skill)) continue;
+    if (!rev || typeof rev !== "object" || Array.isArray(rev)) continue;
+    const s = skill as Record<string, unknown>;
+    const r = rev as Record<string, unknown>;
+    const name = str(s.name);
+    const digest = str(r.digest);
+    const revNum = r.revision;
+    if (!name || !SKILL_TAG.test(name) || !digest) continue;
+    if (typeof s.description !== "string") continue;
+    if (typeof revNum !== "number" || !Number.isInteger(revNum) || revNum < 1) continue;
+    const approvedRevision =
+      typeof s.approved_revision === "number" && Number.isInteger(s.approved_revision) && s.approved_revision >= 1
+        ? s.approved_revision
+        : null;
+    return {
+      name,
+      revision: revNum,
+      digest,
+      description: s.description.trim(),
+      created: result.created,
+      approvedRevision,
+    };
+  }
+  return null;
+}
+
+/**
+ * Workspace skill drafts saved by `workspace_skill_draft` tool calls in this
+ * turn. Deduplicated by skill `name` in order of first appearance, keeping the
+ * latest draft per skill if a turn drafted the same skill more than once.
+ */
+export function skillDraftsInTurn(entries: readonly ThreadEntry[]): TurnSkillDraft[] {
+  const byName = new Map<string, TurnSkillDraft>();
+  const order: string[] = [];
+  for (const step of toolSteps([...entries])) {
+    if (step.call.kind !== "tool_call" || !step.result || step.error || step.refused) continue;
+    const call = parseToolCall(step.call.text ?? "");
+    if (!call || call.name !== "workspace_skill_draft") continue;
+    const draft = parseSkillDraftResult(step.result);
+    if (!draft) continue;
+    if (!byName.has(draft.name)) order.push(draft.name);
+    byName.set(draft.name, draft);
+  }
+  return order.map((name) => byName.get(name)!);
 }

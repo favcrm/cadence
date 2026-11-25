@@ -45,10 +45,11 @@ check(elapsedSecs(1000, 10_000) === 9 && elapsedSecs(10_000, 1000) === null && e
 // Tool labels and subjects.
 check(toolKey('app_call {"q":"Gia"}') === "app_call" && toolKey("web_search: cafes") === "web_search", "tool key");
 check(toolLabel('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "Use an app", "a known tool has a label");
-for (const [name, label] of [["agent_message", "Message an agent"], ["find_tools", "Find tools"], ["use_tool", "Use a tool"], ["tool_result_read", "Read a tool result"], ["connected_read", "Read a connected account"], ["connected_action", "Propose an account action"], ["catalog_search", "Search tools"], ["mcp_call_read", "Read from a connector"]] as const) {
+for (const [name, label] of [["agent_message", "Message an agent"], ["find_tools", "Find tools"], ["use_tool", "Use a tool"], ["tool_result_read", "Read a tool result"], ["connected_read", "Read a connected account"], ["connected_action", "Propose an account action"], ["catalog_search", "Search tools"], ["mcp_call_read", "Read from a connector"], ["workspace_skill_draft", "Draft a workspace skill"], ["workspace_skill", "Load a workspace skill"]] as const) {
   check(toolLabel(`${name} {"q":"x"}`) === label, `${name} is labelled ${label}`);
   check(translateUiText(label, "zh-TW") !== label, `${label} has a written-Chinese string`);
 }
+check(toolSubject('workspace_skill_draft {"name":"weekly-report"}') === "weekly-report", "workspace_skill_draft extracts the skill name");
 check(toolLabel("bash: cadence board read") === null && toolLabel("master ask-form") === null, "an unknown tool has none");
 check(toolSubject('app_call {"app":"accounting","op":"contacts.search","q":"Gia"}') === "contacts.search · Gia", "an app call leads with its operation, then the naming field");
 check(toolSubject('agent_message {"action":"send","alias":"bookkeeper","context_app":"accounting","text":"draft supplier bill"}') === "bookkeeper · accounting", "agent_message send shows alias and context_app without body text");

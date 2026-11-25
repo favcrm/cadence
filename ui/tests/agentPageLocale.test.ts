@@ -13,6 +13,8 @@ const path = require("node:path");
 const FILES = [
   "src/features/agents/AgentTabs.tsx",
   "src/features/agents/AgentChannels.tsx",
+  "src/features/agents/SkillDrawer.tsx",
+  "src/features/agents/WorkspaceSkillsDrawer.tsx",
   "src/features/agents/SkillPanels.tsx",
   "src/features/agents/workspaceSkills.ts",
   "src/features/agents/profileTools.ts",

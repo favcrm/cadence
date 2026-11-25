@@ -8,7 +8,7 @@ import { resources } from "../../lib/resources";
 import { readTeamMembers } from "../../lib/teamRoster";
 import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
-import { HireBlock } from "../auth/WriteGate";
+import { HireBlock, WriteGate, useWriteBlock } from "../auth/WriteGate";
 import AgentAvatar from "./AgentAvatar";
 import SeatCard, { PersonalSeat, TeammateSeat } from "./SeatCard";
 import MyAssistantPage from "./MyAssistantPage";
@@ -23,6 +23,7 @@ import ProfileSeat, { ConnectRuntime, workText } from "./ProfileSeat";
 import AgentSidebar from "./AgentSidebar";
 import NewAgentDialog from "./NewAgentDialog";
 import Recruit from "./Recruit";
+import { WorkspaceSkillsDrawer } from "./WorkspaceSkillsDrawer";
 import { HireGate, RoleCard } from "./RecruitCards";
 import {
   nextAlias,
@@ -116,7 +117,11 @@ export default function Agents({
   const [joined, setJoined] = useState<{ profile: HiredProfile; role: AgentRole } | null>(null);
   const roles = useAgentRoles();
   const installed = useQuery(resources.apps);
+  const boardBlock = useContext(WriteGate);
   const hireBlock = useContext(HireBlock);
+  const writeBlock = useWriteBlock(operator !== true) ?? boardBlock;
+  const skillsWritable = hostedBoard && operator === true && writeBlock === null;
+  const [skillsOpen, setSkillsOpen] = useState(false);
   const payload = state.data;
   const issueIndexed = issueIndex(issuesState.data ?? []);
   // Agents belong to the team, not a project: the roster lists them all.
@@ -397,6 +402,9 @@ export default function Agents({
           <p>{t("Your team. Recruit a ready-made role, or ask Master to find one.")}</p>
         </div>
         <div className="rc-acts">
+          {hostedBoard && (
+            <Button onClick={() => setSkillsOpen(true)}>{t("Skills")}</Button>
+          )}
           <Button onClick={askMaster}>{t("Ask Master")}</Button>
           <Button
             variant="primary"
@@ -507,6 +515,14 @@ export default function Agents({
       )}
       {sheet}
       {creating && <NewAgentDialog onClose={() => setCreating(false)} onCreated={() => onRetry()} />}
+      {hostedBoard && skillsOpen && (
+        <WorkspaceSkillsDrawer
+          writable={skillsWritable}
+          scopedRoster={scopedRoster}
+          toast={onToast}
+          onClose={() => setSkillsOpen(false)}
+        />
+      )}
     </main>
   );
 }
