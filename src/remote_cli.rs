@@ -367,6 +367,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_identities_set"
         | "delivery_policy_set"
         | "delivery_enqueue"
+        | "delivery_ship"
         | "review_producer_attest"
         | "audit_revoke_project"
         | "audit_approve_scope_project"

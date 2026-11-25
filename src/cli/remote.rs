@@ -165,6 +165,9 @@ fn verb_for(
                     if proposal.contains_key("assigned_reviews") && preview_digest.is_none() {
                         return Err(Error::rejected("delivery policy assigned_reviews requires --preview-digest — nothing was sent"));
                     }
+                    if proposal.contains_key("review_workflow") && preview_digest.is_none() {
+                        return Err(Error::rejected("delivery policy review_workflow requires --preview-digest — nothing was sent"));
+                    }
                     args.extend(proposal.clone());
                     args.insert("project".into(), json!(project));
                     args.insert("expected_revision".into(), json!(expected_revision));
