@@ -246,6 +246,96 @@ impl Shared {
         rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         Ok(rows)
     }
+}
+
+struct ConnectionCreateTarget<'a> {
+    provider: &'a str,
+    account: &'a str,
+    shape: &'a str,
+    descriptor: &'a crate::platform::connections::ProviderDescriptor,
+}
+
+struct ConnectionRotateContext<'a> {
+    id: &'a str,
+    descriptor: &'a crate::platform::connections::ProviderDescriptor,
+    expected_id: Option<&'a str>,
+    expected_rev: Option<u64>,
+}
+
+fn descriptor_scopes(descriptor: &crate::platform::connections::ProviderDescriptor) -> Vec<String> {
+    descriptor
+        .capabilities
+        .iter()
+        .flat_map(|c| c.scopes.clone())
+        .collect()
+}
+
+fn validate_connection_rpc_params(method: &str, params: &Value) -> Result<()> {
+    let allowed: &[&str] = match method {
+        "connection_providers" | "connection_list" => &[],
+        "connection_show" | "connection_check" => &["connection_id"],
+        "connection_revoke" => &[
+            "connection_id",
+            "expected_connection_id",
+            "expected_revision",
+        ],
+        "connection_test" => &[
+            "connection_id",
+            "expected_revision",
+            "expected_registration_digest",
+        ],
+        // CAD-785: the `smtp` shape carries typed host, port,
+        // TLS mode, username, secret and sender fields instead of
+        // an opaque token. Both shapes share one allowlist; each
+        // shape refuses the other's credential field below.
+        "connection_create" => &[
+            "provider",
+            "account",
+            "shape",
+            "token",
+            "host",
+            "port",
+            "tls_mode",
+            "username",
+            "secret",
+            "sender",
+            "sender_name",
+            "scopes",
+            "accept_same_uid_risk",
+        ],
+        "connection_rotate" => &[
+            "connection_id",
+            "expected_connection_id",
+            "expected_revision",
+            "token",
+            "host",
+            "port",
+            "tls_mode",
+            "username",
+            "secret",
+            "sender",
+            "sender_name",
+            "scopes",
+            "accept_same_uid_risk",
+        ],
+        _ => return Err(Error::rejected("unknown connection operation")),
+    };
+    let object = params
+        .as_object()
+        .ok_or_else(|| Error::rejected("connection parameters must be an object"))?;
+    if object.keys().any(|k| !allowed.contains(&k.as_str())) {
+        return Err(Error::rejected("unsupported connection parameter"));
+    }
+    if params
+        .get("accept_same_uid_risk")
+        .is_some_and(|v| !v.is_boolean())
+    {
+        return Err(Error::rejected("custody risk acceptance must be boolean"));
+    }
+    Ok(())
+}
+
+impl Shared {
     pub(super) fn rpc_connection(
         self: &Arc<Self>,
         method: &str,
@@ -253,353 +343,365 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_connection("connection management", params, peer_pid)?;
-        let allowed: &[&str] = match method {
-            "connection_providers" | "connection_list" => &[],
-            "connection_show" | "connection_check" => &["connection_id"],
-            "connection_revoke" => &[
-                "connection_id",
-                "expected_connection_id",
-                "expected_revision",
-            ],
-            "connection_test" => &[
-                "connection_id",
-                "expected_revision",
-                "expected_registration_digest",
-            ],
-            // CAD-785: the `smtp` shape carries typed host, port,
-            // TLS mode, username, secret and sender fields instead of
-            // an opaque token. Both shapes share one allowlist; each
-            // shape refuses the other's credential field below.
-            "connection_create" => &[
-                "provider",
-                "account",
-                "shape",
-                "token",
-                "host",
-                "port",
-                "tls_mode",
-                "username",
-                "secret",
-                "sender",
-                "sender_name",
-                "scopes",
-                "accept_same_uid_risk",
-            ],
-            "connection_rotate" => &[
-                "connection_id",
-                "expected_connection_id",
-                "expected_revision",
-                "token",
-                "host",
-                "port",
-                "tls_mode",
-                "username",
-                "secret",
-                "sender",
-                "sender_name",
-                "scopes",
-                "accept_same_uid_risk",
-            ],
-            _ => return Err(Error::rejected("unknown connection operation")),
-        };
-        let object = params
-            .as_object()
-            .ok_or_else(|| Error::rejected("connection parameters must be an object"))?;
-        if object.keys().any(|k| !allowed.contains(&k.as_str())) {
-            return Err(Error::rejected("unsupported connection parameter"));
-        }
-        if params
-            .get("accept_same_uid_risk")
-            .is_some_and(|v| !v.is_boolean())
-        {
-            return Err(Error::rejected("custody risk acceptance must be boolean"));
-        }
+        validate_connection_rpc_params(method, params)?;
         match method {
-            "connection_providers" => {
-                let mut rows = Vec::new();
-                for (provider, adapter) in &self.platforms {
-                    let descriptor = self.connection_descriptor(provider).ok();
-                    let verification_support = self.connection_verification_support(provider, None);
-                    rows.push(json!({"provider":provider,"descriptor":descriptor,"descriptor_available":descriptor.is_some(),"manifest_status":match (adapter.table().manifest_version.as_deref(),adapter.reported_manifest_version()) {(Some(a),Some(b)) if a==b=>"matched",(_,None)=>"missing",_=>"mismatched"},"reviewed_pin":adapter.table().manifest_version,"reported_pin":adapter.reported_manifest_version(),"network_checked":false,"registration_digest":adapter.connection_registration().map(|r|crate::platform::connections::registration_digest(&format!("{r}:{}",serde_json::to_string(&descriptor).unwrap_or_default()))),"verification_support":verification_support}));
-                }
-                if !self.platforms.contains_key("local") {
-                    rows.push(json!({"provider":"local","descriptor":Value::Null,"descriptor_available":false,"manifest_status":"missing","reviewed_pin":Value::Null,"reported_pin":Value::Null,"network_checked":false,"registration_digest":Value::Null,"verification_support":self.connection_verification_support("local",None)}));
-                }
-                rows.sort_by(|a, b| a["provider"].as_str().cmp(&b["provider"].as_str()));
-                Ok(json!({"providers":rows}))
-            }
+            "connection_providers" => self.connection_providers(),
             "connection_list" | "connection_show" | "connection_check" => {
-                let operation = self.custody_operation()?;
-                let mut rows = self.connection_list_locked()?;
-                for row in &mut rows {
-                    if let Some(id) = row["id"].as_str() {
-                        if let Some(record) = self.store.connection_credential(id)? {
-                            *row = self.connection_record_admitted(&record, &operation)?;
-                        }
-                    }
-                }
-                if method == "connection_list" {
-                    // `hosted_smtp`: enrolled senders send through the
-                    // hosted `smtp.internal` pass-through (CAD-1126).
-                    return Ok(
-                        json!({"connections":rows,"hosted_smtp":self.smtp_internal.is_some()}),
-                    );
-                }
-                let id = connection_id(params)?;
-                let row = rows
-                    .into_iter()
-                    .find(|r| r["id"] == id)
-                    .ok_or_else(|| Error::rejected("connection is unavailable or stale"))?;
-                Ok(json!({"connection":row}))
+                self.connection_read(method, params)
             }
             "connection_test" => self.connection_test(params),
-            "connection_create" => {
-                let provider = platform::connections::provider_identifier(
-                    required_str(params, "provider")?,
-                    "Provider",
-                )?;
-                let account = platform::connections::provider_account_identifier(
-                    &provider,
-                    required_str(params, "account")?,
-                )?;
-                let descriptor = self.connection_descriptor(&provider)?;
-                let shape = required_str(params, "shape")?;
-                if platform::is_builtin(&provider, &account)
-                    || descriptor.builtin_accounts.contains(&account)
-                    || !descriptor.enrollment_shapes.iter().any(|s| s == shape)
-                {
-                    return Err(Error::rejected(
-                        "connection enrollment shape is unsupported",
-                    ));
-                }
-                // Each shape refuses the other's credential field:
-                // a token paste is never reinterpreted as SMTP
-                // material, and SMTP fields never ride a token shape.
-                if shape == platform::smtp::ENROLLMENT_SHAPE {
-                    if params.get("token").is_some() {
-                        return Err(Error::rejected(
-                            "SMTP enrollment carries typed fields — no token",
-                        ));
-                    }
-                    let shapeliness = smtp_create_params(&provider, &account, params)?;
-                    // CAD-1128: encrypted admission refuses BEFORE the
-                    // hosted verification reads key material or sends
-                    // relay traffic — the ordering is the contract's.
-                    if self.platform_custody.encrypted().is_some() {
-                        self.refuse_hosted_encrypted()?;
-                    }
-                    self.verify_hosted_smtp(&shapeliness)?;
-                    let enrolled = self
-                        .enroll_inner(
-                            &shapeliness,
-                            false,
-                            None,
-                            Some(
-                                &descriptor
-                                    .capabilities
-                                    .iter()
-                                    .flat_map(|c| c.scopes.clone())
-                                    .collect::<Vec<_>>(),
-                            ),
-                            Some(&|record| self.connection_metadata_projection(record)),
-                        )
-                        .map_err(|error| {
-                            connection_error(
-                                error,
-                                params.get("secret").and_then(Value::as_str).unwrap_or(""),
-                            )
-                        })?;
-                    return Ok(json!({"connection": enrolled["connection"]}));
-                }
-                if params.get("secret").is_some()
-                    || params.get("host").is_some()
-                    || params.get("port").is_some()
-                    || params.get("tls_mode").is_some()
-                    || params.get("username").is_some()
-                    || params.get("sender").is_some()
-                    || params.get("sender_name").is_some()
-                {
-                    return Err(Error::rejected(
-                        "token enrollment carries a token — no SMTP fields",
-                    ));
-                }
-                let token = required_str(params, "token")?;
-                let enrolled=self.enroll_inner(&json!({"platform":provider,"account":account,"shape":shape,"token":token,"scopes":params.get("scopes").ok_or_else(||Error::rejected("scopes are required"))?,"accept_same_uid_risk":params.get("accept_same_uid_risk").cloned().unwrap_or(json!(false))}),false,None,Some(&descriptor.capabilities.iter().flat_map(|c|c.scopes.clone()).collect::<Vec<_>>()),Some(&|record|self.connection_metadata_projection(record))).map_err(|error|connection_error(error,token))?;
-                let _guard = self
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let record = self
-                    .store
-                    .connection_credential(
-                        enrolled["account"]["connection_id"]
-                            .as_str()
-                            .ok_or_else(|| Error::internal("missing connection identity"))?,
-                    )?
-                    .ok_or_else(|| Error::rejected("connection was concurrently removed"))?;
-                Ok(json!({"connection":self.connection_record(&provider,&account,Some(&record))?}))
-            }
-            "connection_rotate" | "connection_revoke" => {
-                let id = connection_id(params)?;
-                let record = self
-                    .store
-                    .connection_credential(id)?
-                    .ok_or_else(|| Error::rejected("connection is unavailable or stale"))?;
-                // CAD-1128: both verbs parse the optional CAS pair once,
-                // strictly. An absent pair stays legacy-optional; a
-                // present field must be exact, and a malformed one
-                // refuses here — before provider verification, custody,
-                // projection or any write.
-                let (expected_id, expected_rev) = Self::expected_cas(params)?;
-                if method == "connection_revoke" {
-                    // CAD-1128: an encrypted revoke requires the exact
-                    // incarnation+revision CAS. Legacy callers may omit
-                    // the pair; supplied expectations are never rewritten
-                    // into a different identity or execution authority.
-                    if record
-                        .custody
-                        .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
-                        && (expected_id != Some(id) || expected_rev.is_none())
-                    {
-                        return Err(Error::invalid(
-                            "stale_revision",
-                            "an encrypted revoke requires exact expected_connection_id and expected_revision",
-                        ));
-                    }
-                    self.revoke_inner_expected(
-                        &json!({"platform":record.platform,"account":record.account}),
-                        expected_id.or(Some(id)),
-                        expected_rev,
-                    )?;
-                    return Ok(json!({"connection_id":id,"revoked":true}));
-                }
-                let descriptor = self.connection_descriptor(&record.platform)?;
-                if !descriptor
-                    .enrollment_shapes
-                    .iter()
-                    .any(|s| s == &record.exchange)
-                {
-                    return Err(Error::rejected(
-                        "connection management shape is unsupported",
-                    ));
-                }
-                // SMTP rotation always carries the fresh secret;
-                // transport/sender fields re-validate when present
-                // and inherit live custody otherwise.
-                if record.exchange == platform::smtp::ENROLLMENT_SHAPE {
-                    if params.get("token").is_some() {
-                        return Err(Error::rejected(
-                            "SMTP rotation carries the fresh secret — no token",
-                        ));
-                    }
-                    let encrypted = record
-                        .custody
-                        .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX);
-                    let operation = encrypted.then(|| self.custody_operation()).transpose()?;
-                    let record = if operation.is_some() {
-                        let current = self.store.connection_credential(id)?.ok_or_else(|| {
-                            Error::invalid("stale_revision", "connection is unavailable or stale")
-                        })?;
-                        if current.platform != record.platform
-                            || current.account != record.account
-                            || current.exchange != record.exchange
-                            || !current
-                                .custody
-                                .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
-                        {
-                            return Err(Error::invalid(
-                                "stale_revision",
-                                "connection identity changed before rotation",
-                            ));
-                        }
-                        current
-                    } else {
-                        record
-                    };
-                    if encrypted {
-                        self.refuse_hosted_encrypted()?;
-                        if expected_id != Some(id)
-                            || expected_rev != Some(record.credential_revision)
-                        {
-                            return Err(Error::invalid(
-                                "stale_revision",
-                                "encrypted rotation requires the exact current connection and revision",
-                            ));
-                        }
-                    }
-                    // Inherit only from the caller-pinned encrypted revision while
-                    // retaining the same custody section through publication.
-                    let current = match operation.as_ref() {
-                        Some(operation) => self.smtp_projection_admitted(&record, operation),
-                        None => self.smtp_projection_typed(&record),
-                    };
-                    let mut mapped = match current {
-                        Ok(current) => smtp_rotate_params(&record, params, &current)?,
-                        Err(_) => smtp_rotate_full_params(params)?,
-                    };
-                    mapped["platform"] = json!(record.platform);
-                    mapped["account"] = json!(record.account);
-                    mapped["shape"] = json!(record.exchange);
-                    self.verify_hosted_smtp(&mapped)?;
-                    let secret = params.get("secret").and_then(Value::as_str).unwrap_or("");
-                    let operation = match operation {
-                        Some(operation) => operation,
-                        None => self.custody_operation()?,
-                    };
-                    let enrolled = self
-                        .enroll_inner_expected(
-                            &operation,
-                            &mapped,
-                            true,
-                            expected_id.or(Some(id)),
-                            expected_rev,
-                            Some(
-                                &descriptor
-                                    .capabilities
-                                    .iter()
-                                    .flat_map(|c| c.scopes.clone())
-                                    .collect::<Vec<_>>(),
-                            ),
-                            Some(&|record| self.connection_metadata_projection(record)),
-                        )
-                        .map_err(|error| connection_error(error, secret))?;
-                    return Ok(json!({"connection": enrolled["connection"]}));
-                }
-                if params.get("secret").is_some() {
-                    return Err(Error::rejected(
-                        "token rotation carries a token — no SMTP secret",
-                    ));
-                }
-                let mut mapped = params.clone();
-                mapped.as_object_mut().unwrap().remove("connection_id");
-                mapped["platform"] = json!(record.platform);
-                mapped["account"] = json!(record.account);
-                let token = required_str(params, "token")?;
-                mapped["shape"] = json!(record.exchange);
-                let operation = self.custody_operation()?;
-                let enrolled = self
-                    .enroll_inner_expected(
-                        &operation,
-                        &mapped,
-                        true,
-                        expected_id.or(Some(id)),
-                        expected_rev,
-                        Some(
-                            &descriptor
-                                .capabilities
-                                .iter()
-                                .flat_map(|c| c.scopes.clone())
-                                .collect::<Vec<_>>(),
-                        ),
-                        Some(&|record| self.connection_metadata_projection(record)),
-                    )
-                    .map_err(|error| connection_error(error, token))?;
-                // Return the attempted committed snapshot, not a later read
-                // that could report a concurrent winner's incarnation.
-                Ok(json!({"connection": enrolled["connection"]}))
-            }
+            "connection_create" => self.connection_create(params),
+            "connection_rotate" | "connection_revoke" => self.connection_mutate(method, params),
             _ => unreachable!(),
         }
+    }
+
+    fn connection_providers(&self) -> Result<Value> {
+        let mut rows = Vec::new();
+        for (provider, adapter) in &self.platforms {
+            let descriptor = self.connection_descriptor(provider).ok();
+            let verification_support = self.connection_verification_support(provider, None);
+            rows.push(json!({"provider":provider,"descriptor":descriptor,"descriptor_available":descriptor.is_some(),"manifest_status":match (adapter.table().manifest_version.as_deref(),adapter.reported_manifest_version()) {(Some(a),Some(b)) if a==b=>"matched",(_,None)=>"missing",_=>"mismatched"},"reviewed_pin":adapter.table().manifest_version,"reported_pin":adapter.reported_manifest_version(),"network_checked":false,"registration_digest":adapter.connection_registration().map(|r|crate::platform::connections::registration_digest(&format!("{r}:{}",serde_json::to_string(&descriptor).unwrap_or_default()))),"verification_support":verification_support}));
+        }
+        if !self.platforms.contains_key("local") {
+            rows.push(json!({"provider":"local","descriptor":Value::Null,"descriptor_available":false,"manifest_status":"missing","reviewed_pin":Value::Null,"reported_pin":Value::Null,"network_checked":false,"registration_digest":Value::Null,"verification_support":self.connection_verification_support("local",None)}));
+        }
+        rows.sort_by(|a, b| a["provider"].as_str().cmp(&b["provider"].as_str()));
+        Ok(json!({"providers": rows}))
+    }
+
+    fn connection_read(&self, method: &str, params: &Value) -> Result<Value> {
+        let operation = self.custody_operation()?;
+        let mut rows = self.connection_list_locked()?;
+        for row in &mut rows {
+            if let Some(id) = row["id"].as_str() {
+                if let Some(record) = self.store.connection_credential(id)? {
+                    *row = self.connection_record_admitted(&record, &operation)?;
+                }
+            }
+        }
+        if method == "connection_list" {
+            // `hosted_smtp`: enrolled senders send through the
+            // hosted `smtp.internal` pass-through (CAD-1126).
+            return Ok(json!({"connections":rows,"hosted_smtp":self.smtp_internal.is_some()}));
+        }
+        let id = connection_id(params)?;
+        let row = rows
+            .into_iter()
+            .find(|r| r["id"] == id)
+            .ok_or_else(|| Error::rejected("connection is unavailable or stale"))?;
+        Ok(json!({"connection": row}))
+    }
+
+    fn connection_create(&self, params: &Value) -> Result<Value> {
+        let provider = platform::connections::provider_identifier(
+            required_str(params, "provider")?,
+            "Provider",
+        )?;
+        let account = platform::connections::provider_account_identifier(
+            &provider,
+            required_str(params, "account")?,
+        )?;
+        let descriptor = self.connection_descriptor(&provider)?;
+        let shape = required_str(params, "shape")?;
+        if platform::is_builtin(&provider, &account)
+            || descriptor.builtin_accounts.contains(&account)
+            || !descriptor.enrollment_shapes.iter().any(|s| s == shape)
+        {
+            return Err(Error::rejected(
+                "connection enrollment shape is unsupported",
+            ));
+        }
+        let target = ConnectionCreateTarget {
+            provider: &provider,
+            account: &account,
+            shape,
+            descriptor: &descriptor,
+        };
+        // Each shape refuses the other's credential field:
+        // a token paste is never reinterpreted as SMTP
+        // material, and SMTP fields never ride a token shape.
+        if shape == platform::smtp::ENROLLMENT_SHAPE {
+            self.connection_create_smtp(&target, params)
+        } else {
+            self.connection_create_token(&target, params)
+        }
+    }
+
+    fn connection_create_smtp(
+        &self,
+        target: &ConnectionCreateTarget<'_>,
+        params: &Value,
+    ) -> Result<Value> {
+        if params.get("token").is_some() {
+            return Err(Error::rejected(
+                "SMTP enrollment carries typed fields — no token",
+            ));
+        }
+        let shapeliness = smtp_create_params(target.provider, target.account, params)?;
+        // CAD-1128: encrypted admission refuses BEFORE the
+        // hosted verification reads key material or sends
+        // relay traffic — the ordering is the contract's.
+        if self.platform_custody.encrypted().is_some() {
+            self.refuse_hosted_encrypted()?;
+        }
+        self.verify_hosted_smtp(&shapeliness)?;
+        let scopes = descriptor_scopes(target.descriptor);
+        let enrolled = self
+            .enroll_inner(
+                &shapeliness,
+                false,
+                None,
+                Some(&scopes),
+                Some(&|record| self.connection_metadata_projection(record)),
+            )
+            .map_err(|error| {
+                connection_error(
+                    error,
+                    params.get("secret").and_then(Value::as_str).unwrap_or(""),
+                )
+            })?;
+        Ok(json!({"connection": enrolled["connection"]}))
+    }
+
+    fn connection_create_token(
+        &self,
+        target: &ConnectionCreateTarget<'_>,
+        params: &Value,
+    ) -> Result<Value> {
+        if params.get("secret").is_some()
+            || params.get("host").is_some()
+            || params.get("port").is_some()
+            || params.get("tls_mode").is_some()
+            || params.get("username").is_some()
+            || params.get("sender").is_some()
+            || params.get("sender_name").is_some()
+        {
+            return Err(Error::rejected(
+                "token enrollment carries a token — no SMTP fields",
+            ));
+        }
+        let token = required_str(params, "token")?;
+        let scopes = descriptor_scopes(target.descriptor);
+        let enrolled = self
+            .enroll_inner(
+                &json!({"platform":target.provider,"account":target.account,"shape":target.shape,"token":token,"scopes":params.get("scopes").ok_or_else(||Error::rejected("scopes are required"))?,"accept_same_uid_risk":params.get("accept_same_uid_risk").cloned().unwrap_or(json!(false))}),
+                false,
+                None,
+                Some(&scopes),
+                Some(&|record| self.connection_metadata_projection(record)),
+            )
+            .map_err(|error| connection_error(error, token))?;
+        let _guard = self
+            .platform_custody_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let record = self
+            .store
+            .connection_credential(
+                enrolled["account"]["connection_id"]
+                    .as_str()
+                    .ok_or_else(|| Error::internal("missing connection identity"))?,
+            )?
+            .ok_or_else(|| Error::rejected("connection was concurrently removed"))?;
+        Ok(
+            json!({"connection": self.connection_record(target.provider, target.account, Some(&record))?}),
+        )
+    }
+
+    fn connection_mutate(&self, method: &str, params: &Value) -> Result<Value> {
+        let id = connection_id(params)?;
+        let record = self
+            .store
+            .connection_credential(id)?
+            .ok_or_else(|| Error::rejected("connection is unavailable or stale"))?;
+        // CAD-1128: both verbs parse the optional CAS pair once,
+        // strictly. An absent pair stays legacy-optional; a
+        // present field must be exact, and a malformed one
+        // refuses here — before provider verification, custody,
+        // projection or any write.
+        let (expected_id, expected_rev) = Self::expected_cas(params)?;
+        if method == "connection_revoke" {
+            return self.connection_revoke(id, &record, expected_id, expected_rev);
+        }
+        self.connection_rotate(id, record, (expected_id, expected_rev), params)
+    }
+
+    fn connection_revoke(
+        &self,
+        id: &str,
+        record: &CredentialRecord,
+        expected_id: Option<&str>,
+        expected_rev: Option<u64>,
+    ) -> Result<Value> {
+        // CAD-1128: an encrypted revoke requires the exact
+        // incarnation+revision CAS. Legacy callers may omit
+        // the pair; supplied expectations are never rewritten
+        // into a different identity or execution authority.
+        if record
+            .custody
+            .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
+            && (expected_id != Some(id) || expected_rev.is_none())
+        {
+            return Err(Error::invalid(
+                "stale_revision",
+                "an encrypted revoke requires exact expected_connection_id and expected_revision",
+            ));
+        }
+        self.revoke_inner_expected(
+            &json!({"platform":record.platform,"account":record.account}),
+            expected_id.or(Some(id)),
+            expected_rev,
+        )?;
+        Ok(json!({"connection_id":id,"revoked":true}))
+    }
+
+    fn connection_rotate(
+        &self,
+        id: &str,
+        record: CredentialRecord,
+        expected_cas: (Option<&str>, Option<u64>),
+        params: &Value,
+    ) -> Result<Value> {
+        let descriptor = self.connection_descriptor(&record.platform)?;
+        if !descriptor
+            .enrollment_shapes
+            .iter()
+            .any(|s| s == &record.exchange)
+        {
+            return Err(Error::rejected(
+                "connection management shape is unsupported",
+            ));
+        }
+        let ctx = ConnectionRotateContext {
+            id,
+            descriptor: &descriptor,
+            expected_id: expected_cas.0,
+            expected_rev: expected_cas.1,
+        };
+        // SMTP rotation always carries the fresh secret;
+        // transport/sender fields re-validate when present
+        // and inherit live custody otherwise.
+        if record.exchange == platform::smtp::ENROLLMENT_SHAPE {
+            self.connection_rotate_smtp(&ctx, record, params)
+        } else {
+            self.connection_rotate_token(&ctx, &record, params)
+        }
+    }
+
+    fn connection_rotate_smtp(
+        &self,
+        ctx: &ConnectionRotateContext<'_>,
+        record: CredentialRecord,
+        params: &Value,
+    ) -> Result<Value> {
+        if params.get("token").is_some() {
+            return Err(Error::rejected(
+                "SMTP rotation carries the fresh secret — no token",
+            ));
+        }
+        let encrypted = record
+            .custody
+            .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX);
+        let operation = encrypted.then(|| self.custody_operation()).transpose()?;
+        let record = if operation.is_some() {
+            let current = self.store.connection_credential(ctx.id)?.ok_or_else(|| {
+                Error::invalid("stale_revision", "connection is unavailable or stale")
+            })?;
+            if current.platform != record.platform
+                || current.account != record.account
+                || current.exchange != record.exchange
+                || !current
+                    .custody
+                    .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
+            {
+                return Err(Error::invalid(
+                    "stale_revision",
+                    "connection identity changed before rotation",
+                ));
+            }
+            current
+        } else {
+            record
+        };
+        if encrypted {
+            self.refuse_hosted_encrypted()?;
+            if ctx.expected_id != Some(ctx.id)
+                || ctx.expected_rev != Some(record.credential_revision)
+            {
+                return Err(Error::invalid(
+                    "stale_revision",
+                    "encrypted rotation requires the exact current connection and revision",
+                ));
+            }
+        }
+        // Inherit only from the caller-pinned encrypted revision while
+        // retaining the same custody section through publication.
+        let current = match operation.as_ref() {
+            Some(operation) => self.smtp_projection_admitted(&record, operation),
+            None => self.smtp_projection_typed(&record),
+        };
+        let mut mapped = match current {
+            Ok(current) => smtp_rotate_params(&record, params, &current)?,
+            Err(_) => smtp_rotate_full_params(params)?,
+        };
+        mapped["platform"] = json!(record.platform);
+        mapped["account"] = json!(record.account);
+        mapped["shape"] = json!(record.exchange);
+        self.verify_hosted_smtp(&mapped)?;
+        let secret = params.get("secret").and_then(Value::as_str).unwrap_or("");
+        let operation = match operation {
+            Some(operation) => operation,
+            None => self.custody_operation()?,
+        };
+        let scopes = descriptor_scopes(ctx.descriptor);
+        let enrolled = self
+            .enroll_inner_expected(
+                &operation,
+                &mapped,
+                true,
+                ctx.expected_id.or(Some(ctx.id)),
+                ctx.expected_rev,
+                Some(&scopes),
+                Some(&|record| self.connection_metadata_projection(record)),
+            )
+            .map_err(|error| connection_error(error, secret))?;
+        Ok(json!({"connection": enrolled["connection"]}))
+    }
+
+    fn connection_rotate_token(
+        &self,
+        ctx: &ConnectionRotateContext<'_>,
+        record: &CredentialRecord,
+        params: &Value,
+    ) -> Result<Value> {
+        if params.get("secret").is_some() {
+            return Err(Error::rejected(
+                "token rotation carries a token — no SMTP secret",
+            ));
+        }
+        let mut mapped = params.clone();
+        mapped.as_object_mut().unwrap().remove("connection_id");
+        mapped["platform"] = json!(record.platform);
+        mapped["account"] = json!(record.account);
+        let token = required_str(params, "token")?;
+        mapped["shape"] = json!(record.exchange);
+        let operation = self.custody_operation()?;
+        let scopes = descriptor_scopes(ctx.descriptor);
+        let enrolled = self
+            .enroll_inner_expected(
+                &operation,
+                &mapped,
+                true,
+                ctx.expected_id.or(Some(ctx.id)),
+                ctx.expected_rev,
+                Some(&scopes),
+                Some(&|record| self.connection_metadata_projection(record)),
+            )
+            .map_err(|error| connection_error(error, token))?;
+        // Return the attempted committed snapshot, not a later read
+        // that could report a concurrent winner's incarnation.
+        Ok(json!({"connection": enrolled["connection"]}))
     }
 }
 
