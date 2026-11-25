@@ -630,7 +630,7 @@ export default function MemberChat({
               <p className="assistant-scope">{scopeDescriptor("personal", t)}</p>
             </div>
             <div className="assistant-heading-actions">
-              {available && conversationId && supportWorkspaceId && (
+              {available && loaded && conversationId && thread.data?.conversation === conversationId && supportWorkspaceId && (
                 <ConversationIdCopy key={conversationId} id={conversationId} workspaceId={supportWorkspaceId} />
               )}
               {!readOnly && surface?.bootstrap === "deferred" && identity.state === "ready" && (
