@@ -4,10 +4,17 @@ import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
 import { fmtInZone, sameDayClock, useTimeZones } from "../../lib/timeZone";
-import type { Connection, Routine, RoutineRun, StagedRoutineProposal } from "../../lib/types";
+import type {
+  AgentEndpoint,
+  Connection,
+  Routine,
+  RoutineRun,
+  StagedRoutineProposal,
+} from "../../lib/types";
 import Button from "../../ui/Button";
 import DrawerShell, { type DrawerMenuItem } from "../app-shell/shared/DrawerShell";
 import type { TabContext } from "./AgentTabs";
+import { IncomingEndpointsSection, formatEndpointEmail } from "./IncomingEndpointsSection";
 import { routinesApi } from "./routinesApi";
 import "./routines.css";
 
@@ -81,6 +88,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
   const [proposals, setProposals] = useState<StagedRoutineProposal[]>([]);
   const [waitingRuns, setWaitingRuns] = useState<RoutineRun[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [endpoints, setEndpoints] = useState<AgentEndpoint[]>([]);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [notServed, setNotServed] = useState(false);
 
@@ -510,6 +518,12 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
         )}
       </div>
 
+      <IncomingEndpointsSection
+        c={c}
+        eventRoutines={events}
+        onEndpointsChange={setEndpoints}
+      />
+
       {loadErr && (
         <p className="text-label text-fail" role="alert">
           {loadErr}{" "}
@@ -778,16 +792,54 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                       </div>
                     </>
                   ) : (
-                    <div className="rtn-field">
-                      <label htmlFor="rtn-event">{t("Event source")}</label>
-                      <input
-                        id="rtn-event"
-                        className="rtn-input num"
-                        value={eventSource}
-                        onChange={(e) => setEventSource(e.target.value)}
-                        placeholder="github.pull_request"
-                      />
-                    </div>
+                    <>
+                      {endpoints.length > 0 && (
+                        <div className="rtn-field">
+                          <label htmlFor="rtn-endpoint-bind">{t("Incoming endpoint (optional)")}</label>
+                          <select
+                            id="rtn-endpoint-bind"
+                            className="rtn-input"
+                            value={
+                              endpoints.find((ep) => {
+                                const src =
+                                  ep.kind === "email"
+                                    ? `email:${formatEndpointEmail(ep.slug)}`
+                                    : `webhook:${ep.id}`;
+                                return eventSource.trim() === src;
+                              })?.id ?? ""
+                            }
+                            onChange={(e) => {
+                              const picked = endpoints.find((ep) => ep.id === e.target.value);
+                              if (!picked) return;
+                              setEventSource(
+                                picked.kind === "email"
+                                  ? `email:${formatEndpointEmail(picked.slug)}`
+                                  : `webhook:${picked.id}`,
+                              );
+                            }}
+                          >
+                            <option value="">{t("Custom event source below…")}</option>
+                            {endpoints.map((ep) => (
+                              <option key={ep.id} value={ep.id}>
+                                {ep.kind === "email"
+                                  ? `${ep.slug} · ${formatEndpointEmail(ep.slug)}`
+                                  : `${ep.slug} · webhook (${ep.id})`}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                      <div className="rtn-field">
+                        <label htmlFor="rtn-event">{t("Event source")}</label>
+                        <input
+                          id="rtn-event"
+                          className="rtn-input num"
+                          value={eventSource}
+                          onChange={(e) => setEventSource(e.target.value)}
+                          placeholder="github.pull_request"
+                        />
+                      </div>
+                    </>
                   )}
 
                   <div className="rtn-field">
@@ -872,6 +924,16 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                         </option>
                       ))}
                     </select>
+                    {newTrigger === "event" &&
+                      newConnAccount &&
+                      connections.find((conn) => conn.id === newConnAccount)?.policy
+                        ?.allow_external_triggers === false && (
+                        <p className="rtn-ep-warn" role="status">
+                          {t(
+                            "Selected connection blocks external triggers (allow_external_triggers: false). Enable external triggers in Connections before external events can invoke it.",
+                          )}
+                        </p>
+                      )}
                   </div>
 
                   <div className="rtn-field">
@@ -1071,6 +1133,16 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                             </option>
                           ))}
                         </select>
+                        {activeRoutine.trigger_kind === "event" &&
+                          editConnAccount &&
+                          connections.find((conn) => conn.id === editConnAccount)?.policy
+                            ?.allow_external_triggers === false && (
+                            <p className="rtn-ep-warn" role="status">
+                              {t(
+                                "Selected connection blocks external triggers (allow_external_triggers: false). Enable external triggers in Connections before external events can invoke it.",
+                              )}
+                            </p>
+                          )}
                         <label htmlFor="rtn-repoint">{t("Destination thread")}</label>
                         <div className="flex flex-wrap gap-2">
                           <input

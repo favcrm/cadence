@@ -10948,3 +10948,115 @@ fn channel_verbs_scopes_effects_assistant_allowlist_and_post_receipt() {
         assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
     }
 }
+
+#[test]
+fn endpoint_request_in_sends_bearer_without_cookies_and_decodes_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote = target(&listener);
+    store_credential(dir.path(), &remote.endpoint);
+
+    let handle = thread::spawn(move || {
+        let mut captured = Vec::new();
+        let responses = [
+            (
+                "200 OK",
+                json!({"endpoints": [{"id": "ep_1", "kind": "email", "slug": "leads"}]}).to_string(),
+            ),
+            (
+                "200 OK",
+                json!({"ok": true, "endpoint": {"id": "ep_2"}, "secret": "whk_once"}).to_string(),
+            ),
+            (
+                "403 Forbidden",
+                json!({"ok": false, "error": {"code": "owner_required", "message": "Only a human workspace owner may access endpoints."}}).to_string(),
+            ),
+        ];
+        for (status_line, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut raw = String::new();
+            let mut content_len = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.to_ascii_lowercase().starts_with("content-length:") {
+                    content_len = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+                }
+                raw.push_str(&line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let mut req_body = vec![0u8; content_len];
+            if content_len > 0 {
+                std::io::Read::read_exact(&mut reader, &mut req_body).unwrap();
+            }
+            captured.push((raw, String::from_utf8(req_body).unwrap()));
+            let reply = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+        }
+        captured
+    });
+
+    let listed = endpoint_request_in(
+        dir.path(),
+        &remote,
+        "GET",
+        "/api/endpoints?agent=sales",
+        None,
+        5,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(listed["endpoints"][0]["id"], "ep_1");
+
+    let created = endpoint_request_in(
+        dir.path(),
+        &remote,
+        "POST",
+        "/api/endpoints",
+        Some(&json!({"kind": "webhook", "agent_uid": "sales", "slug": "orders", "auth_mode": "bearer"})),
+        5,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(created["secret"], "whk_once");
+
+    let err = endpoint_request_in(
+        dir.path(),
+        &remote,
+        "GET",
+        "/api/endpoints",
+        None,
+        5,
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("403") || err.code() == Some("owner_required"),
+        "{err}"
+    );
+
+    let captured = handle.join().unwrap();
+    assert!(captured[0]
+        .0
+        .starts_with("GET /api/endpoints?agent=sales HTTP/1.1"));
+    assert!(captured[0].0.to_ascii_lowercase().contains(&format!(
+        "authorization: bearer {}",
+        BRIDGE.to_ascii_lowercase()
+    )));
+    assert!(!captured[0].0.to_ascii_lowercase().contains("\ncookie:"));
+    assert!(captured[1].0.starts_with("POST /api/endpoints HTTP/1.1"));
+    assert!(captured[1].1.contains("\"slug\":\"orders\""));
+}
