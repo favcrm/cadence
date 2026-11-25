@@ -88,12 +88,14 @@ function renderWithNavigation(children: React.ReactNode) {
 }
 const props = { project: "cadence", readOnly: false, actor: "master", onToast: () => {}, navHref: () => "/" };
 const flush = async () => { await new Promise((resolve) => setTimeout(resolve, 10)); };
-async function render(extra: Partial<typeof props> = {}) { await React.act(async () => { renderWithNavigation(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
+async function render(extra: Partial<React.ComponentProps<typeof Context>> = {}) { await React.act(async () => { renderWithNavigation(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
 async function go(href: string) { await React.act(async () => { navigate(href); await flush(); }); await React.act(flush); }
 async function run() {
-  await render();
+  await render({ hosted: false, operator: true });
   assert(location.search.includes("file=README.md"), "Context opens the project README first");
   assert(host.textContent?.includes("Notes for projects/cadence/README.md"), "raw daemon text renders as Markdown");
+  assert(host.querySelector("button[aria-label='File actions']"), "a proven native operator can act on the open Context document");
+  assert(!Array.from(host.querySelectorAll("a")).some((link) => link.textContent?.trim() === "Trash"), "workspace Trash stays out of project Context");
   assert(requests.every((url) => !url.endsWith("path=") && !url.includes("path=projects&")), "tree never requests global parents");
   assert(Array.from(host.querySelectorAll("a")).some((link) => link.textContent === "Edit" && link.href.includes("/context?") && link.href.includes("mode=edit")), "Edit stays in the Context tab");
   assert(!host.textContent?.includes("Repository references") && !host.querySelector(".context-references"), "Context contains only the shared Wiki workspace");

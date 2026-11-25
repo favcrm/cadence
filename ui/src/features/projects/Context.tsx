@@ -19,6 +19,7 @@ interface ContextProps {
   /** A hosted board (undefined until the board's meta is known). */
   hosted?: boolean;
   viewerSub?: string | null;
+  operator?: WikiProps["operator"];
 }
 
 export default function Context({
@@ -31,6 +32,7 @@ export default function Context({
   noWiki = false,
   hosted,
   viewerSub,
+  operator,
 }: ContextProps) {
   const t = useTranslate();
   const href = useHref();
@@ -49,7 +51,7 @@ export default function Context({
   return (
     <main className="context-workspace" aria-label={`${project} context`}>
       {project === "all" ? <div className="p-5 text-secondary text-ink-400">{t("Choose a project to open its context.")}</div> : route ? (
-        <Wiki key={project} hosted={hosted} viewerSub={viewerSub} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} readOnlyReason={readOnlyReason} actor={actor} onToast={onToast} />
+        <Wiki key={project} hosted={hosted} viewerSub={viewerSub} operator={operator} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} readOnlyReason={readOnlyReason} actor={actor} onToast={onToast} />
       ) : <div className="p-5" role="alert">{t("This page is outside the project’s context.")} <Link className="lnk" href={`/projects/${encodeURIComponent(project)}/context`}>{t("Open project context")}</Link></div>}
     </main>
   );

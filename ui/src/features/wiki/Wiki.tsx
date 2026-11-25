@@ -669,7 +669,8 @@ function BrowsePane({
   const link = wikiReaderHref(page.path, at, section, citedPage);
   // Native boards do not send the hosted permission bit. Only a proven
   // operator gets that fallback, and profile/memory are read-only views.
-  const removable = page.removable ?? (hosted === false && operator === true &&
+  const removable = page.removable === true || (page.removable === undefined &&
+    hosted === false && operator === true &&
     !/^agents\/[^/]+\/(?:profile|memory)(?:\/|$)/.test(page.path));
   const actions = <>
     <CopyWikiLink key={link} href={link} />
