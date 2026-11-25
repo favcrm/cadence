@@ -708,479 +708,589 @@ impl Shared {
         pid: u32,
     ) -> Result<Value> {
         match method {
-            "app_binding_quote" => {
-                strict_fields(
-                    params,
-                    &[
-                        "install_id",
-                        "context_id",
-                        "slot",
-                        "token",
-                        "key",
-                        "origin",
-                        "public_session",
-                    ],
-                )?;
-                self.operator_connection("app capability quote", params, pid)?;
-                let install = required_str(params, "install_id")?;
-                let slot = required_str(params, "slot")?;
-                let context = optional_str(params, "context_id");
-                let actor = self.account_image_actor(params)?;
-                let pm = self.pm_at(&self.pm_dir()?)?;
-                let (proof, request) =
-                    workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-                        let _custody = self
-                            .platform_custody_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let _release = self
-                            .app_release_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let proof = self
-                            .app_binding_auto_image(install, context, slot, &actor, bundle, files)?
-                            .ok_or_else(|| Error::rejected("capability binding is absent"))?;
-                        let request = self.prepare_app_capability_quote(&proof)?;
-                        Ok((proof, request))
-                    })?;
-                let quote = request.fetch()?;
-                if self.account_image_actor(params)? != actor {
-                    return Err(Error::rejected("capability quote native actor changed"));
-                }
-                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-                    let _custody = self.custody_operation()?;
-                    let _release = self
-                        .app_release_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    self.account_image_actor_live(&actor)?;
-                    self.app_account_binding_owned(&actor, &proof)?;
-                    self.app_binding_receipt_current(
-                        install, context, slot, &proof, bundle, files,
-                    )?;
-                    self.recheck_app_capability_quote(&proof, &quote)?;
-                    Ok(json!({"slot":slot,"binding_digest":proof.digest,
-                        "quote":quote,"quote_digest":app_runs::material_digest(&json!(quote))}))
-                })
-            }
-            "app_run_capability_call" => {
-                strict_fields(params, &["message", "token", "slot", "request_id", "input"])?;
-                let alias = self.app_capability_caller(pid, "app capability call")?;
-                let message = required_str(params, "message")?;
-                let turn = required_str(params, "token")?;
-                let slot =
-                    crate::proto::identifier(required_str(params, "slot")?, "Capability slot")?;
-                let request = crate::proto::identifier(
-                    required_str(params, "request_id")?,
-                    "Capability request",
-                )?;
-                let input = params
-                    .get("input")
-                    .ok_or_else(|| Error::rejected("capability input is required"))?;
-                if !input.is_object() || serde_json::to_vec(input)?.len() > 64 * 1024 {
-                    return Err(Error::rejected(
-                        "capability input must be a JSON object within 64 KiB",
-                    ));
-                }
-                let msg = self
-                    .store
-                    .message(message)?
-                    .filter(|m| {
-                        m.alias == alias
-                            && m.source == "app_run_dispatch"
-                            && m.state == "running"
-                            && m.turn_id.as_deref() == Some(turn)
-                    })
-                    .ok_or_else(|| {
-                        Error::rejected("capability needs the active assigned app turn")
-                    })?;
-                let (run_id, install) = self
-                    .store
-                    .app_message_installation(&msg.id)?
-                    .ok_or_else(|| Error::rejected("capability app association is absent"))?;
-                let checked_run = self.store.app_run_show(&run_id)?;
-                // The next probe prices every frozen slot, not only the one
-                // the worker named. Lineage is offline and ignores non-account
-                // slots, so an unknown or mixed slot cannot skip it.
-                self.account_frozen_lineage(&checked_run)?;
-                self.probe_app_run_prices(&checked_run)?;
-                let quote = self
-                    .prepare_app_run_quotes(&checked_run)?
-                    .remove(&slot)
-                    .ok_or_else(|| Error::rejected("run capability quote is absent"))??
-                    .fetch()?;
-                if checked_run["snapshot"]["capabilities"][&slot]["config"]["provider"]
-                    == crate::platform::account_media::PLATFORM
-                {
-                    return self.execute_account_run_capability(
-                        &checked_run,
-                        &slot,
-                        &quote,
-                        (input, &request),
-                        Some((&alias, message, turn)),
-                    );
-                }
-                let pm = self.pm_at(&self.pm_dir()?)?;
-                // Claim under the runtime/custody/release guards; provider I/O
-                // remains outside them, followed by a fresh result check.
-                let prepared = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
-                    let _custody = self.custody_operation()?;
-                    let _release = self
-                        .app_release_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let run = self.store.app_run_show(&run_id)?;
-                    self.app_run_binding_current(&run, bundle, files)?;
-                    let (run, step, proof) = self.store.app_capability_turn(
-                        &alias,
-                        message,
-                        turn,
-                        &slot,
-                        required_str(bundle, "digest")?,
-                    )?;
-                    // CAD-1374: the sealed approving human bound at approval
-                    // time. Null for a legacy approval (no human recorded).
-                    let sealed_human = run["approval"]["human"].clone();
-                    // CAD-1141: price drift is accepted. The fresh quote is
-                    // the call's `max_charge_minor` ceiling (authority below);
-                    // the frozen snapshot itself must still be unchanged.
-                    if run["snapshot_digest"] != checked_run["snapshot_digest"] {
-                        return Err(Error::rejected(
-                            "run snapshot digest changed since run approval",
-                        ));
-                    }
-                    self.recheck_app_capability_quote(&proof, &quote)?;
-                    let config = &proof.config;
-                    let provider = required_str(config, "provider")?;
-                    let tool = required_str(&config["mapping"], "tool")?;
-                    let effect = required_str(&config["mapping"], "effect")?;
-                    let adapter = self
-                        .platforms
-                        .get(provider)
-                        .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
-                    if !matches!(effect, "read" | "draft")
-                        || classify_call(
-                            adapter.table(),
-                            adapter.reported_manifest_version().as_deref(),
-                            tool,
-                        ) != if effect == "read" {
-                            Effect::Read
-                        } else {
-                            Effect::Draft
-                        }
-                    {
-                        return Err(Error::rejected(
-                            "bound app capability is not a current read/draft action",
-                        ));
-                    }
-                    let input_digest = app_runs::material_digest(input);
-                    if let Some(existing) =
-                        self.store.app_capability_result_for_slot(&run_id, &slot)?
-                    {
-                        if existing["step_id"] != step
-                            || existing["request_id"] != request
-                            || existing["input_digest"] != input_digest
-                            || existing["binding_digest"] != proof.digest
-                        {
-                            return Err(Error::rejected(
-                                "approved run capability slot already has its one result",
-                            ));
-                        }
-                        return Ok(std::ops::ControlFlow::Break(existing));
-                    }
-                    let call_id = format!(
-                        "app-call-{}",
-                        uuid::Uuid::new_v5(
-                            &uuid::Uuid::NAMESPACE_OID,
-                            format!("{run_id}:{slot}").as_bytes(),
-                        )
-                        .simple()
-                    );
-                    // The claim is the exactly-once gate: a second identical
-                    // request makes no provider call and must not fail the run
-                    // (the first call may still be in flight).
-                    if !self.store.app_capability_claim(
-                        crate::store::app_capabilities::AppCapabilityClaim {
-                            run: &run_id,
-                            step: &step,
-                            message,
-                            turn,
-                            slot: &slot,
-                            request: &request,
-                            binding_digest: &proof.digest,
-                            input_digest: &input_digest,
-                            call_id: &call_id,
-                        },
-                    )? {
-                        return Err(Error::unknown("A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made."));
-                    }
-                    let authority = json!({
-                        "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
-                        "install_id":install,"context_id":run["context_id"],
-                        "step_id":step,"slot":slot,"binding":proof,
-                        "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
-                        "quote":quote,
-                        "call_id":call_id,
-                    });
-                    let credential = self.app_capability_credential(config)?;
-                    // CAD-1374: a NEW external call re-proves the approving
-                    // human after the durable claim and before any provider
-                    // bytes leave. A revoked/demoted human refuses here; the
-                    // claim stays as an honest prepared intent, never resent.
-                    if sealed_human.is_object() {
-                        self.fresh_run_human(&sealed_human)?;
-                    }
-                    // Re-read the live run and active assigned turn after the
-                    // fresh I/O. The approval human binding and the turn must
-                    // still be the ones proven above.
-                    let (current, current_step, current_proof) = self.store.app_capability_turn(
-                        &alias,
-                        message,
-                        turn,
-                        &slot,
-                        required_str(bundle, "digest")?,
-                    )?;
-                    if current["approval"]["human"] != sealed_human
-                        || current_step != step
-                        || current_proof.digest != proof.digest
-                    {
-                        return Err(Error::rejected(
-                            "capability approval or turn changed before the external call",
-                        ));
-                    }
-                    Ok(std::ops::ControlFlow::Continue((
-                        std::sync::Arc::clone(adapter),
-                        credential,
-                        authority,
-                        call_id,
-                        input_digest,
-                        step,
-                        proof,
-                        sealed_human,
-                    )))
-                })?;
-                let (
-                    adapter,
-                    credential,
-                    authority,
-                    call_id,
-                    input_digest,
-                    step,
-                    proof,
-                    sealed_human,
-                ) = match prepared {
-                    std::ops::ControlFlow::Continue(prepared) => prepared,
-                    std::ops::ControlFlow::Break(existing) => return Ok(existing),
-                };
-                crate::issue::lockseam::outside_lock("app-capability-provider-call");
-                let output = adapter
-                    .execute_app_capability_outcome(&credential, &authority, input, &call_id)
-                    .map_err(|error| {
-                        let reason = if crate::platform::refuse_leak(
-                            "app capability failure",
-                            error.reason(),
-                            &credential,
-                        )
-                        .is_ok()
-                        {
-                            error.reason().chars().take(250).collect::<String>()
-                        } else {
-                            "Provider failure details were withheld because they matched credential custody.".into()
-                        };
-                        let _ = self
-                            .store
-                            .app_run_call_failed(&run_id, &step, error.kind(), &reason);
-                        run_capability_error(&error, reason)
-                    })?;
-                // CAD-1258 interleaving point: a revoke or upgrade may land here.
-                crate::issue::lockseam::outside_lock("app-capability-before-record");
-                let recorded = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let _release = self
-                        .app_release_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    self.app_run_binding_current(&self.store.app_run_show(&run_id)?, bundle, files)
-                        .map_err(super::app_effects_rpc::lock2_authority)?;
-                    let (current, current_step, current_proof) = self
-                        .store
-                        .app_capability_turn(
-                            &alias,
-                            message,
-                            turn,
-                            &slot,
-                            required_str(bundle, "digest")?,
-                        )
-                        .map_err(super::app_effects_rpc::lock2_authority)?;
-                    if current["approval"]["human"] != sealed_human
-                        || current_step != step
-                        || current_proof.digest != proof.digest
-                    {
-                        return Err(super::app_effects_rpc::lock2_authority(Error::rejected(
-                            "capability approval or turn changed during the external call",
-                        )));
-                    }
-                    crate::platform::refuse_leak(
-                        "app capability result",
-                        &output.result.to_string(),
-                        &credential,
-                    )?;
-                    if let Some(asset) = &output.asset {
-                        crate::platform::refuse_leak(
-                            "app capability asset",
-                            &String::from_utf8_lossy(&asset.bytes),
-                            &credential,
-                        )?;
-                    }
-                    self.store
-                        .app_capability_record(
-                            crate::store::app_capabilities::AppCapabilityRecord {
-                                id: &call_id,
-                                run: &run_id,
-                                step: &step,
-                                message,
-                                turn,
-                                slot: &slot,
-                                request: &request,
-                                binding_digest: &proof.digest,
-                                input_digest: &input_digest,
-                                result: &output.result,
-                                asset: output.asset.as_ref().map(|asset| {
-                                    (asset.media_type.as_str(), asset.bytes.as_slice())
-                                }),
-                            },
-                        )
-                        .map_err(|error| Error::internal(error.to_string()))
-                });
-                if let Err(error) = &recorded {
-                    // The provider answered but lock 2 refused or could not
-                    // retain it: leave a durable uncertain failure naming
-                    // the cause, never a silent drop. The claim blocks any
-                    // resend. If that write fails too, say so.
-                    let reason = super::app_effects_rpc::lock2_failure_reason(
-                        error,
-                        &[credential.as_slice()],
-                    );
-                    if let Err(write) =
-                        self.store
-                            .app_run_call_failed(&run_id, &step, "uncertain", &reason)
-                    {
-                        return Err(Error::unknown(format!(
-                            "{reason} (the failure could not be recorded: {})",
-                            super::app_effects_rpc::lock2_cause(&write, &[credential.as_slice()])
-                        )));
-                    }
-                    // The caller gets the same screened reason, never the raw
-                    // lock-2 error text.
-                    return Err(Error::unknown(reason));
-                }
-                recorded
-            }
+            "app_binding_quote" => self.rpc_app_binding_quote(params, pid),
+            "app_run_capability_call" => self.rpc_app_run_capability_call(params, pid),
             "app_run_capability_results"
             | "app_run_capability_result"
             | "app_run_capability_asset" => {
-                strict_fields(
-                    params,
-                    if method == "app_run_capability_results" {
-                        &["run_id"]
-                    } else {
-                        &["receipt_id", "message", "token"]
-                    },
-                )?;
-                if let Some(message) = optional_str(params, "message") {
-                    if method == "app_run_capability_results" {
-                        return Err(Error::rejected("worker cannot list capability results"));
-                    }
-                    let token = required_str(params, "token")?;
-                    let alias = self.app_capability_caller(pid, "app capability receipt")?;
-                    let receipt_id = required_str(params, "receipt_id")?;
-                    let receipt = self.store.app_capability_result(receipt_id)?;
-                    let run = self.store.app_run_show(required_str(&receipt, "run_id")?)?;
-                    self.probe_app_run_prices(&run)?;
-                    let pm = self.pm_at(&self.pm_dir()?)?;
-                    return workspace::with_runtime_snapshot(
-                        &pm,
-                        required_str(&run, "install_id")?,
-                        |bundle, files| {
-                            let _custody = self.custody_operation()?;
-                            let _release = self
-                                .app_release_lock
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            self.app_run_binding_current(&run, bundle, files)?;
-                            self.store.app_capability_receipt_for_turn(
-                                receipt_id,
-                                &alias,
-                                message,
-                                token,
-                                required_str(bundle, "digest")?,
-                            )?;
-                            if method == "app_run_capability_asset" {
-                                self.store.app_capability_asset(receipt_id)
-                            } else {
-                                Ok(receipt)
-                            }
-                        },
-                    );
-                }
-                if params.get("token").is_some() {
-                    return Err(Error::rejected("token requires its assigned message"));
-                }
-                self.operator_connection("app capability receipt", params, pid)?;
-                // Historical operator reads must not turn an unsupported
-                // encrypted binding into a cache-return bypass. Only classify
-                // the stored routing targets: no provider quote, credential
-                // load, execution grant, or legacy historical revalidation.
-                let _custody = self.custody_operation()?;
-                let _release = self
-                    .app_release_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let run_id = if method == "app_run_capability_results" {
-                    required_str(params, "run_id")?.to_string()
-                } else {
-                    let receipt = self
-                        .store
-                        .app_capability_result(required_str(params, "receipt_id")?)
-                        .map_err(|error| match error {
-                            Error::Rejected(message)
-                                if method == "app_run_capability_asset"
-                                    && message == "app capability result unavailable" =>
-                            {
-                                Error::rejected("app capability asset unavailable")
-                            }
-                            other => other,
-                        })?;
-                    required_str(&receipt, "run_id")?.to_string()
-                };
-                let run = self.store.app_run_show(&run_id)?;
-                if let Some(capabilities) = run["snapshot"]["capabilities"].as_object() {
-                    for value in capabilities.values() {
-                        let proof: crate::store::app_bindings::BindingProof =
-                            serde_json::from_value(value.clone()).map_err(|_| {
-                                Error::rejected("run capability binding receipt is invalid")
-                            })?;
-                        self.refuse_encrypted_binding(&proof.config)?;
-                    }
-                }
-                match method {
-                    "app_run_capability_results" => self
-                        .store
-                        .app_capability_results(required_str(params, "run_id")?),
-                    "app_run_capability_result" => self
-                        .store
-                        .app_capability_result(required_str(params, "receipt_id")?),
-                    _ => self
-                        .store
-                        .app_capability_asset(required_str(params, "receipt_id")?),
-                }
+                self.rpc_app_capability_receipt_read(method, params, pid)
             }
             _ => Err(Error::rejected("unknown app capability method")),
         }
     }
+
+    fn rpc_app_binding_quote(&self, params: &Value, pid: u32) -> Result<Value> {
+        strict_fields(
+            params,
+            &[
+                "install_id",
+                "context_id",
+                "slot",
+                "token",
+                "key",
+                "origin",
+                "public_session",
+            ],
+        )?;
+        self.operator_connection("app capability quote", params, pid)?;
+        let install = required_str(params, "install_id")?;
+        let slot = required_str(params, "slot")?;
+        let context = optional_str(params, "context_id");
+        let actor = self.account_image_actor(params)?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let (proof, request) = workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let proof = self
+                .app_binding_auto_image(install, context, slot, &actor, bundle, files)?
+                .ok_or_else(|| Error::rejected("capability binding is absent"))?;
+            let request = self.prepare_app_capability_quote(&proof)?;
+            Ok((proof, request))
+        })?;
+        let quote = request.fetch()?;
+        if self.account_image_actor(params)? != actor {
+            return Err(Error::rejected("capability quote native actor changed"));
+        }
+        workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let _custody = self.custody_operation()?;
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.account_image_actor_live(&actor)?;
+            self.app_account_binding_owned(&actor, &proof)?;
+            self.app_binding_receipt_current(install, context, slot, &proof, bundle, files)?;
+            self.recheck_app_capability_quote(&proof, &quote)?;
+            Ok(json!({
+                "slot": slot,
+                "binding_digest": proof.digest,
+                "quote": quote,
+                "quote_digest": app_runs::material_digest(&json!(quote))
+            }))
+        })
+    }
+
+    fn parse_capability_call_request<'a>(
+        &self,
+        params: &'a Value,
+        pid: u32,
+    ) -> Result<CapabilityCallRequest<'a>> {
+        strict_fields(params, &["message", "token", "slot", "request_id", "input"])?;
+        let alias = self.app_capability_caller(pid, "app capability call")?;
+        let message = required_str(params, "message")?;
+        let turn = required_str(params, "token")?;
+        let slot = crate::proto::identifier(required_str(params, "slot")?, "Capability slot")?;
+        let request =
+            crate::proto::identifier(required_str(params, "request_id")?, "Capability request")?;
+        let input = params
+            .get("input")
+            .ok_or_else(|| Error::rejected("capability input is required"))?;
+        if !input.is_object() || serde_json::to_vec(input)?.len() > 64 * 1024 {
+            return Err(Error::rejected(
+                "capability input must be a JSON object within 64 KiB",
+            ));
+        }
+        Ok(CapabilityCallRequest {
+            alias,
+            message,
+            turn,
+            slot,
+            request,
+            input,
+        })
+    }
+
+    fn prepare_capability_call(
+        &self,
+        pm: &crate::issue::Pm,
+        target: &CapabilityRunTarget<'_>,
+        req: &CapabilityCallRequest<'_>,
+    ) -> Result<std::ops::ControlFlow<Value, PreparedCapabilityCall>> {
+        workspace::with_runtime_snapshot(pm, target.install, |bundle, files| {
+            let _custody = self.custody_operation()?;
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let run = self.store.app_run_show(target.run_id)?;
+            self.app_run_binding_current(&run, bundle, files)?;
+            let (run, step, proof) = self.store.app_capability_turn(
+                &req.alias,
+                req.message,
+                req.turn,
+                &req.slot,
+                required_str(bundle, "digest")?,
+            )?;
+            // CAD-1374: the sealed approving human bound at approval
+            // time. Null for a legacy approval (no human recorded).
+            let sealed_human = run["approval"]["human"].clone();
+            // CAD-1141: price drift is accepted. The fresh quote is
+            // the call's `max_charge_minor` ceiling (authority below);
+            // the frozen snapshot itself must still be unchanged.
+            if run["snapshot_digest"] != target.checked_run["snapshot_digest"] {
+                return Err(Error::rejected(
+                    "run snapshot digest changed since run approval",
+                ));
+            }
+            self.recheck_app_capability_quote(&proof, target.quote)?;
+            let config = &proof.config;
+            let provider = required_str(config, "provider")?;
+            let tool = required_str(&config["mapping"], "tool")?;
+            let effect = required_str(&config["mapping"], "effect")?;
+            let adapter = self
+                .platforms
+                .get(provider)
+                .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
+            if !matches!(effect, "read" | "draft")
+                || classify_call(
+                    adapter.table(),
+                    adapter.reported_manifest_version().as_deref(),
+                    tool,
+                ) != if effect == "read" {
+                    Effect::Read
+                } else {
+                    Effect::Draft
+                }
+            {
+                return Err(Error::rejected(
+                    "bound app capability is not a current read/draft action",
+                ));
+            }
+            let input_digest = app_runs::material_digest(req.input);
+            if let Some(existing) = self
+                .store
+                .app_capability_result_for_slot(target.run_id, &req.slot)?
+            {
+                if existing["step_id"] != step
+                    || existing["request_id"] != req.request
+                    || existing["input_digest"] != input_digest
+                    || existing["binding_digest"] != proof.digest
+                {
+                    return Err(Error::rejected(
+                        "approved run capability slot already has its one result",
+                    ));
+                }
+                return Ok(std::ops::ControlFlow::Break(existing));
+            }
+            let call_id = format!(
+                "app-call-{}",
+                uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID,
+                    format!("{}:{}", target.run_id, req.slot).as_bytes(),
+                )
+                .simple()
+            );
+            // The claim is the exactly-once gate: a second identical
+            // request makes no provider call and must not fail the run
+            // (the first call may still be in flight).
+            if !self.store.app_capability_claim(
+                crate::store::app_capabilities::AppCapabilityClaim {
+                    run: target.run_id,
+                    step: &step,
+                    message: req.message,
+                    turn: req.turn,
+                    slot: &req.slot,
+                    request: &req.request,
+                    binding_digest: &proof.digest,
+                    input_digest: &input_digest,
+                    call_id: &call_id,
+                },
+            )? {
+                return Err(Error::unknown(
+                    "A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made.",
+                ));
+            }
+            let authority = json!({
+                "schema": 1,
+                "run_id": target.run_id,
+                "run_snapshot_digest": run["snapshot_digest"],
+                "install_id": target.install,
+                "context_id": run["context_id"],
+                "step_id": step,
+                "slot": req.slot,
+                "binding": proof,
+                "inputs": run["snapshot"]["inputs"],
+                "source": run["snapshot"]["source"],
+                "quote": target.quote,
+                "call_id": call_id,
+            });
+            let credential = self.app_capability_credential(config)?;
+            // CAD-1374: a NEW external call re-proves the approving
+            // human after the durable claim and before any provider
+            // bytes leave. A revoked/demoted human refuses here; the
+            // claim stays as an honest prepared intent, never resent.
+            if sealed_human.is_object() {
+                self.fresh_run_human(&sealed_human)?;
+            }
+            // Re-read the live run and active assigned turn after the
+            // fresh I/O. The approval human binding and the turn must
+            // still be the ones proven above.
+            let (current, current_step, current_proof) = self.store.app_capability_turn(
+                &req.alias,
+                req.message,
+                req.turn,
+                &req.slot,
+                required_str(bundle, "digest")?,
+            )?;
+            if current["approval"]["human"] != sealed_human
+                || current_step != step
+                || current_proof.digest != proof.digest
+            {
+                return Err(Error::rejected(
+                    "capability approval or turn changed before the external call",
+                ));
+            }
+            Ok(std::ops::ControlFlow::Continue(PreparedCapabilityCall {
+                adapter: std::sync::Arc::clone(adapter),
+                credential,
+                authority,
+                call_id,
+                input_digest,
+                step,
+                proof,
+                sealed_human,
+            }))
+        })
+    }
+
+    fn execute_capability_provider_call(
+        &self,
+        run_id: &str,
+        prepared: &PreparedCapabilityCall,
+        input: &Value,
+    ) -> Result<crate::platform::AppCapabilityOutput> {
+        prepared
+            .adapter
+            .execute_app_capability_outcome(
+                &prepared.credential,
+                &prepared.authority,
+                input,
+                &prepared.call_id,
+            )
+            .map_err(|error| {
+                let reason = if crate::platform::refuse_leak(
+                    "app capability failure",
+                    error.reason(),
+                    &prepared.credential,
+                )
+                .is_ok()
+                {
+                    error.reason().chars().take(250).collect::<String>()
+                } else {
+                    "Provider failure details were withheld because they matched credential custody."
+                        .into()
+                };
+                let _ = self.store.app_run_call_failed(
+                    run_id,
+                    &prepared.step,
+                    error.kind(),
+                    &reason,
+                );
+                run_capability_error(&error, reason)
+            })
+    }
+
+    fn record_capability_call_result(
+        &self,
+        pm: &crate::issue::Pm,
+        target: &CapabilityRunTarget<'_>,
+        req: &CapabilityCallRequest<'_>,
+        prepared: &PreparedCapabilityCall,
+        output: &crate::platform::AppCapabilityOutput,
+    ) -> Result<Value> {
+        let recorded = workspace::with_runtime_snapshot(pm, target.install, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.app_run_binding_current(&self.store.app_run_show(target.run_id)?, bundle, files)
+                .map_err(super::app_effects_rpc::lock2_authority)?;
+            let (current, current_step, current_proof) = self
+                .store
+                .app_capability_turn(
+                    &req.alias,
+                    req.message,
+                    req.turn,
+                    &req.slot,
+                    required_str(bundle, "digest")?,
+                )
+                .map_err(super::app_effects_rpc::lock2_authority)?;
+            if current["approval"]["human"] != prepared.sealed_human
+                || current_step != prepared.step
+                || current_proof.digest != prepared.proof.digest
+            {
+                return Err(super::app_effects_rpc::lock2_authority(Error::rejected(
+                    "capability approval or turn changed during the external call",
+                )));
+            }
+            crate::platform::refuse_leak(
+                "app capability result",
+                &output.result.to_string(),
+                &prepared.credential,
+            )?;
+            if let Some(asset) = &output.asset {
+                crate::platform::refuse_leak(
+                    "app capability asset",
+                    &String::from_utf8_lossy(&asset.bytes),
+                    &prepared.credential,
+                )?;
+            }
+            self.store
+                .app_capability_record(crate::store::app_capabilities::AppCapabilityRecord {
+                    id: &prepared.call_id,
+                    run: target.run_id,
+                    step: &prepared.step,
+                    message: req.message,
+                    turn: req.turn,
+                    slot: &req.slot,
+                    request: &req.request,
+                    binding_digest: &prepared.proof.digest,
+                    input_digest: &prepared.input_digest,
+                    result: &output.result,
+                    asset: output
+                        .asset
+                        .as_ref()
+                        .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
+                })
+                .map_err(|error| Error::internal(error.to_string()))
+        });
+        if let Err(error) = &recorded {
+            // The provider answered but lock 2 refused or could not
+            // retain it: leave a durable uncertain failure naming
+            // the cause, never a silent drop. The claim blocks any
+            // resend. If that write fails too, say so.
+            let reason = super::app_effects_rpc::lock2_failure_reason(
+                error,
+                &[prepared.credential.as_slice()],
+            );
+            if let Err(write) =
+                self.store
+                    .app_run_call_failed(target.run_id, &prepared.step, "uncertain", &reason)
+            {
+                return Err(Error::unknown(format!(
+                    "{reason} (the failure could not be recorded: {})",
+                    super::app_effects_rpc::lock2_cause(&write, &[prepared.credential.as_slice()])
+                )));
+            }
+            // The caller gets the same screened reason, never the raw
+            // lock-2 error text.
+            return Err(Error::unknown(reason));
+        }
+        recorded
+    }
+
+    fn rpc_app_run_capability_call(&self, params: &Value, pid: u32) -> Result<Value> {
+        let req = self.parse_capability_call_request(params, pid)?;
+        let msg = self
+            .store
+            .message(req.message)?
+            .filter(|m| {
+                m.alias == req.alias
+                    && m.source == "app_run_dispatch"
+                    && m.state == "running"
+                    && m.turn_id.as_deref() == Some(req.turn)
+            })
+            .ok_or_else(|| Error::rejected("capability needs the active assigned app turn"))?;
+        let (run_id, install) = self
+            .store
+            .app_message_installation(&msg.id)?
+            .ok_or_else(|| Error::rejected("capability app association is absent"))?;
+        let checked_run = self.store.app_run_show(&run_id)?;
+        // The next probe prices every frozen slot, not only the one
+        // the worker named. Lineage is offline and ignores non-account
+        // slots, so an unknown or mixed slot cannot skip it.
+        self.account_frozen_lineage(&checked_run)?;
+        self.probe_app_run_prices(&checked_run)?;
+        let quote = self
+            .prepare_app_run_quotes(&checked_run)?
+            .remove(&req.slot)
+            .ok_or_else(|| Error::rejected("run capability quote is absent"))??
+            .fetch()?;
+        if checked_run["snapshot"]["capabilities"][&req.slot]["config"]["provider"]
+            == crate::platform::account_media::PLATFORM
+        {
+            return self.execute_account_run_capability(
+                &checked_run,
+                &req.slot,
+                &quote,
+                (req.input, &req.request),
+                Some((&req.alias, req.message, req.turn)),
+            );
+        }
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let target = CapabilityRunTarget {
+            run_id: &run_id,
+            install: &install,
+            checked_run: &checked_run,
+            quote: &quote,
+        };
+        // Claim under the runtime/custody/release guards; provider I/O
+        // remains outside them, followed by a fresh result check.
+        let prepared = match self.prepare_capability_call(&pm, &target, &req)? {
+            std::ops::ControlFlow::Continue(prepared) => prepared,
+            std::ops::ControlFlow::Break(existing) => return Ok(existing),
+        };
+        crate::issue::lockseam::outside_lock("app-capability-provider-call");
+        let output = self.execute_capability_provider_call(&run_id, &prepared, req.input)?;
+        // CAD-1258 interleaving point: a revoke or upgrade may land here.
+        crate::issue::lockseam::outside_lock("app-capability-before-record");
+        self.record_capability_call_result(&pm, &target, &req, &prepared, &output)
+    }
+
+    fn rpc_app_capability_receipt_read(
+        &self,
+        method: &str,
+        params: &Value,
+        pid: u32,
+    ) -> Result<Value> {
+        strict_fields(
+            params,
+            if method == "app_run_capability_results" {
+                &["run_id"]
+            } else {
+                &["receipt_id", "message", "token"]
+            },
+        )?;
+        if let Some(message) = optional_str(params, "message") {
+            return self.read_worker_capability_receipt(method, params, message, pid);
+        }
+        if params.get("token").is_some() {
+            return Err(Error::rejected("token requires its assigned message"));
+        }
+        self.read_operator_capability_receipt(method, params, pid)
+    }
+
+    fn read_worker_capability_receipt(
+        &self,
+        method: &str,
+        params: &Value,
+        message: &str,
+        pid: u32,
+    ) -> Result<Value> {
+        if method == "app_run_capability_results" {
+            return Err(Error::rejected("worker cannot list capability results"));
+        }
+        let token = required_str(params, "token")?;
+        let alias = self.app_capability_caller(pid, "app capability receipt")?;
+        let receipt_id = required_str(params, "receipt_id")?;
+        let receipt = self.store.app_capability_result(receipt_id)?;
+        let run = self.store.app_run_show(required_str(&receipt, "run_id")?)?;
+        self.probe_app_run_prices(&run)?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, required_str(&run, "install_id")?, |bundle, files| {
+            let _custody = self.custody_operation()?;
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.app_run_binding_current(&run, bundle, files)?;
+            self.store.app_capability_receipt_for_turn(
+                receipt_id,
+                &alias,
+                message,
+                token,
+                required_str(bundle, "digest")?,
+            )?;
+            if method == "app_run_capability_asset" {
+                self.store.app_capability_asset(receipt_id)
+            } else {
+                Ok(receipt)
+            }
+        })
+    }
+
+    fn read_operator_capability_receipt(
+        &self,
+        method: &str,
+        params: &Value,
+        pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("app capability receipt", params, pid)?;
+        // Historical operator reads must not turn an unsupported
+        // encrypted binding into a cache-return bypass. Only classify
+        // the stored routing targets: no provider quote, credential
+        // load, execution grant, or legacy historical revalidation.
+        let _custody = self.custody_operation()?;
+        let _release = self
+            .app_release_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = if method == "app_run_capability_results" {
+            required_str(params, "run_id")?.to_string()
+        } else {
+            let receipt = self
+                .store
+                .app_capability_result(required_str(params, "receipt_id")?)
+                .map_err(|error| match error {
+                    Error::Rejected(message)
+                        if method == "app_run_capability_asset"
+                            && message == "app capability result unavailable" =>
+                    {
+                        Error::rejected("app capability asset unavailable")
+                    }
+                    other => other,
+                })?;
+            required_str(&receipt, "run_id")?.to_string()
+        };
+        let run = self.store.app_run_show(&run_id)?;
+        if let Some(capabilities) = run["snapshot"]["capabilities"].as_object() {
+            for value in capabilities.values() {
+                let proof: crate::store::app_bindings::BindingProof =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        Error::rejected("run capability binding receipt is invalid")
+                    })?;
+                self.refuse_encrypted_binding(&proof.config)?;
+            }
+        }
+        match method {
+            "app_run_capability_results" => self
+                .store
+                .app_capability_results(required_str(params, "run_id")?),
+            "app_run_capability_result" => self
+                .store
+                .app_capability_result(required_str(params, "receipt_id")?),
+            _ => self
+                .store
+                .app_capability_asset(required_str(params, "receipt_id")?),
+        }
+    }
+}
+
+struct CapabilityCallRequest<'a> {
+    alias: String,
+    message: &'a str,
+    turn: &'a str,
+    slot: String,
+    request: String,
+    input: &'a Value,
+}
+
+struct CapabilityRunTarget<'a> {
+    run_id: &'a str,
+    install: &'a str,
+    checked_run: &'a Value,
+    quote: &'a crate::platform::AppCapabilityQuote,
+}
+
+struct PreparedCapabilityCall {
+    adapter: Arc<dyn crate::platform::PlatformAdapter>,
+    credential: Vec<u8>,
+    authority: Value,
+    call_id: String,
+    input_digest: String,
+    step: String,
+    proof: BindingProof,
+    sealed_human: Value,
 }
 
 #[cfg(all(test, unix, feature = "test-seam"))]
