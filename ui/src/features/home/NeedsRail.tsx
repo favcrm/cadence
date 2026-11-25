@@ -97,6 +97,8 @@ export default function NeedsRail({
   templateList,
   hasLiveAgents = false,
   streamDegraded = false,
+  deepLinkActionId = null,
+  onClearDeepLinkAction,
 }: {
   /** Only Master Home supplies the existing operator overview. */
   overview?: ResourceState<Overview>;
@@ -126,6 +128,9 @@ export default function NeedsRail({
   hasLiveAgents?: boolean;
   /** True when the live event stream is degraded to 15s polling. */
   streamDegraded?: boolean;
+  /** CAD-2825: staged action ID from `/?action=<actionId>` deep-link. */
+  deepLinkActionId?: string | null;
+  onClearDeepLinkAction?: () => void;
 }) {
   const [tab, setTab] = useState<"todo" | "feed">("todo");
   const [todoFilter, setTodoFilter] = useState<TodoCategory>("all");
@@ -240,7 +245,7 @@ export default function NeedsRail({
     if (restoreFocus !== false) restoreRailFocus(detailOpener.current);
   };
 
-  const openFeedDetail = (next: RailFeedTarget, opener: HTMLElement) => {
+  const openFeedDetail = (next: RailFeedTarget, opener: HTMLElement | null) => {
     detailOpener.current = opener;
     reviewOpening.current = true;
     closeDrawerImmediate();
@@ -425,6 +430,58 @@ export default function NeedsRail({
   useEffect(() => {
     if (decisionsOn) return homeDecisions.onReviewRequest((id, opener) => openStaged.current(id, opener));
   }, [decisionsOn]);
+
+  // CAD-2825: opening `/?action=<actionId>` waits for staged decisions to load,
+  // auto-opens that exact action in StagedWriteDetail, or surfaces a non-destructive notice.
+  const handledActionRef = useRef<string | null>(null);
+  const [deepLinkNotice, setDeepLinkNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!deepLinkActionId) {
+      handledActionRef.current = null;
+      return;
+    }
+    if (handledActionRef.current === deepLinkActionId) return;
+    if (!decisionsOn || staged.phase === "unavailable") {
+      handledActionRef.current = deepLinkActionId;
+      const msg = t("Staged approvals are not available in this view.");
+      setDeepLinkNotice(msg);
+      onToast?.(msg);
+      onClearDeepLinkAction?.();
+      return;
+    }
+    if (staged.phase === "idle" || staged.phase === "loading") return;
+    if (staged.phase === "error") {
+      handledActionRef.current = deepLinkActionId;
+      const msg = t("Could not load pending approvals to open that action. Try refreshing.");
+      setDeepLinkNotice(msg);
+      onToast?.(msg);
+      onClearDeepLinkAction?.();
+      return;
+    }
+    handledActionRef.current = deepLinkActionId;
+    const queue = staged.pending.map((w) => w.id);
+    const at = queue.indexOf(deepLinkActionId);
+    if (at >= 0) {
+      setDeepLinkNotice(null);
+      setTab("todo");
+      reviewStaged(queue, at, null);
+      onClearDeepLinkAction?.();
+      return;
+    }
+    const decidedMatch = staged.decided.find((w) => w.id === deepLinkActionId);
+    if (decidedMatch) {
+      const msg = t("That staged action has already been decided.");
+      setDeepLinkNotice(msg);
+      onToast?.(msg);
+      openFeedDetail({ kind: "decided_write", write: decidedMatch }, null);
+      onClearDeepLinkAction?.();
+      return;
+    }
+    const msg = t("That staged action is no longer pending (it may already have been decided or expired).");
+    setDeepLinkNotice(msg);
+    onToast?.(msg);
+    onClearDeepLinkAction?.();
+  }, [deepLinkActionId, decisionsOn, staged.phase, staged.pending, staged.decided, onClearDeepLinkAction, onToast, t]);
 
   const openDecision = (key: string, opener?: HTMLElement) => {
     const stagedCard = cards.find((n) => n.key === key && n.action.type === "staged");
@@ -632,6 +689,14 @@ export default function NeedsRail({
         </p>
       )}
       {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
+      {deepLinkNotice && review === null && (
+        <p className="todo-note text-label text-ink-300 px-3 pt-2" role="status" data-deep-link-notice>
+          <span>{deepLinkNotice}</span>{" "}
+          <button type="button" className="lnk text-label" onClick={() => setDeepLinkNotice(null)}>
+            {t("Dismiss")}
+          </button>
+        </p>
+      )}
       {staged.notice && review === null && (
         <p className="todo-note text-label text-ink-300 px-3 pt-2" role="status">
           <span>{noticeText(staged.notice, t)}</span>

@@ -461,3 +461,36 @@ equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects
     "stripAppRouteParams preserves global cross-route host keys even if passed as extraSectionQuery",
   );
 }
+
+// CAD-2825: /?action=<actionId> deep-links a staged decision on Home and stays tidy on navigation.
+{
+  const deep = readLocation("/", "?action=act_123&keep=1");
+  equal(deep.route, { screen: "home", actionId: "act_123" }, "readLocation parses ?action= on Home");
+  equal(locationHref(deep, "?action=act_123&keep=1"), "/?keep=1&action=act_123", "Home deep-link round-trips when active");
+  equal(
+    locationHref(goTo(deep, { screen: "home" }), "?action=act_123&keep=1", deep.route),
+    "/?keep=1",
+    "clearing or navigating to Home strips ?action= while preserving unrelated params",
+  );
+  equal(
+    locationHref(goTo(deep, { screen: "projects", slug: null, section: "issues" }), "?action=act_123&keep=1", deep.route),
+    "/projects?keep=1&view=list",
+    "switching away from Home to /projects strips ?action=",
+  );
+  equal(
+    locationHref(goTo(deep, { screen: "threads" }), "?action=act_123&keep=1", deep.route),
+    "/threads?keep=1",
+    "switching away from Home to /threads strips ?action=",
+  );
+  const combined = readLocation("/", "?chat=assistant&action=act_456");
+  equal(
+    combined.route,
+    { screen: "home", privateChat: true, actionId: "act_456" },
+    "readLocation parses both ?chat=assistant and ?action= on Home",
+  );
+  equal(
+    locationHref({ ...combined, route: { screen: "home", privateChat: true } }, "?chat=assistant&action=act_456", combined.route),
+    "/?chat=assistant",
+    "clearing actionId preserves ?chat=assistant on Home",
+  );
+}

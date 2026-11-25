@@ -124,6 +124,9 @@ export default function MemberChat({
   templateCount,
   templateList,
   streamDegraded = false,
+  deepLinkActionId = null,
+  onClearDeepLinkAction,
+  onToast,
 }: {
   /** The session-scoped store/draft key — `${sessionId}:${sub}`. */
   scope: string;
@@ -136,6 +139,9 @@ export default function MemberChat({
   templateCount?: number;
   templateList?: HostedTemplateList;
   streamDegraded?: boolean;
+  deepLinkActionId?: string | null;
+  onClearDeepLinkAction?: () => void;
+  onToast?: (msg: string) => void;
 }) {
   const t = useTranslate();
   const roster = useQuery(resources.agents);
@@ -634,6 +640,17 @@ export default function MemberChat({
     templateRail != null ||
     templateList != null ||
     agents.length > 0;
+  const handledNoRailActionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!deepLinkActionId) {
+      handledNoRailActionRef.current = null;
+      return;
+    }
+    if (hasRail || handledNoRailActionRef.current === deepLinkActionId) return;
+    handledNoRailActionRef.current = deepLinkActionId;
+    onToast?.(t("Staged approvals are not available in this view."));
+    onClearDeepLinkAction?.();
+  }, [deepLinkActionId, hasRail, onClearDeepLinkAction, onToast, t]);
 
   return (
     <AssistantActorProvider actor={actor}>
@@ -888,6 +905,9 @@ export default function MemberChat({
             } : undefined}
             readOnly={readOnly}
             decisions={decisions}
+            deepLinkActionId={deepLinkActionId}
+            onClearDeepLinkAction={onClearDeepLinkAction}
+            onToast={onToast}
           />
         </aside>
       )}

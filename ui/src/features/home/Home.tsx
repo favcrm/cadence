@@ -780,6 +780,8 @@ export default function Home({
   templateReviewCanApprove = false,
   streamDegraded = false,
   workspaceEmpty = false,
+  deepLinkActionId = null,
+  onClearDeepLinkAction,
 }: {
   readOnly: boolean;
   canLocalDispatch?: boolean;
@@ -790,6 +792,8 @@ export default function Home({
   templateReviewEnabled?: boolean;
   templateReviewCanApprove?: boolean;
   streamDegraded?: boolean;
+  deepLinkActionId?: string | null;
+  onClearDeepLinkAction?: () => void;
   /** CAD-1817: the verified session proves operator authority, the only
    *  viewer that may edit the workspace coordinator's identity. `null`
    *  is unproven, never an operator. */
@@ -870,6 +874,9 @@ export default function Home({
           templateCount={review.pendingCount}
           templateList={review.templateList}
           streamDegraded={streamDegraded}
+          deepLinkActionId={deepLinkActionId}
+          onClearDeepLinkAction={onClearDeepLinkAction}
+          onToast={onToast}
         />
         {review.drawer}
       </>
@@ -898,6 +905,8 @@ export default function Home({
         templateList={review.templateList}
         streamDegraded={streamDegraded}
         workspaceEmpty={workspaceEmpty}
+        deepLinkActionId={deepLinkActionId}
+        onClearDeepLinkAction={onClearDeepLinkAction}
       />
       {review.drawer}
     </>
@@ -927,6 +936,8 @@ function MasterHome({
   templateList,
   streamDegraded = false,
   workspaceEmpty = false,
+  deepLinkActionId = null,
+  onClearDeepLinkAction,
 }: {
   readOnly: boolean;
   canLocalDispatch?: boolean;
@@ -937,6 +948,8 @@ function MasterHome({
   templateCount?: number;
   templateList?: HostedTemplateList;
   streamDegraded?: boolean;
+  deepLinkActionId?: string | null;
+  onClearDeepLinkAction?: () => void;
   operator?: boolean | null;
   overview: ResourceState<Overview>;
   documentFollowUps?: DocumentFollowUpState;
@@ -1685,6 +1698,8 @@ function MasterHome({
           onOpenDecision={onOpenDecision}
           decisions={decisions}
           streamDegraded={streamDegraded}
+          deepLinkActionId={deepLinkActionId}
+          onClearDeepLinkAction={onClearDeepLinkAction}
           onAskFeedItem={!effectiveReadOnly ? (item) => setSeed((s) => ({
             text: `Check in with ${item.alias}${item.ticket_id ? ` on ${item.ticket_id}` : ""}. Latest update (${item.state_label}): ${item.latest_action}. What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,

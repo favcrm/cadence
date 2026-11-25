@@ -154,7 +154,14 @@ function Badge({ needs, owner }: { needs: unknown[]; owner: boolean }) {
   return React.createElement("span", { "data-badge": true }, String(useHomeCount(needs as never, decisions.pending.length)));
 }
 
-async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?: boolean } = {}) {
+async function render(opts: {
+  needs?: unknown[];
+  decisions?: boolean;
+  readOnly?: boolean;
+  deepLinkActionId?: string | null;
+  onClearDeepLinkAction?: () => void;
+  onToast?: (msg: string) => void;
+} = {}) {
   resetTodoLocal();
   posts.length = 0;
   listCalls = 0;
@@ -173,6 +180,9 @@ async function render(opts: { needs?: unknown[]; decisions?: boolean; readOnly?:
           overview, readOnly: opts.readOnly ?? false, onOpenIssue: () => {}, permissionsHref: "/settings/permissions",
           onAsk: () => {}, onOpenDecision: () => {}, onAskAgent: () => {},
           decisions: opts.decisions ?? true,
+          deepLinkActionId: opts.deepLinkActionId ?? null,
+          onClearDeepLinkAction: opts.onClearDeepLinkAction,
+          onToast: opts.onToast,
         }),
       ),
     );
@@ -1384,6 +1394,80 @@ listStatus = 200;
     await w.done();
   }
   onDecide = null;
+}
+
+// CAD-2825: /?action=<actionId> deep-link opens exact pending staged decision,
+// handles already-decided or missing actions cleanly, and invokes clear callback.
+{
+  // 1. Pending target opens exact action (2nd in queue) and clears URL.
+  actions = [customer("dl_first"), issueRow("dl_target")];
+  let cleared = 0;
+  const toasts: string[] = [];
+  {
+    const w = await render({
+      deepLinkActionId: "dl_target",
+      onClearDeepLinkAction: () => { cleared += 1; },
+      onToast: (msg) => { toasts.push(msg); },
+    });
+    await settle(() => assert(drawerEl(), "deep-link opens StagedWriteDetail for pending action"));
+    const drawerText = text(drawerEl());
+    assert(drawerText.includes("Add the gift pack to the checklist"), `focused on target action (${drawerText.slice(0, 200)})`);
+    assert(cleared === 1, `cleared URL once (got ${cleared})`);
+    assert(w.host.querySelector("[data-deep-link-notice]") === null, "no missing notice on pending match");
+    await w.done();
+  }
+
+  // 2. Already-decided target opens Feed detail drawer + shows notice and clears URL.
+  actions = [customer("dl_done", { status: "approved", decidedAt: Date.now(), result: { ok: true } })];
+  cleared = 0;
+  toasts.length = 0;
+  {
+    const w = await render({
+      deepLinkActionId: "dl_done",
+      onClearDeepLinkAction: () => { cleared += 1; },
+      onToast: (msg) => { toasts.push(msg); },
+    });
+    await settle(() => assert(document.querySelector('[data-drawer="feed-detail"]'), "already-decided deep-link opens feed detail drawer"));
+    assert(cleared === 1, "decided deep-link clears URL");
+    assert(toasts.some((m) => m.includes("already been decided")), `toast notifies already decided (${toasts.join("|")})`);
+    await click(labelled(document.querySelector('[data-drawer="feed-detail"]')!, "Close"));
+    await settle(() => assert(w.host.querySelector("[data-deep-link-notice]"), "notice visible after closing feed detail"));
+    await w.done();
+  }
+
+  // 3. Missing action ID shows non-destructive dismissible notice without crashing.
+  actions = [customer("dl_other")];
+  cleared = 0;
+  toasts.length = 0;
+  {
+    const w = await render({
+      deepLinkActionId: "dl_missing",
+      onClearDeepLinkAction: () => { cleared += 1; },
+      onToast: (msg) => { toasts.push(msg); },
+    });
+    await settle(() => assert(w.host.querySelector("[data-deep-link-notice]"), "missing deep-link shows notice"));
+    const notice = text(w.host.querySelector("[data-deep-link-notice]"));
+    assert(notice.includes("no longer pending"), `clear notice (${notice})`);
+    assert(cleared === 1 && toasts.some((m) => m.includes("no longer pending")), "clears URL and toasts");
+    await click(labelled(w.host.querySelector("[data-deep-link-notice]")!, "Dismiss"));
+    assert(w.host.querySelector("[data-deep-link-notice]") === null, "notice dismisses cleanly");
+    await w.done();
+  }
+
+  // 4. Decisions disabled (non-owner / unavailable view) shows non-destructive notice and clears URL.
+  cleared = 0;
+  toasts.length = 0;
+  {
+    const w = await render({
+      decisions: false,
+      deepLinkActionId: "dl_unauth",
+      onClearDeepLinkAction: () => { cleared += 1; },
+      onToast: (msg) => { toasts.push(msg); },
+    });
+    await settle(() => assert(w.host.querySelector("[data-deep-link-notice]"), "unavailable deep-link shows notice"));
+    assert(cleared === 1 && toasts.some((m) => m.includes("not available")), "clears URL and notifies unavailable");
+    await w.done();
+  }
 }
 
 console.log("staged decision checks passed");
