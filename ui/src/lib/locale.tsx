@@ -4605,3 +4605,16 @@ const CAD2764_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2764_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2792_ZHTW: Record<string, string> = {
+  "Filter models…": "篩選模型…",
+  "Filter models": "篩選模型",
+  "No matching models": "沒有符合的模型",
+  Off: "關閉",
+  Min: "極低",
+  Med: "中",
+  Max: "最高",
+};
+for (const [key, value] of Object.entries(CAD2792_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

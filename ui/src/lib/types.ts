@@ -968,6 +968,9 @@ export interface MasterModels {
   models?: {
     id?: string;
     label?: string | null;
+    is_default?: boolean;
+    efforts?: string[];
+    default_effort?: string | null;
     cost_tier?: string | null;
     allowed_for?: string[];
   }[];

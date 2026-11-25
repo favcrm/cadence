@@ -1,4 +1,13 @@
-import { masterModelsOptions, offeredCommands, pickLanded, restingStatus, SLASH_COMMANDS } from "../src/features/home/master";
+import {
+  effortMeterBars,
+  effortShortLabel,
+  filterModelOptions,
+  masterModelsOptions,
+  offeredCommands,
+  pickLanded,
+  restingStatus,
+  SLASH_COMMANDS,
+} from "../src/features/home/master";
 import type { MasterModels } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -85,6 +94,53 @@ equal(restingStatus("waiting_input"), null, "an unlisted state is not rounded up
     SLASH_COMMANDS.filter((c) => c.name !== "permissions").map((c) => c.name),
     "an unknown board keeps non-native-only commands",
   );
+}
+
+// CAD-2792: default flag, per-model efforts, filterModelOptions, and 3-bar effort meter helpers.
+{
+  const parsed = masterModelsOptions({
+    current: { model: "thinkingmachines/inkling-2-mini", effort: "medium" },
+    models: [
+      {
+        id: "deepseek/deepseek-v4.1-flash-1017",
+        label: "DeepSeek V4.1 Flash",
+        is_default: true,
+        efforts: [],
+        default_effort: null,
+      },
+      {
+        id: "thinkingmachines/inkling-2-mini",
+        label: "Inkling 2 Mini",
+        is_default: false,
+        efforts: ["low", "medium", "high"],
+        default_effort: "low",
+      },
+    ],
+    efforts: ["low", "medium", "high"],
+  });
+  equal(parsed.models[0].isDefault, true, "is_default parsed");
+  equal(parsed.models[0].efforts, [], "empty efforts preserved");
+  equal(parsed.models[1].efforts, ["low", "medium", "high"], "per-model efforts preserved");
+  equal(parsed.models[1].defaultEffort, "low", "default_effort parsed");
+
+  equal(filterModelOptions(parsed.models, "").length, 2, "blank query keeps all");
+  equal(filterModelOptions(parsed.models, "inkling").map((m) => m.id), ["thinkingmachines/inkling-2-mini"], "matches label");
+  equal(filterModelOptions(parsed.models, "v4.1").map((m) => m.id), ["deepseek/deepseek-v4.1-flash-1017"], "matches id");
+  equal(filterModelOptions(parsed.models, "missing"), [], "no match returns empty");
+
+  equal(effortMeterBars("none"), 0, "none -> 0 bars");
+  equal(effortMeterBars("minimal"), 1, "minimal -> 1 bar");
+  equal(effortMeterBars("low"), 1, "low -> 1 bar");
+  equal(effortMeterBars("medium"), 2, "medium -> 2 bars");
+  equal(effortMeterBars("high"), 3, "high -> 3 bars");
+  equal(effortMeterBars("max"), 3, "max -> 3 bars");
+
+  equal(effortShortLabel("none"), "Off", "none short label");
+  equal(effortShortLabel("minimal"), "Min", "minimal short label");
+  equal(effortShortLabel("low"), "Low", "low short label");
+  equal(effortShortLabel("medium"), "Med", "medium short label");
+  equal(effortShortLabel("high"), "High", "high short label");
+  equal(effortShortLabel("max"), "Max", "max short label");
 }
 
 console.log("master models checks passed");

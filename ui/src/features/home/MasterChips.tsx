@@ -70,12 +70,15 @@ export default function MasterChips({
   row,
   readOnly,
   canPickModel = true,
+  showEffort = true,
 }: {
   master: MasterState | null | undefined;
   row?: Agent;
   readOnly: boolean;
   /** False when this board has no model list to pick from: no chip at all. */
   canPickModel?: boolean;
+  /** False when the composer renders the effort selector instead of the header. */
+  showEffort?: boolean;
 }) {
   const t = useTranslate();
   // The id, for the tooltip and the catalogue; a hosted board's label is the id too.
@@ -216,7 +219,7 @@ export default function MasterChips({
           )}
         </span>
       )}
-      {effort && (
+      {showEffort && effort && (
         <span className="relative">
           <button
             type="button"

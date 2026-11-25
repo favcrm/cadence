@@ -4523,3 +4523,199 @@ button.turnsource:hover {
 .turncard-flag::before {
   content: "⚠ ";
 }
+
+/* CAD-2792: Searchable model select and direct 3-bar effort pill inside composer. */
+.composer-model-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: .375rem;
+  min-width: 0;
+  flex-wrap: nowrap;
+}
+.composer-pill-wrap {
+  position: relative;
+  min-width: 0;
+}
+.composer-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  max-width: 15rem;
+  height: 1.625rem;
+  padding: 0 .5rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .375rem;
+  background: color-mix(in srgb, var(--color-ink-900) 55%, transparent);
+  color: var(--color-ink-300);
+  font-size: var(--text-micro);
+  line-height: 1.25;
+  cursor: pointer;
+  transition: border-color .12s ease, color .12s ease, background-color .12s ease;
+}
+.composer-model-controls.compact .composer-pill {
+  max-width: 11.5rem;
+  height: 1.5rem;
+  padding: 0 .4rem;
+}
+.composer-pill:hover:not(:disabled),
+.composer-pill[aria-expanded="true"]:not(:disabled) {
+  border-color: var(--color-edge-hover);
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.composer-pill:disabled {
+  opacity: .45;
+  cursor: default;
+}
+.composer-pill-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-pill-caret {
+  color: var(--color-ink-500);
+  font-size: .625rem;
+  flex-shrink: 0;
+}
+.effort-meter {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 11px;
+  flex-shrink: 0;
+}
+.effort-bar {
+  width: 2.5px;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--color-ink-500) 40%, transparent);
+}
+.effort-bar-1 { height: 5px; }
+.effort-bar-2 { height: 8px; }
+.effort-bar-3 { height: 11px; }
+.effort-bar[data-lit="true"] {
+  background: var(--color-accent);
+}
+.composer-pop-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  cursor: default;
+}
+.composer-pop {
+  position: absolute;
+  bottom: calc(100% + .375rem);
+  left: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .625rem;
+  background: var(--color-ink-850);
+  box-shadow: 0 12px 32px rgb(0 0 0 / .35);
+  overflow: hidden;
+}
+.composer-pop-model {
+  width: min(21rem, calc(100vw - 2rem));
+}
+.composer-pop-effort {
+  min-width: 8.5rem;
+}
+.composer-pop-search {
+  padding: .375rem;
+  border-bottom: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+}
+.composer-pop-search input {
+  width: 100%;
+  padding: .3125rem .5rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .375rem;
+  background: var(--color-ink-900);
+  color: var(--color-ink-100);
+  font-size: var(--text-label);
+  outline: none;
+}
+.composer-pop-search input:focus {
+  border-color: var(--color-accent);
+}
+.composer-pop-list {
+  max-height: 16rem;
+  overflow-y: auto;
+  padding: .25rem;
+}
+.composer-pop-empty {
+  margin: 0;
+  padding: .5rem .625rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+}
+.composer-pop-item {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  width: 100%;
+  padding: .4rem .5rem;
+  border-radius: .375rem;
+  color: var(--color-ink-200);
+  font-size: var(--text-label);
+  text-align: left;
+  cursor: pointer;
+}
+.composer-pop-item:hover:not(:disabled),
+.composer-pop-item.is-highlighted:not(:disabled) {
+  background: var(--color-ink-800);
+}
+.composer-pop-item:disabled {
+  opacity: .45;
+  cursor: default;
+}
+.composer-pop-item-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.composer-pop-item-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-pop-item-id {
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  color: var(--color-ink-500);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-default-badge {
+  flex-shrink: 0;
+  padding: .0625rem .375rem;
+  border-radius: .25rem;
+  background: color-mix(in srgb, var(--color-ink-700) 60%, transparent);
+  color: var(--color-ink-300);
+  font-size: var(--text-micro);
+  font-weight: 500;
+}
+.composer-pop-check {
+  color: var(--color-ok);
+  flex-shrink: 0;
+}
+@media (width < 640px) {
+  .home-master .composer-foot > .composer-model-controls {
+    grid-column: 1 / -1;
+    order: 4;
+    display: flex;
+    align-items: center;
+    gap: .375rem;
+    padding: .25rem .375rem .2rem;
+    border-top: 1px solid color-mix(in srgb, var(--color-ink-700) 45%, transparent);
+  }
+  .home-master [data-composer-block] {
+    order: 5;
+  }
+  .composer-pill {
+    max-width: 11.5rem;
+  }
+}

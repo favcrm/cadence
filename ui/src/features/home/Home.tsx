@@ -34,6 +34,7 @@ import { BrowserCard } from "../canvas/BrowserPanel";
 import { useBrowserFeed } from "../canvas/browserStore";
 import { ImageConversation } from "../canvas/imageConversation";
 import Composer from "./Composer";
+import ComposerModelControls from "../app-shell/chat/ComposerModelControls";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -237,14 +238,12 @@ function HeaderMenu({
   master,
   row,
   readOnly,
-  canPickModel,
   scope,
   profileHref,
 }: {
   master: MasterState | null | undefined;
   row: Agent | undefined;
   readOnly: boolean;
-  canPickModel: boolean;
   /** The header's scope line, moved here on a narrow screen. */
   scope: string;
   profileHref?: string;
@@ -321,7 +320,7 @@ function HeaderMenu({
               </button>
             </div>
             <p className="assistant-scope" data-menu-scope>{scope}</p>
-            <MasterChips master={master} row={row} readOnly={readOnly} canPickModel={canPickModel} />
+            <MasterChips master={master} row={row} readOnly={readOnly} canPickModel={false} showEffort={false} />
             <AssistantAboutButton className="assistant-menu-about" profileHref={profileHref} />
           </div>
         </>
@@ -1046,6 +1045,7 @@ function MasterHome({
   const effectiveReadOnly = readOnly || writeBlock !== null || operator !== true;
   const offered = useMemo(() => offeredCommands(hosted, master.data?.commands), [hosted, master.data?.commands]);
   const canPickModel = offered.some((c) => c.name === "model");
+  const canPickEffort = offered.some((c) => c.name === "effort");
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   // The seq watermark for the enter animation: items at or below the mount
@@ -1754,12 +1754,11 @@ function MasterHome({
                 {actor.scope === "personal" && personalBootstrap.bootstrap === "pending" && (
                   <span className="text-micro text-ink-500">{t("first-time setup")}</span>
                 )}
-                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} />
+                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} canPickModel={false} showEffort={false} />
                 <HeaderMenu
                   master={master.data}
                   row={masterRow}
                   readOnly={readOnly}
-                  canPickModel={canPickModel}
                   scope={scopeDescriptor(actor.scope, t)}
                   profileHref={profileHref}
                 />
@@ -1974,6 +1973,17 @@ function MasterHome({
               beforeSend={mentionHandoff.beforeSend}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
+              modelControls={
+                <ComposerModelControls
+                  master={master.data}
+                  row={masterRow}
+                  conversation={hosted ? (homeConversation ?? undefined) : undefined}
+                  readOnly={readOnly || writeBlock !== null}
+                  canPickModel={canPickModel}
+                  canPickEffort={canPickEffort}
+                  onRefreshState={() => void resources.masterState.refresh()}
+                />
+              }
               attachReason={readOnly
                 ? t("The board is read-only.")
                 : missing

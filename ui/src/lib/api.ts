@@ -1951,7 +1951,10 @@ export const api = {
     }),
   /** `GET /api/master/models` — the dropdowns' list (CAD-575's route,
    *  operator-gated; the chip shows the refusal until it lands). */
-  masterModels: () => get<MasterModels>("/api/master/models"),
+  masterModels: (conversation?: string) =>
+    get<MasterModels>(
+      `/api/master/models${conversation ? `?conversation=${encodeURIComponent(conversation)}` : ""}`,
+    ),
 
   /** CAD-1548 — harnesses, profiles, providers and models. */
   agentSettings: () => get<AgentSettingsSnapshot>("/api/settings/agents"),

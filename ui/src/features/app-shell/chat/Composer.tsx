@@ -8,6 +8,7 @@ import {
   useSyncExternalStore,
   type KeyboardEvent,
   type MouseEvent,
+  type ReactNode,
 } from "react";
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
@@ -172,6 +173,8 @@ export interface ComposerProps {
   showSilentToggle?: boolean;
   silent?: boolean;
   onSilentChange?: (next: boolean) => void;
+  /** Optional model and reasoning-effort selector docked inside the footer. */
+  modelControls?: ReactNode;
 }
 
 /** One host action behind the compact composer's More actions menu. */
@@ -455,6 +458,7 @@ export default function Composer({
   showSilentToggle = false,
   silent = false,
   onSilentChange,
+  modelControls,
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
@@ -1028,6 +1032,7 @@ export default function Composer({
           <div className="app-chat-composer-tools">
             {attachInput}
             {attachControl(true)}
+            {modelControls}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
             {prepareEdit && libraryPin && prepareEdit.sourceMediaTypes.includes(libraryPin.media_type) && <button type="button" className="lnk text-label min-h-8 px-2" disabled={!!block || reserved || !draft.trim()} onClick={prepare}>{t("Prepare edit")}</button>}
             {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
@@ -1103,10 +1108,11 @@ export default function Composer({
       {refsRow}
       {attachChips}
       {boxEl}
-      {/* CAD-2425: one footer row — attach, optional /note toggle, keyboard hint, then send. */}
+      {/* CAD-2792: clean footer row — attach, model & effort pills, optional /note toggle (Channels only), then send. */}
       <div className="composer-foot" data-composer-foot="">
         {attachInput}
         {attachControl(true)}
+        {modelControls}
         {showSilentToggle && onSilentChange && (
           <button
             type="button"
@@ -1126,12 +1132,7 @@ export default function Composer({
             {t(block)}
           </p>
         ) : (
-          <>
-            <span className="flex-1" />
-            <p className="composer-hint" data-composer-hint>
-              {t("Enter to send · Shift+Enter for a new line")}
-            </p>
-          </>
+          <span className="flex-1" />
         )}
         {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />}
       </div>
