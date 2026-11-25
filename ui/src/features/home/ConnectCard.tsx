@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useId, useRef, useState } from "react";
 import { ApiError, api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { usingPrivateOperation } from "../../lib/privateSession";
@@ -7,12 +7,18 @@ import { routePath } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import { useMaybeResource } from "../../lib/useResource";
 import { useVisiblePoll } from "../../lib/useVisiblePoll";
-import type { Connection, CustomMcpConnectionSummary, CustomMcpToolPin } from "../../lib/types";
+import type { Connection, CustomMcpAuthKind, CustomMcpConnectionSummary } from "../../lib/types";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import { useImageConversation } from "../canvas/imageConversation";
-import { CustomMcpConnectDrawer } from "../settings/CustomMcpDrawer";
 import { connectionNeedsAttention, hostedAccount } from "../settings/connectionsView";
-import { customMcpAuthorizationUrl, customMcpErrorText, customMcpReturn, isToolDestructiveHint, isToolReadOnlyHint } from "../settings/customMcpView";
+import {
+  customMcpAuthOptionLabel,
+  customMcpAuthorizationUrl,
+  customMcpErrorText,
+  customMcpReturn,
+  validateCustomMcpUrlInput,
+} from "../settings/customMcpView";
+import { submitCustomMcpConnect } from "../settings/customMcpConnect";
 import { hostedConnectError, hostedConnectUrl, UI_HOSTED_REFUSED } from "../settings/hostedConnect";
 import { withoutConnectParams } from "../workspace-apps/socialConnect";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
@@ -75,6 +81,7 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
   const setup = parseCustomMcpSetup(entry);
   const model = parseConnectRef(entry);
   const isOwner = writeBlock === null && operatorBlock === null;
+  const isSignedIn = writeBlock === null;
   const isPlatformOwner = !setup && model !== null && model.toolkit !== "custom_mcp" && isOwner;
   const connectionsRes = isPlatformOwner ? resources.connections : null;
   const connectionsState = useMaybeResource(connectionsRes);
@@ -99,15 +106,15 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
     { onFocus: true, maxDurationMs: waiting ? 120_000 : undefined },
   );
 
-  if (setup && isOwner) {
-    return <CustomMcpSetupCard key={`${conversation}:${entry.seq}`} entry={entry} setup={setup} density={density} conversation={conversation} />;
+  if (setup && isSignedIn) {
+    return <CustomMcpSetupCard key={`${conversation}:${entry.seq}`} entry={entry} setup={setup} density={density} conversation={conversation} canShareWorkspace={isOwner} />;
   }
   if (!model) return <p className="text-micro text-ink-500 break-words chatcard-line">· {plainText(entry.text, 500)}</p>;
-  // Owner only: a member or an unconfirmed session reads the text line.
-  if (!isOwner) {
+  const isCustomMcp = model.toolkit === "custom_mcp";
+  // Platform toolkits require owner; personal Custom MCP reconnect cards are available to any signed-in member.
+  if (!isOwner && !(isCustomMcp && isSignedIn)) {
     return <p className="text-micro text-ink-500 break-words chatcard-line" data-kind="connect_ref">· {plainText(entry.text, 500)}</p>;
   }
-  const isCustomMcp = model.toolkit === "custom_mcp";
   const mcpReturned =
     isCustomMcp && typeof window !== "undefined" &&
       !new URLSearchParams(window.location.search).has("mcp_setup")
@@ -344,20 +351,327 @@ function matchesSetupScopes(actual: readonly string[], expected: string | undefi
   return actual.length === scopes.length && scopes.every((scope) => actual.includes(scope));
 }
 
-function reviewableRead(pin: CustomMcpToolPin): boolean {
-  return pin.mode === "approval" && !pin.drifted &&
-    !["call_tool", "execute_tool", "run_tool", "use_tool"].includes(pin.tool_name.toLowerCase()) &&
-    isToolReadOnlyHint(pin) && !isToolDestructiveHint(pin);
+function CustomMcpSetupConfirmModal({
+  setup,
+  endpoint,
+  returnTo,
+  editEndpoint,
+  canShareWorkspace,
+  onClose,
+  onOAuthStarted,
+  onConnected,
+}: {
+  setup: { label: string; endpointUrl: string; requiredScopes?: string[]; returnTo: string };
+  endpoint: string;
+  returnTo: string;
+  editEndpoint: boolean;
+  canShareWorkspace: boolean;
+  onClose: () => void;
+  onOAuthStarted: (connectionId: string, endpointUrl: string, nonce: string) => void;
+  onConnected: (connection: CustomMcpConnectionSummary) => void;
+}) {
+  const t = useTranslate();
+  const baseId = useId();
+  const [endpointUrl, setEndpointUrl] = useState(endpoint);
+  const [editingUrl, setEditingUrl] = useState(editEndpoint);
+  const [visibility, setVisibility] = useState<"personal" | "shared">("personal");
+  const [authKind, setAuthKind] = useState<CustomMcpAuthKind>("auto");
+  const [bearerToken, setBearerToken] = useState("");
+  const [customHeadersText, setCustomHeadersText] = useState("");
+  const [oauthClientId, setOauthClientId] = useState("");
+  const [oauthClientSecret, setOauthClientSecret] = useState("");
+  const [oauthScopesText, setOauthScopesText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [crossSite, setCrossSite] = useState<{ authorizationUrl: string; host: string } | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busy) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, onClose]);
+
+  const urlError = validateCustomMcpUrlInput(endpointUrl);
+
+  const submit = async () => {
+    if (busy) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await submitCustomMcpConnect({
+        name: setup.label,
+        endpointUrl,
+        urlError,
+        visibility,
+        authKind,
+        bearerToken,
+        customHeadersText,
+        oauthClientId,
+        oauthClientSecret,
+        oauthScopesText,
+        requiredScopesPreset: setup.requiredScopes,
+        returnToBase: returnTo,
+        requireOAuthRedirect:
+          authKind === "auto" || authKind === "oauth" || authKind === "oauth_static",
+      });
+      if (!res.ok) {
+        setError(t(res.error));
+        return;
+      }
+      if (res.kind === "oauth_redirect") {
+        onOAuthStarted(res.connectionId, res.normalizedEndpoint, res.nonce);
+        if (res.sameSite) {
+          if (typeof window !== "undefined") window.location.assign(res.authorizationUrl);
+          return;
+        }
+        setCrossSite({
+          authorizationUrl: res.authorizationUrl,
+          host: res.discovery?.authorization_host ?? new URL(res.authorizationUrl).host,
+        });
+        return;
+      }
+      onConnected(res.connection);
+    } finally {
+      // Secrets exist only inside this single request; clear unconditionally.
+      setBearerToken("");
+      setCustomHeadersText("");
+      setOauthClientSecret("");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      role="presentation"
+      onClick={() => {
+        if (!busy) onClose();
+      }}
+    >
+      <div
+        className="card p-5 max-w-md w-full space-y-3 bg-ink-850 border border-ink-700 shadow-xl min-w-0"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={`${baseId}-title`}
+        data-mcp-confirm-modal
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <h2 id={`${baseId}-title`} className="text-heading font-semibold text-ink-100 break-words">
+              {t("Connect {label}").replace("{label}", () => setup.label)}
+            </h2>
+            <p className="text-micro text-ink-400 mt-0.5 break-words">
+              {t("Read-only tools run automatically. Write actions will ask for your approval.")}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm shrink-0"
+            disabled={busy}
+            aria-label={t("Close")}
+            onClick={onClose}
+          >
+            ✕
+          </button>
+        </div>
+
+        {crossSite ? (
+          <div className="space-y-3" data-mcp-cross-site-confirm>
+            <div className="rounded border border-accent/40 bg-accent/10 p-3 space-y-1.5 text-micro text-ink-300">
+              <p className="text-label font-medium text-ink-100">{t("Confirm external sign-in host")}</p>
+              <p className="break-words">
+                {t("This server redirects OAuth sign-in to")} <code className="num text-ink-100">{crossSite.host}</code>.
+              </p>
+            </div>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCrossSite(null)}>
+                {t("Back")}
+              </button>
+              <a href={crossSite.authorizationUrl} className="btn btn-primary btn-sm">
+                {t("Continue to OAuth sign-in →")}
+              </a>
+            </div>
+          </div>
+        ) : (
+          <form
+            className="space-y-3 min-w-0"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submit();
+            }}
+          >
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor={`${baseId}-url`} className="text-label font-medium text-ink-200">
+                  {t("Endpoint")}
+                </label>
+                <button
+                  type="button"
+                  className="lnk text-micro"
+                  disabled={busy}
+                  onClick={() => setEditingUrl((v) => !v)}
+                >
+                  {editingUrl ? t("Lock") : t("Edit endpoint")}
+                </button>
+              </div>
+              <input
+                id={`${baseId}-url`}
+                type="url"
+                required
+                autoComplete="off"
+                spellCheck={false}
+                value={endpointUrl}
+                onChange={(e) => setEndpointUrl(e.target.value)}
+                readOnly={!editingUrl}
+                disabled={busy}
+                className="field w-full num text-micro"
+              />
+            </div>
+
+            {setup.requiredScopes && setup.requiredScopes.length > 0 && (
+              <p className="text-micro text-ink-300 break-words">
+                {t("Required OAuth scopes")}: <code>{setup.requiredScopes.join(" ")}</code>
+              </p>
+            )}
+
+            <div className="space-y-1">
+              <span className="text-label font-medium text-ink-200">{t("Who can use this server")}</span>
+              {canShareWorkspace ? (
+                <div className="flex flex-wrap gap-2 pt-0.5" role="radiogroup" aria-label={t("Who can use this server")}>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={visibility === "personal"}
+                    disabled={busy}
+                    className={`btn btn-sm ${visibility === "personal" ? "btn-primary" : "btn-ghost"}`}
+                    onClick={() => setVisibility("personal")}
+                  >
+                    {t("Personal (just me)")}
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={visibility === "shared"}
+                    disabled={busy}
+                    className={`btn btn-sm ${visibility === "shared" ? "btn-primary" : "btn-ghost"}`}
+                    onClick={() => setVisibility("shared")}
+                  >
+                    {t("Shared with company")}
+                  </button>
+                </div>
+              ) : (
+                <p className="text-micro text-ink-400 break-words">
+                  {t("Personal (just me) — only your own assistant turns can use this server.")}
+                </p>
+              )}
+            </div>
+
+            <details className="text-micro text-ink-300" open={authKind !== "auto"}>
+              <summary className="cursor-pointer select-none font-medium text-ink-300">
+                {t("Advanced auth")}: <span className="text-ink-200">{t(customMcpAuthOptionLabel(authKind))}</span>
+              </summary>
+              <div className="mt-2 space-y-2">
+                <div className="flex flex-wrap gap-1.5">
+                  {(["auto", "oauth", "oauth_static", "bearer", "header"] as const).map((kind) => (
+                    <button
+                      key={kind}
+                      type="button"
+                      disabled={busy}
+                      className={`btn btn-sm ${authKind === kind ? "btn-primary" : "btn-ghost"}`}
+                      onClick={() => setAuthKind(kind)}
+                    >
+                      {t(customMcpAuthOptionLabel(kind))}
+                    </button>
+                  ))}
+                </div>
+                {authKind === "bearer" && (
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={bearerToken}
+                    onChange={(e) => setBearerToken(e.target.value)}
+                    placeholder={t("Bearer token")}
+                    className="field w-full num"
+                    disabled={busy}
+                  />
+                )}
+                {authKind === "header" && (
+                  <textarea
+                    rows={2}
+                    value={customHeadersText}
+                    onChange={(e) => setCustomHeadersText(e.target.value)}
+                    placeholder="x-api-key: value"
+                    className="field w-full num"
+                    disabled={busy}
+                  />
+                )}
+                {authKind === "oauth_static" && (
+                  <div className="space-y-1.5">
+                    <input
+                      type="text"
+                      autoComplete="off"
+                      value={oauthClientId}
+                      onChange={(e) => setOauthClientId(e.target.value)}
+                      placeholder={t("OAuth client ID")}
+                      className="field w-full num"
+                      disabled={busy}
+                    />
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      value={oauthClientSecret}
+                      onChange={(e) => setOauthClientSecret(e.target.value)}
+                      placeholder={t("OAuth client secret (optional)")}
+                      className="field w-full num"
+                      disabled={busy}
+                    />
+                    <input
+                      type="text"
+                      autoComplete="off"
+                      value={oauthScopesText}
+                      onChange={(e) => setOauthScopesText(e.target.value)}
+                      placeholder={t("Scopes (space-separated, optional)")}
+                      className="field w-full num"
+                      disabled={busy}
+                    />
+                  </div>
+                )}
+              </div>
+            </details>
+
+            {error && (
+              <p className="text-micro text-fail break-words" role="alert">
+                {error}
+              </p>
+            )}
+
+            <div className="flex flex-wrap justify-end gap-2 pt-1">
+              <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={onClose}>
+                {t("Cancel")}
+              </button>
+              <button type="submit" className="btn btn-primary btn-sm" disabled={busy || urlError !== null}>
+                {busy ? t("Connecting…") : t("Confirm & Connect")}
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
+    </div>
+  );
 }
 
-function CustomMcpSetupCard({ entry, setup, density, conversation }: {
+function CustomMcpSetupCard({ entry, setup, density, conversation, canShareWorkspace }: {
   entry: ThreadEntry;
   setup: CustomMcpSetup;
   density: CardDensity;
   conversation: string | null;
+  canShareWorkspace: boolean;
 }) {
   const t = useTranslate();
-  const [drawer, setDrawer] = useState<"connect" | "edit" | null>(null);
+  const [modal, setModal] = useState<"connect" | "edit" | null>(null);
   const [busy, setBusy] = useState(false);
   const [resumed, setResumed] = useState(false);
   const [resumedPreset, setResumedPreset] = useState(false);
@@ -547,43 +861,61 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     });
   }
 
-  function continueReply() {
-    if (!conversation || !connId || !attempt) return;
+  function continueReply(directConnectionId?: string) {
+    const targetConnId = directConnectionId ?? connId;
+    if (!conversation || !targetConnId) return;
+    if (!directConnectionId && !attempt) return;
     void run(() => usingPrivateOperation(undefined, async (operation) => {
       const list = await api.customMcpList(true, operation);
-      const selected = presetAttempt ? findOffer(list, attempt.profile) : undefined;
-      const row = list.connections.find(verified);
-      if (row?.status !== "active" || !liveCallback(attempt) ||
-          (presetAttempt ? (!selected || !attempt.nonce || !eligible(row, selected) ||
+      const selected = !directConnectionId && presetAttempt ? findOffer(list, attempt!.profile) : undefined;
+      const row = list.connections.find((item) =>
+        directConnectionId ? item.id === directConnectionId && item.connected_by_you === true : verified(item),
+      );
+      if (row?.status !== "active" || (!directConnectionId && (!liveCallback(attempt!) ||
+          (presetAttempt ? (!selected || !attempt!.nonce || !eligible(row, selected) ||
             row.standing_read_profile !== selected.profile || row.standing_read_access !== "allowed")
-            : !!row.standing_read_profile)) {
-        setConnection(presetAttempt ? null : row ?? null);
+            : !!row.standing_read_profile)))) {
+        setConnection(!directConnectionId && presetAttempt ? null : row ?? null);
         setError("Cadence could not verify this Custom MCP connection.");
         return;
       }
-      const message = await setupMessageId(conversation, entry.seq, attempt);
-      if (!liveCallback(attempt)) return;
+      const messageAttempt = directConnectionId
+        ? { id: directConnectionId, endpoint: new URL(row.endpoint_url).href, nonce: "direct-connect" }
+        : attempt!;
+      const message = await setupMessageId(conversation, entry.seq, messageAttempt);
+      if (!directConnectionId && !liveCallback(attempt!)) return;
       const sent = await sendToMaster(
-        presetAttempt
-          ? resumeStandingRead(connId, selected!.tool_name)
-          : `Custom MCP connection ${connId} is connected. Continue my original request using only currently permitted tools. If a tool is unavailable, explain what access is needed.`,
+        !directConnectionId && presetAttempt
+          ? resumeStandingRead(targetConnId, selected!.tool_name)
+          : `Custom MCP connection ${targetConnId} is connected. Continue my original request using only currently permitted tools. If a tool is unavailable, explain what access is needed.`,
         message, undefined, undefined, conversation, operation,
       );
       if (!sent.ok) {
         setError(sent.error);
         return;
       }
-      const current = liveCallback(attempt);
-      if (current && presetAttempt) setResumedPreset(true);
-      forget(attempt);
-      if (current) setResumed(true);
+      if (!directConnectionId && attempt) {
+        const current = liveCallback(attempt);
+        if (current && presetAttempt) setResumedPreset(true);
+        forget(attempt);
+        if (current) setResumed(true);
+      } else {
+        setResumed(true);
+      }
     }));
   }
 
   useEffect(() => {
-    if (!presetAttempt || !attempt?.nonce || !offer || !connection ||
-        connection.status !== "active" || connection.standing_read_access !== "allowed" ||
+    if (!attempt?.nonce || !connection || connection.status !== "active" ||
         resumed || autoResumeAttempt.current === attempt.nonce) return;
+    if (presetAttempt) {
+      if (!offer || connection.standing_read_access !== "allowed") return;
+      autoResumeAttempt.current = attempt.nonce;
+      continueReply();
+      return;
+    }
+    const readable = (connection.tools ?? []).some((pin) => pin.mode === "read" && !pin.drifted);
+    if (!readable) return;
     autoResumeAttempt.current = attempt.nonce;
     continueReply();
   }, [presetAttempt, attempt?.nonce, offer, connection, resumed]);
@@ -651,43 +983,10 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     }));
   }
 
-  function enableRead(pin: CustomMcpToolPin) {
-    if (!connId || !connection || !attempt) return;
-    void run(async () => {
-      const { connections } = await api.customMcpList();
-      const row = connections.find(verified);
-      setConnection(row ?? null);
-      const current = row?.tools?.find((tool) => tool.tool_name === pin.tool_name);
-      if (row?.status !== "active" || !liveCallback(attempt) ||
-          row.snapshot_revision !== connection.snapshot_revision ||
-          !Number.isSafeInteger(connection.snapshot_revision) || connection.snapshot_revision <= 0 ||
-          !/^sha256:[0-9a-f]{64}$/.test(pin.tool_digest) ||
-          !Number.isSafeInteger(pin.updated_at) || pin.updated_at < 0 ||
-          !current || current.tool_digest !== pin.tool_digest || current.updated_at !== pin.updated_at || !reviewableRead(current)) {
-        setError("Tool access changed. Review the current tool before enabling it.");
-        return;
-      }
-      let updated: CustomMcpConnectionSummary;
-      try {
-        ({ connection: updated } = await api.customMcpEnableReviewedRead(connId, pin.tool_name, {
-          snapshot_revision: connection.snapshot_revision,
-          tool_digest: pin.tool_digest,
-          tool_updated_at: pin.updated_at,
-        }));
-      } catch (e: unknown) {
-        if (e instanceof ApiError && e.code === "stale_revision") setConnection(null);
-        throw e;
-      }
-      if (verified(updated)) setConnection(updated);
-      else setRecheck((value) => value + 1);
-    });
-  }
-
   const current = outcome === "connected" && connection?.id === connId ? connection : null;
   const active = current?.status === "active";
   const tools = current?.tools ?? [];
   const canRead = tools.some((pin) => pin.mode === "read" && !pin.drifted);
-  const readOptions = tools.filter(reviewableRead);
   const settings = `${routePath({ screen: "settings", section: "connections" })}?mcp_focus=${encodeURIComponent(connId ?? existingCatalog?.id ?? setup.label)}`;
   let status: string | null = null;
   let actions;
@@ -701,10 +1000,14 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       ? "Connected · Read access" : "Read access is not ready. Check this connection.";
     actions = current.standing_read_access !== "allowed"
       ? <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>
-      : error ? <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Resume")}</button> : null;
+      : error ? <button type="button" className="btn btn-primary" disabled={busy} onClick={() => continueReply()}>{t("Resume")}</button> : null;
   } else if (active) {
-    status = canRead ? "Connected." : "Connected. No tools can run automatically.";
-    actions = <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Continue in chat")}</button>;
+    status = canRead
+      ? (busy ? "Connected. Resuming chat…" : "Connected.")
+      : "Connected. No tools can run automatically.";
+    actions = (!canRead || error)
+      ? <button type="button" className="btn btn-primary" disabled={busy} onClick={() => continueReply()}>{t("Continue in chat")}</button>
+      : <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>;
   } else if (authorizationUrl) {
     actions = <a href={authorizationUrl} className="btn btn-primary">{t("Continue to OAuth sign-in →")}</a>;
   } else if (connId) {
@@ -722,7 +1025,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
         ) : current?.status !== "needs_review" && (!presetAttempt || offer) ? (
           <button type="button" className="btn btn-primary" disabled={busy} onClick={retryOAuth}>{t("Retry OAuth sign-in")}</button>
         ) : null}
-        {!presetAttempt && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setDrawer("edit")}>{t("Edit endpoint")}</button>}
+        {!presetAttempt && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setModal("edit")}>{t("Edit endpoint")}</button>}
       </div>
     );
   } else if (offer === undefined) {
@@ -741,8 +1044,8 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   } else {
     actions = (
       <div className="flex flex-wrap gap-2">
-        <button type="button" className="btn btn-primary" disabled={!conversation} onClick={() => setDrawer("connect")}>{t("Connect {label}").replace("{label}", () => setup.label)}</button>
-        <button type="button" className="btn btn-ghost" disabled={!conversation} onClick={() => setDrawer("edit")}>{t("Edit endpoint")}</button>
+        <button type="button" className="btn btn-primary" disabled={!conversation} onClick={() => setModal("connect")}>{t("Connect {label}").replace("{label}", () => setup.label)}</button>
+        <button type="button" className="btn btn-ghost" disabled={!conversation} onClick={() => setModal("edit")}>{t("Edit endpoint")}</button>
       </div>
     );
   }
@@ -756,36 +1059,21 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
         <p className="text-label text-ink-300 break-words">{plainText(entry.text, 500)}</p>
         {offer && !connId && <p className="text-micro text-ink-300">{t("Allow Atlas to read in your personal chats until you disconnect. Other agents and workspace members cannot use this access.")}</p>}
         {status && <p className={`text-micro ${active ? "text-ok" : "text-warn"}`} role="status">{t(status)}</p>}
-        {active && !presetAttempt && (
-          <details className="text-micro text-ink-300">
-            <summary className="cursor-pointer">{t("Review tool access")}</summary>
-            <p>{t("Tools you enable can run without asking again.")}</p>
-            {readOptions.length > 0 ? (
-              <ul className="mt-2 space-y-2">
-                {readOptions.map((pin) => (
-                  <li key={pin.tool_name} className="flex flex-wrap items-start gap-2">
-                    <div className="min-w-0 flex-1 break-words">
-                      <code>{pin.tool_name}</code>
-                      <p>{pin.description}</p>
-                    </div>
-                    <button type="button" className="btn btn-sm btn-secondary" disabled={busy}
-                      aria-label={`${t("Enable read access")}: ${pin.tool_name}`} onClick={() => enableRead(pin)}
-                    >{t("Enable read access")}</button>
-                  </li>
-                ))}
-              </ul>
-            ) : <p>{t("No read-only tools are available to enable here.")}</p>}
-            <a className="btn btn-sm btn-ghost" href={settings} target="_blank" rel="noopener noreferrer">{t("Manage in Connections")}</a>
-          </details>
-        )}
         {current?.status === "needs_review" && <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>}
         {error && <p className="text-label text-fail break-words" role="alert">{t(error)}</p>}
       </TurnCard>
-      {drawer && (
-        <CustomMcpConnectDrawer
-          setup={{ ...setup, endpointUrl: endpoint, returnTo, editEndpoint: drawer === "edit" }}
-          onClose={() => setDrawer(null)}
-          onConnected={() => setDrawer(null)}
+      {modal && (
+        <CustomMcpSetupConfirmModal
+          setup={{ ...setup, endpointUrl: endpoint, returnTo }}
+          endpoint={endpoint}
+          returnTo={returnTo}
+          editEndpoint={modal === "edit"}
+          canShareWorkspace={canShareWorkspace}
+          onClose={() => setModal(null)}
+          onConnected={(conn) => {
+            setModal(null);
+            continueReply(conn.id);
+          }}
           onOAuthStarted={remember}
         />
       )}

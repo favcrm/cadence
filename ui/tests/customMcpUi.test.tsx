@@ -171,13 +171,17 @@ async function main() {
       return jsonRes({ connection: returnedMcp });
     }
     if (url.endsWith("/api/connections/mcp") && method === "POST") {
-      creates.push(JSON.parse(String(init?.body)));
+      const reqBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      creates.push(reqBody);
       if (standingProfile) return jsonRes({
         mode: "oauth_redirect", authorization_url: "https://inventory.example/authorize?scope=stock%3Aread",
         connection_id: sampleMcp.id,
       });
+      const scopeParam = Array.isArray(reqBody.required_scopes) && reqBody.required_scopes.length > 0
+        ? `&scope=${encodeURIComponent((reqBody.required_scopes as string[]).join(" "))}`
+        : "";
       return jsonRes({
-        mode: "oauth_redirect", authorization_url: "https://auth.acme.example/authorize?state=xyz", connection_id: "conn_mcp_new_1",
+        mode: "oauth_redirect", authorization_url: `https://auth.acme.example/authorize?state=xyz${scopeParam}`, connection_id: "conn_mcp_new_1",
         discovery: { issuer: "https://auth.acme.example", authorization_host: "auth.acme.example", registration: "dcr", scopes: ["mcp:read"], resource_metadata_url: "https://mcp.acme.example/.well-known/oauth-protected-resource" },
       });
     }
@@ -232,9 +236,24 @@ async function main() {
 
   await act(async () => byText('[role="tab"]', "Policies")!.click());
   await settle(() => assert(document.querySelector('[data-connection-policy]') && text().includes("Action safety") && text().includes("nova"), "owner Policies tab shows policy & allowed agents"));
+  await act(async () => byText('[data-connection-policy] [role="radio"]', "Just me (Personal)")!.click());
+  await settle(() => assert(!byText('[data-connection-policy] [role="checkbox"]', "nova"), "switching to Personal hides agent access checkboxes"));
+  await act(async () => byText('[data-connection-policy] [role="radio"]', "Shared with workspace")!.click());
   await act(async () => byText('[data-connection-policy] [role="radio"]', "Read only")!.click());
   await act(async () => byText('[data-connection-policy] button', "Save access settings")!.click());
   await settle(() => assert(document.querySelector('.custmcp-ok-banner')?.textContent?.includes("Access settings saved"), "green ok banner shown instead of warning"));
+
+  // P2: Promoting personal -> shared shows pin reset warning banner in Policies tab.
+  returnedMcp = { ...sampleMcp, visibility: "personal", connected_by_you: true };
+  await act(async () => { root.render(React.createElement(Connections, { viewer: { operator: true, readOnly: false }, hostedBoard: true })); });
+  await settle(() => assert(host.querySelector('[data-connections-group="custom-mcp"] button'), "personal connection listed"));
+  await act(async () => (host.querySelector('[data-connections-group="custom-mcp"] button') as HTMLButtonElement).click());
+  await settle(() => assert(document.querySelector('[data-drawer="custom-mcp"]'), "drawer opens"));
+  await act(async () => byText('[role="tab"]', "Policies")!.click());
+  await settle(() => assert(document.querySelector('[data-connection-policy]'), "policy tab ready"));
+  await act(async () => byText('[data-connection-policy] [role="radio"]', "Shared with workspace")!.click());
+  await settle(() => assert(text().includes("Promoting to Shared resets any write tools set to Always allow back to Ask first"), "P2 promote warning shown"));
+  returnedMcp = { ...sampleMcp, visibility: "shared", connected_by_you: true };
 
   await act(async () => (document.querySelector('[data-drawer="custom-mcp"] button[aria-label*="Close"]') as HTMLButtonElement).click());
   const closingDrawer = document.querySelector('[data-drawer="custom-mcp"][data-closing]');
@@ -242,8 +261,16 @@ async function main() {
   await act(async () => { closingDrawer.dispatchEvent(new win.Event("transitionend", { bubbles: true })); });
   await settle(() => assert(!document.querySelector('[data-drawer="custom-mcp"]'), "inspect drawer closes"));
 
+  const redirectedUrls: string[] = [];
+  const origAssign = win.location.assign?.bind(win.location);
+  Object.defineProperty(win.location, "assign", {
+    configurable: true,
+    value: (nextUrl: string) => { redirectedUrls.push(nextUrl); },
+  });
+
   await act(async () => byText("button", "+ Connect custom MCP server")!.click());
   await settle(() => assert(text().includes("1. Endpoint") && text().includes("2. Discovery & Consent") && text().includes("Auto MCP OAuth 2.1 + PKCE"), "3-step connect drawer opens"));
+  assert(byText('[role="radio"][aria-checked="true"]', "Just me (Personal)") !== undefined, "connect drawer defaults to Personal");
 
   await act(async () => byText('[role="radio"]', "OAuth client ID")!.click());
   await settle(() => {
@@ -255,28 +282,69 @@ async function main() {
     Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(el, val);
     el.dispatchEvent(new win.Event("input", { bubbles: true }));
   };
+  // Same-site OAuth (mcp.acme.example -> auth.acme.example) redirects directly without stopping at Step 2.
   await act(async () => {
     setNativeValue(document.querySelector('input[placeholder="Acme Billing MCP"]') as HTMLInputElement, "Acme OAuth");
     setNativeValue(document.querySelector('input[type="url"]') as HTMLInputElement, "https://mcp.acme.example/v1/mcp");
   });
   await act(async () => { document.querySelector("form")!.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); });
   await settle(() => {
+    assert(redirectedUrls.some((u) => u.includes("auth.acme.example/authorize")), "same-site OAuth redirects immediately");
+    assert(!document.querySelector("[data-mcp-discovery-preview]"), "same-site OAuth skips Step 2 confirmation");
+  });
+  assert(creates.at(-1)?.visibility === "personal", "Settings connect defaults visibility to personal");
+
+  // Cross-site OAuth (mcp.other.example -> auth.acme.example) stops at Step 2 confirmation.
+  await act(async () => {
+    setNativeValue(document.querySelector('input[type="url"]') as HTMLInputElement, "https://mcp.other.example/v1/mcp");
+  });
+  await act(async () => { document.querySelector("form")!.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); });
+  await settle(() => {
     const preview = document.querySelector("[data-mcp-discovery-preview]")?.textContent ?? "";
-    assert(preview.includes("auth.acme.example") && preview.includes("Dynamic Client Registration") && preview.includes("Continue to OAuth sign-in"), "Step 2 discovery preview shown");
+    assert(preview.includes("auth.acme.example") && preview.includes("Dynamic Client Registration") && preview.includes("Continue to OAuth sign-in"), "Step 2 discovery preview shown for cross-site OAuth");
   });
 
+  // Member read-only on shared server & unauthenticated readOnly gate.
   policyCalls.length = 0;
   await act(async () => { root.render(React.createElement(Connections, { viewer: { operator: false, readOnly: false }, hostedBoard: true })); });
   await settle(() => {
-    assert(text().includes("Shared Custom MCP servers (read-only)") && !text().includes("+ Connect custom MCP server") && document.querySelectorAll('input[type="password"]').length === 0, "member view read-only");
+    assert(text().includes("+ Connect custom MCP server"), "signed-in member sees + Connect custom MCP server");
   });
+  await act(async () => byText("button", "+ Connect custom MCP server")!.click());
+  await settle(() => {
+    const radios = Array.from(document.querySelectorAll('[role="dialog"] [role="radio"]')).map((el) => el.textContent ?? "");
+    assert(radios.some((r) => r.includes("Personal")) && !radios.some((r) => r.includes("Shared")), "member connect drawer only offers Personal");
+  });
+  await act(async () => (document.querySelector('[role="dialog"] button[aria-label*="Close"]') as HTMLButtonElement).click());
+  const closingConnect = document.querySelector('[role="dialog"][data-closing]');
+  if (closingConnect) {
+    await act(async () => { closingConnect.dispatchEvent(new win.Event("transitionend", { bubbles: true })); });
+  }
+  await settle(() => assert(host.querySelector('[data-connections-group="custom-mcp"] button'), "shared MCP listed for member"));
   await act(async () => (host.querySelector('[data-connections-group="custom-mcp"] button') as HTMLButtonElement).click());
   await settle(() => {
     const drawer = document.querySelector('[data-drawer="custom-mcp"]');
-    assert(drawer && drawer.textContent?.includes("Read-only view") && drawer.querySelectorAll('.custmcp-mode-btn').length === 0, "member read-only drawer");
+    assert(drawer && drawer.textContent?.includes("Read-only view") && drawer.querySelectorAll('.custmcp-mode-btn').length === 0, "member read-only on shared server");
   });
   await act(async () => byText('[role="tab"]', "Policies")!.click());
   await settle(() => assert(document.querySelector('[data-mcp-policy-readonly]') && policyCalls.length === 0, "member Policies read-only with 0 /policy requests"));
+
+  // Member CAN edit tools on their own personal MCP connection.
+  returnedMcp = { ...sampleMcp, visibility: "personal", connected_by_you: true };
+  await act(async () => { root.render(React.createElement(Connections, { key: "member-personal", viewer: { operator: false, readOnly: false }, hostedBoard: true })); });
+  await settle(() => assert(host.querySelector('[data-connections-group="custom-mcp"] button'), "member sees personal connection"));
+  await act(async () => (host.querySelector('[data-connections-group="custom-mcp"] button') as HTMLButtonElement).click());
+  await settle(() => assert(document.querySelector('[data-drawer="custom-mcp"] .custmcp-mode-btn'), "member can edit tools on their own personal server"));
+  returnedMcp = sampleMcp;
+
+  // Read-only unauthenticated viewer stays strictly read-only.
+  await act(async () => { root.render(React.createElement(Connections, { viewer: { operator: false, readOnly: true }, hostedBoard: true })); });
+  await settle(() => {
+    assert(text().includes("Shared Custom MCP servers (read-only)") && !text().includes("+ Connect custom MCP server") && document.querySelectorAll('input[type="password"]').length === 0, "readOnly viewer read-only");
+  });
+  if (origAssign) {
+    Object.defineProperty(win.location, "assign", { configurable: true, value: origAssign });
+  }
 
   const { ConnectCard } = require("../src/features/home/ConnectCard") as typeof import("../src/features/home/ConnectCard");
   win.history.replaceState({}, "", "/home?aos_connect=connected&toolkit=custom_mcp&connection_id=conn_mcp_billing_1");
@@ -424,38 +492,64 @@ async function main() {
     assert(!byText("button", "Continue in chat"), "unverified return has no continuation");
   }
 
-  const brokerAnnotations = { readOnlyHint: true, destructiveHint: false };
-  const readGuard = guardedMcpReadRequest.read_guard;
   const reviewedTool = {
     ...sampleMcp.tools[0],
     tool_name: guardedMcpReadRequest.tools[0].tool_name,
     description: "Search the catalog.",
     annotations: { readOnlyHint: true },
-    tool_digest: readGuard.tool_digest,
-    updated_at: readGuard.tool_updated_at,
+    mode: "read" as const,
+    tool_digest: guardedMcpReadRequest.read_guard.tool_digest,
+    updated_at: guardedMcpReadRequest.read_guard.tool_updated_at,
   };
-  returnedMcp = { ...sampleMcp, snapshot_revision: readGuard.snapshot_revision, tools: [
-    reviewedTool,
-    { ...sampleMcp.tools[0], tool_name: "execute_tool", description: "Broker", annotations: brokerAnnotations },
-  ] };
-  await openSetup("recovered-tab");
-  await settle(() => assert(byText("button", "Continue in chat"), "shared receipt recovers the exact active connection"));
-  await act(async () => byText("summary", "Review tool access")!.click());
-  assert(!document.querySelector('[aria-label="Enable read access: execute_tool"]'), "broker has no inline read promotion after disclosure");
-  await act(async () => (document.querySelector('[aria-label="Enable read access: catalog.search"]') as HTMLButtonElement).click());
-  await settle(() => assert(!text().includes("No tools can run automatically"), "enable updates the verified tool status"));
-  assert(JSON.stringify(toolWrites) === JSON.stringify([guardedMcpReadRequest]),
-    "explicit enable matches the shared wire fixture for the reviewed pin");
+  returnedMcp = { ...sampleMcp, snapshot_revision: guardedMcpReadRequest.read_guard.snapshot_revision, tools: [reviewedTool] };
+  win.localStorage.setItem(receiptKey, attemptReceipt);
+  messageWrites.length = 0;
+  await openSetup("auto-resume-readable");
+  await settle(() => assert(messageWrites.length === 1 && text().includes("Reply resumed"), "active readable connection auto-resumes chat without manual review accordion"));
+  assert(!document.body.textContent?.includes("Review tool access"), "Review tool access accordion removed");
 
-  returnedMcp = { ...returnedMcp, tools: [reviewedTool] };
-  rejectNextGuard = true;
-  await openSetup("stale-guard");
-  await settle(() => assert(byText("button", "Continue in chat"), "stale case shows reviewed tool"));
-  await act(async () => byText("summary", "Review tool access")!.click());
-  await act(async () => (document.querySelector('[aria-label="Enable read access: catalog.search"]') as HTMLButtonElement).click());
-  await settle(() => assert(text().includes("Refresh and review again"), "stale guard requires review and reload"));
-  assert(toolWrites.at(1) && !toolWrites.at(2) && JSON.stringify(toolWrites[0]) === JSON.stringify(toolWrites[1]),
-    "stale response does not trigger an unguarded update");
+  // Compact Confirm Modal in chat ConnectCard: Personal default, owner vs member scope, same-site redirect vs cross-site confirm.
+  const { HireBlock, WriteGate } = require("../src/features/auth/WriteGate") as typeof import("../src/features/auth/WriteGate");
+  win.localStorage.removeItem(receiptKey);
+  win.history.replaceState({}, "", "/home");
+  standingProfile = false;
+  const modalRedirects: string[] = [];
+  Object.defineProperty(win.location, "assign", {
+    configurable: true,
+    value: (nextUrl: string) => { modalRedirects.push(nextUrl); },
+  });
+  await act(async () => {
+    root.render(React.createElement(PageLocale, null, React.createElement(WriteGate.Provider, { value: null }, React.createElement(HireBlock.Provider, { value: "Owner only" }, React.createElement(ImageConversation, { value: "thread-20" }, React.createElement(ConnectCard, { key: "member-modal", entry: setupEntry }))))));
+  });
+  await settle(() => assert(byText("button", "Connect Acme Billing"), "member sees Connect button in chat"));
+  await act(async () => byText("button", "Connect Acme Billing")!.click());
+  await settle(() => assert(document.querySelector("[data-mcp-confirm-modal]") && text().includes("Read-only tools run automatically"), "member opens compact Confirm Modal"));
+  assert(!byText("[data-mcp-confirm-modal] [role=\"radio\"]", "Shared with company"), "member modal hides Shared with company");
+  await act(async () => byText("[data-mcp-confirm-modal] button", "Confirm & Connect")!.click());
+  await settle(() => assert(modalRedirects.some((u) => u.includes("auth.acme.example/authorize")), "member modal auto-redirects on same-site OAuth"));
+  assert(creates.at(-1)?.visibility === "personal", "member modal sends visibility: personal");
+
+  // Owner modal shows Shared toggle and cross-site confirmation.
+  const crossSiteEntry = {
+    ...setupEntry, seq: 22,
+    payload: { v: 2, toolkit: "custom_mcp", toolkit_label: "External MCP", endpoint_url: "https://mcp.other-vendor.example/v1/mcp", required_scopes: ["mcp:read"] },
+  } satisfies ThreadEntry;
+  await act(async () => {
+    root.render(React.createElement(PageLocale, null, React.createElement(WriteGate.Provider, { value: null }, React.createElement(HireBlock.Provider, { value: null }, React.createElement(ImageConversation, { value: "thread-22" }, React.createElement(ConnectCard, { key: "owner-modal", entry: crossSiteEntry }))))));
+  });
+  await settle(() => assert(byText("button", "Connect External MCP"), "owner sees Connect External MCP button"));
+  await act(async () => byText("button", "Connect External MCP")!.click());
+  await settle(() => assert(byText('[data-mcp-confirm-modal] [role="radio"]', "Shared with company"), "owner sees Shared with company option"));
+  assert(byText('[data-mcp-confirm-modal] [role="radio"][aria-checked="true"]', "Personal (just me)") !== undefined, "owner modal defaults to Personal");
+  await act(async () => byText("[data-mcp-confirm-modal] button", "Confirm & Connect")!.click());
+  await settle(() => assert(document.querySelector("[data-mcp-cross-site-confirm]") && text().includes("auth.acme.example"), "cross-site OAuth shows inline confirmation inside modal"));
+  await act(async () => byText("[data-mcp-confirm-modal] button", "✕")!.click());
+  if (origAssign) {
+    Object.defineProperty(win.location, "assign", { configurable: true, value: origAssign });
+  }
+  win.localStorage.removeItem("cadence:mcp-setup:thread-22:22");
+  win.localStorage.setItem(receiptKey, attemptReceipt);
+  returnedMcp = sampleMcp;
 
   await openSetup("cancelled", "cancelled");
   assert(text().includes("was cancelled") && !byText("button", "Continue in chat"), "cancel is recoverable without claiming success");
@@ -500,7 +594,7 @@ async function main() {
   assert(!byText("button", "Continue in chat") && !byText("button", "Enable read access"), "preset does not expose generic promotion or continuation");
   assert(messageWrites.at(0)?.conversation === "thread-21" && /^mcp-setup-[0-9a-f]{64}$/.test(String(messageWrites.at(0)?.message)), "resume targets the original conversation with deterministic identity");
   assert(JSON.stringify(messageWrites[0]).includes("stock.lookup"), "resume names only the offered tool");
-  assert(toolWrites.slice().length === 2, "preset does not write tool modes");
+  assert(toolWrites.slice().length === 0, "preset does not write tool modes");
   await renderInventory("remounted");
   assert(messageWrites.length === 1, "remount does not send again");
   await settle(() => assert(text().includes("Connected · Read access"), "already allowed connection stays visible after reload"));

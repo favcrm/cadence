@@ -479,11 +479,11 @@ function ConnectionsIndex({
           <h1 id="connections-title" className="text-section font-medium text-ink-100">{t("Connections")}</h1>
           <p className="text-label text-ink-400 mt-1 break-words">{t("The accounts your apps use. Credentials stay here; each app chooses how it uses them.")}</p>
         </div>
-        {viewer.operator && (!hostedBoard || activeTab === "services") && (
+        {(viewer.operator || (!viewer.readOnly && hostedBoard)) && (!hostedBoard || activeTab === "services") && (
           <div className="flex flex-wrap gap-1.5 shrink-0 items-center">
-            <StaleChip state={listState ?? emptyGate} />
-            <StaleChip state={providersState ?? emptyGate} />
-            {canWrite && hostedBoard && (
+            {viewer.operator && <StaleChip state={listState ?? emptyGate} />}
+            {viewer.operator && <StaleChip state={providersState ?? emptyGate} />}
+            {!viewer.readOnly && hostedBoard && (
               <Button
                 size="sm"
                 variant="secondary"
@@ -562,17 +562,56 @@ function ConnectionsIndex({
           aria-labelledby={hostedBoard ? "conn-tab-services" : undefined}
           className="space-y-4 min-w-0"
         >
-          <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
-          {hostedBoard && mcpRows.length > 0 && (
-            <CustomMcpServerList
-              rows={mcpRows}
-              highlightId={null}
-              readOnly
-              onOpen={(row) => {
-                setOpenMcpTab("tools");
-                setOpenMcpId(row.id);
-              }}
-            />
+          {hostedBoard && !viewer.readOnly ? (
+            <>
+              <p className="text-label text-ink-400 break-words">
+                {t("Workspace-wide integrations are managed by the owner. Your personal Custom MCP servers appear below.")}
+              </p>
+              {mcpRows.length > 0 ? (
+                <CustomMcpServerList
+                  rows={mcpRows}
+                  highlightId={null}
+                  readOnly={false}
+                  onOpen={(row) => {
+                    setOpenMcpTab("tools");
+                    setOpenMcpId(row.id);
+                  }}
+                />
+              ) : (
+                <PageState title={t("No personal MCP servers yet")}>
+                  {t("Connect a remote Streamable HTTP MCP server for your personal assistant turns.")}
+                </PageState>
+              )}
+              {mcpConnectOpen && (
+                <CustomMcpConnectDrawer
+                  canShareWorkspace={false}
+                  onClose={() => setMcpConnectOpen(false)}
+                  onOAuthStarted={() => {}}
+                  onConnected={(conn) => {
+                    setMcpConnectOpen(false);
+                    setMcpRows((cur) => [conn, ...cur.filter((item) => item.id !== conn.id)]);
+                    setOpenMcpTab("tools");
+                    setOpenMcpId(conn.id);
+                    loadCustomMcp();
+                  }}
+                />
+              )}
+            </>
+          ) : (
+            <>
+              <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
+              {hostedBoard && mcpRows.length > 0 && (
+                <CustomMcpServerList
+                  rows={mcpRows}
+                  highlightId={null}
+                  readOnly
+                  onOpen={(row) => {
+                    setOpenMcpTab("tools");
+                    setOpenMcpId(row.id);
+                  }}
+                />
+              )}
+            </>
           )}
           {hostedBoard && openMcp && (
             <CustomMcpInspectDrawer
@@ -711,8 +750,9 @@ function ConnectionsIndex({
               />
             </SettingsDrawer>
           )}
-          {hostedBoard && mcpConnectOpen && canWrite && (
+          {hostedBoard && mcpConnectOpen && !viewer.readOnly && (
             <CustomMcpConnectDrawer
+              canShareWorkspace={canWrite}
               onClose={() => setMcpConnectOpen(false)}
               onConnected={(created) => {
                 setMcpConnectOpen(false);

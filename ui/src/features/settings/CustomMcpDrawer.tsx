@@ -33,6 +33,7 @@ import {
   schemaParamSummary,
   validateCustomMcpUrlInput,
 } from "./customMcpView";
+import { submitCustomMcpConnect } from "./customMcpConnect";
 import SettingsDrawer from "./SettingsDrawer";
 import "./connections.css";
 
@@ -76,18 +77,22 @@ export function CustomMcpConnectDrawer({
   onConnected,
   onOAuthStarted,
   setup,
+  canShareWorkspace = true,
+  onRedirect,
 }: {
   onClose: () => void;
   onConnected: (connection: CustomMcpConnectionSummary) => void;
   onOAuthStarted: (connectionId: string, endpointUrl: string, nonce: string) => void;
   setup?: { label: string; endpointUrl: string; requiredScopes?: string[]; returnTo: string; editEndpoint?: boolean };
+  canShareWorkspace?: boolean;
+  onRedirect?: (url: string) => void;
 }) {
   const t = useTranslate();
   const baseId = useId();
   const [name, setName] = useState(setup?.label ?? "");
   const [endpointUrl, setEndpointUrl] = useState(setup?.endpointUrl ?? "");
   const [urlTouched, setUrlTouched] = useState(false);
-  const [visibility, setVisibility] = useState<"shared" | "personal">("shared");
+  const [visibility, setVisibility] = useState<"shared" | "personal">("personal");
   const [authKind, setAuthKind] = useState<CustomMcpAuthKind>("auto");
   const [bearerToken, setBearerToken] = useState("");
   const [customHeadersText, setCustomHeadersText] = useState("");
@@ -116,101 +121,42 @@ export function CustomMcpConnectDrawer({
     if (busy) return;
     setUrlTouched(true);
     setError(null);
-    const trimmedName = name.trim();
-    if (!trimmedName) {
-      setError("Enter a name for this Custom MCP server.");
-      return;
-    }
-    if (urlError !== null) {
-      setError(urlError);
-      return;
-    }
-
-    let parsedHeaders: Array<{ name: string; value: string }> | undefined;
-    if (authKind === "header") {
-      const checked = parseCustomHeadersInput(customHeadersText);
-      if (checked.error !== null) {
-        setError(checked.error);
-        return;
-      }
-      parsedHeaders = checked.headers;
-    }
-    if (authKind === "bearer" && !bearerToken.trim()) {
-      setError("Enter the Bearer token or API key.");
-      return;
-    }
-    if (authKind === "oauth_static" && !oauthClientId.trim()) {
-      setError("Enter the OAuth client_id.");
-      return;
-    }
-
-    const scopes = oauthScopesText
-      .split(/[\s,]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const requiredScopes = setup
-      ? setup.requiredScopes ?? (authKind === "oauth_static" && scopes.length ? scopes : undefined)
-      : undefined;
-    const nonce = setup ? crypto.randomUUID() : "";
-    const returnTo = setup
-      ? (() => {
-          const url = new URL(setup.returnTo);
-          url.searchParams.set("mcp_attempt", nonce);
-          return url.href;
-        })()
-      : typeof window !== "undefined" ? `${window.location.origin}/settings/connections` : undefined;
-
     setBusy(true);
     try {
-      const reply = await api.customMcpCreate({
-        name: trimmedName,
-        endpoint_url: endpointUrl.trim(),
-        auth_kind: setup && authKind === "auto" ? "oauth" : authKind,
+      const res = await submitCustomMcpConnect({
+        name,
+        endpointUrl,
+        urlError,
         visibility,
-        ...(requiredScopes ? { required_scopes: requiredScopes } : {}),
-        ...(authKind === "bearer" ? { bearer_token: bearerToken.trim() } : {}),
-        ...(authKind === "header" && parsedHeaders ? { custom_headers: parsedHeaders } : {}),
-        ...(authKind === "oauth_static"
-          ? {
-              oauth_client: {
-                client_id: oauthClientId.trim(),
-                ...(oauthClientSecret.trim() ? { client_secret: oauthClientSecret.trim() } : {}),
-                ...(scopes.length > 0 ? { scopes } : {}),
-              },
-            }
-          : {}),
-        ...(returnTo ? { return_to: returnTo } : {}),
+        authKind,
+        bearerToken,
+        customHeadersText,
+        oauthClientId,
+        oauthClientSecret,
+        oauthScopesText,
+        requiredScopesPreset: setup?.requiredScopes,
+        returnToBase: setup?.returnTo,
+        requireOAuthRedirect: Boolean(setup),
       });
-      if (reply.mode === "oauth_redirect") {
-        const safeUrl = customMcpAuthorizationUrl(reply);
-        if (safeUrl === null) {
-          setError("Server did not return a valid https:// authorization URL.");
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      if (res.kind === "oauth_redirect") {
+        onOAuthStarted(res.connectionId, res.normalizedEndpoint, res.nonce);
+        if (res.sameSite) {
+          if (onRedirect) onRedirect(res.authorizationUrl);
+          else if (typeof window !== "undefined") window.location.assign(res.authorizationUrl);
           return;
         }
-        if (requiredScopes) {
-          const requested = new URL(safeUrl).searchParams.getAll("scope");
-          const scopes = requested[0]?.split(" ") ?? [];
-          if (requested.length !== 1 || scopes.length !== requiredScopes.length ||
-              requiredScopes.some((scope) => !scopes.includes(scope))) {
-            setError("The provider did not request exactly the required OAuth scopes.");
-            return;
-          }
-        }
-        onOAuthStarted(reply.connection_id, new URL(endpointUrl.trim()).href, nonce);
         setDiscoveryStep({
-          authorizationUrl: safeUrl,
-          connectionId: reply.connection_id,
-          ...(reply.discovery ? { discovery: reply.discovery } : {}),
+          authorizationUrl: res.authorizationUrl,
+          connectionId: res.connectionId,
+          ...(res.discovery ? { discovery: res.discovery } : {}),
         });
         return;
       }
-      if (setup) {
-        setError("This server did not start OAuth sign-in.");
-        return;
-      }
-      onConnected(reply.connection);
-    } catch (e: unknown) {
-      setError(customMcpErrorText(e));
+      onConnected(res.connection);
     } finally {
       // Secrets exist only inside this single request; clear unconditionally.
       setBearerToken("");
@@ -232,7 +178,7 @@ export function CustomMcpConnectDrawer({
         <span className="custmcp-step">{t("3. Pinned Tools")}</span>
       </div>
       <p className="text-label text-ink-400 break-words">
-        {t("Connect a remote Streamable HTTP (https://) MCP server. Auto OAuth 2.1 + PKCE discovers metadata automatically; tools stay pinned and start in safe Approval or Off mode.")}
+        {t("Connect a remote Streamable HTTP (https://) MCP server. Auto OAuth 2.1 + PKCE discovers metadata automatically; read-only tools run immediately and write actions ask for approval first.")}
       </p>
       {discoveryStep ? (
         <div className="rounded border border-accent/40 bg-accent/10 p-3 space-y-2.5" role="status" data-mcp-discovery-preview>
@@ -280,8 +226,10 @@ export function CustomMcpConnectDrawer({
           <div className="conn-policy-group">
             <span className="slabel">{t("Who can use this server")}</span>
             <div className="conn-policy-grid" role="radiogroup" aria-label={t("Who can use this server")}>
-              <PolicyRadio checked={visibility === "shared"} disabled={busy} title={t("Shared with company")} sub={t("All workspace members and approved agents can use enabled tools.")} onClick={() => setVisibility("shared")} />
-              <PolicyRadio checked={visibility === "personal"} disabled={busy} title={t("Just me (Personal)")} sub={t("Only your own turns can access this server.")} onClick={() => setVisibility("personal")} />
+              <PolicyRadio checked={visibility === "personal"} disabled={busy} title={t("Just me (Personal)")} sub={t("Only your own assistant turns can use this server.")} onClick={() => setVisibility("personal")} />
+              {canShareWorkspace && (
+                <PolicyRadio checked={visibility === "shared"} disabled={busy} title={t("Shared with company")} sub={t("All workspace members and approved agents can use enabled tools.")} onClick={() => setVisibility("shared")} />
+              )}
             </div>
           </div>
           <details className="custmcp-manual" open={authKind !== "auto"}>
@@ -375,7 +323,8 @@ export function CustomMcpInspectDrawer({
   onRevoked: (id: string) => void;
 }) {
   const t = useTranslate();
-  const canEdit = canWrite;
+  const canEdit = canWrite || (connection.visibility === "personal" && connection.connected_by_you === true);
+  const canEditPolicy = canWrite;
   const [tab, setTab] = useState<CustomMcpDrawerTab>(initialTab);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
@@ -398,13 +347,13 @@ export function CustomMcpInspectDrawer({
   const [revokeArmed, setRevokeArmed] = useState(false);
 
   // Routine & agent policy draft (for Policies tab).
-  const agentsState = useMaybeResource(canEdit ? resources.agents : null);
+  const agentsState = useMaybeResource(canEditPolicy ? resources.agents : null);
   useEffect(() => {
-    if (canEdit && tab === "policies") {
+    if (canEditPolicy && tab === "policies") {
       void resources.agents.revalidate();
     }
-  }, [canEdit, tab]);
-  const [policyLoaded, setPolicyLoaded] = useState(!canEdit);
+  }, [canEditPolicy, tab]);
+  const [policyLoaded, setPolicyLoaded] = useState(!canEditPolicy);
   const [baseVis, setBaseVis] = useState<"shared" | "personal">(connection.visibility);
   const [baseWriteMode, setBaseWriteMode] = useState<"ask_approval" | "read_only">("ask_approval");
   const [baseExt, setBaseExt] = useState(false);
@@ -420,7 +369,7 @@ export function CustomMcpInspectDrawer({
   }, [connection.id, connection.visibility]);
 
   useEffect(() => {
-    if (!canEdit) {
+    if (!canEditPolicy) {
       setPolicyLoaded(true);
       return;
     }
@@ -451,7 +400,7 @@ export function CustomMcpInspectDrawer({
     return () => {
       alive = false;
     };
-  }, [canEdit, connection.id]);
+  }, [canEditPolicy, connection.id]);
 
   const prevModesRef = useRef<{ id: string; modes: Record<string, CustomMcpToolMode> }>({
     id: connection.id,
@@ -624,25 +573,28 @@ export function CustomMcpInspectDrawer({
     setFeedback({ ok: true, text: t("Workspace Agent Guide saved.") });
   });
 
-  const savePolicy = () => runAction("policy", async () => {
-    const effectiveExt = visDraft === "shared" ? extDraft : false;
-    const res = await routinesApi.connectionPolicySet(connection.id, {
-      visibility: visDraft,
-      write_mode: writeModeDraft,
-      allow_external_triggers: effectiveExt,
-      allowed_agents: agentsDraft,
+  const savePolicy = () => {
+    if (!canEditPolicy) return;
+    return runAction("policy", async () => {
+      const effectiveExt = visDraft === "shared" ? extDraft : false;
+      const res = await routinesApi.connectionPolicySet(connection.id, {
+        visibility: visDraft,
+        write_mode: writeModeDraft,
+        allow_external_triggers: effectiveExt,
+        allowed_agents: agentsDraft,
+      });
+      const nextVis = res.policy.visibility === "personal" ? "personal" : "shared";
+      const nextWm = res.policy.write_mode === "read_only" ? "read_only" : "ask_approval";
+      const nextExt = Boolean(res.policy.allow_external_triggers);
+      const nextAg = Array.isArray(res.policy.allowed_agents) ? res.policy.allowed_agents : [];
+      setBaseVis(nextVis); setVisDraft(nextVis);
+      setBaseWriteMode(nextWm); setWriteModeDraft(nextWm);
+      setBaseExt(nextExt); setExtDraft(nextExt);
+      setBaseAgents(nextAg); setAgentsDraft(nextAg);
+      onUpdated({ ...connection, visibility: nextVis });
+      setFeedback({ ok: true, text: t("Access settings saved.") });
     });
-    const nextVis = res.policy.visibility === "personal" ? "personal" : "shared";
-    const nextWm = res.policy.write_mode === "read_only" ? "read_only" : "ask_approval";
-    const nextExt = Boolean(res.policy.allow_external_triggers);
-    const nextAg = Array.isArray(res.policy.allowed_agents) ? res.policy.allowed_agents : [];
-    setBaseVis(nextVis); setVisDraft(nextVis);
-    setBaseWriteMode(nextWm); setWriteModeDraft(nextWm);
-    setBaseExt(nextExt); setExtDraft(nextExt);
-    setBaseAgents(nextAg); setAgentsDraft(nextAg);
-    onUpdated({ ...connection, visibility: nextVis });
-    setFeedback({ ok: true, text: t("Access settings saved.") });
-  });
+  };
 
   const toggleAllowedAgent = (alias: string) => {
     setAgentsDraft((prev) => (prev.includes(alias) ? prev.filter((item) => item !== alias) : [...prev, alias]));
@@ -973,16 +925,24 @@ export function CustomMcpInspectDrawer({
   const policiesPanel = (
     <div className="space-y-4 min-w-0">
       {okBanner}
-      {!canEdit ? (
+      {!canEditPolicy ? (
         <div className="conn-policy" data-mcp-policy-readonly>
           <div className="conn-policy-group">
             <span className="slabel">{t("Who can use this server")}</span>
-            <p className="text-label text-ink-200">{t(connection.visibility === "shared" ? "Shared with company" : "Personal")}</p>
-            <p className="text-micro text-ink-400 break-words">{t("Everyone in the workspace and allowed agents can use enabled read tools.")}</p>
+            <p className="text-label text-ink-200">{t(connection.visibility === "shared" ? "Shared with company" : "Just me (Personal)")}</p>
+            <p className="text-micro text-ink-400 break-words">
+              {connection.visibility === "shared"
+                ? t("Everyone in the workspace and allowed agents can use enabled read tools.")
+                : t("Only your own assistant turns can use this server.")}
+            </p>
           </div>
           <div className="conn-policy-group">
             <span className="slabel">{t("Action safety")}</span>
-            <p className="text-micro text-ink-400 break-words">{t("Only workspace owners can approve writes or change routine and agent policies.")}</p>
+            <p className="text-micro text-ink-400 break-words">
+              {connection.visibility === "shared"
+                ? t("Only workspace owners can approve writes or change sharing and agent policies.")
+                : t("Only workspace owners can promote a personal connection to Shared with workspace.")}
+            </p>
           </div>
         </div>
       ) : (
@@ -995,14 +955,18 @@ export function CustomMcpInspectDrawer({
               <PolicyRadio checked={visDraft === "personal"} disabled={busyAction !== null} title={t("Just me (Personal)")} sub={t("Only your turns and routines pinned to this account can use it.")} onClick={() => setVisDraft("personal")} />
             </div>
           </div>
-          {rosterAgents.length > 0 && (
-            <div className="conn-policy-group">
-              <span className="slabel">{t("Agent access")}</span>
-              <p className="text-micro text-ink-400 break-words">
-                {visDraft === "shared"
-                  ? t("All workspace agents may call this shared MCP server. Restrict access by switching to Personal or configuring agent permissions below.")
-                  : t("Only your turns can use this server. Specific agents can be restricted below.")}
-              </p>
+          {visDraft === "shared" && connection.visibility === "personal" && (
+            <div className="rounded border border-warn/40 bg-warn/10 p-2.5 text-micro text-ink-200 break-words" role="note">
+              {t("Promoting to Shared resets any write tools set to Always allow back to Ask first, and shares this connection with the workspace.")}
+            </div>
+          )}
+          {visDraft === "shared" ? (
+            rosterAgents.length > 0 && (
+              <div className="conn-policy-group">
+                <span className="slabel">{t("Agent access")}</span>
+                <p className="text-micro text-ink-400 break-words">
+                  {t("All workspace agents may call this shared MCP server. Restrict access by switching to Personal or configuring agent permissions below.")}
+                </p>
               <div className="space-y-1">
                 {rosterAgents.map((agentRow) => {
                   const checked = agentsDraft.includes(agentRow.alias);
@@ -1014,6 +978,14 @@ export function CustomMcpInspectDrawer({
                   );
                 })}
               </div>
+            </div>
+            )
+          ) : (
+            <div className="conn-policy-group">
+              <span className="slabel">{t("Agent access")}</span>
+              <p className="text-micro text-ink-400 break-words">
+                {t("Only your own assistant turns can use this server.")}
+              </p>
             </div>
           )}
           <div className="conn-policy-group">
@@ -1122,7 +1094,7 @@ export function CustomMcpInspectDrawer({
       }
       warning={warningText} tabs={tabs} tab={tab}
       onTab={(nextId) => { if (nextId === "tools" || nextId === "guide" || nextId === "policies" || nextId === "auth") setTab(nextId); }}
-      note={canEdit ? undefined : t("Read-only view — only workspace owners can edit or disconnect Custom MCP servers.")}
+      note={canEdit ? undefined : t("Read-only view — only workspace owners or the creator of a personal server can edit or disconnect it.")}
       onClose={onClose}
     />
   );

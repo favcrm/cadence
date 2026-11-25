@@ -489,3 +489,71 @@ export function schemaParamSummary(schema: Record<string, unknown>): string[] {
     .slice(0, 12)
     .map((key) => (required.has(key) ? `${key}*` : key));
 }
+
+const SHARED_HOSTING_SUFFIXES = [
+  "workers.dev",
+  "pages.dev",
+  "cadencecloud.app",
+  "herokuapp.com",
+  "vercel.app",
+  "netlify.app",
+  "appspot.com",
+  "cloudfront.net",
+] as const;
+
+const TWO_PART_PUBLIC_SUFFIXES = new Set([
+  "co.uk",
+  "org.uk",
+  "gov.uk",
+  "ac.uk",
+  "com.hk",
+  "edu.hk",
+  "gov.hk",
+  "org.hk",
+  "com.cn",
+  "net.cn",
+  "org.cn",
+  "com.au",
+  "net.au",
+  "org.au",
+  "co.jp",
+  "ne.jp",
+  "or.jp",
+  "co.kr",
+  "com.sg",
+  "com.tw",
+]);
+
+function registrableSiteKey(host: string): string | null {
+  const h = host.trim().toLowerCase().replace(/\.$/, "");
+  if (!h) return null;
+  if (SHARED_HOSTING_SUFFIXES.some((s) => h === s || h.endsWith(`.${s}`))) return h;
+  const parts = h.split(".");
+  if (parts.length <= 2) return h;
+  const lastTwo = parts.slice(-2).join(".");
+  if (TWO_PART_PUBLIC_SUFFIXES.has(lastTwo) && parts.length >= 3) {
+    return parts.slice(-3).join(".");
+  }
+  return lastTwo;
+}
+
+/**
+ * Returns true when an OAuth authorization URL stays on the same site as the
+ * MCP endpoint so chat/settings connect can redirect straight to OAuth without
+ * an intermediate domain confirmation stop. This is purely a UX shortcut
+ * (shared-hosting suffixes are treated as cross-site); `agenticos-v2` still
+ * enforces SSRF, HTTPS, and OAuth metadata validation server-side.
+ */
+export function isSameSiteHost(endpointUrl: string, authUrl: string): boolean {
+  try {
+    const endpointHost = new URL(endpointUrl).hostname.toLowerCase();
+    const authHost = new URL(authUrl).hostname.toLowerCase();
+    if (!endpointHost || !authHost) return false;
+    if (endpointHost === authHost) return true;
+    const endpointSite = registrableSiteKey(endpointHost);
+    const authSite = registrableSiteKey(authHost);
+    return endpointSite !== null && endpointSite === authSite;
+  } catch {
+    return false;
+  }
+}
