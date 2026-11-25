@@ -69,9 +69,9 @@ function resolveAlternateContent(element: XmlElement): readonly XmlNode[] | unde
   return branch?.children ?? [];
 }
 
-/** Parses a whole part. */
-export function parsePart(text: string): XmlElement {
-  return parseXml(text, PARSE_OPTIONS);
+/** Parses a whole part, optionally requiring the given Office root. */
+export function parsePart(text: string, expectedRoot?: string): XmlElement {
+  return parseXml(text, PARSE_OPTIONS, expectedRoot);
 }
 
 /** Streams a part's elements at `depth` (the root is 0) one subtree at a time. */
@@ -80,9 +80,9 @@ export function streamPart(text: string, depth: number, expectedRoot?: string): 
 }
 
 /** Reads and parses a part, or returns undefined when the package has no such part. */
-export async function readPart(zip: ZipArchive, partName: string): Promise<XmlElement | undefined> {
+export async function readPart(zip: ZipArchive, partName: string, expectedRoot?: string): Promise<XmlElement | undefined> {
   if (!zip.has(partName)) return undefined;
-  return parsePart(await readPartText(zip, partName));
+  return parsePart(await readPartText(zip, partName), expectedRoot);
 }
 
 /** A part's text. XML may be UTF-16 with a byte order mark, though Office writes UTF-8. */
