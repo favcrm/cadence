@@ -13,7 +13,8 @@ import { subscribeSse } from "../../lib/sse";
 import type { MasterState, ThreadRef } from "../../lib/types";
 import { agentOn } from "../../lib/agentOn";
 import type { HostedTemplateList, HostedTemplateRail } from "../templates/HostedTemplateReview";
-import SharedComposer from "../app-shell/chat/Composer";
+import AssistantComposer from "../app-shell/chat/AssistantComposer";
+import type { AttachDestination } from "../app-shell/chat/attach";
 import { composerDraftState, requestComposerFocus, setComposerDraft } from "../app-shell/chat/composerStore";
 import Conversation from "../app-shell/chat/Conversation";
 import { appendComposerDraft } from "./composerFill";
@@ -22,6 +23,9 @@ import { WORKSPACE_SKILLS_COMMAND } from "./master";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
+import { AttachmentNamesContext } from "./TurnRichCards";
+import { PdfPageTarget } from "./PdfPageAction";
+import { attachmentNames } from "./turnCards";
 import { useDockHeight } from "./useDockHeight";
 import {
   applyMemberEarlier,
@@ -40,6 +44,7 @@ import {
   threadItems,
   visibleWindow,
   WINDOW,
+  type PendingAttachment,
 } from "./thread";
 import { ImageConversation } from "../canvas/imageConversation";
 import { useCanvasFeed } from "../canvas/feed";
@@ -143,6 +148,8 @@ export default function MemberChat({
     void store.revalidate();
   }, [store]);
   const [surface, setSurface] = useState<MemberSurface | null>(null);
+  const [memberModelState, setMemberModelState] = useState<MasterState | null>(null);
+  const modelReadSeq = useRef(0);
   const [activityFeed, setActivityFeed] = useState<{ revision: number; turn: MemberLiveTurn | null }>({
     revision: 0,
     turn: null,
@@ -305,6 +312,46 @@ export default function MemberChat({
   // wired to the canvas and the Browser tab explicitly.
   const conversationId = surface?.conversation ?? null;
   const available = surface?.ok === true;
+  const composerKey = `member-assist:${scope}`;
+  const refreshMemberModelState = useCallback(() => {
+    const seq = ++modelReadSeq.current;
+    if (!available || conversationId === null) {
+      setMemberModelState(null);
+      return;
+    }
+    api
+      .masterState(conversationId)
+      .then((next) => {
+        if (!alive.current || modelReadSeq.current !== seq) return;
+        setMemberModelState(next);
+      })
+      .catch(() => {
+        if (!alive.current || modelReadSeq.current !== seq) return;
+        setMemberModelState((prev) =>
+          prev?.session?.id === conversationId ? prev : null,
+        );
+      });
+  }, [available, conversationId]);
+
+  useEffect(() => {
+    refreshMemberModelState();
+  }, [refreshMemberModelState]);
+
+  const attachDestination: AttachDestination | undefined =
+    !readOnly && conversationId !== null ? { conversation: conversationId } : undefined;
+  const canAttach = attachDestination !== undefined;
+  const canPickModel =
+    !readOnly &&
+    conversationId !== null &&
+    (memberModelState?.commands?.includes("model") ?? false);
+  const canPickEffort =
+    !readOnly &&
+    conversationId !== null &&
+    (memberModelState?.commands?.includes("effort") ?? false);
+  const memberAttachmentNames = useMemo(
+    () => attachmentNames(thread.data?.entries ?? []),
+    [thread.data?.entries],
+  );
   useEffect(() => {
     const updateTurn = (update: (turn: MemberLiveTurn | null) => MemberLiveTurn | null) => {
       setActivityFeed((current) => {
@@ -353,6 +400,13 @@ export default function MemberChat({
           const snapshot = JSON.parse(data) as MasterState | null;
           if (snapshot?.session?.id === conversationId &&
               (!Object.hasOwn(snapshot, "actor_identity") || snapshot.actor_identity?.conversation_id === conversationId)) {
+            if (
+              snapshot.model !== undefined ||
+              snapshot.effort !== undefined ||
+              snapshot.commands !== undefined
+            ) {
+              setMemberModelState((prev) => ({ ...(prev ?? snapshot), ...snapshot }));
+            }
             const turn = snapshot.turn;
             if (turn?.conversation === conversationId && turn.state === "working") {
               publish(typeof turn.message === "string" && turn.message !== "" ? turn.message : null);
@@ -453,8 +507,8 @@ export default function MemberChat({
   }, [store, limit]);
 
   const onRetry = useCallback(
-    (message: string, text: string, _refs?: ThreadRef[], _attachments?: { id: string }[]) => {
-      void sendToAssistant(scope, text, message).then(() => engage());
+    (message: string, text: string, _refs?: ThreadRef[], attachments?: PendingAttachment[]) => {
+      void sendToAssistant(scope, text, message, undefined, attachments).then(() => engage());
     },
     [scope, engage],
   );
@@ -602,7 +656,9 @@ export default function MemberChat({
 
   return (
     <AssistantActorProvider actor={actor}>
+    <PdfPageTarget.Provider value={attachDestination ? { key: composerKey, destination: attachDestination } : null}>
     <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
+    <AttachmentNamesContext.Provider value={memberAttachmentNames}>
     <main className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 flex-1 min-h-0 grid gap-5 grid-rows-[minmax(0,1fr)] ${
       hasRail ? "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]" : ""
     }`}>
@@ -717,9 +773,9 @@ export default function MemberChat({
             {sendNote !== null && (
               <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
             )}
-            <SharedComposer
+            <AssistantComposer
               density="full"
-              storeKey={`member-assist:${scope}`}
+              storeKey={composerKey}
               block={readOnly ? t("The board is read-only.") : null}
               commands={[WORKSPACE_SKILLS_COMMAND]}
               mentionCandidates={memberMentionCandidates}
@@ -727,8 +783,8 @@ export default function MemberChat({
               onDraftChange={handoff.onDraftChange}
               beforeSend={handoff.beforeSend}
               onNotice={(notice) => setSendNote(displayUiNotice(notice, t))}
-              onSend={({ body }) => {
-                void sendToAssistant(scope, body).then((receipt) => {
+              onSend={({ body, attachments }) =>
+                sendToAssistant(scope, body, undefined, undefined, attachments).then((receipt) => {
                   // The actual receipt decides the note: a queued-but-
                   // unlaunched send names its cause, never a fake reply.
                   setSendNote(
@@ -737,10 +793,24 @@ export default function MemberChat({
                       : null,
                   );
                   engage();
-                });
-              }}
+                })
+              }
               refocusAfterSend
-              attach={false}
+              attach={{
+                enabled: canAttach,
+                reason: readOnly
+                  ? t("The board is read-only.")
+                  : t("Your assistant conversation must be ready before attaching files."),
+                destination: attachDestination,
+              }}
+              modelPicker={{
+                master: memberModelState,
+                conversation: conversationId ?? undefined,
+                readOnly,
+                canPickModel,
+                canPickEffort,
+                onRefreshState: refreshMemberModelState,
+              }}
               className="card p-2.5 relative"
               placeholder={messagePlaceholder(identity, "personal", t)}
               ariaLabel={messageLabel(identity, "personal", t)}
@@ -784,7 +854,9 @@ export default function MemberChat({
         </aside>
       )}
     </main>
+    </AttachmentNamesContext.Provider>
     </StagedSourceContext.Provider>
+    </PdfPageTarget.Provider>
     </AssistantActorProvider>
   );
 }

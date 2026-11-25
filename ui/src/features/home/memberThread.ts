@@ -9,6 +9,7 @@ import {
   mergeEntries,
   newMessageId,
   settlePending,
+  type PendingAttachment,
   type ThreadEntry,
   type ThreadState,
 } from "./thread";
@@ -458,9 +459,13 @@ export function sendToAssistant(
   text: string,
   message = newMessageId(),
   operation?: PrivateOperation,
+  attachments?: PendingAttachment[],
 ): Promise<MemberSendReceipt> {
   const body = text.trim();
   if (!body) return Promise.resolve({ ok: false, error: "Nothing to send." });
+  const wireAttachments = attachments?.length
+    ? attachments.map((attachment) => ({ id: attachment.id }))
+    : undefined;
   const store = memberThreadStore(scope);
   // The same-message pending row THIS scope already holds may carry an
   // earlier attempt's `delivery` observation (member-local; the shared
@@ -490,7 +495,7 @@ export function sendToAssistant(
     try {
       op.assertCurrent();
       memberWrite(store, (s) => {
-        const added = addPending(s, message, body, Date.now()) as MemberThreadState;
+        const added = addPending(s, message, body, Date.now(), undefined, attachments) as MemberThreadState;
         return previousDelivery === undefined
           ? added
           : {
@@ -500,7 +505,7 @@ export function sendToAssistant(
               ),
             };
       });
-      const receipt: MemberAssistSend = await api.memberAssistSend(body, message);
+      const receipt: MemberAssistSend = await api.memberAssistSend(body, message, wireAttachments);
       op.assertCurrent();
       const receiptScope = receiptScopeOf(receipt, message);
       if (!receiptScope.ok) {

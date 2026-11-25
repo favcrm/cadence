@@ -24,7 +24,6 @@ import { useQuery, useResource } from "../../../lib/useResource";
 import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER, offeredCommands } from "../../home/master";
-import ComposerModelControls from "./ComposerModelControls";
 import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
 import { appendComposerDraft, ComposerFillContext } from "../../home/composerFill";
 import { PdfPageTarget } from "../../home/PdfPageAction";
@@ -106,7 +105,8 @@ import {
 } from "./composerStore";
 import type { ActionContext } from "./actions";
 import { renderCapability } from "./capabilities";
-import Composer, { type ComposerAction } from "./Composer";
+import AssistantComposer from "./AssistantComposer";
+import type { ComposerAction } from "./Composer";
 import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
@@ -2422,7 +2422,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             : null
         }
       />
-      <Composer
+      <AssistantComposer
         key={composerKey}
         density="compact"
         block={canSend && binding.error === null ? null : "read-only"}
@@ -2455,17 +2455,15 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         ariaLabel={composerLabels.ariaLabel}
         placeholder={composerLabels.placeholder}
         className="app-chat-form"
-        modelControls={
-          <ComposerModelControls
-            master={masterState.data}
-            conversation={hosted && convId !== null ? convId : undefined}
-            readOnly={!canSend || binding.error !== null}
-            canPickModel={canPickModel}
-            canPickEffort={canPickEffort}
-            compact
-            onRefreshState={() => void masterSource.refresh()}
-          />
-        }
+        modelPicker={{
+          master: masterState.data,
+          conversation: hosted && convId !== null ? convId : undefined,
+          readOnly: !canSend || binding.error !== null,
+          canPickModel,
+          canPickEffort,
+          compact: true,
+          onRefreshState: () => void masterSource.refresh(),
+        }}
       />
     </div>
     </PdfPageTarget.Provider>

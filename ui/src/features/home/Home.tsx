@@ -34,7 +34,6 @@ import { BrowserCard } from "../canvas/BrowserPanel";
 import { useBrowserFeed } from "../canvas/browserStore";
 import { ImageConversation } from "../canvas/imageConversation";
 import Composer from "./Composer";
-import ComposerModelControls from "../app-shell/chat/ComposerModelControls";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -1973,17 +1972,15 @@ function MasterHome({
               beforeSend={mentionHandoff.beforeSend}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
-              modelControls={
-                <ComposerModelControls
-                  master={master.data}
-                  row={masterRow}
-                  conversation={hosted ? (homeConversation ?? undefined) : undefined}
-                  readOnly={readOnly || writeBlock !== null}
-                  canPickModel={canPickModel}
-                  canPickEffort={canPickEffort}
-                  onRefreshState={() => void resources.masterState.refresh()}
-                />
-              }
+              modelPicker={{
+                master: master.data,
+                row: masterRow,
+                conversation: hosted ? (homeConversation ?? undefined) : undefined,
+                readOnly: readOnly || writeBlock !== null,
+                canPickModel,
+                canPickEffort,
+                onRefreshState: () => void resources.masterState.refresh(),
+              }}
               attachReason={readOnly
                 ? t("The board is read-only.")
                 : missing
