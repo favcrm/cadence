@@ -1148,29 +1148,7 @@ impl ProviderAdapter for PiAdapter {
         }; // No caller flag/marker/command can construct this context.
         let master = crate::master::is_master(&agent.alias);
         let params = agent.params.clone().unwrap_or(Value::Null);
-        // CAD-559: pi launches only on an explicit model the operator
-        // allowlisted — `master start`/`register` decide it, and a
-        // hand-edited or stale row is refused here rather than falling
-        // back to whatever Pi would pick.
-        let want = params
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if want.trim().is_empty() {
-            return Err(Error::rejected(format!(
-                "pi agent '{}' has no model configured — pass --model \
-                 <provider/id> or configure the {} default in Settings > Agents; a \
-                 silent provider fallback is never used (CAD-559)",
-                agent.alias,
-                if master { "master" } else { "worker" }
-            )));
-        }
-        let pi_policy = settings_policy(&self.env)?;
-        crate::pi_policy::require_allowed(
-            pi_policy.as_ref(),
-            if master { "master" } else { "worker" },
-            want,
-        )?;
+        let want = self.validate_pi_model(agent, &params, master)?;
         // CAD-1085: open the owned console before the transport exists so the
         // adapter's generation tag is the measured runtime's, and so a failed
         // bootstrap refuses before any prompt state is touched.
@@ -1225,148 +1203,7 @@ impl ProviderAdapter for PiAdapter {
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
-        // A master carries no role pin (an empty role is never a review); the
-        // worker branch below replaces this with the role's environment.
-        let mut role_env = super::reviewer_gh_env(&self.env, "", &self.state_dir)?;
-        let mut env = if self.agent_uid.is_none() {
-            let mut env = vec![
-                ("CADENCE_ALIAS".to_string(), agent.alias.clone()),
-                (
-                    "CADENCE_STATE_DIR".to_string(),
-                    self.state_dir.to_string_lossy().to_string(),
-                ),
-            ];
-            env.extend(super::daemon_context_env(&self.env));
-            if master {
-                let pm = self
-                    .env
-                    .var("CADENCE_PM_DIR")
-                    .filter(|v| !v.is_empty())
-                    .is_none()
-                    .then(crate::issue::default_dir)
-                    .and_then(Result::ok);
-                env.extend(crate::master::env_overrides(
-                    "pi",
-                    &self.state_dir,
-                    pm.as_deref(),
-                    master_confined(&self.env, agent),
-                ));
-                if *self.profile.lock().unwrap() == crate::master::Profile::App {
-                    env.push((
-                        crate::master::CONVERSATION_ENV.to_string(),
-                        "app".to_string(),
-                    ));
-                }
-            }
-            // CAD-570: every pi agent gets its own XDG_CACHE_HOME inside
-            // its private dir, created 0700 — pi-devin's model catalog
-            // lives at `$XDG_CACHE_HOME/pi-devin/models.json`, and under
-            // Landlock the operator's `~/.cache` is denied outright (the
-            // smoke host's confined master EACCES'd it every open). The
-            // dir is inside the already-granted provider/worker dir, so
-            // confinement needs nothing new; unconfined, the explicit
-            // value keeps a worker off the shared `~/.cache` its env
-            // allowlist would otherwise inherit — two agents never share
-            // one catalog file. Push order is deliberate: the worker's
-            // env keep-list re-inherits the operator's XDG_CACHE_HOME and
-            // `env_overrides` sets none, so this pair always wins.
-            let cache_dir = pi_cache_dir(&self.state_dir, &agent.alias)?;
-            ensure_private_dir(&cache_dir)?;
-            env.push((
-                "XDG_CACHE_HOME".to_string(),
-                cache_dir.to_string_lossy().to_string(),
-            ));
-            if !master && want.starts_with("devin/") {
-                let source_root = self
-                    .env
-                    .var("XDG_CACHE_HOME")
-                    .filter(|v| !v.is_empty())
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        self.env
-                            .var("HOME")
-                            .filter(|v| !v.is_empty())
-                            .map(|v| PathBuf::from(v).join(".cache"))
-                    })
-                    .ok_or_else(|| {
-                        Error::rejected("Offline Devin catalog source is unavailable")
-                    })?;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?
-                    .as_millis();
-                let now = u64::try_from(now)
-                    .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?;
-                devin_catalog::seed(
-                    &cache_dir,
-                    &source_root.join("pi-devin/models.json"),
-                    want,
-                    now,
-                )?;
-            }
-            if !master {
-                // CAD-544 worker: a private `PI_CODING_AGENT_DIR` under the
-                // state dir — auth arrives as the scoped file copy, never
-                // via env or argv; `~/.pi` is never inherited. An
-                // unattended worker must not stall on a git credential
-                // prompt, so GIT_TERMINAL_PROMPT=0.
-                let config = pi_worker_config_dir(&self.state_dir, &agent.alias)?;
-                let operator = crate::master::operator_provider_config(
-                    "pi",
-                    self.env.var("PI_CODING_AGENT_DIR"),
-                    self.env.var("HOME"),
-                );
-                if agent.provider == "omp" {
-                    // OMP uses its native agent.db, not Pi's auth.json. Keep its
-                    // login private; never copy the operator's entire database.
-                    ensure_private_dir(&config)?;
-                } else if want.starts_with("agenticos/") {
-                    agenticos::seed(&config, &pi_config_dir(&self.state_dir), want)?;
-                } else if let Some(operator) = operator.as_deref() {
-                    copy_pi_auth(&config, operator)?;
-                } else {
-                    ensure_private_dir(&config)?;
-                }
-                env.push((
-                    "PI_CODING_AGENT_DIR".to_string(),
-                    config.to_string_lossy().to_string(),
-                ));
-                env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
-                // CAD-844: a reviewer keeps HOME, so without this `gh` would
-                // read the operator's saved login and could post with their
-                // account. Pin a private, empty gh config instead; a read-only
-                // token, when the operator provisions one, is a separate input.
-                role_env = pi_launch::reviewer_gh_env(
-                    &self.env,
-                    &agent.role,
-                    &self.state_dir,
-                    &agent.alias,
-                )?;
-                if confinement.is_some() {
-                    // CAD-556: under Landlock the daemon's TMPDIR may be a
-                    // shared root — the worker gets its own so `mktemp`
-                    // and friends stay inside the policy. And git reads
-                    // `~/.gitconfig` fatally on EACCES: point the global
-                    // config at the worker's file (seeded with the
-                    // operator's identity — repo-local `user.*` still
-                    // outranks it, empty is fine).
-                    let dir = pi_worker_dir(&self.state_dir, &agent.alias)?;
-                    let tmp = dir.join("tmp");
-                    ensure_private_dir(&tmp)?;
-                    seed_worker_gitconfig(&dir, &self.env)?;
-                    env.push(("TMPDIR".to_string(), tmp.to_string_lossy().to_string()));
-                    env.push((
-                        "GIT_CONFIG_GLOBAL".to_string(),
-                        dir.join("gitconfig").to_string_lossy().to_string(),
-                    ));
-                }
-            }
-            env
-        } else {
-            Vec::new()
-        }; // Helper privately derives protected HOME/env/cwd.
-           // No update checks or telemetry on any managed startup path.
-        env.push(("PI_OFFLINE".to_string(), "1".to_string()));
+        let (env, role_env) = self.build_launch_env(agent, master, &want, confinement.is_some())?;
         let idle_secs = params
             .get("turn_idle_secs")
             .and_then(Value::as_u64)
@@ -1396,8 +1233,9 @@ impl ProviderAdapter for PiAdapter {
             } else {
                 match protected {
                     Some(ctx) => {
-                        let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
-                            .map_err(Error::rejected)?;
+                        let routing =
+                            crate::protected_pi_profile::Routing::for_agent(master, &want)
+                                .map_err(Error::rejected)?;
                         transport.launch_protected(ctx, &routing, &self.log_path)?
                     }
                     None => transport.launch(&workdir, &self.log_path, &env, &role_env)?,
@@ -1405,178 +1243,14 @@ impl ProviderAdapter for PiAdapter {
             };
             #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
             let pid = transport.launch(&workdir, &self.log_path, &env, &role_env)?;
-            // Effort: validate against the model's real levels, then verify
-            // what stuck — Pi answers success even on a silent fallback.
-            if let Some(effort) = params.get("effort").and_then(Value::as_str) {
-                let applied = self
-                    .request("set_thinking_level", json!({"level": effort}))
-                    .and_then(|r| {
-                        if r.get("success").and_then(Value::as_bool) == Some(true) {
-                            Ok(())
-                        } else {
-                            Err(self.command_error("set_thinking_level", &r))
-                        }
-                    })
-                    .and_then(|()| self.request("get_state", json!({})))
-                    .map(|r| {
-                        r.pointer("/data/thinkingLevel")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                match applied {
-                    Ok(Some(level)) if level == effort => {}
-                    Ok(got) => {
-                        return Err(Error::provider(format!(
-                            "pi refused effort '{effort}' (thinking level stayed at \
-                         {}) — supported levels: {}",
-                            got.as_deref().unwrap_or("unknown"),
-                            registry::PI_EFFORTS.join(", ")
-                        )))
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            // An old/mocked runtime may not support the extension commands.
-            // Ordinary queued turns remain compatible; native input is disabled.
-            let commands_data = self.checked("get_commands", json!({})).ok();
-            let guard_ready = guard_path.is_some()
-                && commands_data.as_ref().is_some_and(|data| {
-                    data.get("commands")
-                        .and_then(Value::as_array)
-                        .is_some_and(|commands| {
-                            [
-                                "cadence-bind-turn",
-                                "cadence-steer-turn",
-                                "cadence-abandon-turn",
-                            ]
-                            .iter()
-                            .all(|name| {
-                                commands.iter().any(|command| {
-                                    command.get("name").and_then(Value::as_str) == Some(*name)
-                                        && command.get("source").and_then(Value::as_str)
-                                            == Some("extension")
-                                        && command
-                                            .pointer("/sourceInfo/path")
-                                            .and_then(Value::as_str)
-                                            == guard_path.as_ref().and_then(|path| path.to_str())
-                                })
-                            })
-                        })
-                });
-            self.shared.guard_ready.store(guard_ready, Ordering::SeqCst);
-            // CAD-2092: loaded skill evidence comes strictly from what the
-            // runtime reports in `get_commands`, never from installed files.
-            if let Some(commands) = commands_data
-                .as_ref()
-                .and_then(|data| data.get("commands"))
-                .and_then(Value::as_array)
-            {
-                let mut loaded: Vec<String> = Vec::new();
-                for command in commands {
-                    if command.get("source").and_then(Value::as_str) != Some("skill") {
-                        continue;
-                    }
-                    if let Some(raw) = command.get("name").and_then(Value::as_str) {
-                        let name = raw.strip_prefix("skill:").unwrap_or(raw).to_string();
-                        if !name.is_empty() && !loaded.contains(&name) {
-                            loaded.push(name);
-                        }
-                    }
-                }
-                self.shared
-                    .emit("cadence/skills_loaded", &json!({ "skills": loaded }));
-            }
-            let state = self.request("get_state", json!({}))?;
-            if state.get("success").and_then(Value::as_bool) != Some(true) {
-                return Err(self.command_error("get_state", &state));
-            }
-            let data = state.get("data").cloned().unwrap_or(Value::Null);
-            let session_id = match data
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                Some(id) => id.to_string(),
-                None if agent.provider == "omp" => {
-                    return Err(Error::provider(
-                        "OMP did not report its native session identity",
-                    ));
-                }
-                None => Uuid::new_v4().to_string(),
-            };
-            if agent.provider == "omp"
-                && !master
-                && [agent.thread_id.as_deref(), agent.session_id.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|owned| owned != session_id)
-            {
-                return Err(Error::rejected(
-                    "OMP reopened with a different native identity; refusing session replacement",
-                ));
-            }
-            *self.pending_session_file.lock().unwrap() = None;
-            // CAD-1752: the session file Pi actually opened (a lane
-            // relaunch forks into a new one) is this worker's current one.
-            if !master {
-                if let Some(file) = data.get("sessionFile").and_then(Value::as_str) {
-                    record_current_session(&self.state_dir, &agent.alias, file);
-                    if agent.provider == "omp" && !Path::new(file).is_file() {
-                        *self.pending_session_file.lock().unwrap() =
-                            Some((agent.alias.clone(), file.to_string()));
-                    }
-                }
-            }
-            let Some((reported_full, reported_id)) = resolved_pi_model(&data) else {
-                return Err(Error::provider("pi did not report a nonempty provider and model id at open — transport closed (CAD-603)"));
-            };
-            // A bare worker id may resolve to Cursor. No conversation has
-            // crossed RPC yet: close before a turn can launch its argv child.
-            crate::pi_policy::require_safe_transport(&reported_full)?;
-            // CAD-559: Pi answers get_state with whatever model it fell
-            // back to — `--model` is a hint, not a contract. Refuse the
-            // launch unless the running model is the allowlisted one.
-            let matches = if want.contains('/') {
-                reported_full == want
-            } else {
-                reported_id == want
-            };
-            if !matches {
-                let config_note = if master {
-                    let config = pi_config_dir(&self.state_dir);
-                    format!(
-                        "; Pi master reads PI_CODING_AGENT_DIR={} (models.json is {})",
-                        config.display(),
-                        if config.join("models.json").is_file() {
-                            "present"
-                        } else {
-                            "absent"
-                        }
-                    )
-                } else {
-                    String::new()
-                };
-                return Err(Error::provider(format!(
-                    "pi reports model {} but '{want}' was requested — the \
-                 provider silently fell back instead of honoring \
-                 --model (CAD-559){config_note}",
-                    reported_full
-                )));
-            }
-            let model = Some(reported_full);
-            let effort = data
-                .get("thinkingLevel")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            Ok(Identity {
-                thread_id: session_id.clone(),
-                session_id,
-                model,
-                effort,
+            self.apply_initial_effort(&params)?;
+            self.inspect_runtime_commands(guard_path.as_deref());
+            self.verify_opened_identity(OpenIdentityCtx {
+                agent,
+                master,
+                want: &want,
                 pid,
-                endpoint: None,
-                generation: Some(generation),
-                attach: None,
+                generation,
             })
         })();
         if initialized.is_err() {
@@ -2004,7 +1678,385 @@ impl ProviderAdapter for PiAdapter {
     }
 }
 
+struct OpenIdentityCtx<'a> {
+    agent: &'a Agent,
+    master: bool,
+    want: &'a str,
+    pid: u32,
+    generation: String,
+}
+
 impl PiAdapter {
+    fn validate_pi_model(&self, agent: &Agent, params: &Value, master: bool) -> Result<String> {
+        // CAD-559: pi launches only on an explicit model the operator
+        // allowlisted — `master start`/`register` decide it, and a
+        // hand-edited or stale row is refused here rather than falling
+        // back to whatever Pi would pick.
+        let want = params
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if want.trim().is_empty() {
+            return Err(Error::rejected(format!(
+                "pi agent '{}' has no model configured — pass --model \
+                 <provider/id> or configure the {} default in Settings > Agents; a \
+                 silent provider fallback is never used (CAD-559)",
+                agent.alias,
+                if master { "master" } else { "worker" }
+            )));
+        }
+        let pi_policy = settings_policy(&self.env)?;
+        crate::pi_policy::require_allowed(
+            pi_policy.as_ref(),
+            if master { "master" } else { "worker" },
+            want,
+        )?;
+        Ok(want.to_string())
+    }
+
+    fn build_launch_env(
+        &self,
+        agent: &Agent,
+        master: bool,
+        want: &str,
+        has_confinement: bool,
+    ) -> Result<(Vec<(String, String)>, super::role_env::RoleEnv)> {
+        // A master carries no role pin (an empty role is never a review); the
+        // worker branch below replaces this with the role's environment.
+        let mut role_env = super::reviewer_gh_env(&self.env, "", &self.state_dir)?;
+        let mut env = if self.agent_uid.is_none() {
+            let mut env = vec![
+                ("CADENCE_ALIAS".to_string(), agent.alias.clone()),
+                (
+                    "CADENCE_STATE_DIR".to_string(),
+                    self.state_dir.to_string_lossy().to_string(),
+                ),
+            ];
+            env.extend(super::daemon_context_env(&self.env));
+            if master {
+                let pm = self
+                    .env
+                    .var("CADENCE_PM_DIR")
+                    .filter(|v| !v.is_empty())
+                    .is_none()
+                    .then(crate::issue::default_dir)
+                    .and_then(Result::ok);
+                env.extend(crate::master::env_overrides(
+                    "pi",
+                    &self.state_dir,
+                    pm.as_deref(),
+                    master_confined(&self.env, agent),
+                ));
+                if *self.profile.lock().unwrap() == crate::master::Profile::App {
+                    env.push((
+                        crate::master::CONVERSATION_ENV.to_string(),
+                        "app".to_string(),
+                    ));
+                }
+            }
+            // CAD-570: every pi agent gets its own XDG_CACHE_HOME inside
+            // its private dir, created 0700 — pi-devin's model catalog
+            // lives at `$XDG_CACHE_HOME/pi-devin/models.json`, and under
+            // Landlock the operator's `~/.cache` is denied outright (the
+            // smoke host's confined master EACCES'd it every open). The
+            // dir is inside the already-granted provider/worker dir, so
+            // confinement needs nothing new; unconfined, the explicit
+            // value keeps a worker off the shared `~/.cache` its env
+            // allowlist would otherwise inherit — two agents never share
+            // one catalog file. Push order is deliberate: the worker's
+            // env keep-list re-inherits the operator's XDG_CACHE_HOME and
+            // `env_overrides` sets none, so this pair always wins.
+            let cache_dir = pi_cache_dir(&self.state_dir, &agent.alias)?;
+            ensure_private_dir(&cache_dir)?;
+            env.push((
+                "XDG_CACHE_HOME".to_string(),
+                cache_dir.to_string_lossy().to_string(),
+            ));
+            if !master && want.starts_with("devin/") {
+                self.seed_devin_worker_catalog(&cache_dir, want)?;
+            }
+            if !master {
+                role_env = self.configure_worker_env(agent, want, has_confinement, &mut env)?;
+            }
+            env
+        } else {
+            Vec::new()
+        }; // Helper privately derives protected HOME/env/cwd.
+           // No update checks or telemetry on any managed startup path.
+        env.push(("PI_OFFLINE".to_string(), "1".to_string()));
+        Ok((env, role_env))
+    }
+
+    fn seed_devin_worker_catalog(&self, cache_dir: &Path, want: &str) -> Result<()> {
+        let source_root = self
+            .env
+            .var("XDG_CACHE_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.env
+                    .var("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|v| PathBuf::from(v).join(".cache"))
+            })
+            .ok_or_else(|| Error::rejected("Offline Devin catalog source is unavailable"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?
+            .as_millis();
+        let now = u64::try_from(now)
+            .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?;
+        devin_catalog::seed(
+            cache_dir,
+            &source_root.join("pi-devin/models.json"),
+            want,
+            now,
+        )
+    }
+
+    fn configure_worker_env(
+        &self,
+        agent: &Agent,
+        want: &str,
+        has_confinement: bool,
+        env: &mut Vec<(String, String)>,
+    ) -> Result<super::role_env::RoleEnv> {
+        // CAD-544 worker: a private `PI_CODING_AGENT_DIR` under the
+        // state dir — auth arrives as the scoped file copy, never
+        // via env or argv; `~/.pi` is never inherited. An
+        // unattended worker must not stall on a git credential
+        // prompt, so GIT_TERMINAL_PROMPT=0.
+        let config = pi_worker_config_dir(&self.state_dir, &agent.alias)?;
+        let operator = crate::master::operator_provider_config(
+            "pi",
+            self.env.var("PI_CODING_AGENT_DIR"),
+            self.env.var("HOME"),
+        );
+        if agent.provider == "omp" {
+            // OMP uses its native agent.db, not Pi's auth.json. Keep its
+            // login private; never copy the operator's entire database.
+            ensure_private_dir(&config)?;
+        } else if want.starts_with("agenticos/") {
+            agenticos::seed(&config, &pi_config_dir(&self.state_dir), want)?;
+        } else if let Some(operator) = operator.as_deref() {
+            copy_pi_auth(&config, operator)?;
+        } else {
+            ensure_private_dir(&config)?;
+        }
+        env.push((
+            "PI_CODING_AGENT_DIR".to_string(),
+            config.to_string_lossy().to_string(),
+        ));
+        env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+        // CAD-844: a reviewer keeps HOME, so without this `gh` would
+        // read the operator's saved login and could post with their
+        // account. Pin a private, empty gh config instead; a read-only
+        // token, when the operator provisions one, is a separate input.
+        let role_env =
+            pi_launch::reviewer_gh_env(&self.env, &agent.role, &self.state_dir, &agent.alias)?;
+        if has_confinement {
+            // CAD-556: under Landlock the daemon's TMPDIR may be a
+            // shared root — the worker gets its own so `mktemp`
+            // and friends stay inside the policy. And git reads
+            // `~/.gitconfig` fatally on EACCES: point the global
+            // config at the worker's file (seeded with the
+            // operator's identity — repo-local `user.*` still
+            // outranks it, empty is fine).
+            let dir = pi_worker_dir(&self.state_dir, &agent.alias)?;
+            let tmp = dir.join("tmp");
+            ensure_private_dir(&tmp)?;
+            seed_worker_gitconfig(&dir, &self.env)?;
+            env.push(("TMPDIR".to_string(), tmp.to_string_lossy().to_string()));
+            env.push((
+                "GIT_CONFIG_GLOBAL".to_string(),
+                dir.join("gitconfig").to_string_lossy().to_string(),
+            ));
+        }
+        Ok(role_env)
+    }
+
+    fn apply_initial_effort(&self, params: &Value) -> Result<()> {
+        // Effort: validate against the model's real levels, then verify
+        // what stuck — Pi answers success even on a silent fallback.
+        let Some(effort) = params.get("effort").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let applied = self
+            .request("set_thinking_level", json!({"level": effort}))
+            .and_then(|r| {
+                if r.get("success").and_then(Value::as_bool) == Some(true) {
+                    Ok(())
+                } else {
+                    Err(self.command_error("set_thinking_level", &r))
+                }
+            })
+            .and_then(|()| self.request("get_state", json!({})))
+            .map(|r| {
+                r.pointer("/data/thinkingLevel")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        match applied {
+            Ok(Some(level)) if level == effort => Ok(()),
+            Ok(got) => Err(Error::provider(format!(
+                "pi refused effort '{effort}' (thinking level stayed at \
+                 {}) — supported levels: {}",
+                got.as_deref().unwrap_or("unknown"),
+                registry::PI_EFFORTS.join(", ")
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn inspect_runtime_commands(&self, guard_path: Option<&Path>) {
+        // An old/mocked runtime may not support the extension commands.
+        // Ordinary queued turns remain compatible; native input is disabled.
+        let commands_data = self.checked("get_commands", json!({})).ok();
+        let guard_ready = guard_path.is_some()
+            && commands_data.as_ref().is_some_and(|data| {
+                data.get("commands")
+                    .and_then(Value::as_array)
+                    .is_some_and(|commands| {
+                        [
+                            "cadence-bind-turn",
+                            "cadence-steer-turn",
+                            "cadence-abandon-turn",
+                        ]
+                        .iter()
+                        .all(|name| {
+                            commands.iter().any(|command| {
+                                command.get("name").and_then(Value::as_str) == Some(*name)
+                                    && command.get("source").and_then(Value::as_str)
+                                        == Some("extension")
+                                    && command.pointer("/sourceInfo/path").and_then(Value::as_str)
+                                        == guard_path.and_then(|path| path.to_str())
+                            })
+                        })
+                    })
+            });
+        self.shared.guard_ready.store(guard_ready, Ordering::SeqCst);
+        // CAD-2092: loaded skill evidence comes strictly from what the
+        // runtime reports in `get_commands`, never from installed files.
+        if let Some(commands) = commands_data
+            .as_ref()
+            .and_then(|data| data.get("commands"))
+            .and_then(Value::as_array)
+        {
+            let mut loaded: Vec<String> = Vec::new();
+            for command in commands {
+                if command.get("source").and_then(Value::as_str) != Some("skill") {
+                    continue;
+                }
+                if let Some(raw) = command.get("name").and_then(Value::as_str) {
+                    let name = raw.strip_prefix("skill:").unwrap_or(raw).to_string();
+                    if !name.is_empty() && !loaded.contains(&name) {
+                        loaded.push(name);
+                    }
+                }
+            }
+            self.shared
+                .emit("cadence/skills_loaded", &json!({ "skills": loaded }));
+        }
+    }
+
+    fn verify_opened_identity(&self, ctx: OpenIdentityCtx<'_>) -> Result<Identity> {
+        let state = self.request("get_state", json!({}))?;
+        if state.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(self.command_error("get_state", &state));
+        }
+        let data = state.get("data").cloned().unwrap_or(Value::Null);
+        let session_id = match data
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => id.to_string(),
+            None if ctx.agent.provider == "omp" => {
+                return Err(Error::provider(
+                    "OMP did not report its native session identity",
+                ));
+            }
+            None => Uuid::new_v4().to_string(),
+        };
+        if ctx.agent.provider == "omp"
+            && !ctx.master
+            && [
+                ctx.agent.thread_id.as_deref(),
+                ctx.agent.session_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|owned| owned != session_id)
+        {
+            return Err(Error::rejected(
+                "OMP reopened with a different native identity; refusing session replacement",
+            ));
+        }
+        *self.pending_session_file.lock().unwrap() = None;
+        // CAD-1752: the session file Pi actually opened (a lane
+        // relaunch forks into a new one) is this worker's current one.
+        if !ctx.master {
+            if let Some(file) = data.get("sessionFile").and_then(Value::as_str) {
+                record_current_session(&self.state_dir, &ctx.agent.alias, file);
+                if ctx.agent.provider == "omp" && !Path::new(file).is_file() {
+                    *self.pending_session_file.lock().unwrap() =
+                        Some((ctx.agent.alias.clone(), file.to_string()));
+                }
+            }
+        }
+        let Some((reported_full, reported_id)) = resolved_pi_model(&data) else {
+            return Err(Error::provider("pi did not report a nonempty provider and model id at open — transport closed (CAD-603)"));
+        };
+        // A bare worker id may resolve to Cursor. No conversation has
+        // crossed RPC yet: close before a turn can launch its argv child.
+        crate::pi_policy::require_safe_transport(&reported_full)?;
+        // CAD-559: Pi answers get_state with whatever model it fell
+        // back to — `--model` is a hint, not a contract. Refuse the
+        // launch unless the running model is the allowlisted one.
+        let matches = if ctx.want.contains('/') {
+            reported_full == ctx.want
+        } else {
+            reported_id == ctx.want
+        };
+        if !matches {
+            let config_note = if ctx.master {
+                let config = pi_config_dir(&self.state_dir);
+                format!(
+                    "; Pi master reads PI_CODING_AGENT_DIR={} (models.json is {})",
+                    config.display(),
+                    if config.join("models.json").is_file() {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                )
+            } else {
+                String::new()
+            };
+            return Err(Error::provider(format!(
+                "pi reports model {} but '{}' was requested — the \
+                 provider silently fell back instead of honoring \
+                 --model (CAD-559){config_note}",
+                reported_full, ctx.want
+            )));
+        }
+        let model = Some(reported_full);
+        let effort = data
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(Identity {
+            thread_id: session_id.clone(),
+            session_id,
+            model,
+            effort,
+            pid: ctx.pid,
+            endpoint: None,
+            generation: Some(ctx.generation),
+            attach: None,
+        })
+    }
+
     /// Bind the durable model task before a protected turn's prompt.
     fn bind_native_task(
         &self,
