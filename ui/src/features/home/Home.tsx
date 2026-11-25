@@ -48,6 +48,7 @@ import { displayName, personalAssistantProfileHref, readConversationIdentity, sc
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
+import ConversationIdCopy from "./ConversationIdCopy";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
@@ -779,6 +780,7 @@ export default function Home({
   readOnly,
   privateChat = false,
   hosted = null,
+  supportWorkspaceId,
   viewerSub = null,
   viewerIsMember = false,
   sessionId = null,
@@ -800,6 +802,7 @@ export default function Home({
   readOnly: boolean;
   privateChat?: boolean;
   hosted?: boolean | null;
+  supportWorkspaceId?: string;
   credentialRequestsEnabled?: boolean;
   templateReviewEnabled?: boolean;
   templateReviewCanApprove?: boolean;
@@ -872,6 +875,7 @@ export default function Home({
     return (
       <>
         <MemberChat
+          supportWorkspaceId={supportWorkspaceId}
           key={scope}
           scope={scope}
           readOnly={readOnly}
@@ -892,6 +896,7 @@ export default function Home({
       <MasterHome
         readOnly={readOnly}
         hosted={hosted}
+        supportWorkspaceId={supportWorkspaceId}
         overview={overview}
         documentFollowUps={documentFollowUps}
         onOpenIssue={onOpenIssue}
@@ -913,51 +918,12 @@ export default function Home({
   );
 }
 
-function ConversationIdCopy({ id }: { id: string }) {
-  const t = useTranslate();
-  const copyLabel = t("Copy ID");
-  const preview = id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;
-  const [result, setResult] = useState<{ copied: boolean }>();
-  useEffect(() => {
-    if (!result) return;
-    const timeout = window.setTimeout(() => setResult(undefined), 2000);
-    return () => window.clearTimeout(timeout);
-  }, [result]);
-
-  return (
-    <div className="home-conversation-id relative flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-      <span className="hidden sm:inline text-micro text-ink-500">{t("Conversation ID")}:</span>
-      <button
-        type="button"
-        className="lnk num min-h-7 cursor-copy text-micro focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-        aria-label={`${copyLabel}: ${preview}`}
-        title={`${copyLabel}: ${id}`}
-        onClick={async () => {
-          try {
-            await navigator.clipboard.writeText(id);
-            setResult({ copied: true });
-          } catch {
-            setResult({ copied: false });
-          }
-        }}
-      >
-        {preview}
-      </button>
-      <span
-        role="status"
-        className={result ? "pointer-events-none absolute right-0 top-full z-10 mt-1 rounded border border-ink-700 bg-ink-900 px-2 py-1 text-micro text-ink-200" : "sr-only"}
-      >
-        {result && t(result.copied ? "Conversation ID copied" : "Could not copy the conversation ID")}
-      </span>
-    </div>
-  );
-}
-
 /** The shared master-transport pane: Native coordinator or verified hosted
  *  actor. The outer Home chooses the layout without changing recipients. */
 function MasterHome({
   readOnly,
   hosted = null,
+  supportWorkspaceId,
   overview,
   documentFollowUps,
   onOpenIssue,
@@ -976,6 +942,7 @@ function MasterHome({
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  supportWorkspaceId?: string;
   credentialRequestsEnabled?: boolean;
   templateRail?: HostedTemplateRail;
   templateCount?: number;
@@ -1766,7 +1733,9 @@ function MasterHome({
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
-              {!missing && homeConversation && <ConversationIdCopy key={homeConversation} id={homeConversation} />}
+              {!missing && homeConversation && (
+                <ConversationIdCopy key={homeConversation} id={homeConversation} workspaceId={supportWorkspaceId} />
+              )}
               {compactHome && latestLabel && (
                 <button
                   type="button"

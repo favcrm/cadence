@@ -108,8 +108,10 @@ for its current state before showing activity for another message.
 
 The Atlas conversation header in Home shows a shortened **Conversation ID**
 when the current chat has an ID. Click the ID, or focus it and press Enter,
-to copy the full value. Share it with the workspace URL for support; the ID
-does not grant access to the chat.
+to copy a support reference that includes the workspace. Support can paste
+the reference in **Agent Sessions** to find the exact conversation. It does
+not grant access. If an older board copies only the ID, share the workspace
+URL with support as well.
 
 In hosted Home, type `/skills` and press Enter to browse approved workspace
 skills without sending a message. Selecting a skill inserts `/skill:<name>`

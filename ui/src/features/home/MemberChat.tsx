@@ -17,6 +17,7 @@ import SharedComposer from "../app-shell/chat/Composer";
 import { composerDraftState, requestComposerFocus, setComposerDraft } from "../app-shell/chat/composerStore";
 import Conversation from "../app-shell/chat/Conversation";
 import { appendComposerDraft } from "./composerFill";
+import ConversationIdCopy from "./ConversationIdCopy";
 import { tailTop } from "./dock";
 import { WORKSPACE_SKILLS_COMMAND } from "./master";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
@@ -109,6 +110,7 @@ const LOADING_IDENTITY: IdentityRead = { state: "loading" };
 export default function MemberChat({
   scope,
   readOnly,
+  supportWorkspaceId,
   onOpenIssue,
   decisions = false,
   documentFollowUps,
@@ -120,6 +122,7 @@ export default function MemberChat({
   /** The session-scoped store/draft key — `${sessionId}:${sub}`. */
   scope: string;
   readOnly: boolean;
+  supportWorkspaceId?: string;
   onOpenIssue: (id: string) => void;
   decisions?: boolean;
   documentFollowUps?: DocumentFollowUpState;
@@ -627,6 +630,9 @@ export default function MemberChat({
               <p className="assistant-scope">{scopeDescriptor("personal", t)}</p>
             </div>
             <div className="assistant-heading-actions">
+              {available && conversationId && supportWorkspaceId && (
+                <ConversationIdCopy key={conversationId} id={conversationId} workspaceId={supportWorkspaceId} />
+              )}
               {!readOnly && surface?.bootstrap === "deferred" && identity.state === "ready" && (
                 <button
                   type="button"
