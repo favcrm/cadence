@@ -55790,6 +55790,16 @@ function invocation(api, app) {
     ...app === null ? {} : { app }
   };
 }
+var MAX_SCHEMA_ERRORS = 8;
+function formatValidationPath2(pointer) {
+  if (!pointer)
+    return "root";
+  return pointer.replace(/^\//, "").split("/").map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~")).join(".");
+}
+function formatSchemaValidationError(toolName, errors) {
+  const details = errors.slice(0, MAX_SCHEMA_ERRORS).map((error) => `${formatValidationPath2(error.path)}: ${error.message}`).join("; ");
+  return details ? `Tool "${toolName}" arguments do not match the declared schema: ${details}.` : `Tool "${toolName}" arguments do not match the declared schema.`;
+}
 function registration(tool, authority, resolveApp, acceptsImages) {
   let validator;
   return {
@@ -55799,8 +55809,9 @@ function registration(tool, authority, resolveApp, acceptsImages) {
     ...tool.replay === undefined ? {} : { replay: tool.replay },
     prepareArguments(input) {
       validator ??= compile(tool.parameters, { formats, unresolvedRefs: "reject" });
-      if (!validator.check(input))
-        throw new Error("Tool arguments do not match the declared schema.");
+      const result = validator.validate(input);
+      if (!result.ok)
+        throw new Error(formatSchemaValidationError(tool.name, result.errors));
       return input;
     },
     execute(input, api, context) {

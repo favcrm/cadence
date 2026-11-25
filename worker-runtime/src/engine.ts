@@ -4,7 +4,7 @@ import {
   type Extension,
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
-import { compile } from "@earendil-works/pi-schema";
+import { compile, type ValidationError } from "@earendil-works/pi-schema";
 import { formats } from "@earendil-works/pi-schema/formats";
 import type {
   AppScope,
@@ -80,6 +80,30 @@ function invocation(
   };
 }
 
+const MAX_SCHEMA_ERRORS = 8;
+
+function formatValidationPath(pointer: string): string {
+  if (!pointer) return "root";
+  return pointer
+    .replace(/^\//, "")
+    .split("/")
+    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"))
+    .join(".");
+}
+
+function formatSchemaValidationError(
+  toolName: string,
+  errors: readonly ValidationError[],
+): string {
+  const details = errors
+    .slice(0, MAX_SCHEMA_ERRORS)
+    .map((error) => `${formatValidationPath(error.path)}: ${error.message}`)
+    .join("; ");
+  return details
+    ? `Tool "${toolName}" arguments do not match the declared schema: ${details}.`
+    : `Tool "${toolName}" arguments do not match the declared schema.`;
+}
+
 function registration(
   tool: RuntimeTool,
   authority: ToolAuthority | undefined,
@@ -96,8 +120,9 @@ function registration(
       // Pi coerces arguments after this hook; enforce the host's original
       // schema before a value such as a fractional revision can be changed.
       validator ??= compile(tool.parameters, { formats, unresolvedRefs: "reject" });
-      if (!validator.check(input))
-        throw new Error("Tool arguments do not match the declared schema.");
+      const result = validator.validate(input);
+      if (!result.ok)
+        throw new Error(formatSchemaValidationError(tool.name, result.errors));
       return input;
     },
     execute(input, api, context) {
