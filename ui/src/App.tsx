@@ -709,6 +709,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             totals: data.totals as AgentsPayload["totals"],
             by_issue: data.by_issue as AgentsPayload["by_issue"],
             profiles: Array.isArray(data.profiles) ? (data.profiles as AgentsPayload["profiles"]) : value.profiles,
+            feed_items: Array.isArray(data.feed_items) ? (data.feed_items as AgentsPayload["feed_items"]) : value.feed_items,
           }));
           // Issue-page lane stores depend on runtime state, including
           // changes which leave their issue card unchanged.
@@ -1478,6 +1479,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             decisions={decisionsOn}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
             resolveAppPath={resolveAppPath}
+            streamDegraded={partialUpdates}
             workspaceEmpty={workspaceEmpty}
             setupNotice={
               <SetupNudge

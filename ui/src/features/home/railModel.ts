@@ -12,7 +12,7 @@ import type { HomeNeed } from "./needs";
 
 export type TodoCategory = "all" | "approvals" | "reviews" | "blocked";
 export type TodoCategoryKey = Exclude<TodoCategory, "all">;
-export type FeedCategory = "all" | "working" | "uploaded" | "completed" | "external";
+export type FeedCategory = "all" | "action" | "working" | "uploaded" | "completed" | "external";
 export type FeedCategoryKey = Exclude<FeedCategory, "all">;
 export type RailTone = "warn" | "info" | "ok" | "fail";
 
@@ -30,6 +30,7 @@ export const TODO_CATEGORY_ORDER: readonly { key: TodoCategoryKey; label: string
 ];
 
 export const FEED_CATEGORY_ORDER: readonly { key: FeedCategoryKey; label: string }[] = [
+  { key: "action", label: "Action" },
   { key: "working", label: "Working" },
   { key: "uploaded", label: "Uploaded" },
   { key: "completed", label: "Completed" },
@@ -138,6 +139,7 @@ export function countFeedCategories(
 ): Record<FeedCategory, number> {
   const counts: Record<FeedCategory, number> = {
     all: entries.length,
+    action: 0,
     working: 0,
     uploaded: 0,
     completed: 0,

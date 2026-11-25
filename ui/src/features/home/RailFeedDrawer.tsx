@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { activityTimeMs } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
-import type { Agent, AgentTask, DocumentFollowUp } from "../../lib/types";
+import type { Agent, AgentFeedItem, AgentTask, DocumentFollowUp } from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import AgentAvatar, { agentLook } from "../agents/AgentAvatar";
@@ -11,10 +11,12 @@ import { displayName } from "../assistant/identity";
 import DrawerShell from "../app-shell/shared/DrawerShell";
 import { ageText, failureReason, isUncertain, isolate, outcomeOf, reasonText, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 import { agentWorkHref, type AgentUpdate } from "./agentUpdateModel";
+import { feedToneForState, formatFeedAge, isLiveFeedState } from "./feedRailModel";
 import { ageLabel, ageWords, metaLine, updateTitle, type HomeNeed } from "./needs";
 import { decidedWriteStatusLabel } from "./railModel";
 
 export type RailFeedTarget =
+  | { kind: "feed_item"; item: AgentFeedItem }
   | {
       kind: "agent";
       agent: Agent;
@@ -34,6 +36,7 @@ export default function RailFeedDrawer({
   target,
   readOnly,
   onAskAgent,
+  onAskFeedItem,
   onAskNeed,
   onOpenIssue,
   onClose,
@@ -41,6 +44,7 @@ export default function RailFeedDrawer({
   target: RailFeedTarget | null;
   readOnly: boolean;
   onAskAgent?: (agent: Agent, update?: AgentUpdate) => void;
+  onAskFeedItem?: (item: AgentFeedItem) => void;
   onAskNeed?: (need: HomeNeed) => void;
   onOpenIssue?: (id: string) => void;
   onClose: (restoreFocus?: boolean) => void;
@@ -49,12 +53,176 @@ export default function RailFeedDrawer({
   const actor = useAssistantActor();
   const assistantName = displayName(actor.read, actor.scope, t);
   const [showRaw, setShowRaw] = useState(false);
+  const [copiedCli, setCopiedCli] = useState(false);
 
   useEffect(() => {
     setShowRaw(false);
+    setCopiedCli(false);
   }, [target]);
 
   if (!target) return null;
+
+  if (target.kind === "feed_item") {
+    const { item } = target;
+    const live = isLiveFeedState(item.state);
+    const tone = feedToneForState(item.state);
+    const updatedMs = Date.parse(item.updated_at);
+    const updatedAge = Number.isFinite(updatedMs)
+      ? `${formatFeedAge(Math.max(0, (Date.now() - updatedMs) / 1000))} ${t("ago")}`
+      : null;
+
+    const copyCommand = async () => {
+      const cmd = item.operator_action?.command;
+      if (!cmd) return;
+      try {
+        await navigator.clipboard?.writeText(cmd);
+      } catch {
+        // Non-clipboard environments still reflect click feedback cleanly.
+      }
+      setCopiedCli(true);
+      window.setTimeout(() => setCopiedCli(false), 1600);
+    };
+
+    return (
+      <DrawerShell
+        kind="feed-detail"
+        label={t("Feed")}
+        kicker={t("Feed")}
+        scrim="board"
+        modal
+        trapFocus
+        avatar={
+          <AgentAvatar
+            slug={agentLook(item.alias, item.look ? { look: item.look } : undefined)}
+            look={item.look ?? undefined}
+            size={36}
+            still={!live}
+            active={live}
+          />
+        }
+        title={item.alias}
+        subtitle={`${item.role}${item.ticket_id ? ` · ${item.ticket_id}` : ""}`}
+        pills={
+          <span className="s-status-pill" data-tone={tone === "muted" ? undefined : tone}>
+            {t(item.state_label)}
+          </span>
+        }
+        note={
+          item.operator_action
+            ? t("Operator-only terminal command — read-only on the board.")
+            : t("Read-only activity")
+        }
+        secondary={
+          item.ticket_id && onOpenIssue ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                onOpenIssue(item.ticket_id!);
+                onClose(false);
+              }}
+            >
+              {item.ticket_id} ↗
+            </Button>
+          ) : undefined
+        }
+        primary={
+          onAskFeedItem && !readOnly ? (
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => {
+                onAskFeedItem(item);
+                onClose(false);
+              }}
+            >
+              {t("Ask {name}").replace("{name}", () => assistantName)} ↗
+            </Button>
+          ) : (
+            <Button size="sm" variant="ghost" onClick={() => onClose()}>
+              {t("Close")}
+            </Button>
+          )
+        }
+        tabs={[
+          {
+            id: "activity",
+            label: t("Activity"),
+            panel: (
+              <div className="dx-panel">
+                <div className="dx-kv-card space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="rc2-verb">{item.action_verb}</span>
+                    {updatedAge ? <span className="text-micro text-ink-500 num">{updatedAge}</span> : null}
+                  </div>
+                  <div className="font-medium text-ink-100">{item.task_title}</div>
+                  <p className="text-label text-ink-300 whitespace-pre-wrap break-words">{item.latest_action}</p>
+                  {(item.runner_label || item.pr_ref || item.head_sha) ? (
+                    <div className="flex flex-wrap items-center gap-2 pt-1 text-micro text-ink-400 font-mono">
+                      {item.runner_label ? <span>{item.runner_label}</span> : null}
+                      {item.pr_ref ? <span>{item.pr_ref}</span> : null}
+                      {item.head_sha ? <span>{item.head_sha.slice(0, 12)}</span> : null}
+                    </div>
+                  ) : null}
+                </div>
+
+                {item.operator_action ? (
+                  <div className="adv-box op-warn space-y-2">
+                    <div className="adv-head">
+                      <strong>{t(item.operator_action.title || "Operator-only terminal command")}</strong>
+                      <button type="button" className="act-btn warn" onClick={() => void copyCommand()}>
+                        {copiedCli ? t("Copied ✓") : t("Copy CLI")}
+                      </button>
+                    </div>
+                    <pre className="cmd-pre">{item.operator_action.command}</pre>
+                    {item.operator_action.gates?.length ? (
+                      <ul className="space-y-1.5 pt-1">
+                        {item.operator_action.gates.map((gate) => (
+                          <li key={gate.name} className="flex items-start justify-between gap-2 text-micro">
+                            <span className={gate.ok ? "text-ok font-medium" : "text-warn font-medium"}>
+                              {gate.ok ? "✓" : "•"} {gate.name}
+                            </span>
+                            <span className="text-ink-400 text-right">{gate.status}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    <p className="text-micro text-ink-400">
+                      {t("Run locally in your terminal — never auto-approved or executed from the board.")}
+                    </p>
+                  </div>
+                ) : null}
+
+                {item.steps && item.steps.length > 0 ? (
+                  <div className="dx-kv-card space-y-2">
+                    <div className="slabel">{t("Execution trace")}</div>
+                    <ul className="space-y-1.5">
+                      {item.steps.map((step, idx) => (
+                        <li key={`${step.label}:${idx}`} className="flex items-center justify-between gap-2 text-label">
+                          <span className="text-ink-200">{step.label}</span>
+                          <span className="step-chip" data-s={step.status}>
+                            {step.status}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                <div className="flex items-center justify-between gap-2 text-micro text-ink-500">
+                  <span>{t("Work receipt only — private chats are never exposed.")}</span>
+                  <Link href={agentWorkHref(item.alias)} className="lnk shrink-0" onClick={() => onClose(false)}>
+                    {t("Agent profile")}
+                  </Link>
+                </div>
+              </div>
+            ),
+          },
+        ]}
+        onClose={() => onClose()}
+      />
+    );
+  }
 
   if (target.kind === "agent") {
     const { agent, updates, tasks, stateLabel } = target;
