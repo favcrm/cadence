@@ -1486,50 +1486,28 @@ pub struct StartOptions {
     pub state_dir: PathBuf,
 }
 
-pub fn run_start(opts: &StartOptions) -> Result<i32> {
-    let mut rows: Vec<Row> = Vec::new();
-    let mut fixes: Vec<String> = Vec::new();
-
-    let now = itime::now_epoch();
-    // ---- scope: every project is read; the focus decides which
-    // findings can move the exit code (CAD-257) ----
-    let sc = scope(None)?;
-    let focus = if opts.all {
-        Focus::All(None)
-    } else if let Some(p) = &opts.project {
+fn resolve_start_focus(opts: &StartOptions, sc: &Scope) -> Result<Focus> {
+    if opts.all {
+        return Ok(Focus::All(None));
+    }
+    if let Some(p) = &opts.project {
         if !sc.projects.iter().any(|x| &x.key == p) {
             return Err(Error::rejected(format!(
                 "unknown project '{p}' — `cadence issue project ls` lists the keys"
             )));
         }
-        Focus::Project(p.clone())
-    } else {
-        match cwd_focus(&sc.projects, &opts.cwd) {
-            Some(focus) => focus,
-            None => Focus::All(Some(format!(
-                "{} is not inside a known project repo — judging every project, as --all",
-                opts.cwd.display()
-            ))),
-        }
-    };
-    let acks = Acks::load(&opts.state_dir);
-    if let Some(e) = &acks.error {
-        rows.push(Row::new("acks").warn(
-            format!("{e} — no acknowledgement applied"),
-            "fix or move the file, then `cadence session ack --list`",
-        ));
+        return Ok(Focus::Project(p.clone()));
     }
+    Ok(match cwd_focus(&sc.projects, &opts.cwd) {
+        Some(focus) => focus,
+        None => Focus::All(Some(format!(
+            "{} is not inside a known project repo — judging every project, as --all",
+            opts.cwd.display()
+        ))),
+    })
+}
 
-    // ---- host: the CAD-72 watchdog — disk, WAL, pipes, orphans,
-    // temp dirs, stale worktrees in one read-only scan ----
-    let host_scan = host_report(
-        &host_scan_for(opts.state_dir.clone(), opts.cwd.clone()),
-        opts.host_report.as_deref(),
-    )?;
-    let host = host_row("host", &host_scan, opts.host_report.as_deref(), &acks, now);
-    rows.push(host);
-
-    // ---- binary vs main ----
+fn check_binary_drift_row(opts: &StartOptions, sc: &Scope) -> Row {
     let mut bin = Row::new("binary");
     let repo_for_binary = match &opts.project {
         Some(p) => sc
@@ -1539,34 +1517,33 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
             .map(|(_, _, r)| r.clone()),
         None => overview::build_repo_match_pub(&sc.projects).map(|(_, r)| r),
     };
-    match repo_for_binary {
-        Some(repo) => {
-            let d = overview::drift_of(&repo, overview::BUILD_COMMIT);
-            if d["known"].as_bool() == Some(true) {
-                let n = d["count"].as_i64().unwrap_or(0);
-                bin = if n > 0 {
-                    bin.warn(
-                        format!(
-                            "binary is {n} commit(s) behind {}",
-                            d["ref"].as_str().unwrap_or("main")
-                        ),
-                        overview::CMD_UPGRADE_LATEST_MAIN,
-                    )
-                } else {
-                    bin.ok(format!(
-                        "at {}",
-                        &overview::BUILD_COMMIT[..10.min(overview::BUILD_COMMIT.len())]
-                    ))
-                };
-            } else {
-                bin = bin.ok(d["reason"].as_str().unwrap_or("cannot tell").to_string());
-            }
-        }
-        None => bin = bin.ok("no repo matches this build — drift unknown"),
+    let Some(repo) = repo_for_binary else {
+        return bin.ok("no repo matches this build — drift unknown");
+    };
+    let d = overview::drift_of(&repo, overview::BUILD_COMMIT);
+    if d["known"].as_bool() == Some(true) {
+        let n = d["count"].as_i64().unwrap_or(0);
+        bin = if n > 0 {
+            bin.warn(
+                format!(
+                    "binary is {n} commit(s) behind {}",
+                    d["ref"].as_str().unwrap_or("main")
+                ),
+                overview::CMD_UPGRADE_LATEST_MAIN,
+            )
+        } else {
+            bin.ok(format!(
+                "at {}",
+                &overview::BUILD_COMMIT[..10.min(overview::BUILD_COMMIT.len())]
+            ))
+        };
+    } else {
+        bin = bin.ok(d["reason"].as_str().unwrap_or("cannot tell").to_string());
     }
-    rows.push(bin);
+    bin
+}
 
-    // ---- daemon ----
+fn check_daemon_row(opts: &StartOptions, fixes: &mut Vec<String>) -> (Fleet, Row) {
     let mut fl = fleet(&opts.state_dir);
     if !fl.reachable && opts.fix {
         match client::daemon_start(&opts.state_dir) {
@@ -1611,9 +1588,10 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     if let Some(f) = fixes.last().filter(|f| f.starts_with("daemon")) {
         drow.fixed = Some(f.clone());
     }
-    rows.push(drow);
+    (fl, drow)
+}
 
-    // ---- board ----
+fn check_board_row(opts: &StartOptions, fixes: &mut Vec<String>) -> Row {
     let mut board = Row::new("board");
     let ui_opts = ui::persisted_opts(&opts.state_dir);
     let port = ui_opts.port.unwrap_or(3010);
@@ -1628,11 +1606,11 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     }
     match ui::detached_pid(&opts.state_dir) {
         None => {
-            board = if board.fixed.is_some() {
+            if board.fixed.is_some() {
                 board.warn("ui start ran but no pid yet", "cadence ui status")
             } else {
                 board.warn("board down", "cadence ui start")
-            };
+            }
         }
         Some(pid) => {
             let mut detail = format!("pid {pid}, :{port}");
@@ -1689,9 +1667,225 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                     board.items.push(result);
                 }
             }
+            board
         }
     }
-    rows.push(board);
+}
+
+fn collect_overview_needs(
+    opts: &StartOptions,
+    owner_of: &HashMap<String, String>,
+) -> (Vec<Finding>, Vec<Finding>) {
+    let agent_proj = |alias: &str| owner_of.get(alias).cloned();
+    let mut recon: Vec<Finding> = Vec::new();
+    let mut inbox: Vec<Finding> = Vec::new();
+    // Overview computes the shared needs-me rows once (gh cache
+    // included); inbox rows split out into their own check.
+    let pm_dir = issue::default_dir().unwrap_or_default();
+    let view = overview::overview(&opts.state_dir, &pm_dir);
+    let needs = view["needs_me"].as_array().cloned().unwrap_or_default();
+    // Hard failures: a fenced agent and an unknown message both
+    // mean a turn's outcome is unaccounted for — the gate refuses
+    // go until a human reconciles (or acknowledges) them.
+    // Everything else warns.
+    for n in &needs {
+        let kind = n["kind"].as_str().unwrap_or_default();
+        let line = format!(
+            "{} — {}",
+            n["title"].as_str().unwrap_or_default(),
+            n["command"].as_str().unwrap_or_default()
+        );
+        let (key, alias) = need_key(n);
+        let project = n["project"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .or_else(|| alias.as_deref().and_then(agent_proj));
+        let sev = if kind == "fenced" {
+            Sev::Fail
+        } else {
+            Sev::Warn
+        };
+        let f = Finding::new(key, project, sev, line);
+        if kind == "inbox_unread" {
+            inbox.push(f);
+        } else {
+            recon.push(f);
+        }
+    }
+    (recon, inbox)
+}
+
+fn collect_unknown_message_findings(
+    fl: &Fleet,
+    owner_of: &HashMap<String, String>,
+    recon: &mut Vec<Finding>,
+) {
+    let agent_proj = |alias: &str| owner_of.get(alias).cloned();
+    // Unknown messages — a fence the overview rows don't name.
+    for a in &fl.agents {
+        let alias = a["alias"].as_str().unwrap_or_default();
+        let show = fl.shows.get(alias).cloned().unwrap_or_default();
+        let mut named = false;
+        for m in show["messages"].as_array().cloned().unwrap_or_default() {
+            if m["state"].as_str() == Some("unknown") {
+                named = true;
+                let id = m["id"].as_str().unwrap_or("?");
+                let head = m["body"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(50)
+                    .collect::<String>();
+                recon.push(Finding::new(
+                    format!("reconcile:{id}"),
+                    agent_proj(alias),
+                    Sev::Fail,
+                    format!(
+                        "agent {alias}: unknown message {id} ({head}) — cadence message reconcile {id} --status interrupted"
+                    ),
+                ));
+            }
+        }
+        if !named && show["unknown"].as_i64().unwrap_or(0) > 0 {
+            recon.push(Finding::new(
+                format!("unknown:{alias}"),
+                agent_proj(alias),
+                Sev::Fail,
+                format!("agent {alias}: unknown message(s) — cadence agent show {alias}"),
+            ));
+        }
+    }
+}
+
+fn collect_stalled_doing_findings(sc: &Scope, fl: &Fleet, recon: &mut Vec<Finding>) {
+    // `doing` issues with no live owner.
+    for v in &sc.views {
+        if v.status != "doing" {
+            continue;
+        }
+        let id = &v.issue.front.id;
+        let text = match v.issue.front.owner.as_deref() {
+            None => Some(format!(
+                "{id} doing with no owner — cadence issue set {id} owner=<alias>"
+            )),
+            Some(owner) => {
+                let live = fl.agents.iter().any(|a| {
+                    a["alias"].as_str() == Some(owner)
+                        && !a["dead"].as_bool().unwrap_or(false)
+                        && !matches!(
+                            a["state"].as_str().unwrap_or_default(),
+                            "stopped" | "stopping" | "offline"
+                        )
+                });
+                (!live).then(|| {
+                    format!("{id} doing but owner {owner} is not live — resume or reassign")
+                })
+            }
+        };
+        if let Some(text) = text {
+            recon.push(Finding::new(
+                format!("doing:{id}"),
+                Some(v.issue.project.clone()),
+                Sev::Warn,
+                text,
+            ));
+        }
+    }
+}
+
+fn collect_worktree_reconcile_findings(opts: &StartOptions, sc: &Scope, recon: &mut Vec<Finding>) {
+    // Open PR on a cadence/<wt> branch whose local worktree is gone
+    // (only checked where the PR's repo has a declared checkout —
+    // the worktree may legitimately live on another host).
+    let (pr_branches, gh_repos) = gh_open(&opts.state_dir, sc, false);
+    for (slug, data) in &gh_repos {
+        let Some((key, _, root)) = sc
+            .repos
+            .iter()
+            .find(|(_, s, _)| s.as_deref() == Some(slug.as_str()))
+        else {
+            continue;
+        };
+        for pr in data["prs"].as_array().cloned().unwrap_or_default() {
+            let Some(head) = pr["headRefName"].as_str() else {
+                continue;
+            };
+            let Some(name) = layout::name_of_branch(head) else {
+                continue;
+            };
+            if !layout::worktree_dir(root, name).exists() {
+                let n = pr["number"].as_i64().unwrap_or(0);
+                recon.push(Finding::new(
+                    format!("pr:{slug}#{n}"),
+                    Some(key.clone()),
+                    Sev::Warn,
+                    format!(
+                        "PR #{n} branch {head} — no {} locally",
+                        layout::rel_dir(name)
+                    ),
+                ));
+            }
+        }
+    }
+    // `.cadence/wt/*` with neither an open PR nor an open issue.
+    for (root, name) in worktree_dirs(&sc.repos) {
+        let branch = layout::branch(&name);
+        let has_pr = pr_branches.contains(&branch);
+        let open_issue = issue_stem(&name)
+            .and_then(|id| sc.issue_status.get(&id))
+            .is_some_and(|s| !matches!(s.as_str(), "done" | "dropped"));
+        if !has_pr && !open_issue {
+            let project = checkout_project(&sc.repos, &root);
+            let rel = layout::rel_dir(&name);
+            recon.push(Finding::new(
+                orphan_worktree_key(&root, &rel),
+                project,
+                Sev::Warn,
+                orphan_worktree_text(&root, &rel),
+            ));
+        }
+    }
+}
+
+pub fn run_start(opts: &StartOptions) -> Result<i32> {
+    let mut rows: Vec<Row> = Vec::new();
+    let mut fixes: Vec<String> = Vec::new();
+
+    let now = itime::now_epoch();
+    // ---- scope: every project is read; the focus decides which
+    // findings can move the exit code (CAD-257) ----
+    let sc = scope(None)?;
+    let focus = resolve_start_focus(opts, &sc)?;
+    let acks = Acks::load(&opts.state_dir);
+    if let Some(e) = &acks.error {
+        rows.push(Row::new("acks").warn(
+            format!("{e} — no acknowledgement applied"),
+            "fix or move the file, then `cadence session ack --list`",
+        ));
+    }
+
+    // ---- host: the CAD-72 watchdog — disk, WAL, pipes, orphans,
+    // temp dirs, stale worktrees in one read-only scan ----
+    let host_scan = host_report(
+        &host_scan_for(opts.state_dir.clone(), opts.cwd.clone()),
+        opts.host_report.as_deref(),
+    )?;
+    let host = host_row("host", &host_scan, opts.host_report.as_deref(), &acks, now);
+    rows.push(host);
+
+    // ---- binary vs main ----
+    rows.push(check_binary_drift_row(opts, &sc));
+
+    // ---- daemon ----
+    let (fl, drow) = check_daemon_row(opts, &mut fixes);
+    rows.push(drow);
+
+    // ---- board ----
+    rows.push(check_board_row(opts, &mut fixes));
 
     // ---- reconcile + inbox: keyed findings, each attributed to a
     // project where something names one ----
@@ -1704,164 +1898,10 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
         rows.push(Row::new("inbox").fail("cannot read mailboxes — daemon unreachable", ""));
     } else {
         let owner_of = agent_projects(&fl.agents, &sc);
-        let agent_proj = |alias: &str| owner_of.get(alias).cloned();
-        let mut recon: Vec<Finding> = Vec::new();
-        let mut inbox: Vec<Finding> = Vec::new();
-        // Overview computes the shared needs-me rows once (gh cache
-        // included); inbox rows split out into their own check.
-        let pm_dir = issue::default_dir().unwrap_or_default();
-        let view = overview::overview(&opts.state_dir, &pm_dir);
-        let needs = view["needs_me"].as_array().cloned().unwrap_or_default();
-        // Hard failures: a fenced agent and an unknown message both
-        // mean a turn's outcome is unaccounted for — the gate refuses
-        // go until a human reconciles (or acknowledges) them.
-        // Everything else warns.
-        for n in &needs {
-            let kind = n["kind"].as_str().unwrap_or_default();
-            let line = format!(
-                "{} — {}",
-                n["title"].as_str().unwrap_or_default(),
-                n["command"].as_str().unwrap_or_default()
-            );
-            let (key, alias) = need_key(n);
-            let project = n["project"]
-                .as_str()
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .or_else(|| alias.as_deref().and_then(agent_proj));
-            let sev = if kind == "fenced" {
-                Sev::Fail
-            } else {
-                Sev::Warn
-            };
-            let f = Finding::new(key, project, sev, line);
-            if kind == "inbox_unread" {
-                inbox.push(f);
-            } else {
-                recon.push(f);
-            }
-        }
-        // Unknown messages — a fence the overview rows don't name.
-        for a in &fl.agents {
-            let alias = a["alias"].as_str().unwrap_or_default();
-            let show = fl.shows.get(alias).cloned().unwrap_or_default();
-            let mut named = false;
-            for m in show["messages"].as_array().cloned().unwrap_or_default() {
-                if m["state"].as_str() == Some("unknown") {
-                    named = true;
-                    let id = m["id"].as_str().unwrap_or("?");
-                    let head = m["body"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .chars()
-                        .take(50)
-                        .collect::<String>();
-                    recon.push(Finding::new(
-                        format!("reconcile:{id}"),
-                        agent_proj(alias),
-                        Sev::Fail,
-                        format!(
-                            "agent {alias}: unknown message {id} ({head}) — cadence message reconcile {id} --status interrupted"
-                        ),
-                    ));
-                }
-            }
-            if !named && show["unknown"].as_i64().unwrap_or(0) > 0 {
-                recon.push(Finding::new(
-                    format!("unknown:{alias}"),
-                    agent_proj(alias),
-                    Sev::Fail,
-                    format!("agent {alias}: unknown message(s) — cadence agent show {alias}"),
-                ));
-            }
-        }
-        // `doing` issues with no live owner.
-        for v in &sc.views {
-            if v.status != "doing" {
-                continue;
-            }
-            let id = &v.issue.front.id;
-            let text = match v.issue.front.owner.as_deref() {
-                None => Some(format!(
-                    "{id} doing with no owner — cadence issue set {id} owner=<alias>"
-                )),
-                Some(owner) => {
-                    let live = fl.agents.iter().any(|a| {
-                        a["alias"].as_str() == Some(owner)
-                            && !a["dead"].as_bool().unwrap_or(false)
-                            && !matches!(
-                                a["state"].as_str().unwrap_or_default(),
-                                "stopped" | "stopping" | "offline"
-                            )
-                    });
-                    (!live).then(|| {
-                        format!("{id} doing but owner {owner} is not live — resume or reassign")
-                    })
-                }
-            };
-            if let Some(text) = text {
-                recon.push(Finding::new(
-                    format!("doing:{id}"),
-                    Some(v.issue.project.clone()),
-                    Sev::Warn,
-                    text,
-                ));
-            }
-        }
-        // Open PR on a cadence/<wt> branch whose local worktree is gone
-        // (only checked where the PR's repo has a declared checkout —
-        // the worktree may legitimately live on another host).
-        let (pr_branches, gh_repos) = gh_open(&opts.state_dir, &sc, false);
-        for (slug, data) in &gh_repos {
-            let Some((key, _, root)) = sc
-                .repos
-                .iter()
-                .find(|(_, s, _)| s.as_deref() == Some(slug.as_str()))
-            else {
-                continue;
-            };
-            for pr in data["prs"].as_array().cloned().unwrap_or_default() {
-                let Some(head) = pr["headRefName"].as_str() else {
-                    continue;
-                };
-                let Some(name) = layout::name_of_branch(head) else {
-                    continue;
-                };
-                if !layout::worktree_dir(root, name).exists() {
-                    let n = pr["number"].as_i64().unwrap_or(0);
-                    recon.push(Finding::new(
-                        format!("pr:{slug}#{n}"),
-                        Some(key.clone()),
-                        Sev::Warn,
-                        format!(
-                            "PR #{n} branch {head} — no {} locally",
-                            layout::rel_dir(name)
-                        ),
-                    ));
-                }
-            }
-        }
-        // `.cadence/wt/*` with neither an open PR nor an open issue.
-        for (root, name) in worktree_dirs(&sc.repos) {
-            let branch = layout::branch(&name);
-            let has_pr = pr_branches.contains(&branch);
-            let open_issue = issue_stem(&name)
-                .and_then(|id| sc.issue_status.get(&id))
-                .is_some_and(|s| !matches!(s.as_str(), "done" | "dropped"));
-            if !has_pr && !open_issue {
-                let project = checkout_project(&sc.repos, &root);
-                let rel = layout::rel_dir(&name);
-                recon.push(Finding::new(
-                    orphan_worktree_key(&root, &rel),
-                    project,
-                    Sev::Warn,
-                    orphan_worktree_text(&root, &rel),
-                ));
-            }
-        }
+        let (mut recon, inbox) = collect_overview_needs(opts, &owner_of);
+        collect_unknown_message_findings(&fl, &owner_of, &mut recon);
+        collect_stalled_doing_findings(&sc, &fl, &mut recon);
+        collect_worktree_reconcile_findings(opts, &sc, &mut recon);
         rows.push(findings_row(
             "reconcile",
             recon,
