@@ -360,7 +360,7 @@ export async function runLinkedWhatsAppAction(
 export async function runOfficialWhatsAppAction(
   installId: string,
   action: OfficialWhatsAppActionName,
-  opts?: { timeoutMs?: number; favcrmCompanyId?: string; idempotencyKey?: string },
+  opts?: { timeoutMs?: number; favcrmCompanyId?: string },
 ): Promise<{
   connect?: OfficialConnectResult;
   official?: OfficialWhatsAppSnapshot;
@@ -371,7 +371,6 @@ export async function runOfficialWhatsAppAction(
   const safeId = assertSafeInstallId(installId);
   const payload: Record<string, string> = {};
   if (opts?.favcrmCompanyId) payload.favcrm_company_id = opts.favcrmCompanyId;
-  if (opts?.idempotencyKey) payload.idempotency_key = opts.idempotencyKey;
   return postJsonMutation(
     `/api/apps/${safeId}/whatsapp-settings/official/${action}`,
     "POST",

@@ -434,12 +434,36 @@ export default function WhatsAppSettingsPanel({
           ),
         );
       } else if (result.official) {
-        setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
-        if (action === "link" || action === "disconnect") {
+        if (action === "disconnect") {
+          if (!result.disconnected) {
+            setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
+            setActionError(t("Could not disconnect Official WhatsApp connection."));
+            return;
+          }
+          setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
           setOfficialInspectResult(null);
-          if (action === "link") setFavcrmCompanyInput("");
+          if (!result.favcrm_revoked) {
+            setActionError(
+              t("Workspace unlinked locally, but upstream FavCRM revocation could not be confirmed."),
+            );
+            return;
+          }
+          if (notice) setStatusNotice(notice);
+        } else if (
+          action === "link" &&
+          (!result.official.available || result.official.binding_status !== "active")
+        ) {
+          setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
+          setActionError(t("Could not link FavCRM workspace."));
+          return;
+        } else {
+          setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
+          if (action === "link") {
+            setOfficialInspectResult(null);
+            setFavcrmCompanyInput("");
+          }
+          if (notice) setStatusNotice(notice);
         }
-        if (notice) setStatusNotice(notice);
       }
       changedRef.current?.();
     } catch (err) {

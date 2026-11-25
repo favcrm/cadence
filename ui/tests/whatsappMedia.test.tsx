@@ -184,12 +184,14 @@ async function testProtocolAndChannel(): Promise<void> {
     let ready = 0;
     let failed = 0;
     const sampleBytes = new TextEncoder().encode("PNG-DATA").buffer;
+    let lastDownloadProvider: unknown;
     const actions: ScreenActions = {
       call: async () => ({ ok: true, data: null }),
       planner: async () => ({ code: "forbidden", text: "no" }),
       onSlot: () => {},
       onLink: () => {},
-      onWhatsAppMediaDownload: async (_conv, _msg, signal) => {
+      onWhatsAppMediaDownload: async (_conv, _msg, signal, provider) => {
+        lastDownloadProvider = provider;
         opts.abortedSignals?.push(signal);
         if (opts.resolvers) {
           return await new Promise((resolve) => {
@@ -218,13 +220,18 @@ async function testProtocolAndChannel(): Promise<void> {
       channel,
       port: pair.port2,
       replies,
+      providers: () => ({ download: lastDownloadProvider }),
       state: () => ({ ready, failed }),
       close: () => { channel.close(); pair.port2.close(); },
     };
   };
 
-  // Admitted read-only member frame transfers ArrayBuffer cleanly
-  const member = mountFrame({ ops: ["whatsapp.messages"] });
+  // Admitted read-only member frame transfers ArrayBuffer cleanly & passes Official provider to host download handler
+  const officialSaved: { fileName: string }[] = [];
+  const member = mountFrame({
+    ops: ["whatsapp.messages"],
+    onSave: (_bytes, _mimeType, fileName) => officialSaved.push({ fileName }),
+  });
   try {
     await flush();
     assert(member.state().ready === 1 && member.state().failed === 0, "member frame with whatsapp.messages becomes ready");
@@ -232,6 +239,17 @@ async function testProtocolAndChannel(): Promise<void> {
     await flush();
     const reply = member.replies.find((m) => m.op === "whatsapp-media-reply");
     assert(reply && reply.ok === true && reply.bytes instanceof ArrayBuffer && new TextDecoder().decode(reply.bytes) === "PNG-DATA" && reply.mime_type === "image/png" && reply.file_name === "shot.png", "ArrayBuffer transfers via whatsapp-media-reply");
+    assert(member.providers().download === "linked", "default whatsapp-media routes to linked provider");
+
+    member.port.postMessage({ v: 2, op: "whatsapp-media", id: "dl_off", conversation_id: "conv_off_1", message_id: "m_off_1", disposition: "download", provider: "official" });
+    await flush();
+    const offReply = member.replies.find((m) => m.op === "whatsapp-media-reply" && m.id === "dl_off");
+    assert(
+      offReply?.ok === true &&
+        member.providers().download === "official" &&
+        officialSaved.some((s) => s.fileName === "shot.png"),
+      "official whatsapp-media passes provider='official' to download handler and saves file",
+    );
   } finally {
     member.close();
   }
@@ -364,8 +382,10 @@ async function testScreenServicesMedia(): Promise<void> {
   const realFetch = globalThis.fetch;
   let nextResponse!: () => Response;
   let lastRequestHeaders: Headers | undefined;
+  let lastRequestBody: unknown;
   globalThis.fetch = (async (_input: any, init?: RequestInit) => {
     lastRequestHeaders = new Headers(init?.headers);
+    lastRequestBody = init?.body;
     return nextResponse();
   }) as unknown as typeof fetch;
 
@@ -475,6 +495,13 @@ async function testScreenServicesMedia(): Promise<void> {
       });
     const staged = await services.stageWhatsAppMedia(sampleFile);
     assert(staged.ok && staged.data.attachment_id === attId && !lastRequestHeaders?.has("content-type"), "stageWhatsAppMedia returns receipt without manual Content-Type");
+    assert(lastRequestBody instanceof FormData && lastRequestBody.get("provider") === "linked", "stageWhatsAppMedia defaults FormData provider to linked");
+
+    const stagedOfficial = await services.stageWhatsAppMedia(sampleFile, "official");
+    assert(
+      stagedOfficial.ok && lastRequestBody instanceof FormData && lastRequestBody.get("provider") === "official",
+      "stageWhatsAppMedia forwards provider='official' in FormData",
+    );
 
     // stage 404 / 413 / 415 / 409 / 403 operation_not_declared must NOT retire mount
     for (const [status, expectedCode, body] of [
@@ -508,10 +535,13 @@ async function testScreenServicesMedia(): Promise<void> {
 
     // deleteStagedWhatsAppMedia 200
     nextResponse = () => Response.json({ deleted: true }, { status: 200 });
-    const del = await services.deleteStagedWhatsAppMedia(attId);
-    assert(del.ok, "deleteStagedWhatsAppMedia succeeds");
+    const del = await services.deleteStagedWhatsAppMedia(attId, "official");
+    assert(
+      del.ok && typeof lastRequestBody === "string" && JSON.parse(lastRequestBody).provider === "official",
+      "deleteStagedWhatsAppMedia forwards provider='official'",
+    );
 
-    // downloadWhatsAppMedia 200, SVG refusal, SHA mismatch refusal, 404/409/422 without retiring mount
+    // downloadWhatsAppMedia 200 (linked + official), SVG refusal, SHA mismatch refusal, 404/409/422 without retiring mount
     nextResponse = () =>
       new Response(samplePng, {
         status: 200,
@@ -523,6 +553,13 @@ async function testScreenServicesMedia(): Promise<void> {
       });
     const dlOk = await services.downloadWhatsAppMedia("1555@s.whatsapp.net", "m1");
     assert(dlOk.ok && dlOk.fileName === "image.png" && dlOk.bytes.byteLength === samplePng.byteLength, "downloadWhatsAppMedia verifies bytes and filename");
+    const dlOfficialOk = await services.downloadWhatsAppMedia("conv_off_1", "m_off_1", undefined, "official");
+    assert(
+      dlOfficialOk.ok &&
+        typeof lastRequestBody === "string" &&
+        JSON.parse(lastRequestBody).provider === "official",
+      "downloadWhatsAppMedia forwards provider='official' in JSON request body",
+    );
 
     nextResponse = () =>
       new Response(new TextEncoder().encode("<svg></svg>"), {

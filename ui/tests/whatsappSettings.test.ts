@@ -28,6 +28,285 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+declare function require(name: string): any;
+
+async function flushUi(turns = 10): Promise<void> {
+  for (let i = 0; i < turns; i += 1) {
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+  }
+}
+
+async function testPanelPopupOriginAndDisconnect(): Promise<void> {
+  const { Window } = require("happy-dom");
+  const win = new Window({ url: "http://localhost/apps/waba" });
+  const prevDescriptors = new Map<string, PropertyDescriptor | undefined>();
+  for (const name of [
+    "window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement",
+    "HTMLTextAreaElement", "HTMLButtonElement", "navigator", "MutationObserver",
+    "Event", "MouseEvent", "KeyboardEvent", "MessageEvent", "FocusEvent", "location",
+  ]) {
+    prevDescriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+    Object.defineProperty(globalThis, name, {
+      value: name === "window" ? win : win[name],
+      configurable: true,
+      writable: true,
+    });
+  }
+  const prevActEnv = Object.getOwnPropertyDescriptor(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+  Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true, configurable: true, writable: true });
+
+  const loader = require("module");
+  const originalRequire = loader.prototype.require;
+  loader.prototype.require = function (this: unknown, id: string) {
+    if (id.endsWith(".css")) return {};
+    if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
+    if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
+    return originalRequire.apply(this, arguments);
+  };
+
+  const originalFetch = globalThis.fetch;
+  const originalOpen = win.open;
+  let getCount = 0;
+  let officialConnected = false;
+  let settingsChangedCount = 0;
+  let disconnectMode: "refused" | "partial" | "ok" = "refused";
+  const openCalls: Array<{ url: string; target?: string; features?: string }> = [];
+
+  try {
+    win.open = (url?: string | URL, target?: string, features?: string) => {
+      openCalls.push({ url: String(url ?? ""), target, features });
+      return null;
+    };
+
+    const currentSnapshot = () => ({
+      viewer_role: "owner",
+      active_provider: "official",
+      reply_mode: "copilot",
+      settings_revision: 4,
+      linked: { available: true, granted: true, state: "idle", connected: false, qr: null },
+      official: {
+        available: true,
+        enabled: true,
+        paused: false,
+        connected: officialConnected,
+        binding_status: "active",
+        company_name: "Demo Business",
+        display_phone_number: officialConnected ? "+852 5555 0148" : null,
+        verified_name: officialConnected ? "Demo Business" : null,
+        waba_id: officialConnected ? "waba_1" : null,
+        phone_number_id: officialConnected ? "pn_1" : null,
+        webhook: null,
+        observed_at: "2026-11-25T12:00:00Z",
+      },
+    });
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith("/api/apps/install_panel/whatsapp-settings")) {
+        getCount += 1;
+        return jsonResponse(currentSnapshot());
+      }
+      if (url.endsWith("/api/apps/install_panel/whatsapp-settings/official/connect")) {
+        return jsonResponse({ url: "https://portal.favcrm.example.test/wa/connect?token=ok", expires_at: "2026-11-25T13:00:00Z" });
+      }
+      if (url.endsWith("/api/apps/install_panel/whatsapp-settings/official/disconnect")) {
+        if (disconnectMode === "refused") {
+          return jsonResponse({
+            disconnected: false,
+            favcrm_revoked: false,
+            official: currentSnapshot().official,
+          });
+        }
+        if (disconnectMode === "partial") {
+          return jsonResponse({
+            disconnected: true,
+            favcrm_revoked: false,
+            official: { ...currentSnapshot().official, connected: false, binding_status: "revoked" },
+          });
+        }
+        return jsonResponse({
+          disconnected: true,
+          favcrm_revoked: true,
+          official: {
+            available: true,
+            enabled: true,
+            paused: false,
+            connected: false,
+            binding_status: "revoked",
+            company_name: null,
+            display_phone_number: null,
+            verified_name: null,
+            waba_id: null,
+            phone_number_id: null,
+            webhook: null,
+            observed_at: "2026-11-25T12:05:00Z",
+          },
+        });
+      }
+      return jsonResponse({}, 404);
+    }) as typeof fetch;
+
+    const React = require("react") as typeof import("react");
+    const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+    const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+    const WhatsAppSettingsPanel = (
+      require("../src/features/workspace-apps/WhatsAppSettingsPanel") as typeof import("../src/features/workspace-apps/WhatsAppSettingsPanel")
+    ).default;
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await React.act(async () => {
+        root.render(
+          React.createElement(
+            LocaleProvider,
+            null,
+            React.createElement(WhatsAppSettingsPanel, {
+              installId: "install_panel",
+              initialMode: "official",
+              onUnsupported: () => {},
+              onSettingsChanged: () => {
+                settingsChangedCount += 1;
+              },
+            }),
+          ),
+        );
+        await flushUi();
+      });
+
+      const buttonWith = (text: string) =>
+        [...container.querySelectorAll("button")].find((b) => b.textContent?.includes(text)) as HTMLButtonElement | undefined;
+
+      const connectBtn = buttonWith("Connect via FavCRM");
+      assert(connectBtn, "Connect via FavCRM button renders for linked un-connected workspace");
+
+      await React.act(async () => {
+        connectBtn.click();
+        await flushUi();
+      });
+
+      assert(
+        openCalls.length === 1 &&
+          openCalls[0]!.url === "https://portal.favcrm.example.test/wa/connect?token=ok" &&
+          openCalls[0]!.target === "favcrm-waba-connect" &&
+          openCalls[0]!.features === "popup,width=640,height=780" &&
+          !openCalls[0]!.features.includes("noopener"),
+        "popup opens without noopener so window.opener stays available",
+      );
+      assert(container.textContent?.includes("Continue setup in FavCRM"), "auth fallback link renders while popup active");
+
+      const getsBeforeEvil = getCount;
+      await React.act(async () => {
+        win.dispatchEvent(
+          new win.MessageEvent("message", {
+            origin: "https://evil.example.test",
+            data: { type: "favcrm:whatsapp-connected" },
+          }),
+        );
+        win.dispatchEvent(
+          new win.MessageEvent("message", {
+            origin: "https://portal.favcrm.example.test",
+            data: { type: "favcrm:unrelated" },
+          }),
+        );
+        await flushUi();
+      });
+      assert(getCount === getsBeforeEvil, "untrusted origins and unrelated messages are ignored");
+
+      // Focus while still disconnected refreshes snapshot cleanly
+      await React.act(async () => {
+        win.dispatchEvent(new win.FocusEvent("focus"));
+        await flushUi();
+      });
+      assert(getCount === getsBeforeEvil + 1, "window focus triggers silent snapshot re-read");
+
+      // Trusted origin + favcrm:whatsapp-connected flips connected state and clears auth banner
+      officialConnected = true;
+      const changedBeforeMsg = settingsChangedCount;
+      await React.act(async () => {
+        win.dispatchEvent(
+          new win.MessageEvent("message", {
+            origin: "https://portal.favcrm.example.test",
+            data: { type: "favcrm:whatsapp-connected" },
+          }),
+        );
+        await flushUi();
+      });
+      assert(
+        getCount === getsBeforeEvil + 2 &&
+          settingsChangedCount > changedBeforeMsg &&
+          container.textContent?.includes("Official WhatsApp connected.") &&
+          !container.textContent?.includes("Continue setup in FavCRM"),
+        "trusted portal postMessage refreshes connected snapshot and clears setup link",
+      );
+
+      // Disconnect with disconnected=false refuses rather than claiming success
+      const openDisconnectConfirm = () => buttonWith("Disconnect");
+      await React.act(async () => {
+        openDisconnectConfirm()!.click();
+        await flushUi();
+      });
+      const confirmRevoke = [...container.querySelectorAll("button")].find(
+        (b) => b.textContent?.includes("Disconnect") && b.className.includes("danger"),
+      ) as HTMLButtonElement | undefined;
+      assert(confirmRevoke, "inline disconnect confirmation button renders");
+
+      disconnectMode = "refused";
+      await React.act(async () => {
+        confirmRevoke.click();
+        await flushUi();
+      });
+      assert(
+        container.textContent?.includes("Could not disconnect Official WhatsApp connection."),
+        "disconnect with disconnected=false surfaces failure notice",
+      );
+
+      // Disconnect with disconnected=true, favcrm_revoked=false reports partial revoke warning
+      disconnectMode = "partial";
+      await React.act(async () => {
+        buttonWith("Disconnect")!.click();
+        await flushUi();
+      });
+      const confirmPartial = [...container.querySelectorAll("button")].find(
+        (b) => b.textContent?.includes("Disconnect") && b.className.includes("danger"),
+      ) as HTMLButtonElement;
+      await React.act(async () => {
+        confirmPartial.click();
+        await flushUi();
+      });
+      assert(
+        container.textContent?.includes("upstream FavCRM revocation could not be confirmed"),
+        "disconnect with favcrm_revoked=false surfaces explicit upstream revoke warning",
+      );
+
+      // Clean end-to-end disconnect
+      disconnectMode = "ok";
+      officialConnected = true;
+      await React.act(async () => {
+        // Reload connected state via focus refresh first or direct connected fixture check -> trigger Recheck
+        buttonWith("Refresh")?.click();
+        await flushUi();
+      });
+    } finally {
+      React.act(() => { root.unmount(); });
+      container.remove();
+    }
+  } finally {
+    loader.prototype.require = originalRequire;
+    globalThis.fetch = originalFetch;
+    win.open = originalOpen;
+    for (const [name, desc] of prevDescriptors.entries()) {
+      if (desc) Object.defineProperty(globalThis, name, desc);
+      else delete (globalThis as Record<string, unknown>)[name];
+    }
+    if (prevActEnv) Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", prevActEnv);
+    else delete (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT;
+  }
+}
+
 async function main() {
   allowPrivateReads();
 
@@ -289,10 +568,23 @@ async function main() {
     assert(officialOk.connect?.url === "https://portal.favcrm.example.test/wa/connect?token=ok", "valid HTTPS Official connect URL accepted");
 
     const inspectOk = await runOfficialWhatsAppAction("install_waba", "inspect", { favcrmCompanyId: "cmp_new_1" });
-    assert(inspectOk.inspect?.workspaceName === "Demo Business" && inspectOk.inspect.role === "owner", "Official inspect returns workspace preview");
+    const inspectReq = [...seenRequests].reverse().find((r) => r.url.endsWith("/official/inspect"));
+    assert(
+      inspectOk.inspect?.workspaceName === "Demo Business" &&
+        inspectOk.inspect.role === "owner" &&
+        inspectReq?.body === JSON.stringify({ favcrm_company_id: "cmp_new_1" }),
+      "Official inspect sends favcrm_company_id and returns workspace preview",
+    );
 
     const linkOk = await runOfficialWhatsAppAction("install_waba", "link", { favcrmCompanyId: "cmp_new_1" });
-    assert(linkOk.official?.available && linkOk.official.binding_status === "active" && linkOk.official.company_name === "Demo Business", "Official link returns active binding snapshot");
+    const linkReq = [...seenRequests].reverse().find((r) => r.url.endsWith("/official/link"));
+    assert(
+      linkOk.official?.available &&
+        linkOk.official.binding_status === "active" &&
+        linkOk.official.company_name === "Demo Business" &&
+        linkReq?.body === JSON.stringify({ favcrm_company_id: "cmp_new_1" }),
+      "Official link sends favcrm_company_id and returns active binding snapshot",
+    );
 
     const rescopeOk = await runOfficialWhatsAppAction("install_waba", "rescope");
     assert(rescopeOk.official?.available && rescopeOk.official.binding_status === "active", "Official rescope refreshes snapshot");
@@ -345,6 +637,7 @@ async function main() {
     globalThis.fetch = originalFetch;
   }
 
+  await testPanelPopupOriginAndDisconnect();
   console.log("whatsappSettings tests passed");
 }
 
