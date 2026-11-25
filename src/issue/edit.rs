@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::issue::model;
 use crate::issue::write::{self, check_tags};
-use crate::issue::{parse, time, Pm};
+use crate::issue::{parse, time, Pm, PmLock};
 
 /// What one `issue edit` asks for. Bodies arrive as text: the CLI
 /// reads files and stdin, so the writer never touches either.
@@ -67,6 +67,59 @@ fn is_http(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
+struct ParsedEdit<'a> {
+    tag_delta: Vec<(bool, String)>,
+    links: Vec<(bool, &'a str, &'a str)>,
+    refs: Vec<(String, String)>,
+    unrefs: Vec<(String, String)>,
+    attachments: Vec<(String, Vec<u8>)>,
+    acceptance: Option<Vec<parse::AcceptanceItem>>,
+    comment: Option<(String, Vec<crate::secret::Finding>)>,
+}
+
+struct PreparedEdit {
+    prev: model::Front,
+    front: model::Front,
+    body: String,
+    changed: Vec<String>,
+    forced: Option<String>,
+    write_issue: bool,
+}
+
+struct EditCommitCtx<'a> {
+    pm: &'a Pm,
+    lock: &'a PmLock,
+    dir: &'a Path,
+    id: &'a str,
+    actor: &'a str,
+}
+
+struct EditOutputCtx<'a> {
+    pm: &'a Pm,
+    dir: &'a Path,
+    id: &'a str,
+    state_dir: Option<&'a Path>,
+    foreign: Vec<String>,
+    comment_name: Option<String>,
+}
+
+fn parse_ref_pairs(flag: &str, raws: &[String]) -> Result<Vec<(String, String)>> {
+    raws.iter()
+        .map(|raw| {
+            part(flag, || {
+                let (kind, target) = if is_http(raw) {
+                    ("url", raw.as_str())
+                } else {
+                    split_kind(flag, raw)?
+                };
+                model::check_ref_kind(kind)?;
+                model::check_ref_value(target)?;
+                Ok((kind.to_string(), target.to_string()))
+            })
+        })
+        .collect()
+}
+
 pub fn edit(
     pm: &Pm,
     id: &str,
@@ -82,6 +135,43 @@ pub fn edit(
     let (project, dir) = write::issue_dir(pm, id)?;
 
     // Phase 1 — parts that need no tracker state.
+    let parsed = parse_edit_inputs(pm, id, spec)?;
+
+    // Phase 2 — under the lock, apply every part to the front and body
+    // in memory. Nothing is on disk until all of it holds.
+    //
+    // CAD-1600: the lock is scoped to this ticket's own directory —
+    // the edit writes `issue.md` and files under `artifacts/` and
+    // `comments/`, all inside it. A crashed writer's leftovers on
+    // other tickets no longer refuse an unrelated edit, while a
+    // leftover inside this ticket still does.
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
+    let prepared = apply_edit_in_memory(pm, &project, &dir, id, spec, &parsed)?;
+
+    // Phase 3 — write everything, then one commit. Any failure undoes
+    // every file this edit touched.
+    let commit_ctx = EditCommitCtx {
+        pm,
+        lock: &lock,
+        dir: &dir,
+        id,
+        actor,
+    };
+    let (foreign, comment_name) = write_and_commit_edit(&commit_ctx, spec, &parsed, &prepared)?;
+
+    // Phase 4 — best-effort post-commit inspection & notices.
+    let out_ctx = EditOutputCtx {
+        pm,
+        dir: &dir,
+        id,
+        state_dir,
+        foreign,
+        comment_name,
+    };
+    Ok(build_edit_output(out_ctx, spec, &parsed, &prepared))
+}
+
+fn parse_edit_inputs<'a>(pm: &Pm, id: &str, spec: &'a EditSpec) -> Result<ParsedEdit<'a>> {
     let mut tag_delta: Vec<(bool, String)> = Vec::new();
     for raw in &spec.tags {
         let (add, tag) = match raw.strip_prefix('-') {
@@ -106,41 +196,11 @@ pub fn edit(
             })
         })
         .collect::<Result<_>>()?;
-    let refs: Vec<(String, String)> = spec
-        .refs
-        .iter()
-        .map(|raw| {
-            part("--ref", || {
-                let (kind, target) = if is_http(raw) {
-                    ("url", raw.as_str())
-                } else {
-                    split_kind("--ref", raw)?
-                };
-                model::check_ref_kind(kind)?;
-                model::check_ref_value(target)?;
-                Ok((kind.to_string(), target.to_string()))
-            })
-        })
-        .collect::<Result<_>>()?;
+    let refs = parse_ref_pairs("--ref", &spec.refs)?;
     // CAD-1522: the inverse of `--ref`, parsed and validated exactly
     // like it so a malformed `--unref` refuses before anything is
     // written. Whether each target exists is checked under the lock.
-    let unrefs: Vec<(String, String)> = spec
-        .unrefs
-        .iter()
-        .map(|raw| {
-            part("--unref", || {
-                let (kind, target) = if is_http(raw) {
-                    ("url", raw.as_str())
-                } else {
-                    split_kind("--unref", raw)?
-                };
-                model::check_ref_kind(kind)?;
-                model::check_ref_value(target)?;
-                Ok((kind.to_string(), target.to_string()))
-            })
-        })
-        .collect::<Result<_>>()?;
+    let unrefs = parse_ref_pairs("--unref", &spec.unrefs)?;
     let mut attachments: Vec<(String, Vec<u8>)> = Vec::new();
     for file in &spec.attach {
         part("--attach", || {
@@ -193,22 +253,31 @@ pub fn edit(
         })?),
         None => None,
     };
+    Ok(ParsedEdit {
+        tag_delta,
+        links,
+        refs,
+        unrefs,
+        attachments,
+        acceptance,
+        comment,
+    })
+}
 
-    // Phase 2 — under the lock, apply every part to the front and body
-    // in memory. Nothing is on disk until all of it holds.
-    //
-    // CAD-1600: the lock is scoped to this ticket's own directory —
-    // the edit writes `issue.md` and files under `artifacts/` and
-    // `comments/`, all inside it. A crashed writer's leftovers on
-    // other tickets no longer refuse an unrelated edit, while a
-    // leftover inside this ticket still does.
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    let (prev, prev_body) = write::load_front(&dir)?;
+fn apply_edit_in_memory(
+    pm: &Pm,
+    project: &crate::issue::project::Project,
+    dir: &Path,
+    id: &str,
+    spec: &EditSpec,
+    parsed: &ParsedEdit<'_>,
+) -> Result<PreparedEdit> {
+    let (prev, prev_body) = write::load_front(dir)?;
     let mut front = prev.clone();
     let mut body = prev_body.clone();
     let mut changed: Vec<String> = Vec::new();
 
-    for (kind, target) in &refs {
+    for (kind, target) in &parsed.refs {
         front
             .refs
             .push(write::new_ref(kind, target, None, None, None));
@@ -217,7 +286,7 @@ pub fn edit(
     // CAD-1522: remove refs by exact kind+target. A target that is not
     // there refuses the whole edit: the caller asked for a correction
     // that cannot be made, and silently doing nothing would hide it.
-    for (kind, target) in &unrefs {
+    for (kind, target) in &parsed.unrefs {
         part("--unref", || {
             let before = front.refs.len();
             front.refs.retain(|r| {
@@ -234,7 +303,7 @@ pub fn edit(
         })?;
         changed.push(format!("unref:{kind}"));
     }
-    for (unlink, kind, target) in &links {
+    for (unlink, kind, target) in &parsed.links {
         let flag = if *unlink { "--unlink" } else { "--link" };
         part(flag, || {
             write::apply_link(pm, &mut front, kind, target, *unlink)
@@ -246,13 +315,13 @@ pub fn edit(
     }
     if !spec.set.is_empty() {
         let keys = part("--set", || {
-            write::apply_pairs(&project, &mut front, &spec.set)
+            write::apply_pairs(project, &mut front, &spec.set)
         })?;
         changed.extend(keys.into_iter().map(|k| format!("set:{k}")));
     }
-    if !tag_delta.is_empty() {
+    if !parsed.tag_delta.is_empty() {
         let mut tags = front.tags.clone();
-        for (add, tag) in &tag_delta {
+        for (add, tag) in &parsed.tag_delta {
             if *add {
                 tags.push(tag.clone());
             } else {
@@ -260,14 +329,14 @@ pub fn edit(
             }
         }
         part("--tag", || {
-            front.tags = check_tags(&project, &tags)?;
+            front.tags = check_tags(project, &tags)?;
             Ok(())
         })?;
         if front.tags != prev.tags {
             changed.push(format!("tags={}", front.tags.join(",")));
         }
     }
-    if let Some(items) = &acceptance {
+    if let Some(items) = &parsed.acceptance {
         part("--acceptance", || {
             body = parse::replace_acceptance(&body, items)?;
             Ok(())
@@ -277,18 +346,18 @@ pub fn edit(
     // The gates `issue set` runs, over the final front: a `--ref pr:`
     // or an `--attach` named review*/…verdict… in the same edit counts
     // as evidence for `status=done` — both land in this one commit.
-    let staged_names: Vec<String> = attachments.iter().map(|(n, _)| n.clone()).collect();
+    let staged_names: Vec<String> = parsed.attachments.iter().map(|(n, _)| n.clone()).collect();
     let forced = part("--set", || {
         write::check_set_gates(
             pm,
-            &project,
+            project,
             &prev,
             &front,
             spec.force.as_deref(),
             &staged_names,
         )
     })?;
-    if !links.is_empty() {
+    if !parsed.links.is_empty() {
         part("--link", || {
             let mut preview = crate::issue::board::load_all(&pm.dir, None)?;
             if let Some(this) = preview.iter_mut().find(|i| i.front.id == id) {
@@ -299,13 +368,17 @@ pub fn edit(
     }
     let issue_text = parse::render(&front, &body)?;
     let prev_text = parse::render(&prev, &prev_body)?;
-    let file = dir.join("issue.md");
     let write_issue = issue_text != prev_text;
-    changed.extend(attachments.iter().map(|(n, _)| format!("attach:{n}")));
-    if comment.is_some() {
+    changed.extend(
+        parsed
+            .attachments
+            .iter()
+            .map(|(n, _)| format!("attach:{n}")),
+    );
+    if parsed.comment.is_some() {
         changed.push("comment".to_string());
     }
-    if !write_issue && attachments.is_empty() && comment.is_none() {
+    if !write_issue && parsed.attachments.is_empty() && parsed.comment.is_none() {
         return Err(Error::rejected(
             "edit changes nothing — pass at least one effective part \
              (--set, --tag, --link, --unlink, --ref, --attach, --acceptance, --comment-file)",
@@ -313,9 +386,9 @@ pub fn edit(
     }
     for sub in ["artifacts", "comments"] {
         let wanted = if sub == "artifacts" {
-            !attachments.is_empty()
+            !parsed.attachments.is_empty()
         } else {
-            comment.is_some()
+            parsed.comment.is_some()
         };
         if wanted
             && dir
@@ -328,29 +401,43 @@ pub fn edit(
             )));
         }
     }
+    Ok(PreparedEdit {
+        prev,
+        front,
+        body,
+        changed,
+        forced,
+        write_issue,
+    })
+}
 
-    // Phase 3 — write everything, then one commit. Any failure undoes
-    // every file this edit touched.
+fn write_and_commit_edit(
+    ctx: &EditCommitCtx<'_>,
+    spec: &EditSpec,
+    parsed: &ParsedEdit<'_>,
+    prepared: &PreparedEdit,
+) -> Result<(Vec<String>, Option<String>)> {
+    let file = ctx.dir.join("issue.md");
     let issue_prev = write::file_preimage(&file);
     let mut created: Vec<PathBuf> = Vec::new();
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut comment_name = None;
     let written = (|| -> Result<Vec<String>> {
-        if write_issue {
-            write::save_front(&dir, &front, &body)?;
+        if prepared.write_issue {
+            write::save_front(ctx.dir, &prepared.front, &prepared.body)?;
             paths.push(file.clone());
         }
-        if !attachments.is_empty() {
-            let artifacts = dir.join("artifacts");
+        if !parsed.attachments.is_empty() {
+            let artifacts = ctx.dir.join("artifacts");
             std::fs::create_dir_all(&artifacts)?;
-            for (name, bytes) in &attachments {
+            for (name, bytes) in &parsed.attachments {
                 let path = write::create_exclusive(&artifacts, name, bytes)?;
                 created.push(path.clone());
                 paths.push(path);
             }
         }
-        if let Some((author, _)) = &comment {
-            let comments = dir.join("comments");
+        if let Some((author, _)) = &parsed.comment {
+            let comments = ctx.dir.join("comments");
             std::fs::create_dir_all(&comments)?;
             let epoch = time::now_epoch();
             let meta = model::CommentFront {
@@ -368,30 +455,30 @@ pub fn edit(
             created.push(path.clone());
             paths.push(path);
         }
-        let mut ids: Vec<&str> = vec![id];
-        for (_, _, target) in &links {
+        let mut ids: Vec<&str> = vec![ctx.id];
+        for (_, _, target) in &parsed.links {
             if !ids.contains(target) {
                 ids.push(target);
             }
         }
-        let mut summary = format!("{id}: edit {}", changed.join(" "));
-        if let Some(reason) = &forced {
+        let mut summary = format!("{}: edit {}", ctx.id, prepared.changed.join(" "));
+        if let Some(reason) = &prepared.forced {
             summary.push_str(&format!(" (forced: {reason})"));
         }
         write::commit_who_scoped(
-            pm,
-            &lock,
+            ctx.pm,
+            ctx.lock,
             &paths,
             &summary,
             &ids,
-            actor,
+            ctx.actor,
             spec.author.as_deref(),
         )
     })();
     let foreign = match written {
         Ok(f) => f,
         Err(e) => {
-            if write_issue {
+            if prepared.write_issue {
                 write::restore_preimage(&file, issue_prev);
             }
             for path in &created {
@@ -400,12 +487,21 @@ pub fn edit(
             return Err(e);
         }
     };
+    Ok((foreign, comment_name))
+}
+
+fn build_edit_output(
+    ctx: EditOutputCtx<'_>,
+    spec: &EditSpec,
+    parsed: &ParsedEdit<'_>,
+    prepared: &PreparedEdit,
+) -> Value {
     // The commit landed. Everything below is best-effort (CAD-908): a
     // failing step warns on stderr and in `post_commit_warnings`, and
     // never turns a landed edit into a reported failure — a retry
     // would post the comment twice.
     let mut post: Vec<String> = Vec::new();
-    let rev = match write::issue_rev(&dir) {
+    let rev = match write::issue_rev(ctx.dir) {
         Ok(rev) => json!(rev),
         Err(e) => {
             write::post_commit_warning(&mut post, format!("rev unavailable: {e}"));
@@ -413,28 +509,33 @@ pub fn edit(
         }
     };
     let mut out = json!({
-        "id": id,
+        "id": ctx.id,
         "rev": rev,
-        "changed": changed,
+        "changed": prepared.changed,
         "committed": true,
     });
     // `issue link` parity: lint-style warnings, and the CAD-757 notice
     // to the holders of a held ticket for each new blocked_by edge.
     out["warnings"] = json!(write::blocked_warnings_best_effort(
-        pm, id, state_dir, &mut post
+        ctx.pm,
+        ctx.id,
+        ctx.state_dir,
+        &mut post
     ));
     // Notices follow the FINAL blocked_by: a target linked and unlinked
     // in this one edit is not a blocker, and its holders hear nothing.
-    let notices: Vec<Value> = links
+    let notices: Vec<Value> = parsed
+        .links
         .iter()
         .filter(|(unlink, kind, target)| {
             !unlink
                 && *kind == "blocked_by"
-                && front.blocked_by.iter().any(|t| t == target)
-                && !prev.blocked_by.iter().any(|t| t == target)
+                && prepared.front.blocked_by.iter().any(|t| t == target)
+                && !prepared.prev.blocked_by.iter().any(|t| t == target)
         })
         .map(|(_, _, target)| {
-            let mut n = crate::issue::blocked::notify_new_blocker(&front, target, state_dir);
+            let mut n =
+                crate::issue::blocked::notify_new_blocker(&prepared.front, target, ctx.state_dir);
             n["target"] = json!(target);
             n
         })
@@ -446,22 +547,23 @@ pub fn edit(
     // worktree ref is still open tells the CLI to print the
     // `issue finish` hint, even when it was already done.
     if write::sets_done(&spec.set)
-        && front
+        && prepared
+            .front
             .refs
             .iter()
             .any(|r| r.kind == "worktree" && r.closed != Some(true))
     {
-        out["worktree_open"] = json!([id]);
+        out["worktree_open"] = json!([ctx.id]);
     }
-    if let Some(name) = comment_name {
+    if let Some(name) = ctx.comment_name {
         out["comment"] = json!(name);
     }
-    if let Some((_, warnings)) = &comment {
+    if let Some((_, warnings)) = &parsed.comment {
         if !warnings.is_empty() {
             out["secret_warnings"] = crate::secret::warnings_json(warnings);
         }
     }
     write::attach_post_warnings(&mut out, &post);
-    write::attach_foreign(&mut out, &foreign);
-    Ok(out)
+    write::attach_foreign(&mut out, &ctx.foreign);
+    out
 }
