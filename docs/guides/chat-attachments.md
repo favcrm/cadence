@@ -327,6 +327,17 @@ the prompt. Text-only or unknown image support refuses that message without
 changing the selected model/provider. Live use requires an operator-selected,
 admitted image-capable runtime; this feature does not change runtime policy.
 
+In a hosted conversation that offers **Prepare edit**, attach the Library
+image, enter the edit instructions, then choose **Prepare edit**. Ordinary
+**Send** (including Enter) sends the pinned image to the assistant for
+discussion or inspection; it does not prepare a reference edit. Preparing an
+edit shows the pinned original, instructions and quote for **Allow once** or
+**Deny**. It does not run or charge for the edit. The control only appears
+when the host advertises the action and supports the attached original's media
+type. Other supported chat images can still be sent for inspection.
+
+### Native reference edits
+
 The assistant uses `media.refine.prepare` with the pinned asset id, revision,
 original digest and the user's instructions. An unpinned or different image
 refuses. The native host freezes the source, supported image model, instructions,

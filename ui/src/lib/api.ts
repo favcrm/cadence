@@ -1129,13 +1129,15 @@ export const api = {
     ),
   /** Generic app-assistant/v1 discovery, durable operations and scoped permissions. */
   assistantActions: (installId: string, contextId: string) =>
-    get<{ contract: "app-assistant/v1"; actions: unknown[]; descriptor_digest: string }>(
+    get<{ contract: "app-assistant/v1"; actions: unknown[]; descriptor_digest: string; prepare?: unknown }>(
       `/api/app-installations/${encodeURIComponent(installId)}/assistant/actions?context_id=${encodeURIComponent(contextId)}`,
     ),
   assistantOperations: (installId: string, contextId: string) =>
     get<{ operations: unknown[] }>(
       `/api/app-installations/${encodeURIComponent(installId)}/assistant/operations?context_id=${encodeURIComponent(contextId)}`,
     ),
+  assistantPrepare: (installId: string, body: { context_id: string; action_id: "media.refine.prepare"; request_id: string; input: { asset_id: string; revision: number; sha256: string; instructions: string } }) =>
+    post<{ operation: unknown }>(`/api/app-installations/${encodeURIComponent(installId)}/assistant/operations`, body),
   assistantOperation: (installId: string, operationId: string) =>
     get<{ operation: unknown }>(
       `/api/app-installations/${encodeURIComponent(installId)}/assistant/operations/${encodeURIComponent(operationId)}`,

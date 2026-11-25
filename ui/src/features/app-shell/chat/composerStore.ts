@@ -373,12 +373,11 @@ export function reserveDraft(key: string): DraftReservation | null {
   return token;
 }
 
-/** Settle a reserved handoff. `accepted` clears the text/refs only when
- *  the version is still the one reserved, so a later explicit edit is
- *  never discarded; a rejected handoff keeps the envelope for an explicit
- *  retry. Either way only this reservation is released, and the cell is
- *  found through the handle even after a scope or frame move. */
-export function settleDraft(reservation: DraftReservation, accepted: boolean): void {
+/** Settle a reserved handoff. A prepared edit consumes its text and image,
+ *  but not unrelated refs or queued files. Later edits and replacement pins
+ *  survive; a rejected handoff keeps the entire envelope for retry. The
+ *  handle finds its original cell even after a scope or frame move. */
+export function settleDraft(reservation: DraftReservation, accepted: boolean | "prepare"): void {
   const held = reservations.get(reservation);
   if (!held) return;
   reservations.delete(reservation);
@@ -388,7 +387,7 @@ export function settleDraft(reservation: DraftReservation, accepted: boolean): v
   if (accepted && cell.libraryImage === held.libraryImage) cell.libraryImage = null;
   if (accepted && cell.version === held.version) {
     cell.text = "";
-    cell.refs = EMPTY_REFS;
+    if (accepted === true) cell.refs = EMPTY_REFS;
     cell.version += 1;
   }
   captureBinding(cell);

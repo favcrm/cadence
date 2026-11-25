@@ -11,6 +11,7 @@ import {
 } from "react";
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
+import { onPrivateSessionReset } from "../../../lib/privateSession";
 import { parseSlash, SLASH_COMMANDS, slashMatches, WORKSPACE_SKILLS_COMMAND, type SlashCommand } from "../../home/master";
 import type { PendingAttachment } from "../../home/thread";
 import WorkspaceSkillPicker from "../../home/WorkspaceSkillPicker";
@@ -144,6 +145,12 @@ export interface ComposerProps {
   onResolveOriginal?: () => void;
   /** Compact only: host actions (CAD-1431) listed in a More actions menu. */
   actions?: ComposerAction[];
+  prepareEdit?: {
+    maxBytes: number;
+    scope: string;
+    sourceMediaTypes: string[];
+    submit: (input: { asset_id: string; revision: number; sha256: string; instructions: string }, requestId: string) => Promise<void>;
+  };
   /**
    * CAD-1880: this pane's turn is stoppable. Stop takes the send slot while
    * a turn runs — the dock no longer carries a working row, so the action
@@ -176,6 +183,8 @@ export interface ComposerAction {
 /** CAD-2422: a message longer than this (UTF-8) is sent as a text attachment.
  *  Large enough for any ordinary message; small next to the 256 KiB model request. */
 const LONG_TEXT_BYTES = 32 * 1024;
+const prepareAttempts = new Map<string, string>();
+onPrivateSessionReset(() => prepareAttempts.clear());
 /** CAD-2422: per composer key, the long text already copied into an
  *  attachment row and that row, so the next send carries the row in its
  *  place while the text itself never leaves the box until it is sent. */
@@ -436,6 +445,7 @@ export default function Composer({
   originalUnresolved = false,
   onResolveOriginal,
   actions,
+  prepareEdit,
   stop = null,
   onArrowUpEmpty,
   mentionCandidates,
@@ -623,6 +633,31 @@ export default function Composer({
   const keepRefused = (arg: string) => {
     if (arg === "") box.current?.select();
   };
+  const prepare = () => {
+    const instructions = draft.trim();
+    if (!prepareEdit || !libraryPin || !prepareEdit.sourceMediaTypes.includes(libraryPin.media_type) || block || !instructions) {
+      onNotice?.("Preparing an edit is unavailable. Check the image and try again.");
+      return;
+    }
+    if (new TextEncoder().encode(instructions).length > prepareEdit.maxBytes) {
+      onNotice?.({ key: "Edit instructions are too long. Keep them within {bytes} bytes.", slots: { bytes: String(prepareEdit.maxBytes) } });
+      return;
+    }
+    const reservation = reserveDraft(key);
+    if (reservation === null) {
+      onNotice?.("Still sending the previous message — wait for it to settle");
+      return;
+    }
+    const input = { asset_id: libraryPin.asset_id, revision: libraryPin.revision, sha256: libraryPin.sha256, instructions };
+    const fingerprint = JSON.stringify([key, prepareEdit.scope, input]);
+    const requestId = prepareAttempts.get(fingerprint) ?? crypto.randomUUID();
+    prepareAttempts.set(fingerprint, requestId);
+    void prepareEdit.submit(input, requestId).then(() => {
+      if (prepareAttempts.get(fingerprint) === requestId) prepareAttempts.delete(fingerprint);
+      settleDraft(reservation, "prepare");
+    }, () => settleDraft(reservation, false));
+  };
+
 
   const submit = () => {
     const body = draft.trim();
@@ -994,6 +1029,7 @@ export default function Composer({
             {attachInput}
             {attachControl(true)}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
+            {prepareEdit && libraryPin && prepareEdit.sourceMediaTypes.includes(libraryPin.media_type) && <button type="button" className="lnk text-label min-h-8 px-2" disabled={!!block || reserved || !draft.trim()} onClick={prepare}>{t("Prepare edit")}</button>}
             {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
           </div>
         </div>

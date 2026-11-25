@@ -178,6 +178,7 @@ function parseRecordPreview(value: unknown): RecordPreview | null {
 }
 const MEDIA_PREVIEW_KEYS = ["asset_id", "revision", "sha256", "title", "artifact_ref", "instructions", "workflow", "slot", "model", "quote", "estimate_micros", "currency", "allow_once"] as const;
 const MEDIA_QUOTE_KEYS = ["schema", "currency", "unit_price_micros", "units", "total_price_micros", "price_revision"] as const;
+const MEDIA_INSTRUCTION_LIMIT = 2000;
 function closedKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const seen = Object.keys(value);
   return seen.length === keys.length && keys.every((key) => seen.includes(key));
@@ -198,7 +199,7 @@ function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
   const sha = text(preview.sha256, 71);
   const title = text(preview.title, 200);
   const artifact = text(preview.artifact_ref, 256);
-  const instructions = text(preview.instructions, 2000);
+  const instructions = text(preview.instructions, MEDIA_INSTRUCTION_LIMIT);
   const slot = text(preview.slot, 64);
   const model = text(preview.model, 80);
   const revision = preview.revision;
@@ -259,7 +260,7 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
 }
 function parseOperation(value: unknown): Operation | null {
   const v = record(value);
-  if (!v || !text(v.id, 128) || !text(v.action_id, 64) || !statuses.has(String(v.status)) ||
+  if (!v || !text(v.id, 128) || !text(v.action_id, 64) || typeof v.status !== "string" || !statuses.has(v.status) ||
       !Number.isSafeInteger(v.revision) || !text(v.summary, 500) || !Array.isArray(v.resource_refs)) return null;
   const refs = v.resource_refs.map(parseRef);
   if (refs.some((ref) => ref === null)) return null;
@@ -276,6 +277,23 @@ function parseOperation(value: unknown): Operation | null {
     permission_request: request,
     error: text(v.error, 500),
   };
+}
+export function matchesPrepareReceipt(value: unknown, installId: string, contextId: string, input: { asset_id: string; revision: number; sha256: string; instructions: string }): boolean {
+  const operation = parseOperation(value);
+  if (!operation || operation.action_id !== "media.refine.prepare" || operation.revision < 1) return false;
+  if (operation.status !== "pending_permission") return true;
+  const request = operation.permission_request;
+  const preview = request?.mediaPreview;
+  return request !== null && !request.allow_always && request.scope.install_id === installId &&
+    request.scope.context_id === contextId && request.scope.action_id === "media.refine.prepare" &&
+    request.scope.resource_id === input.asset_id && preview !== null && preview !== undefined &&
+    preview.asset_id === input.asset_id && preview.revision === input.revision &&
+    preview.sha256 === input.sha256 && preview.instructions === input.instructions;
+}
+
+export interface PrepareCapability {
+  maxBytes: number;
+  sourceMediaTypes: string[];
 }
 function parsePermission(value: unknown): Permission | null {
   const v = record(value);
@@ -472,12 +490,13 @@ interface AssistantData {
   actions: Action[];
   operations: Operation[];
   permissions: Permission[];
+  prepare: PrepareCapability | null;
   error: string | null;
   /** The app's assistant descriptor is not consented yet: a calm, permanent-until-approved state. */
   consent: boolean;
 }
 function emptyData(scopeKey: string): AssistantData {
-  return { scopeKey, connectionRevision: null, actions: [], operations: [], permissions: [], error: null, consent: false };
+  return { scopeKey, connectionRevision: null, actions: [], operations: [], permissions: [], prepare: null, error: null, consent: false };
 }
 
 /** How a failed read settles. `none`: the app declares no assistant actions
@@ -498,7 +517,14 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange }: {
+// A confirmed write can outlive its originating pane. Notify just the active
+// readers of that installation/context, including readers that remounted.
+const operationWriteListeners = new Set<(installId: string, contextId: string) => void>();
+export function notifyAssistantOperationWrite(installId: string, contextId: string): void {
+  for (const listener of operationWriteListeners) listener(installId, contextId);
+}
+
+export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange, onPrepareChange }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
@@ -510,6 +536,7 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   /** The transcript snapshot this scope must reconcile before actions become live. */
   connectionRevision: number;
   onPendingChange: (pending: boolean, reconciledRevision: number | null) => void;
+  onPrepareChange: (capability: PrepareCapability | null, reconciledRevision: number | null) => void;
 }) {
   const t = useTranslate();
   const scopeKey = JSON.stringify([installId, contextId]);
@@ -531,6 +558,9 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   useEffect(() => {
     onPendingChange(pendingDecision, reconciledRevision);
   }, [pendingDecision, reconciledRevision, onPendingChange]);
+  useEffect(() => {
+    onPrepareChange(visible.error ? null : visible.prepare, reconciledRevision);
+  }, [visible.prepare, visible.error, reconciledRevision, onPrepareChange]);
 
   useEffect(() => {
     // An unresolved context owns no poller and sends no assistant requests.
@@ -565,6 +595,15 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
         const actionResponse = actions.value;
         const operationResponse = operations.value;
         const permissionResponse = permissions.value;
+        const prepare = record(actionResponse.prepare);
+        const maxBytes = prepare?.max_instruction_bytes;
+        const mediaTypes = prepare?.source_media_types;
+        const capability: PrepareCapability | null =
+          prepare?.action_id === "media.refine.prepare" &&
+          typeof maxBytes === "number" && Number.isSafeInteger(maxBytes) && maxBytes > 0 &&
+          Array.isArray(mediaTypes) && mediaTypes.length > 0 &&
+          mediaTypes.every((value) => typeof value === "string" && /^image\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(value))
+            ? { maxBytes: Math.min(maxBytes, MEDIA_INSTRUCTION_LIMIT), sourceMediaTypes: mediaTypes } : null;
         if (!Array.isArray(actionResponse.actions) || !Array.isArray(operationResponse.operations) || !Array.isArray(permissionResponse.permissions)) {
           throw new Error("The assistant service returned an invalid response.");
         }
@@ -574,6 +613,7 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
           actions: actionResponse.actions.map(parseAction).filter((v): v is Action => v !== null),
           operations: operationResponse.operations.map((row) => parseOperation(record(row)?.operation ?? row)).filter((v): v is Operation => v !== null),
           permissions: permissionResponse.permissions.map((row) => parsePermission(record(row)?.permission ?? row)).filter((v): v is Permission => v !== null),
+          prepare: capability,
           error: null,
           consent: false,
         });
@@ -623,6 +663,9 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     const resumeRead = () => {
       if (alive && !document.hidden) void written();
     };
+    const onOperationWrite = (writtenInstall: string, writtenContext: string) => {
+      if (writtenInstall === installId && writtenContext === contextId) void written();
+    };
 
     const handle: Poller = { alive: () => alive, written, refresh: poll };
     // No context yet: nothing to ask for (an empty context ID is a 400).
@@ -630,9 +673,11 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     poller.current = handle;
     document.addEventListener("visibilitychange", resumeRead);
     const unsubscribeMaster = subscribeMasterChanged(resumeRead);
+    operationWriteListeners.add(onOperationWrite);
     return () => {
       alive = false;
       document.removeEventListener("visibilitychange", resumeRead);
+      operationWriteListeners.delete(onOperationWrite);
       unsubscribeMaster();
       if (poller.current === handle) poller.current = null;
     };
