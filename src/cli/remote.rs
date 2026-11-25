@@ -33,6 +33,20 @@ fn unsupported(verb: &str, flag: &str, why: &str) -> Error {
     Error::rejected(format!("remote `{verb}` cannot {flag} — {why}"))
 }
 
+fn validate_review_id(id: &str) -> Result<()> {
+    let valid = id.strip_prefix("revjob_").is_some_and(|token| {
+        !token.is_empty()
+            && token.len() <= 200
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    });
+    if !valid {
+        return Err(Error::rejected("invalid review job id — nothing was sent"));
+    }
+    Ok(())
+}
+
 /// The kinds a hosted project timeline entry can carry (CAD-2240).
 const TIMELINE_KINDS: [&str; 7] = [
     "created", "status", "owner", "claim", "comment", "message", "review",
@@ -583,14 +597,126 @@ fn verb_for(
         Commands::Issue {
             action:
                 cadence_agent::issue::cli::IssueAction::Review {
+                    action: Some(action),
+                    ..
+                },
+        } => {
+            use cadence_agent::issue::cli::WorkflowReviewAction;
+            args.insert("version".into(), json!("hosted-cadence-review-workflow.v1"));
+            match action {
+                WorkflowReviewAction::Request {
+                    issue,
+                    target,
+                    slot,
+                    agent,
+                    text,
+                    file,
+                } => {
+                    if slot.is_some() != agent.is_some() {
+                        return Err(Error::rejected(
+                            "--slot and --agent must be supplied together",
+                        ));
+                    }
+                    args.insert("issue".into(), json!(issue));
+                    for (key, value) in [("target", target), ("slot", slot), ("agent", agent)] {
+                        if let Some(value) = value {
+                            args.insert(key.into(), json!(value));
+                        }
+                    }
+                    if text.is_some() || file.is_some() {
+                        if slot.is_none() {
+                            return Err(Error::rejected(
+                                "a review brief requires --slot and --agent",
+                            ));
+                        }
+                        let body = read_body_capped(text.clone(), file.clone(), 16 * 1024)?;
+                        if body.trim().is_empty() || body.len() > 16 * 1024 {
+                            return Err(Error::rejected(
+                                "review brief must be nonblank and at most 16 KiB",
+                            ));
+                        }
+                        args.insert("text".into(), json!(body));
+                    }
+                    "review_request"
+                }
+                WorkflowReviewAction::Submit {
+                    review_id,
+                    decision,
+                    text,
+                    file,
+                } => {
+                    validate_review_id(review_id)?;
+                    let report = read_body_capped(text.clone(), file.clone(), 256 * 1024)?;
+                    if report.trim().is_empty() || report.len() > 256 * 1024 {
+                        return Err(Error::rejected(
+                            "a review report must be nonblank and at most 256 KiB",
+                        ));
+                    }
+                    args.insert("review_id".into(), json!(review_id));
+                    args.insert("decision".into(), json!(decision));
+                    args.insert("report".into(), json!(report));
+                    "review_submit"
+                }
+            }
+        }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Claim {
+                    id,
+                    by,
+                    note,
+                    take_over,
+                },
+        } if id.starts_with("revjob_") => {
+            validate_review_id(id)?;
+            if by.is_some() || note.is_some() || take_over.is_some() {
+                return Err(Error::rejected(
+                    "review claims do not accept authoring claim options",
+                ));
+            }
+            args.insert("version".into(), json!("hosted-cadence-review-workflow.v1"));
+            args.insert("review_id".into(), json!(id));
+            "review_claim"
+        }
+        Commands::Delivery {
+            action:
+                DeliveryAction::Ship {
+                    issue,
+                    target,
+                    r#override,
+                    reason,
+                },
+        } => {
+            args.insert("version".into(), json!("hosted-cadence-review-workflow.v1"));
+            args.insert("issue".into(), json!(issue));
+            args.insert("target".into(), json!(target));
+            if *r#override {
+                args.insert("override".into(), json!(true));
+            }
+            if let Some(reason) = reason {
+                args.insert("reason".into(), json!(reason));
+            }
+            "delivery_ship"
+        }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Review {
                     id,
                     artifact,
                     digest,
                     decision,
                     text,
                     file,
+                    ..
                 },
         } => {
+            let (Some(id), Some(artifact), Some(digest), Some(decision)) =
+                (id, artifact, digest, decision)
+            else {
+                return Err(Error::usage(
+                    "issue review requires an issue, artifact, digest and decision",
+                ));
+            };
             if !artifact
                 .strip_prefix("hosted:")
                 .is_some_and(cadence_agent::issue::model::valid_artifact_name)
@@ -3272,6 +3398,14 @@ where
         }
     }
     let (verb, mut args) = verb_for(&command, command_path.as_deref())?;
+    if matches!(verb, "review_claim" | "review_submit") {
+        return Err(Error::rejected(
+            "review claim authority is unavailable: the runtime must provide a server-validated review job grant; no human credential was used",
+        ));
+    }
+    if verb == "delivery_ship" {
+        refuse_managed(&target, "delivery ship")?;
+    }
     let keyed_issue_create = verb == "issue_new" && args.contains_key("request_id");
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
@@ -5713,14 +5847,121 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn hosted_review_workflow_uses_shared_wire_fixture() {
+        use clap::Parser;
+        // Vendored from agenticos-v2/packages/contracts/src/hosted-cadence-review-workflow.fixture.json.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../contracts/hosted-cadence-review-workflow.fixture.json"
+        ))
+        .unwrap();
+        let target = fixture["calls"]["delivery_ship"]["target"]
+            .as_str()
+            .unwrap();
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            (
+                "review_request",
+                vec![
+                    "issue",
+                    "review",
+                    "request",
+                    "SALE-42",
+                    "--target",
+                    target,
+                    "--slot",
+                    "commercial",
+                    "--agent",
+                    "ap_commercial",
+                    "--text",
+                    "Check scope and terms.",
+                ],
+            ),
+            ("review_claim", vec!["issue", "claim", "revjob_example"]),
+            (
+                "review_submit",
+                vec![
+                    "issue",
+                    "review",
+                    "submit",
+                    "revjob_example",
+                    "--decision",
+                    "pass",
+                    "--text",
+                    "Scope and terms checked.",
+                ],
+            ),
+            (
+                "delivery_ship",
+                vec![
+                    "delivery",
+                    "ship",
+                    "SALE-42",
+                    "--target",
+                    target,
+                    "--override",
+                    "--reason",
+                    "Owner accepts the remaining review risk.",
+                ],
+            ),
+        ];
+        for (verb, args) in cases {
+            let mut argv = vec!["cadence"];
+            argv.extend(args);
+            let parsed = crate::cli::Cli::try_parse_from(argv).unwrap();
+            assert!(
+                parsed.agent.is_none(),
+                "recipient --agent must not select the caller"
+            );
+            let (actual, body) = outcome(&parsed.command).unwrap();
+            assert_eq!(actual, verb);
+            assert_eq!(body, fixture["calls"][verb]);
+        }
+    }
+    #[test]
+    fn hosted_review_workflow_refuses_invalid_shapes() {
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect::<Vec<_>>()
+        };
+        for parts in [
+            vec![
+                "issue",
+                "review",
+                "request",
+                "SALE-42",
+                "--slot",
+                "commercial",
+            ],
+            vec!["issue", "review", "request", "SALE-42", "--text", "brief"],
+            vec!["issue", "claim", "revjob_"],
+            vec!["issue", "claim", "revjob_example", "--by", "someone"],
+            vec![
+                "issue",
+                "review",
+                "submit",
+                "revjob_example",
+                "--decision",
+                "approve",
+                "--text",
+                "report",
+            ],
+            vec!["delivery", "ship", "SALE-42", "--target", "x", "--override"],
+        ] {
+            assert!(cad2083_argv(&args(&parts)).is_err());
+        }
+    }
+
+    #[test]
     fn issue_review_sends_the_digest_it_was_given_and_refuses_a_bad_one() {
         let digest = "7743ce348d9284d677a185f33295b92266cc435a5b5f775029b300066d26693a";
         let (verb, args) = outcome(&Commands::Issue {
             action: IssueAction::Review {
-                id: "CAD-1".into(),
-                artifact: "hosted:drafts.md".into(),
-                digest: digest.into(),
-                decision: "pass".into(),
+                action: None,
+                id: Some("CAD-1".into()),
+                artifact: Some("hosted:drafts.md".into()),
+                digest: Some(digest.into()),
+                decision: Some("pass".into()),
                 text: Some("Uses only the supplied facts.".into()),
                 file: None,
             },
@@ -5741,10 +5982,11 @@ mod read_contract_tests {
         let bad = |action: IssueAction| outcome(&Commands::Issue { action }).unwrap_err();
         let review = |artifact: &str, digest: &str, decision: &str, text: Option<&str>| {
             IssueAction::Review {
-                id: "CAD-1".into(),
-                artifact: artifact.into(),
-                digest: digest.into(),
-                decision: decision.into(),
+                action: None,
+                id: Some("CAD-1".into()),
+                artifact: Some(artifact.into()),
+                digest: Some(digest.into()),
+                decision: Some(decision.into()),
                 text: text.map(str::to_string),
                 file: None,
             }

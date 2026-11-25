@@ -117,6 +117,10 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// `settings.*` envelopes (per operation, never the broad `cli.*` pair) —
 /// see [`settings_op_scope`].
 pub const REMOTE_VERBS: &[&str] = &[
+    "review_request",
+    "review_claim",
+    "review_submit",
+    "delivery_ship",
     // cli.read
     "status",
     "my_work",

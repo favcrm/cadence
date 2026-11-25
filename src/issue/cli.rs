@@ -92,6 +92,34 @@ pub enum CheckoutAction {
 }
 
 #[derive(Subcommand)]
+pub enum WorkflowReviewAction {
+    /// Request the configured review workflow for an issue.
+    Request {
+        issue: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, requires = "agent")]
+        slot: Option<String>,
+        #[arg(long, requires = "slot")]
+        agent: Option<String>,
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        #[arg(long, conflicts_with = "text")]
+        file: Option<PathBuf>,
+    },
+    /// Submit findings under the current review claim.
+    Submit {
+        review_id: String,
+        #[arg(long, value_parser = ["pass", "revise", "blocked"])]
+        decision: String,
+        #[arg(long, conflicts_with = "file", required_unless_present = "file")]
+        text: Option<String>,
+        #[arg(long, conflicts_with = "text", required_unless_present = "text")]
+        file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum IssueAction {
     /// Create the PM dir skeleton (pm.yaml, README, .gitignore, git
     /// init + first commit) and install the pre-commit/post-commit
@@ -576,17 +604,25 @@ pub enum IssueAction {
     /// File one reviewer verdict on an exact artifact revision. Hosted only:
     /// the digest must be the `sha256` this reviewer read back, so a verdict
     /// cannot be written for a revision nobody read.
+    #[command(
+        subcommand_precedence_over_arg = true,
+        subcommand_negates_reqs = true,
+        args_conflicts_with_subcommands = true
+    )]
     Review {
-        id: String,
+        #[command(subcommand)]
+        action: Option<WorkflowReviewAction>,
+        #[arg(required = true)]
+        id: Option<String>,
         /// The qualified artifact identifier from `issue show`.
-        #[arg(long)]
-        artifact: String,
+        #[arg(long, required = true)]
+        artifact: Option<String>,
         /// Lowercase hex SHA-256 of the bytes this reviewer read.
-        #[arg(long)]
-        digest: String,
+        #[arg(long, required = true)]
+        digest: Option<String>,
         /// `pass`, `revise` or `blocked`.
-        #[arg(long)]
-        decision: String,
+        #[arg(long, required = true)]
+        decision: Option<String>,
         /// The findings.
         #[arg(short = 'm', long, conflicts_with = "file")]
         text: Option<String>,

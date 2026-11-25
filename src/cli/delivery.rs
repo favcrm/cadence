@@ -182,6 +182,16 @@ pub(crate) enum DeliveryAction {
         #[arg(long)]
         browser_qa: bool,
     },
+    /// Ask the hosted owner route to deliver an exact reviewed target.
+    Ship {
+        issue: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long, requires = "reason")]
+        r#override: bool,
+        #[arg(long, requires = "override")]
+        reason: Option<String>,
+    },
     /// Hosted (CAD-1946): evaluate the merge gate server-side, record an
     /// owner approval + immutable `tenant_delivery_evidence`, sign `v2`
     /// SSHSIG, comment on the PR and enable auto-merge (operator only).
@@ -361,6 +371,11 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
         DeliveryAction::Policy { .. } => {
             return Err(Error::rejected(
                 "delivery policy is hosted-only: select a hosted org with `--org <org>`; nothing was sent",
+            ));
+        }
+        DeliveryAction::Ship { .. } => {
+            return Err(Error::rejected(
+                "delivery ship is hosted-only: select a hosted org with `--org <org>`; nothing was sent",
             ));
         }
         DeliveryAction::Check { .. } => {
