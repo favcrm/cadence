@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { navigate } from "../../lib/useLocation";
 import { useQuery, useResource } from "../../lib/useResource";
@@ -14,13 +14,14 @@ import type { MasterState, ThreadRef } from "../../lib/types";
 import { agentOn } from "../../lib/agentOn";
 import type { HostedTemplateList, HostedTemplateRail } from "../templates/HostedTemplateReview";
 import AssistantComposer from "../app-shell/chat/AssistantComposer";
+import { useAssistantModelState } from "../app-shell/chat/assistantModelState";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { composerDraftState, requestComposerFocus, setComposerDraft } from "../app-shell/chat/composerStore";
 import Conversation from "../app-shell/chat/Conversation";
 import { appendComposerDraft } from "./composerFill";
 import ConversationIdCopy from "./ConversationIdCopy";
 import { tailTop } from "./dock";
-import { WORKSPACE_SKILLS_COMMAND } from "./master";
+import { fmtCommandResult, helpSummary, SLASH_COMMANDS } from "./master";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
 import { homeDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
@@ -151,8 +152,6 @@ export default function MemberChat({
     void store.revalidate();
   }, [store]);
   const [surface, setSurface] = useState<MemberSurface | null>(null);
-  const [memberModelState, setMemberModelState] = useState<MasterState | null>(null);
-  const modelReadSeq = useRef(0);
   const [activityFeed, setActivityFeed] = useState<{ revision: number; turn: MemberLiveTurn | null }>({
     revision: 0,
     turn: null,
@@ -316,41 +315,26 @@ export default function MemberChat({
   const conversationId = surface?.conversation ?? null;
   const available = surface?.ok === true;
   const composerKey = `member-assist:${scope}`;
-  const refreshMemberModelState = useCallback(() => {
-    const seq = ++modelReadSeq.current;
-    if (!available || conversationId === null) {
-      setMemberModelState(null);
-      return;
-    }
-    api
-      .masterState(conversationId)
-      .then((next) => {
-        if (!alive.current || modelReadSeq.current !== seq) return;
-        setMemberModelState(next);
-      })
-      .catch(() => {
-        if (!alive.current || modelReadSeq.current !== seq) return;
-        setMemberModelState((prev) =>
-          prev?.session?.id === conversationId ? prev : null,
-        );
-      });
-  }, [available, conversationId]);
-
-  useEffect(() => {
-    refreshMemberModelState();
-  }, [refreshMemberModelState]);
+  const {
+    offered: memberCommands,
+    canStop: memberCanStop,
+    refresh: refreshMemberModelState,
+    applyStreamSnapshot: applyMemberStreamSnapshot,
+    modelPicker: memberModelPicker,
+  } = useAssistantModelState({
+    hosted: true,
+    conversationId,
+    enabled: available,
+    scopeKey: scope,
+    readOnly,
+    requireLoaded: true,
+    requireConversation: true,
+    excludeCommands: ["new"],
+  });
 
   const attachDestination: AttachDestination | undefined =
     !readOnly && conversationId !== null ? { conversation: conversationId } : undefined;
   const canAttach = attachDestination !== undefined;
-  const canPickModel =
-    !readOnly &&
-    conversationId !== null &&
-    (memberModelState?.commands?.includes("model") ?? false);
-  const canPickEffort =
-    !readOnly &&
-    conversationId !== null &&
-    (memberModelState?.commands?.includes("effort") ?? false);
   const memberAttachmentNames = useMemo(
     () => attachmentNames(thread.data?.entries ?? []),
     [thread.data?.entries],
@@ -403,13 +387,7 @@ export default function MemberChat({
           const snapshot = JSON.parse(data) as MasterState | null;
           if (snapshot?.session?.id === conversationId &&
               (!Object.hasOwn(snapshot, "actor_identity") || snapshot.actor_identity?.conversation_id === conversationId)) {
-            if (
-              snapshot.model !== undefined ||
-              snapshot.effort !== undefined ||
-              snapshot.commands !== undefined
-            ) {
-              setMemberModelState((prev) => ({ ...(prev ?? snapshot), ...snapshot }));
-            }
+            applyMemberStreamSnapshot(snapshot);
             const turn = snapshot.turn;
             if (turn?.conversation === conversationId && turn.state === "working") {
               publish(typeof turn.message === "string" && turn.message !== "" ? turn.message : null);
@@ -440,7 +418,7 @@ export default function MemberChat({
       if (after !== null) resumeActivity.current = { conversation: conversationId, after };
       stream.close();
     };
-  }, [conversationId, store, available, feedRevision]);
+  }, [conversationId, store, available, feedRevision, applyMemberStreamSnapshot]);
   // Auto-open is off here: an artifact opens the drawer when the person asks,
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
@@ -783,7 +761,68 @@ export default function MemberChat({
               density="full"
               storeKey={composerKey}
               block={readOnly ? t("The board is read-only.") : null}
-              commands={[WORKSPACE_SKILLS_COMMAND]}
+              commands={memberCommands}
+              onCommand={(name, arg) => {
+                if (name === "help") {
+                  setSendNote(helpSummary(memberCommands));
+                  return arg ? false : undefined;
+                }
+                if (name === "skills") {
+                  setSendNote(t("Choose a skill from the /skills menu."));
+                  return false;
+                }
+                if (name === "new") {
+                  setSendNote(t("This command isn't available in this workspace. `/help` lists what is."));
+                  return arg ? false : undefined;
+                }
+                const knownSlash = SLASH_COMMANDS.find((c) => c.name === name);
+                if (!knownSlash) {
+                  setSendNote(t("Unknown command — `/help` lists what is available."));
+                  return false;
+                }
+                const known = memberCommands.find((c) => c.name === name);
+                if (!known) {
+                  setSendNote(t("This command isn't available in this workspace. `/help` lists what is."));
+                  return arg ? false : undefined;
+                }
+                if (arg && known.arg === undefined) {
+                  setSendNote(t("This command takes nothing after its name, so it did not run."));
+                  return false;
+                }
+                if (conversationId === null) {
+                  setSendNote(t("Your assistant conversation must be ready before running commands."));
+                  return false;
+                }
+                void api
+                  .masterCommand(name, arg || undefined, undefined, undefined, conversationId)
+                  .then((r) => {
+                    refreshMemberModelState();
+                    const formatted = fmtCommandResult(r);
+                    setSendNote(formatted.text ?? (formatted.value !== undefined ? JSON.stringify(formatted.value) : t("Done")));
+                  })
+                  .catch((e: unknown) => {
+                    setSendNote(e instanceof ApiError ? e.message : String(e));
+                  });
+                return true;
+              }}
+              stop={
+                running !== null && !readOnly && conversationId !== null && memberCanStop
+                  ? {
+                      onStop: () => {
+                        void api
+                          .masterCommand("stop", undefined, undefined, running, conversationId)
+                          .then((r) => {
+                            refreshMemberModelState();
+                            const text = fmtCommandResult(r).text;
+                            if (text) setSendNote(text);
+                          })
+                          .catch((e: unknown) => {
+                            setSendNote(e instanceof ApiError ? e.message : String(e));
+                          });
+                      },
+                    }
+                  : null
+              }
               mentionCandidates={memberMentionCandidates}
               allowNote
               onDraftChange={handoff.onDraftChange}
@@ -809,14 +848,7 @@ export default function MemberChat({
                   : t("Your assistant conversation must be ready before attaching files."),
                 destination: attachDestination,
               }}
-              modelPicker={{
-                master: memberModelState,
-                conversation: conversationId ?? undefined,
-                readOnly,
-                canPickModel,
-                canPickEffort,
-                onRefreshState: refreshMemberModelState,
-              }}
+              modelPicker={memberModelPicker}
               className="card p-2.5 relative"
               placeholder={messagePlaceholder(identity, "personal", t)}
               ariaLabel={messageLabel(identity, "personal", t)}

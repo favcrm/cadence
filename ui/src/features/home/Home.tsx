@@ -16,19 +16,20 @@ import { HomeMentionHandoffCard, useHomeMentionHandoff } from "../mentions/HomeM
 import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import {
   composerBlock,
+  fmtCommandResult,
+  helpText,
   kvRows,
   MASTER,
   masterStatus,
   restingStatus,
-  offeredCommands,
   SLASH_COMMANDS,
-  type SlashCommand,
   START_COMMAND,
   RESUME_COMMAND,
   turnState,
   type MasterStatus,
   type TurnState,
 } from "./master";
+import { useAssistantModelState } from "../app-shell/chat/assistantModelState";
 import { useCanvasFeed } from "../canvas/feed";
 import { BrowserCard } from "../canvas/BrowserPanel";
 import { useBrowserFeed } from "../canvas/browserStore";
@@ -486,26 +487,6 @@ function CmdCard({
       )}
     </div>
   );
-}
-
-/** `/help` — the catalog rendered as a GFM table. */
-function helpText(commands: readonly SlashCommand[]): string {
-  const rows = commands.filter((c) => c.name !== "help").map(
-    (c) => `| \`/${c.name}${c.arg ? ` ${c.arg}` : ""}\` | ${c.blurb} |`,
-  );
-  // A board that runs nothing else has no table worth showing.
-  if (rows.length === 0) return "Just type your message. `/help` is the only command in this workspace right now.";
-  return `**Commands**\n\n| command | what it does |\n|---|---|\n${rows.join("\n")}`;
-}
-
-/** What a `masterCommand` answer shows on its card: a string result is
- * text; a JSON payload is `value` (listed as fields, raw behind a
- * toggle); null is a bare ack. */
-function fmtCommandResult(r: MasterCommandResult): { text?: string; value?: unknown } {
-  const v = r.result;
-  if (typeof v === "string") return { text: v };
-  if (v == null) return { text: r.ok ? "done" : "no result" };
-  return { value: v };
 }
 
 function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean | null }) {
@@ -973,7 +954,6 @@ function MasterHome({
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
   const teammates = useWorkspaceTeammates(hosted === true);
-  const master = useQuery(resources.masterState);
   const [seed, setSeed] = useState<{ text: string; n: number; refs?: ThreadRef[] }>({
     text: "",
     n: 0,
@@ -1019,9 +999,12 @@ function MasterHome({
   const writeBlock = useWriteBlock(readOnly) ?? gateBlock;
   const block = composerBlock(writeBlock, status, hosted);
   const effectiveReadOnly = readOnly || writeBlock !== null || operator !== true;
-  const offered = useMemo(() => offeredCommands(hosted, master.data?.commands), [hosted, master.data?.commands]);
-  const canPickModel = offered.some((c) => c.name === "model");
-  const canPickEffort = offered.some((c) => c.name === "effort");
+  const modelState = useAssistantModelState({
+    hosted,
+    readOnly: readOnly || writeBlock !== null,
+  });
+  const master = modelState.state;
+  const offered = modelState.offered;
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   // The seq watermark for the enter animation: items at or below the mount
@@ -1959,13 +1942,9 @@ function MasterHome({
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               modelPicker={{
-                master: master.data,
+                ...modelState.modelPicker,
                 row: masterRow,
                 conversation: hosted ? (homeConversation ?? undefined) : undefined,
-                readOnly: readOnly || writeBlock !== null,
-                canPickModel,
-                canPickEffort,
-                onRefreshState: () => void resources.masterState.refresh(),
               }}
               attachReason={readOnly
                 ? t("The board is read-only.")
