@@ -7,7 +7,9 @@ import {
   stagedInTurn,
   stagedStatus,
 } from "../src/features/home/turnCards";
+import { api } from "../src/lib/api";
 import { ApiError } from "../src/lib/apiError";
+import { guardedMcpReadRequest } from "./custom-mcp-read-guard.fixture";
 import {
   failureReason,
   outcomeOf,
@@ -27,6 +29,7 @@ import {
   customMcpReturn,
   customMcpStatusView,
   customMcpToolModeLabel,
+  isSameSiteHost,
   mcpFocusParam,
   parseCustomHeadersInput,
   schemaParamSummary,
@@ -265,4 +268,67 @@ equal(
   "removed readOnlyHint warning",
 );
 
-console.log("customMcp: ok");
+// Same-site host detection for skipping redundant intermediate OAuth confirmation.
+assert(isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://mcp.acme.example/oauth/authorize"), "exact host is same-site");
+assert(isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://auth.acme.example/authorize"), "shared apex domain is same-site");
+assert(!isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://accounts.google.com/o/oauth2/v2/auth"), "different apex is cross-site");
+assert(!isSameSiteHost("https://foo.workers.dev/mcp", "https://bar.workers.dev/auth"), "shared workers.dev subdomains are cross-site");
+assert(!isSameSiteHost("https://foo.cadencecloud.app/mcp", "https://bar.cadencecloud.app/auth"), "shared cadencecloud.app subdomains are cross-site");
+assert(isSameSiteHost("https://mcp.shop.com.hk/mcp", "https://auth.shop.com.hk/auth"), "same 2-part ccTLD registrable domain is same-site");
+assert(!isSameSiteHost("https://foo.com.hk/mcp", "https://bar.com.hk/auth"), "different 2-part ccTLD domains are cross-site");
+
+async function testReviewedReadWireContract(): Promise<void> {
+  const realFetch = globalThis.fetch;
+  let capturedPath = "";
+  let capturedMethod = "";
+  let capturedBody: unknown = null;
+  let rejectStale = false;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const rawUrl = input instanceof Request ? input.url : String(input);
+    capturedPath = new URL(rawUrl, "http://localhost").pathname;
+    capturedMethod = init?.method ?? "GET";
+    capturedBody = init?.body ? JSON.parse(String(init.body)) : null;
+    if (rejectStale) {
+      return new Response(
+        JSON.stringify({ error: "Tool catalog changed before approval", code: "stale_revision" }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ connection: { id: "conn_mcp_12345678" } }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    await api.customMcpEnableReviewedRead(
+      "conn_mcp_12345678",
+      guardedMcpReadRequest.tools[0].tool_name,
+      guardedMcpReadRequest.read_guard,
+    );
+    equal(capturedMethod, "POST", "reviewed read enable uses POST");
+    equal(capturedPath, "/api/connections/mcp/conn_mcp_12345678/tools", "reviewed read enable hits tools endpoint");
+    equal(capturedBody, guardedMcpReadRequest, "reviewed read enable matches shared wire fixture");
+
+    rejectStale = true;
+    let staleErr: unknown = null;
+    try {
+      await api.customMcpEnableReviewedRead(
+        "conn_mcp_12345678",
+        guardedMcpReadRequest.tools[0].tool_name,
+        guardedMcpReadRequest.read_guard,
+      );
+    } catch (e: unknown) {
+      staleErr = e;
+    }
+    assert(staleErr instanceof ApiError, "stale_revision throws ApiError");
+    equal(staleErr.status, 409, "stale_revision preserves 409 status");
+    equal(staleErr.code, "stale_revision", "stale_revision preserves error code");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+void testReviewedReadWireContract().then(() => {
+  console.log("customMcp: ok");
+});

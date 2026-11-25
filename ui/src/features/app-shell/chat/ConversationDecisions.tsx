@@ -22,7 +22,7 @@ export default function ConversationDecisions({
   onReview?: () => void;
   /** CAD-2364: the pane's store for this conversation, so its answers' chips read the same list. */
   store?: DecisionsStore;
-  /** CAD-2755: the viewer is the workspace owner, so a custom MCP card offers Always allow. */
+  /** Signed-in members see Always allow on custom MCP cards; `agenticos-v2` authoritatively enforces `403 owner_required` on shared servers and non-MCP actions. */
   canAlwaysAllow?: boolean;
 }) {
   const t = useTranslate();
