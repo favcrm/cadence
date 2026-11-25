@@ -342,7 +342,7 @@ export function customMcpToolModeLabel(mode: CustomMcpToolMode): string {
     case "approval":
       return "Ask approval";
     case "read":
-      return "Auto-read";
+      return "Always allow";
   }
 }
 
