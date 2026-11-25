@@ -128,6 +128,9 @@ pub fn bound_session() -> Option<Arc<AgentSlot>> {
         .clone()
 }
 
+mod managed_publish;
+pub use managed_publish::managed_publish;
+
 /// Wiki traffic and verdicts keep the member's login (operator decision,
 /// AOS-502). An allowlist: anything not named here uses the agent credential.
 pub(super) fn stays_on_login(surface: Surface, verb: &str) -> bool {

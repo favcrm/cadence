@@ -733,6 +733,7 @@ fn stale_delivery_apply_sends_exact_fence_once_and_returns_conflict() {
                 key: TEST_PROJECT.into(),
                 repos: vec![TEST_REPO.into()],
                 delivery_file: None,
+                assigned_reviews_file: None,
                 show: false,
                 preview: false,
                 expect_rev: Some(7),
@@ -797,6 +798,7 @@ fn unfenced_profile_policy_is_refused_but_legacy_policy_still_dispatches() {
         &repos,
         Some(profile_policy),
         None,
+        None,
     )
     .unwrap_err();
     assert!(
@@ -816,6 +818,7 @@ fn unfenced_profile_policy_is_refused_but_legacy_policy_still_dispatches() {
         &repos,
         Some(legacy_policy),
         None,
+        None,
     )
     .unwrap_err();
     assert!(err.to_string().contains("revision_conflict"), "{err}");
@@ -831,6 +834,74 @@ fn unfenced_profile_policy_is_refused_but_legacy_policy_still_dispatches() {
         )]
     );
     assert_eq!(server.request_count(), 2);
+}
+
+#[test]
+fn assigned_review_policy_apply_refuses_legacy_preview_and_preserves_explicit_disable() {
+    let env = ScopedEnv::new();
+    let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for supported in [false, true] {
+        let server = StubRelayServer::start(
+            None,
+            Arc::new(move |verb, _| {
+                if verb == "delivery_policy" {
+                    let mut proposal = json!({"repos": [TEST_REPO], "delivery": null});
+                    if supported {
+                        proposal["assigned_reviews"] = Value::Null;
+                    }
+                    HttpReply::json(
+                        200,
+                        json!({
+                            "state": "preview", "project": TEST_PROJECT,
+                            "expected_revision": 7, "preview_digest": digest, "proposal": proposal,
+                        }),
+                    )
+                } else {
+                    HttpReply::json(
+                        200,
+                        json!({
+                            "state": "recorded", "project": TEST_PROJECT, "repos": [TEST_REPO],
+                            "delivery": null, "revision": 8, "assigned_reviews": null,
+                        }),
+                    )
+                }
+            }),
+        );
+        let endpoint = server.endpoint();
+        env.write_credential(
+            &endpoint,
+            TEST_SUBJECT,
+            TEST_ISSUER,
+            &["cli.read", "cli.write", "audit.approve"],
+        );
+        let result = cadence_agent::delivery::hosted_gate::set_delivery(
+            &target_with(&endpoint, None),
+            5,
+            TEST_PROJECT,
+            &[TEST_REPO.into()],
+            None,
+            Some((7, digest)),
+            Some(&Value::Null),
+        );
+        let mut expected = vec![(
+            "delivery_policy".to_owned(),
+            json!({"project": TEST_PROJECT, "proposal": {"repos": [TEST_REPO], "assigned_reviews": null}}),
+        )];
+        if supported {
+            assert_eq!(result.unwrap().get("assigned_reviews"), Some(&Value::Null));
+            expected.push((
+                "delivery_policy_set".to_owned(),
+                json!({"project": TEST_PROJECT, "repos": [TEST_REPO], "assigned_reviews": null,
+                    "expected_revision": 7, "preview_digest": digest}),
+            ));
+        } else {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("did not preview these exact"));
+        }
+        assert_eq!(server.take_calls(), expected);
+    }
 }
 
 // ---- Scenario 2: Foreign/forged HTTP 200 receipt rejection ----

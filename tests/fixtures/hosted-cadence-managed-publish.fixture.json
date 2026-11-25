@@ -1,0 +1,21 @@
+{
+  "method": "POST",
+  "path": "/__platform/hosted-cadence/ws_26e7601c-d62f-4fc3-8b19-df2980d098d8/repo-publish",
+  "request": {
+    "repo": "favcrm/cadence",
+    "requestId": "5c33622d-ec14-44f6-a42a-0a0119f26e2f",
+    "expectedHead": "cccccccccccccccccccccccccccccccccccccccc",
+    "title": "Update help",
+    "files": [{ "path": "docs/help.md", "contents": "TmV3IGRvY3MuCg==" }]
+  },
+  "receipt": {
+    "ok": true,
+    "data": {
+      "pr": 7,
+      "pullId": "PR_fixture_7",
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "duplicate": false,
+      "url": "https://github.com/favcrm/cadence/pull/7"
+    }
+  }
+}

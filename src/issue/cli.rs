@@ -956,6 +956,10 @@ pub enum ProjectAction {
         /// sent. Omitted: no section, so the default policy applies.
         #[arg(long)]
         delivery_file: Option<std::path::PathBuf>,
+        /// JSON assigned-review settings; use `null` to explicitly disable.
+        /// Use with --preview or the exact preview revision and digest.
+        #[arg(long, conflicts_with = "show")]
+        assigned_reviews_file: Option<std::path::PathBuf>,
         /// Read the recorded policy without changing it.
         #[arg(long, conflicts_with_all = ["repos", "delivery_file", "preview", "expect_rev", "preview_digest"])]
         show: bool,
