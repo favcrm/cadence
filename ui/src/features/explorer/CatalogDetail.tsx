@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
@@ -18,7 +18,7 @@ import {
   pickLocaleEntry,
 } from "../workspace-apps/appLocale";
 import "./explorer.css";
-import { PublicAppDetail } from "./publicDirectory";
+import { CatalogDetailSkeleton, PublicAppDetail } from "./publicDirectory";
 
 /**
  * One catalog app (`/apps/catalog/<id>`). A published public app renders
@@ -36,21 +36,22 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   // CAD-1438: Open spells the canonical `/apps/<key>` route — for the
   // operator resolved against the verified install list, for a member
   // the key route itself proves the mapping before rendering anything.
-  const installs = useInstallations(viewer.operator === true, id).list;
+  const installs = useInstallations(publicHit === "no" && viewer.operator === true, id).list;
   const installed = card?.state === "installed" || card?.state === "off";
   const removed = card?.removed === true;
   const retired = card?.retired === true;
 
+  const setPublicResult = useCallback((found: boolean) => setPublicHit(found ? "yes" : "no"), []);
+
   useEffect(() => {
-    setPublicHit("pending");
-    if (viewer.operator === null) return;
+    if (publicHit !== "no" || viewer.operator === null) return;
     const controller = new AbortController();
     setError(null);
     void appExplorer.entry(id, controller.signal)
       .then((c) => { if (!controller.signal.aborted) setCard(c); })
       .catch((e: unknown) => { if (!controller.signal.aborted) setError(appLoadErrorCopy(e, "Could not load the app. Try again in a moment.")); });
     return () => controller.abort();
-  }, [id, viewer.operator]);
+  }, [id, viewer.operator, publicHit]);
 
   const restore = () => {
     if (!card?.install_id) return;
@@ -64,7 +65,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   if (publicHit !== "no") {
     return (
       <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={t("app catalog detail")}>
-        <PublicAppDetail id={id} viewer={viewer} onResolved={(found) => setPublicHit(found ? "yes" : "no")} />
+        <PublicAppDetail id={id} viewer={viewer} onResolved={setPublicResult} />
       </main>
     );
   }
@@ -86,7 +87,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   }
   if (!card) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
-      <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
+      <CatalogDetailSkeleton label={t("Loading…")} />
     </main>;
   }
 

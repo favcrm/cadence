@@ -1,13 +1,13 @@
 import { useSyncExternalStore } from "react";
 import type { MasterState } from "../../../lib/types";
 import { conversationList } from "../conversationClient";
-import { knownInstalls, onKnownInstallsChanged } from "./chatVisibility";
+import { knownInstalls, observedConversationInstalls, onKnownInstallsChanged } from "./chatVisibility";
 
 function subscribe(listener: () => void): () => void {
   let offLists: (() => void)[] = [];
   const observe = () => {
     offLists.forEach((off) => off());
-    offLists = knownInstalls().map((id) => conversationList(id).subscribe(listener));
+    offLists = observedConversationInstalls().map((id) => conversationList(id).subscribe(listener));
     listener();
   };
   const offInstalls = onKnownInstallsChanged(observe);

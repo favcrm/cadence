@@ -1,6 +1,5 @@
-/* CAD-1565: the public apps directory and one app's detail — card grid,
- * listing story and the workspace release panel. Tokens stay the board's;
- * the decorative cover art lives in appCover.css (AppCover). */
+/* Public catalog controls, app detail and workspace release panel. Gallery
+ * tile styles are shared with Apps home; AppCover is detail art only. */
 
 .pubdir {
   display: block;
@@ -31,85 +30,34 @@
   color: var(--color-ink-500);
 }
 
-.pubdir-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(290px, 100%), 1fr));
-  gap: 20px;
-}
+.pubdir-retired { margin-top: 20px; color: var(--color-ink-400); }
+.pubdir-retired > summary { cursor: pointer; width: fit-content; margin-bottom: 12px; }
 
-/* Whole-card link: the article is the card; the anchor fills it so no
- * control nests inside another control. */
-.pub-card {
-  min-width: 0;
-  overflow: hidden;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  background: var(--color-ink-850);
-  transition: border-color 0.15s ease;
-}
-.pub-card:hover {
-  border-color: var(--color-ink-500);
-}
-.pub-card:has(.pub-card-link:focus-visible) {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 3px;
-}
-.pub-card-link,
-.pub-card-link:hover {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  color: var(--color-ink-300);
-}
-.pub-card-link:focus-visible {
-  outline: none;
-}
-.pub-card-copy {
-  display: flex;
-  flex: 1;
-  min-width: 0;
-  flex-direction: column;
-  padding: 18px;
-}
-.pub-card-category {
-  color: var(--color-ink-500);
-  font-size: var(--text-micro);
-  margin-bottom: 6px;
-}
-.pub-card-title {
-  display: block;
-  font-size: var(--text-cardtitle);
-  font-weight: 600;
+.pub-skeleton-heading { display: grid; gap: 9px; }
+.pub-skeleton-heading > .app-skeleton { height: 13px; width: 92px; }
+.pub-skeleton-heading > .app-skeleton:nth-child(2) { height: 25px; width: min(220px, 80%); }
+.pub-skeleton-heading > .app-skeleton:nth-child(3) { width: min(480px, 92%); }
+.pub-skeleton-heading > .app-skeleton:nth-child(4) { width: 145px; }
+.pub-skeleton-cover { aspect-ratio: 2 / 1; border-radius: 0.5rem; }
+.pub-skeleton-workspace { display: grid; gap: 14px; min-height: 156px; }
+.pub-skeleton-workspace > .app-skeleton { height: 13px; width: 60%; }
+.pub-skeleton-workspace > .app-skeleton:last-child { height: 30px; width: 100%; }
+
+.pub-review.pub-install-review-dialog {
+  width: min(32rem, calc(100% - 2rem));
+  max-height: calc(100% - 2rem);
+  margin: auto;
+  padding: 1.25rem;
+  border: 1px solid var(--color-edge);
+  border-radius: 0.625rem;
   color: var(--color-ink-100);
+  background: var(--color-ink-850);
+  overscroll-behavior: contain;
 }
-.pub-card-summary {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  overflow: hidden;
-  min-height: 2.9em;
-  margin: 7px 0 14px;
-  color: var(--color-ink-400);
-  font-size: var(--text-secondary);
-  line-height: 1.45;
-}
-.pub-card-publisher {
-  color: var(--color-ink-500);
-  font-size: var(--text-micro);
-}
-.pub-card-footer {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  margin-top: auto;
-  padding-top: 20px;
-  font-size: var(--text-micro);
-  color: var(--color-ink-400);
-}
+.pub-install-review-dialog::backdrop { background: var(--color-scrim); }
+.pub-review.pub-install-review-dialog:not([open]) { display: none; }
 
-/* The install/update state a card or the panel wears. */
+/* The install/update state the panel wears. */
 .pub-status {
   display: inline-flex;
   align-items: center;
@@ -363,7 +311,7 @@
   font-size: var(--text-label);
   line-height: 1.55;
 }
-.pub-install-panel:has(.pub-review) {
+.pub-install-panel:has(section.pub-review) {
   position: static;
 }
 .pub-review h2 {
@@ -472,12 +420,9 @@
   }
 }
 @media (width < 640px) {
+  .pubdir-tools .field { flex-basis: 100%; }
+  .pubdir-category { flex-basis: 0; min-width: 0; max-width: none; }
   .pub-version {
     min-height: 44px;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .pub-card {
-    transition: none;
   }
 }

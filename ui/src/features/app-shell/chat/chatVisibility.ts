@@ -34,16 +34,23 @@ export function visibleConversation(): { installId: string; conversation: string
  * looking for its conversation in these installs' observed lists.
  */
 let installs: string[] = [];
+let observedInstalls: string[] = [];
 const installListeners = new Set<() => void>();
 
-export function setKnownInstalls(ids: string[]): void {
-  if (ids.length === installs.length && ids.every((id, index) => id === installs[index])) return;
+export function setKnownInstalls(ids: string[], observed: string[] = ids): void {
+  if (ids.length === installs.length && ids.every((id, index) => id === installs[index]) &&
+      observed.length === observedInstalls.length && observed.every((id, index) => id === observedInstalls[index])) return;
   installs = ids;
+  observedInstalls = observed;
   installListeners.forEach((listener) => listener());
 }
 
 export function knownInstalls(): string[] {
   return installs;
+}
+
+export function observedConversationInstalls(): string[] {
+  return observedInstalls;
 }
 
 export function onKnownInstallsChanged(listener: () => void): () => void {

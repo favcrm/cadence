@@ -1,11 +1,11 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { localizedAppTitle, parseAppDisplayI18n } from "../workspace-apps/appLocale";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
-import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
+import { AppGlyph, TrustChip, useEscape } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 import InstallCheckPanel from "./InstallCheckPanel";
@@ -13,7 +13,7 @@ import { Notice } from "../app-shell/shared/States";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import "./explorer.css";
 import { PublicDirectory } from "./publicDirectory";
-import AppCover from "./AppCover";
+import { AppTile } from "../apps/AppTile";
 
 /**
  * The Apps Explorer (CAD-1471, `/apps/explore`). Published apps come from
@@ -36,7 +36,15 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   const requests = requestsLoad.data;
   const error = catalogLoad.error === null ? null : appLoadErrorCopy(catalogLoad.error, "The catalog didn't load.");
 
-  const tombstones = useMemo(() => catalog ?? [], [catalog]);
+  const retiredListings = (publishedIds: ReadonlySet<string>) => {
+    const cards = catalog?.filter((card) => !publishedIds.has(card.id)) ?? [];
+    return cards.length > 0 && <details className="pubdir-retired">
+      <summary>{t("From the retired catalog")}</summary>
+      <div className="apps-grid">
+        {cards.map((card) => <TombstoneCard key={card.id} card={card} isOp={isOp} />)}
+      </div>
+    </details>;
+  };
 
 
   if (viewer.operator === null && viewer.access === "unavailable") {
@@ -76,7 +84,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
           )}
         </div>
       </div>
-      <PublicDirectory viewer={viewer} />
+      <PublicDirectory viewer={viewer} afterListings={retiredListings} />
 
       {isOp && gitOpen && (
         <GitAdd
@@ -100,16 +108,6 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
       )}
       {catalogLoad.retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
 
-      {tombstones.length > 0 && (
-        <section className="sec" aria-label={t("Earlier catalog apps")}>
-          <h2 className="text-cardtitle font-medium text-ink-100 mb-3">{t("From the retired catalog")}</h2>
-          <div className="pubdir-grid">
-            {tombstones.map((c) => (
-              <TombstoneCard key={c.id} card={c} isOp={isOp} />
-            ))}
-          </div>
-        </section>
-      )}
     </main>
   );
 }
@@ -122,26 +120,20 @@ function TombstoneCard({ card, isOp }: { card: CatalogCard; isOp: boolean }) {
     locale,
     t,
   );
-  return (
-    <article className="pub-card">
-      <Link className="pub-card-link" href={`/apps/catalog/${encodeURIComponent(card.id)}`}
-        aria-labelledby={`retired-name-${card.id}`} aria-describedby={`retired-state-${card.id}`}>
-        <AppCover name={card.name} title={title} category={card.listing?.category} />
-        <span className="pub-card-copy">
-          <span className="pub-card-category">{t("Retired source")}</span>
-          <span className="pub-card-title" id={`retired-name-${card.id}`}>{title}</span>
-          <span className="pub-card-summary">{card.retired_reason ? t(card.retired_reason) : t("Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}</span>
-          <span className="pub-card-footer" id={`retired-state-${card.id}`}>
-            <InstallStateChip state={card.removed ? "removed" : card.state} />
-            <span>{t("Retired")}</span>
-          </span>
-          {isOp && (card.request_count ?? 0) > 0 && (
-            <span className="text-micro text-ink-500">{t("{count} app requests").replace("{count}", String(card.request_count))}</span>
-          )}
-        </span>
-      </Link>
-    </article>
-  );
+  return <AppTile
+    name={card.name}
+    icon={card.listing?.icon}
+    title={title}
+    summary={t(card.retired_reason || "Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}
+    version={card.version ? `v${card.version}` : ""}
+    status={t(card.removed ? "Removed" : card.state === "off" ? "Access off" : card.state === "installed" ? "Installed" : "Retired")}
+    tone={!card.removed && card.state === "installed" ? "" : "muted"}
+    category={t("Retired source")}
+    href={`/apps/catalog/${encodeURIComponent(card.id)}`}
+    meta={isOp && (card.request_count ?? 0) > 0
+      ? <span className="card-publisher">{t("{count} app requests").replace("{count}", String(card.request_count))}</span>
+      : undefined}
+  />;
 }
 
 /** The operator's "Add from Git URL" — a live check against the repo

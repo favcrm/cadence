@@ -383,9 +383,19 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const [menuOpen, setMenuOpen] = useState(false);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   // A full-width canvas folds the sidebar to its rail without touching the person's own preference (CAD-2657).
-  const { collapsed: sidebarPref } = useSidebarPrefs();
+  const { collapsed: sidebarPref, appsOpen } = useSidebarPrefs();
   const canvasFull = useCanvasChrome().full;
   const sidebarCollapsed = sidebarPref || canvasFull;
+  const [desktopSidebar, setDesktopSidebar] = useState(() =>
+    typeof window === "undefined" || typeof window.matchMedia !== "function" || window.matchMedia("(min-width: 1024px)").matches);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(min-width: 1024px)");
+    const update = () => setDesktopSidebar(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   const sidebarCollapseRef = useRef<HTMLButtonElement>(null);
   const setSidebarCollapsed = (collapsed: boolean) => {
     updateSidebarPrefs((prefs) => ({ ...prefs, collapsed }));
@@ -1059,7 +1069,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     if (entering) setAppsVisitTick((n) => n + 1);
   }, [onAppsBrowserRoute]);
   const installationsRefreshKey = `${appsVisitTick}:${appsTick}`;
-  const installations = useInstallations(listReader, installationsRefreshKey, memberHome ? "home" : "list");
+  const installations = useInstallations(listReader, installationsRefreshKey, memberHome ? "home" : "list", meta?.operator === true);
   // A removed or disabled app is not an app to open: drop it from the menu.
   // It stays visible on the Apps surface, which is where it is managed.
   const installed: VerifiedApp[] = useMemo(
@@ -1110,22 +1120,29 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
     : null;
+  const observedAssistantApps = useMemo(() => {
+    const visible = appsOpen && ((desktopSidebar && !sidebarCollapsed) || menuOpen);
+    return new Set(installed.filter((app) => visible || app.installId === activeId).map((app) => app.installId));
+  }, [installed, appsOpen, desktopSidebar, sidebarCollapsed, menuOpen, activeId]);
   const [unreadProbesFallback, setUnreadProbesFallback] = useState(false);
   useEffect(() => {
     setUnreadProbesFallback(false);
-    if (!onAppScreen) return;
+    if (!onAppScreen) {
+      const frame = window.requestAnimationFrame(() => setUnreadProbesFallback(true));
+      return () => window.cancelAnimationFrame(frame);
+    }
     const timer = window.setTimeout(() => setUnreadProbesFallback(true), 2500);
     return () => window.clearTimeout(timer);
   }, [onAppScreen, routeInstallId]);
-  const deferUnreadProbes = onAppScreen && activeApp === null && !unreadProbesFallback;
+  const deferWhatsAppProbes = onAppScreen && activeApp === null && !unreadProbesFallback;
   const [unreadProbesMounted, setUnreadProbesMounted] = useState(() => !onAppScreen);
   useEffect(() => {
     if (!listReader) {
       setUnreadProbesMounted(false);
       return;
     }
-    if (!deferUnreadProbes) setUnreadProbesMounted(true);
-  }, [listReader, deferUnreadProbes]);
+    if (!deferWhatsAppProbes) setUnreadProbesMounted(true);
+  }, [listReader, deferWhatsAppProbes]);
   // CAD-1193: one viewer for every consumer — `access` splits the
   // `operator: null` unknown into "checking" (a probe is still in
   // flight or has never run) and "unavailable" (a completed probe
@@ -1394,12 +1411,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           {onAppScreen && <div ref={setAppActionsTarget} className="app-header-actions-target" />}
         </header>
 
-        {unreadProbesMounted && (
-          <>
-            <AssistantUnreadProbes apps={installed} />
-            <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />
-          </>
-        )}
+        {listReader && <AssistantUnreadProbes apps={installed} observed={unreadProbesFallback ? undefined : observedAssistantApps} />}
+        {listReader && unreadProbesMounted && <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />}
 
         {updateBanner && (
           <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">
@@ -1822,13 +1835,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "apps" && !route.project && (
-          <Apps viewer={viewer} installationsList={installations.list} />
+          <Apps key={`${viewer.operator}:${viewer.readOnly}`} viewer={viewer} installationsList={installations.list} />
         )}
         {route.screen === "appsExplore" && (
           <Explorer viewer={viewer} />
         )}
         {route.screen === "appsCatalog" && (
-          <CatalogDetail id={route.id} viewer={viewer} />
+          <CatalogDetail key={route.id} id={route.id} viewer={viewer} />
         )}
         {route.screen === "appsManage" && (
           <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} appAgentSession={appAgentSession} hosted={hostedBoard} />

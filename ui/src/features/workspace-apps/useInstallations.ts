@@ -30,8 +30,8 @@ export interface InstallationsState {
  *  `name` (the key), `title`, `removed` and `project_link`; nothing else of
  *  the operator's `Installation` is present, so these rows serve app-key
  *  resolution and the menu only. */
-async function memberRows(signal: AbortSignal): Promise<Installation[]> {
-  const home = await appExplorer.home(signal);
+async function memberRows(signal: AbortSignal, shared: boolean): Promise<Installation[]> {
+  const home = await appExplorer.home(signal, shared ? "member" : undefined);
   if (!Array.isArray(home?.installations)) throw new Error("The server returned an invalid app list.");
   return home.installations.map((row) => ({
     install_id: row.install_id,
@@ -46,8 +46,12 @@ async function memberRows(signal: AbortSignal): Promise<Installation[]> {
   }) as unknown as Installation);
 }
 
-export function useInstallations(enabled: boolean, refreshKey: unknown, source: "list" | "home" = "list"): InstallationsState {
-  const [list, setList] = useState<Installation[] | null>(() => (enabled && source === "list" ? readInstallationsSnapshot() : null));
+export function useInstallations(enabled: boolean, refreshKey: unknown, source: "list" | "home" = "list", shareOperatorRead = true): InstallationsState {
+  const authority = source === "home" ? "member" : shareOperatorRead ? "operator" : "viewer";
+  const [loaded, setLoaded] = useState<{ authority: string; list: Installation[] | null }>(() => ({
+    authority, list: enabled && authority === "operator" ? readInstallationsSnapshot() : null,
+  }));
+  const list = loaded.authority === authority ? loaded.list : null;
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -56,28 +60,23 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
     if (!enabled) {
       // Not the operator (any more): drop the last operator list and state.
       dropInstallationsSnapshot();
-      setList(null); setError(null); setRetrying(false); setLoading(false);
+      setLoaded({ authority, list: null }); setError(null); setRetrying(false); setLoading(false);
       return;
     }
-    if (source === "list") {
-      setList((prev) => prev ?? readInstallationsSnapshot());
+    if (authority === "operator") {
+      setLoaded((prev) => ({ authority, list: prev.authority === authority ? prev.list ?? readInstallationsSnapshot() : readInstallationsSnapshot() }));
     }
     const controller = new AbortController();
     setLoading(true);
     setRetrying(false);
-    loadWithBackoff(
-      () => source === "home"
-        ? memberRows(controller.signal)
-        : readInstallationsGuarded(controller.signal),
-      {
-        signal: controller.signal,
-        onRetry: () => { if (!controller.signal.aborted) setRetrying(true); },
-      },
-    ).then(
+    loadWithBackoff(() => source === "home" ? memberRows(controller.signal, manual === 0) : readInstallationsGuarded(controller.signal, shareOperatorRead && manual === 0, authority === "operator"), {
+      signal: controller.signal,
+      onRetry: () => { if (!controller.signal.aborted) setRetrying(true); },
+    }).then(
       (value) => {
         if (controller.signal.aborted) return;
         if (!Array.isArray(value)) { setError("The server returned an invalid app list."); }
-        else { setList(value); setError(null); }
+        else { setLoaded({ authority, list: value }); setError(null); }
         setRetrying(false); setLoading(false);
       },
       (cause: unknown) => {
@@ -86,7 +85,7 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
       },
     );
     return () => controller.abort();
-  }, [enabled, refreshKey, manual, source]);
+  }, [enabled, refreshKey, manual, source, shareOperatorRead, authority]);
   const retry = useCallback(() => setManual((n) => n + 1), []);
   return { list, error, retrying, loading, retry };
 }

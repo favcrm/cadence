@@ -441,17 +441,16 @@ under "Recently removed" for 30 days. Within that window
 consent for the same bytes. After the window it refuses: the install can only
 stay removed, and the page no longer offers Restore. Restore remains available
 in **Recently removed** on the Apps page and in historical Explorer details.
-Directory cards are whole links without nested actions. The installed
-gallery's cards open the app itself (`/apps/<key>`); an operator's small
+The installed gallery's cards open the app itself (`/apps/<key>`); an operator's
 settings action on each card opens `/apps/manage/<id>`.
 
 ## Explorer routes
 
 In the board, `/apps` is the installed-app home, including Favorites and project
-apps. **Explore apps** opens the native directory at `/apps/explore`. Each
-directory card opens `/apps/catalog/<id>` with its overview, features, releases
-and workspace panel; installed-gallery cards open the app at `/apps/<key>`, with
-a small operator settings action to `/apps/manage/<id>`.
+apps. **Explore apps** (`/apps/explore`) uses the same icon tiles with search,
+category and installation-status filters. Each directory card is one link to
+`/apps/catalog/<id>`; it does not launch the app. Published listings appear once;
+earlier entries without a published match remain under the retired catalog.
 
 On a compatible hosted board, use **Manage → Default app agent** to select an
 existing active profile for your own conversations in an approved installation.
@@ -465,9 +464,10 @@ Ask questions about installed apps in the regular Home chat. The assistant
 can use the app tools available to that conversation. Proposals still follow
 the existing review and approval flow.
 
-A verified operator selects an immutable published release, chooses **Review
-installation** or **Review update**, reviews the checked package and access
-changes, then explicitly confirms Apply. Fresh installs may choose an older
+For a fresh install, a verified operator chooses **Review & install** to check the
+selected immutable release. The dialog shows its requested access and compatibility.
+Confirm **Install** there only after the check succeeds. Updates still start with
+**Review update**. Fresh installs may choose an older
 eligible release. Updates may skip the recommendation for an eligible intermediate
 version, but never downgrade or run automatically. Apply rechecks publication,
 digest and the checked installation/catalogue generation. A withdrawn release

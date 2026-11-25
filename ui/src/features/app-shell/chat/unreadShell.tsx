@@ -84,11 +84,12 @@ function UnreadProbe({ installId }: { installId: string }) {
   return null;
 }
 
-/** One observed list per installed app; ownership reads also resolve queued View. */
-export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] | null }) {
+/** Observe every installed app by default; callers may defer offscreen probes during initial paint. */
+export function AssistantUnreadProbes({ apps, observed }: { apps: { installId: string }[] | null; observed?: ReadonlySet<string> }) {
   useEffect(() => {
-    setKnownInstalls(apps === null ? [] : apps.map((app) => app.installId));
-  }, [apps]);
+    const ids = apps === null ? [] : apps.map((app) => app.installId);
+    setKnownInstalls(ids, observed === undefined ? ids : ids.filter((id) => observed.has(id)));
+  }, [apps, observed]);
   if (apps === null) return null;
-  return <>{apps.map((app) => <UnreadProbe key={app.installId} installId={app.installId} />)}</>;
+  return <>{apps.filter((app) => observed === undefined || observed.has(app.installId)).map((app) => <UnreadProbe key={app.installId} installId={app.installId} />)}</>;
 }

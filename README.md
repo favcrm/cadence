@@ -111,10 +111,11 @@ invalid explicit values are refused, not replaced with the default. Hosted
 boards retain their internal catalogue route. These reads do not grant
 installation, connection or execution approval.
 
-An operator selects a published version, chooses **Review installation** or
-**Review update**, inspects access and compatibility, then confirms the exact
-package. **Other versions** permits an eligible older fresh install or an
-intermediate update; existing installations never downgrade or auto-update.
+For a fresh install, choose **Review & install** to check the selected package,
+inspect its requested access and compatibility, then confirm **Install** in the
+same dialog. For an update, choose **Review update**. **Other versions** permits
+an eligible older fresh install or an intermediate update; existing installations
+never downgrade or auto-update.
 Changing the selection discards the check. An unconfirmed result stays blocked
 across navigation until **Check installation** reads it back; it is not retried.
 Package installation does not approve connections or execution. Manual-source

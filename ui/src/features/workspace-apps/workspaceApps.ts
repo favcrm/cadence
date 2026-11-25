@@ -477,7 +477,9 @@ export const workspaceApps = {
       throw new ApiError("The tool revocation could not be verified.", 502);
     return receipt;
   },
-  installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
+  installations: (signal?: AbortSignal, shared = false) => shared
+    ? coalesceInFlightRead(installationListReads, "operator", (sharedSignal) => request<Installation[]>("/api/app-installations", sharedSignal), signal)
+    : request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
   upgradeCheck: (id: string, body: UpgradeCheckBody, signal?: AbortSignal) =>
     request<UpgradeProposal>(`${installation(id)}/upgrade/check`, signal, body),
@@ -652,6 +654,11 @@ export const workspaceApps = {
 export const APPS_CHANGED_EVENT = "cadence:apps-changed";
 export function notifyAppsChanged(): void {
   dropAppCatalogSnapshot();
+  installationsEpoch += 1;
+  abortFlights(installationListReads);
+  abortFlights(homeReads);
+  abortFlights(appHomeReads);
+  dropInstallationsSnapshot();
   try { window.dispatchEvent(new Event(APPS_CHANGED_EVENT)); } catch { /* no window in a test */ }
 }
 
@@ -874,7 +881,9 @@ export type UpgradeApplyBody = UpgradeBody & {
 export const appExplorer = {
   catalog: (signal?: AbortSignal) => request<{ catalog: CatalogCard[] }>("/api/app-catalog", signal),
   entry: (id: string, signal?: AbortSignal) => request<CatalogCard>(`/api/app-catalog/${part(id)}`, signal),
-  home: (signal?: AbortSignal) => request<{ installations: HomeInstallation[] }>("/api/app-home", signal),
+  home: (signal?: AbortSignal, authority?: "operator" | "member" | "viewer") => authority
+    ? coalesceInFlightRead(homeReads, authority, (sharedSignal) => request<{ installations: HomeInstallation[] }>("/api/app-home", sharedSignal), signal)
+    : request<{ installations: HomeInstallation[] }>("/api/app-home", signal),
   favorites: async (signal?: AbortSignal) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", signal)),
   requests: (signal?: AbortSignal) => request<{ requests: InstallRequest[] }>("/api/app-requests", signal),
   /** CAD-1194: the read-only install proposal. `source` is a path or a
@@ -988,6 +997,9 @@ const scopeReads = new Map<string, InFlightRead<[Installation, AppContext[]]>>()
 const appHomeReads = new Map<string, InFlightRead<HomeInstallation[]>>();
 const appFavoritesReads = new Map<string, InFlightRead<FavoritesPayload>>();
 const appCatalogReads = new Map<string, InFlightRead<CatalogCard[]>>();
+const installationListReads = new Map<string, InFlightRead<Installation[]>>();
+let installationsEpoch = 0;
+const homeReads = new Map<string, InFlightRead<{ installations: HomeInstallation[] }>>();
 let snapshotEpoch = 0;
 
 function abortFlights<T>(reads: Map<string, InFlightRead<T>>): void {
@@ -1173,7 +1185,7 @@ export function prefetchWorkspaceApp(installId: string): void {
  *  screen paints the last read at once and refetches behind it. */
 const APP_CATALOG_TTL_MS = 5 * 60 * 1000;
 let installationsSnapshot: { at: number; session: string | null; rows: Installation[] } | null = null;
-let appHomeSnapshot: { at: number; session: string | null; rows: HomeInstallation[] } | null = null;
+let appHomeSnapshot: { at: number; session: string | null; authority: string; rows: HomeInstallation[] } | null = null;
 let appFavoritesSnapshot: { at: number; session: string | null; data: FavoritesPayload } | null = null;
 let appCatalogSnapshot: { at: number; session: string | null; cards: CatalogCard[] } | null = null;
 
@@ -1218,26 +1230,18 @@ export function readInstallationsSnapshot(): Installation[] | null {
   return installationsSnapshot.rows;
 }
 
-/**
- * Guarded `/api/app-installations` read: passes `signal` directly to the caller's
- * fetch so disable/unmount abort propagates immediately, while enforcing the same
- * session/epoch fence before storing or returning results.
- */
-export async function readInstallationsGuarded(signal?: AbortSignal): Promise<Installation[]> {
+/** Guard the installation read against session and mutation changes. */
+export async function readInstallationsGuarded(signal?: AbortSignal, shared = false, storeSnapshot = true): Promise<Installation[]> {
   const requestSession = sessionKey();
   const generation = privateSessionGeneration();
   const epoch = snapshotEpoch;
-  const rows = await workspaceApps.installations(signal);
+  const listEpoch = installationsEpoch;
+  const rows = await workspaceApps.installations(signal, shared);
   if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
-  if (
-    epoch !== snapshotEpoch ||
-    requestSession !== sessionKey() ||
-    generation !== privateSessionGeneration() ||
-    !privateReadsAllowed()
-  ) {
-    throw new ApiError("The session changed while loading this app", 401);
+  if (listEpoch !== installationsEpoch || epoch !== snapshotEpoch || requestSession !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+    throw new ApiError("The session changed while loading apps", 401);
   }
-  if (Array.isArray(rows)) installationsSnapshot = { at: Date.now(), session: requestSession, rows };
+  if (storeSnapshot && Array.isArray(rows)) installationsSnapshot = { at: Date.now(), session: requestSession, rows };
   return rows;
 }
 
@@ -1245,20 +1249,20 @@ export function dropInstallationsSnapshot(): void {
   installationsSnapshot = null;
 }
 
-export function readAppHomeSnapshot(): HomeInstallation[] | null {
-  if (!appHomeSnapshot || !privateReadsAllowed() || appHomeSnapshot.session !== sessionKey() ||
+export function readAppHomeSnapshot(authority: string): HomeInstallation[] | null {
+  if (!appHomeSnapshot || appHomeSnapshot.authority !== authority || !privateReadsAllowed() || appHomeSnapshot.session !== sessionKey() ||
       Date.now() - appHomeSnapshot.at > SNAPSHOT_TTL_MS) return null;
   return appHomeSnapshot.rows;
 }
 
-export function readAppHomeFresh(signal?: AbortSignal): Promise<HomeInstallation[]> {
+export function readAppHomeFresh(signal: AbortSignal | undefined, authority: "operator" | "member" | "viewer" | undefined): Promise<HomeInstallation[]> {
   return coalesceInFlightRead(
     appHomeReads,
-    "__app_home__",
+    `__app_home__:${authority ?? "unknown"}`,
     async (sharedSignal, requestSession) => {
-      const res = await appExplorer.home(sharedSignal);
+      const res = await appExplorer.home(sharedSignal, authority);
       const rows = res.installations;
-      if (Array.isArray(rows)) appHomeSnapshot = { at: Date.now(), session: requestSession, rows };
+      if (authority && Array.isArray(rows)) appHomeSnapshot = { at: Date.now(), session: requestSession, authority, rows };
       return rows;
     },
     signal,
@@ -1291,6 +1295,8 @@ export function writeAppFavoritesSnapshot(data: FavoritesPayload): void {
 
 onPrivateReadsPaused(() => {
   snapshotEpoch += 1;
+  abortFlights(installationListReads);
+  abortFlights(homeReads);
   abortFlights(snapshotReads);
   abortFlights(screenSnapshotReads);
   abortFlights(scopeReads);
@@ -1302,6 +1308,8 @@ onPrivateReadsPaused(() => {
 });
 
 onPrivateSessionReset(() => {
+  abortFlights(installationListReads);
+  abortFlights(homeReads);
   abortFlights(snapshotReads);
   abortFlights(screenSnapshotReads);
   abortFlights(scopeReads);

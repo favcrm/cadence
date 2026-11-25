@@ -33,13 +33,13 @@ import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { PrivateAppDialog } from "../workspace-apps/PrivateAppDialog";
 import { ResourceGate } from "../../ui/ResourceStatus";
+import { AppTile, AppTileSkeletons } from "./AppTile";
 import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { Select } from "../../ui/Select";
 import { appErrorCopy, appLoadErrorCopy, UNVERIFIED_APPS_COPY } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
-import { AppGlyph } from "../explorer/shared";
 import PageState from "../../ui/PageState";
 import { IconApps, IconLock, IconSearch, IconSettings } from "../../ui/icons";
 import "../explorer/explorer.css";
@@ -111,7 +111,8 @@ export default function Apps({
   // CAD-1189: every list here loads with the shared busy backoff, keeps
   // its last good answer on a failed refresh, and never reads an error as
   // "no apps". Seed with the tab-scoped SWR snapshot on return visits.
-  const homeLoad = useBackoffLoad((signal) => readAppHomeFresh(signal), revision, undefined, readAppHomeSnapshot());
+  const authority = viewer.operator === true ? "operator" : viewer.operator === false ? (viewer.readOnly ? "viewer" : "member") : undefined;
+  const homeLoad = useBackoffLoad((signal) => readAppHomeFresh(signal, authority), revision, undefined, authority ? readAppHomeSnapshot(authority) : null);
   const favLoad = useBackoffLoad((signal) => readAppFavoritesFresh(signal), revision, undefined, readAppFavoritesSnapshot());
   const home = homeLoad.data;
   const [pinned, setPinned] = useState<FavoritesPayload | null>(null);
@@ -404,24 +405,7 @@ export default function Apps({
           )}
           {retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
           {home === null ? (
-            loadError === null && !retrying && (
-              <div
-                className="apps-grid apps-skeleton-grid"
-                role="status"
-                aria-live="polite"
-                aria-label={t("Loading your apps…")}
-              >
-                <span className="sr-only">{t("Loading your apps…")}</span>
-                {Array.from({ length: 6 }, (_, i) => (
-                  <div key={i} className="card app-card apps-skeleton-card" aria-hidden="true">
-                    <span className="apps-skeleton-icon wa-loading-bar wa-skel-pulse" />
-                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "62%", height: "0.9rem" }} />
-                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "86%", height: "0.75rem" }} />
-                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "44%", height: "0.7rem", marginTop: "auto" }} />
-                  </div>
-                ))}
-              </div>
-            )
+            loadError === null && <AppTileSkeletons label={t("Loading your apps…")} compact={layout === "list"} />
           ) : (
             <>
               {emptyWorkspace && (
@@ -763,64 +747,33 @@ function InstalledCard({
     : effectiveState === "attention" ? "Needs attention"
     : "Installed";
   const tone = effectiveState === "update" ? "info" : effectiveState === "setup" || effectiveState === "attention" ? "warn" : "";
-  const nameId = `app-card-name-${h.install_id}`;
-  const statusId = `app-card-status-${h.install_id}`;
   const listing = h.listing;
   const category = listing?.category;
   const title = localized?.title ?? homeAppTitle(h, locale, t);
   const summary = localized?.tagline ?? homeAppTagline(h, locale, t);
   const publisher = listing?.publisher?.name;
   return (
-    <article className={`card app-card ${pinned ? "is-pinned" : ""}`}>
-      <div className="app-card-body">
-        <div className="app-tile-icon">
-          <AppGlyph name={h.name} icon={h.icon} title={title} size={layout === "list" ? "sm" : "xl"} />
-        </div>
-        <div className="app-card-copy">
-          <div className="app-card-title-group">
-            <h3 className="app-card-name" id={nameId}>
-              {href === null ? (
-                title
-              ) : (
-                <Link
-                  className="app-card-link"
-                  href={href}
-                  aria-describedby={statusId}
-                  onClick={onOpen}
-                  onMouseEnter={() => prefetchAppScope(h.install_id)}
-                  onFocus={() => prefetchAppScope(h.install_id)}
-                >
-                  {title}
-                </Link>
-              )}
-            </h3>
-            {category && <span className="card-category">{localizedAppCategory(category, locale)}</span>}
-          </div>
-          {summary && <p className="app-card-summary">{summary}</p>}
-          {publisher && <span className="card-publisher">{publisher}</span>}
-          {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
-          <div className="card-footer">
-            <span className="num">{h.version ? `v${h.version}` : t("Installed")}</span>
-            {catalogUpdate ? (
-              <Link
-                className="app-update-link num"
-                id={statusId}
-                href={catalogUpdateHref(catalogUpdate.catalogId, h.install_id)}
-                aria-label={`${t("Review update")} — ${title} (v${catalogUpdate.latestVersion})`}
-                title={t("Review update")}
-              >
-                → v{catalogUpdate.latestVersion}
-              </Link>
-            ) : (
-              <span className="app-status" id={statusId} data-state={tone}>{t(statusKey)}</span>
-            )}
-          </div>
-          {href === null && (
-            <div className="app-card-copy-note">{t("No unique app page — see Manage")}</div>
-          )}
-        </div>
-      </div>
-      <div className="app-card-actions">
+    <AppTile
+      name={h.name}
+      icon={h.icon}
+      title={title}
+      summary={summary}
+      category={category ? localizedAppCategory(category, locale) : undefined}
+      meta={<>
+        {publisher && <span className="card-publisher">{publisher}</span>}
+        {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
+      </>}
+      version={h.version ? `v${h.version}` : t("Installed")}
+      status={t(statusKey)}
+      statusAction={catalogUpdate ? <Link className="app-update-link num" href={catalogUpdateHref(catalogUpdate.catalogId, h.install_id)} aria-label={`${t("Review update")} — ${title} (v${catalogUpdate.latestVersion})`} title={t("Review update")}>→ v{catalogUpdate.latestVersion}</Link> : undefined}
+      tone={tone}
+      href={href}
+      note={t("No unique app page — see Manage")}
+      onOpen={onOpen}
+      onPrefetch={() => prefetchAppScope(h.install_id)}
+      pinned={pinned}
+      compact={layout === "list"}
+      actions={<>
         <button
           type="button"
           className={`app-card-action-btn ${pinned ? "is-pinned" : ""}`}
@@ -842,8 +795,8 @@ function InstalledCard({
             <IconSettings size={14} />
           </Link>
         )}
-      </div>
-    </article>
+      </>}
+    />
   );
 }
 
