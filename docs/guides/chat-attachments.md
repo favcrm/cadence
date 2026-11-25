@@ -375,26 +375,32 @@ The hosted board serves an operator's own attachment back to the browser at
 `GET /api/chat/attachments/<chf-id>?conversation=<id>`. The route is scoped
 exactly as a send is — the signed-in subject and the resolved conversation — so
 an unknown id, another conversation's row or a missing blob answers `404`.
-The route serves raster images (PNG/JPEG/WebP), PDF, MP4/WebM and XLSX. An SVG
-upload's retained source is never served: the preview is the bounded raster the model was
-shown, when one exists. A PDF is served `inline` with no sandbox policy so the
-browser's own viewer opens it in a new tab; every other kind carries `nosniff`,
-`Content-Security-Policy: sandbox; default-src 'none'` and `private, no-store`.
+The route serves raster images (PNG/JPEG/WebP), PDF, MP4/WebM, DOCX, PPTX and
+XLSX. An SVG upload's retained source is never served: the preview is the
+bounded raster the model was shown, when one exists. A PDF is served `inline`
+with no sandbox policy so the browser's own viewer opens it in a new tab;
+every other kind carries `nosniff`, `Content-Security-Policy: sandbox;
+default-src 'none'` and `private, no-store`.
 
 Video uploads are accepted at up to 20 MiB (text, PDF and raster stay at
 10 MiB). A video is stored and played, never decoded: the model still receives
 its name, size and type only. A local board has no such route, and the client
 keeps the metadata chips there without requesting attachment bytes.
 
-### Preview a workbook in chat
+### Preview Office attachments in chat
 
-On the hosted board, select a sent `.xlsx` attachment to open it in the chat
-canvas. Use **Worksheet** to switch sheets. The browser renders a read-only
-preview of up to 10 visible sheets, 200 rows and 40 columns per sheet, from
-files up to 25 MiB. Formulas display their last saved results; they never run
-in the preview. Charts and pictures are not drawn. The canvas indicates when
-content is omitted, unavailable or exceeds the preview limits. Opening a
-workbook does not import it or create a Works record.
+On the hosted board, select a sent `.docx`, `.pptx` or `.xlsx` attachment to
+open it in the same read-only canvas. Word shows document text and tables (up
+to 1,500 blocks); PowerPoint shows up to 50 slides with a slide selector.
+Use **Worksheet** to switch sheets in a workbook (up to 10 sheets, 200 rows
+and 40 columns per sheet). Excel formulas display their last saved results;
+they never run in the preview.
+
+The browser reads at most 25 MiB per file. It indicates omissions and refuses
+unavailable, unsupported or oversized attachments. Unsupported content such
+as embedded media is not loaded, and document links are not followed. Closing
+the preview or moving to another conversation cancels obsolete reads. Opening
+any of these files does not import it or create a Works record.
 
 ### Give the assistant selected PDF pages as images
 
