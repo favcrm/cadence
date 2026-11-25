@@ -180,9 +180,11 @@ async function main() {
       const scopeParam = Array.isArray(reqBody.required_scopes) && reqBody.required_scopes.length > 0
         ? `&scope=${encodeURIComponent((reqBody.required_scopes as string[]).join(" "))}`
         : "";
+      const sameHost = typeof reqBody.endpoint_url === "string" && reqBody.endpoint_url.startsWith("https://mcp.acme.example");
+      const authHost = sameHost ? "mcp.acme.example" : "auth.acme.example";
       return jsonRes({
-        mode: "oauth_redirect", authorization_url: `https://auth.acme.example/authorize?state=xyz${scopeParam}`, connection_id: "conn_mcp_new_1",
-        discovery: { issuer: "https://auth.acme.example", authorization_host: "auth.acme.example", registration: "dcr", scopes: ["mcp:read"], resource_metadata_url: "https://mcp.acme.example/.well-known/oauth-protected-resource" },
+        mode: "oauth_redirect", authorization_url: `https://${authHost}/authorize?state=xyz${scopeParam}`, connection_id: "conn_mcp_new_1",
+        discovery: { issuer: `https://${authHost}`, authorization_host: authHost, registration: "dcr", scopes: ["mcp:read"], resource_metadata_url: "https://mcp.acme.example/.well-known/oauth-protected-resource" },
       });
     }
     if (url.endsWith("/api/threads/master/messages") && method === "POST") {
@@ -282,15 +284,15 @@ async function main() {
     Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(el, val);
     el.dispatchEvent(new win.Event("input", { bubbles: true }));
   };
-  // Same-site OAuth (mcp.acme.example -> auth.acme.example) redirects directly without stopping at Step 2.
+  // Exact-host OAuth (mcp.acme.example -> mcp.acme.example) redirects directly without stopping at Step 2.
   await act(async () => {
     setNativeValue(document.querySelector('input[placeholder="Acme Billing MCP"]') as HTMLInputElement, "Acme OAuth");
     setNativeValue(document.querySelector('input[type="url"]') as HTMLInputElement, "https://mcp.acme.example/v1/mcp");
   });
   await act(async () => { document.querySelector("form")!.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); });
   await settle(() => {
-    assert(redirectedUrls.some((u) => u.includes("auth.acme.example/authorize")), "same-site OAuth redirects immediately");
-    assert(!document.querySelector("[data-mcp-discovery-preview]"), "same-site OAuth skips Step 2 confirmation");
+    assert(redirectedUrls.some((u) => u.includes("mcp.acme.example/authorize")), "exact-host OAuth redirects immediately");
+    assert(!document.querySelector("[data-mcp-discovery-preview]"), "exact-host OAuth skips Step 2 confirmation");
   });
   assert(creates.at(-1)?.visibility === "personal", "Settings connect defaults visibility to personal");
 
@@ -524,15 +526,16 @@ async function main() {
   await settle(() => assert(byText("button", "Connect Acme Billing"), "member sees Connect button in chat"));
   await act(async () => byText("button", "Connect Acme Billing")!.click());
   await settle(() => assert(document.querySelector("[data-mcp-confirm-modal]") && text().includes("Read-only tools run automatically"), "member opens compact Confirm Modal"));
+  assert(document.querySelector("[data-mcp-confirm-modal]")?.parentElement?.parentElement === document.body, "confirm modal portals directly onto document.body outside turn-card-in");
   assert(!byText("[data-mcp-confirm-modal] [role=\"radio\"]", "Shared with company"), "member modal hides Shared with company");
   await act(async () => byText("[data-mcp-confirm-modal] button", "Confirm & Connect")!.click());
-  await settle(() => assert(modalRedirects.some((u) => u.includes("auth.acme.example/authorize")), "member modal auto-redirects on same-site OAuth"));
+  await settle(() => assert(modalRedirects.some((u) => u.includes("mcp.acme.example/authorize")), "member modal auto-redirects on exact-host OAuth"));
   assert(creates.at(-1)?.visibility === "personal", "member modal sends visibility: personal");
 
-  // Owner modal shows Shared toggle and cross-site confirmation.
+  // Owner modal shows Shared toggle and cross-host confirmation (including different subdomains).
   const crossSiteEntry = {
     ...setupEntry, seq: 22,
-    payload: { v: 2, toolkit: "custom_mcp", toolkit_label: "External MCP", endpoint_url: "https://mcp.other-vendor.example/v1/mcp", required_scopes: ["mcp:read"] },
+    payload: { v: 2, toolkit: "custom_mcp", toolkit_label: "External MCP", endpoint_url: "https://sub.acme.example/v1/mcp", required_scopes: ["mcp:read"] },
   } satisfies ThreadEntry;
   await act(async () => {
     root.render(React.createElement(PageLocale, null, React.createElement(WriteGate.Provider, { value: null }, React.createElement(HireBlock.Provider, { value: null }, React.createElement(ImageConversation, { value: "thread-22" }, React.createElement(ConnectCard, { key: "owner-modal", entry: crossSiteEntry }))))));

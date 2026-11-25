@@ -268,14 +268,17 @@ equal(
   "removed readOnlyHint warning",
 );
 
-// Same-site host detection for skipping redundant intermediate OAuth confirmation.
-assert(isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://mcp.acme.example/oauth/authorize"), "exact host is same-site");
-assert(isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://auth.acme.example/authorize"), "shared apex domain is same-site");
-assert(!isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://accounts.google.com/o/oauth2/v2/auth"), "different apex is cross-site");
-assert(!isSameSiteHost("https://foo.workers.dev/mcp", "https://bar.workers.dev/auth"), "shared workers.dev subdomains are cross-site");
-assert(!isSameSiteHost("https://foo.cadencecloud.app/mcp", "https://bar.cadencecloud.app/auth"), "shared cadencecloud.app subdomains are cross-site");
-assert(isSameSiteHost("https://mcp.shop.com.hk/mcp", "https://auth.shop.com.hk/auth"), "same 2-part ccTLD registrable domain is same-site");
-assert(!isSameSiteHost("https://foo.com.hk/mcp", "https://bar.com.hk/auth"), "different 2-part ccTLD domains are cross-site");
+// Fail-closed exact-host detection for skipping redundant intermediate OAuth confirmation.
+assert(isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://mcp.acme.example/oauth/authorize"), "exact host is same-host");
+assert(isSameSiteHost("https://MCP.ACME.EXAMPLE./v1/mcp", "https://mcp.acme.example/oauth/authorize"), "normalized exact host is same-host");
+assert(!isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://auth.acme.example/authorize"), "different subdomain requires host confirmation");
+assert(!isSameSiteHost("https://mcp.acme.example/v1/mcp", "https://accounts.google.com/o/oauth2/v2/auth"), "different apex is cross-host");
+assert(!isSameSiteHost("https://foo.workers.dev/mcp", "https://bar.workers.dev/auth"), "shared workers.dev subdomains are cross-host");
+assert(!isSameSiteHost("https://foo.github.io/mcp", "https://bar.github.io/auth"), "shared github.io subdomains are cross-host");
+assert(!isSameSiteHost("https://foo.cadencecloud.app/mcp", "https://bar.cadencecloud.app/auth"), "shared cadencecloud.app subdomains are cross-host");
+assert(!isSameSiteHost("https://mcp.shop.com.hk/mcp", "https://auth.shop.com.hk/auth"), "different subdomains on ccTLD are cross-host");
+assert(!isSameSiteHost("https://foo.com.br/mcp", "https://bar.com.br/auth"), "different domains on multi-part ccTLD are cross-host");
+assert(!isSameSiteHost("http://mcp.acme.example/v1/mcp", "https://mcp.acme.example/oauth/authorize"), "non-https endpoint fails closed");
 
 async function testReviewedReadWireContract(): Promise<void> {
   const realFetch = globalThis.fetch;
