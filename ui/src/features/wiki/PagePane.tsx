@@ -82,13 +82,13 @@ export default function PagePane({ page, navHref, readOnly, hosted, section, cit
         {page.edited_by && <>{t("Edited by")} <b>{whoLabel(page.edited_by, viewerSub, t, hosted)}</b></>}
         {page.edited_by && page.mtime && " · "}{relTime(page.mtime)}
       </p>}
-      <article className="md wk-md issue-reader">
+      {!moved && <article className="md wk-md issue-reader">
         {page.text?.trim() ? <PageText path={page.path} text={page.text} /> : <p className="text-ink-500">{page.historical
           ? canDownload
             ? t("This revision has no page text. Download the pinned original.")
             : t("This board cannot serve this file’s historical bytes.")
           : t("This page is empty.")}</p>}
-      </article>
+      </article>}
     </>
   );
 }

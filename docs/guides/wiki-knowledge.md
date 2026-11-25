@@ -73,11 +73,12 @@ contributor label for other, unresolved subjects.
 revision. The recipient still needs access to the same workspace and path.
 An older `MOVED` pointer offers **Open document** when it names a Wiki path.
 
-Supported PDFs and static UTF-8 HTML attachments preview in the Wiki reader.
-PDF pages are rendered without running document actions. HTML previews keep
-only supported content and simple inline styling. Scripts, forms, remote
-assets, and navigation are disabled. **Download original** remains available
-for unsupported files and preview failures.
+PDF attachments served as `application/pdf` preview one page at a time,
+without running document actions. Rendered pages have a maximum of 2048
+pixels on either side and a 10 MiB image limit. HTML preview requires valid
+UTF-8 and at most 1 MiB. It keeps supported static content and simple inline
+styling; scripts, forms, remote assets, and navigation are disabled.
+Use **Download original** for unsupported files and preview failures.
 
 On hosted boards, only a verified workspace owner may move shared Wiki
 content to Trash. Existing private-folder and private-project permissions

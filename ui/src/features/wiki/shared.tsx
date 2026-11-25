@@ -140,8 +140,8 @@ export function useWikiBlobSource(path: string, kind: PreviewKind, withDownload 
       .then((blob) => {
         if (!current()) return;
         const download = withDownload ? localUrl(blob.slice(0, blob.size, "application/octet-stream")) : null;
-        const publish = (src: string | null) => {
-          if (current()) setLoaded({ path, key, generation, kind, withDownload, src, download, bytes: withDownload ? blob : null, error: null });
+        const publish = (src: string | null, bytes: Blob | null = null) => {
+          if (current()) setLoaded({ path, key, generation, kind, withDownload, src, download, bytes, error: null });
         };
         if (kind === "image") {
           const owned = new FileReader();
@@ -150,14 +150,17 @@ export function useWikiBlobSource(path: string, kind: PreviewKind, withDownload 
             if (typeof owned.result === "string") publish(owned.result);
           };
           owned.onerror = () => {
-            if (current()) setLoaded({ path, key, generation, kind, withDownload, src: null, download, bytes: blob, error: "Could not decode this image" });
+            if (current()) setLoaded({ path, key, generation, kind, withDownload, src: null, download, bytes: null, error: "Could not decode this image" });
           };
           owned.readAsDataURL(blob);
         } else {
           const mime = blob.type.split(";")[0].trim().toLowerCase();
           const video = ["video/mp4", "video/webm", "video/ogg", "video/quicktime", "video/x-m4v"].includes(mime);
           const preview = kind === "video" && video;
-          publish(preview ? localUrl(blob.slice(0, blob.size, mime)) : null);
+          // Only the fetched PDF MIME admits PDF.js. HTML is served as an
+          // attachment and is admitted separately by the static sanitizer.
+          const document = withDownload && (kind === "html" || (kind === "pdf" && mime === "application/pdf"));
+          publish(preview ? localUrl(blob.slice(0, blob.size, mime)) : null, document ? blob : null);
         }
       })
       .catch((error: unknown) => {

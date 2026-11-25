@@ -124,6 +124,7 @@ async function blobTransportChecks() {
   Object.defineProperty(globalThis, "FileReader", { value: TestReader, configurable: true });
   const files: Record<string, string> = {
     "movie.mp4": "video/mp4", "notes.pdf": "application/pdf", "photo.png": "image/png",
+    "changed.pdf": "application/pdf",
     "unsafe.mp4": "text/html", "unsafe.html": "text/html", "late.pdf": "application/pdf",
   };
   const calls: { url: string; init?: RequestInit }[] = [];
@@ -139,7 +140,8 @@ async function blobTransportChecks() {
     }
     if (url.pathname === "/api/wiki/file") {
       const body = path === "unsafe.html" ? '<h1>Sample HTML</h1><a href="https://example.test">External address</a><form></form>' : "private file bytes";
-      const response = new Response(body, { headers: { "Content-Type": files[path] } });
+      const type = path === "changed.pdf" ? "application/octet-stream" : files[path];
+      const response = new Response(body, { headers: { "Content-Type": type } });
       if (path === "late.pdf") response.blob = () => new Promise<Blob>((resolve) => { releaseBody = resolve; });
       return response;
     }
@@ -177,6 +179,10 @@ async function blobTransportChecks() {
     equal(revoked.includes(pdfUrl), true, "pausing reads revokes the PDF immediately");
     equal(host.querySelector("a[download], .wk-document-page"), null, "paused private PDF bytes disappear without another fetch");
     allowPrivateReads();
+
+    await renderWiki("changed.pdf");
+    equal(host.querySelector<HTMLAnchorElement>("a[download]")?.download, "changed.pdf", "a stale PDF listing still offers the original");
+    equal(host.querySelector(".wk-download") !== null, true, "a response no longer served as PDF goes directly to download");
 
     await renderWiki("unsafe.mp4");
     equal(host.querySelector("video"), null, "a misleading video extension cannot inline active MIME");

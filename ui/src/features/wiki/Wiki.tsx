@@ -382,6 +382,7 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
               readOnlyReason={readOnlyReason}
               hosted={hosted}
               viewerSub={viewerSub}
+              operator={operator}
               trashHref={trashHref}
               at={route.at}
               section={route.section}
@@ -453,6 +454,7 @@ function BrowsePane({
   readOnlyReason,
   hosted,
   viewerSub,
+  operator,
   trashHref,
   at,
   section,
@@ -473,6 +475,7 @@ function BrowsePane({
   readOnlyReason?: string | null;
   hosted?: boolean;
   viewerSub?: string | null;
+  operator?: boolean | null;
   /** The operator's Trash screen, absent for a non-operator or a context. */
   trashHref: string | null;
   at?: string;
@@ -664,9 +667,13 @@ function BrowsePane({
 
   const page = open.page;
   const link = wikiReaderHref(page.path, at, section, citedPage);
+  // Native boards do not send the hosted permission bit. Only a proven
+  // operator gets that fallback, and profile/memory are read-only views.
+  const removable = page.removable ?? (hosted === false && operator === true &&
+    !/^agents\/[^/]+\/(?:profile|memory)(?:\/|$)/.test(page.path));
   const actions = <>
     <CopyWikiLink key={link} href={link} />
-    {!readOnly && at === undefined && !page.historical && (hosted === false || page.removable === true) && (
+    {!readOnly && at === undefined && !page.historical && removable && (
       <ReaderTrash key={page.path} path={page.path}
         onRemoved={(landing) => {
           onToast("ok", `${baseName(page.path)} moved to ${landing}`);
