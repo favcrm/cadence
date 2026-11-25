@@ -644,8 +644,13 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
               },
             } : {}),
             ...(mediaDownloadServices ? {
-              onWhatsAppMediaDownload: (conversationId: string, messageId: string, signal: AbortSignal) =>
-                mediaDownloadServices.downloadWhatsAppMedia(conversationId, messageId, signal),
+              onWhatsAppMediaDownload: (
+                conversationId: string,
+                messageId: string,
+                signal: AbortSignal,
+                provider = "linked",
+              ) =>
+                mediaDownloadServices.downloadWhatsAppMedia(conversationId, messageId, signal, provider),
               onWhatsAppMediaSave: triggerWhatsAppMediaSave,
             } : {}),
             ...(whatsappUxEnabled ? {

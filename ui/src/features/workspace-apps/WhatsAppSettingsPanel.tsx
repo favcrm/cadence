@@ -23,6 +23,8 @@ import {
   saveWhatsAppProvider,
   shouldShowLinkedIdleNudge,
   type LinkedWhatsAppSnapshot,
+  type OfficialInspectResult,
+  type OfficialWhatsAppActionName,
   type OfficialWhatsAppSnapshot,
   type WhatsAppProvider,
   type WhatsAppSettingsSnapshot,
@@ -30,6 +32,7 @@ import {
 import "./whatsappSettings.css";
 
 type LinkedConfirmKind = "pause" | "disconnect" | "relink" | null;
+type OfficialConfirmKind = "pause" | "disconnect" | null;
 type BadgeTone = "ok" | "warn" | "bad" | "accent" | "muted";
 
 function chooseInitialMode(
@@ -156,9 +159,11 @@ export default function WhatsAppSettingsPanel({
   const [linkedUncertain, setLinkedUncertain] = useState(false);
   const [officialUncertain, setOfficialUncertain] = useState(false);
   const [linkedConfirm, setLinkedConfirm] = useState<LinkedConfirmKind>(null);
-  const [officialConfirmPause, setOfficialConfirmPause] = useState(false);
+  const [officialConfirm, setOfficialConfirm] = useState<OfficialConfirmKind>(null);
   const [nudgeDismissed, setNudgeDismissed] = useState(false);
   const [officialAuthUrl, setOfficialAuthUrl] = useState<string | null>(null);
+  const [favcrmCompanyInput, setFavcrmCompanyInput] = useState("");
+  const [officialInspectResult, setOfficialInspectResult] = useState<OfficialInspectResult | null>(null);
   const [qrPollCount, setQrPollCount] = useState(1);
 
   const unsupportedRef = useRef(onUnsupported);
@@ -180,9 +185,11 @@ export default function WhatsAppSettingsPanel({
     setLinkedUncertain(false);
     setOfficialUncertain(false);
     setLinkedConfirm(null);
-    setOfficialConfirmPause(false);
+    setOfficialConfirm(null);
     setNudgeDismissed(false);
     setOfficialAuthUrl(null);
+    setFavcrmCompanyInput("");
+    setOfficialInspectResult(null);
     setQrPollCount(1);
   }, [installId]);
 
@@ -269,16 +276,50 @@ export default function WhatsAppSettingsPanel({
   }, [busyAction, linkedStateForPoll, loadSnapshot]);
 
   useEffect(() => {
-    if (!linkedConfirm && !officialConfirmPause) return;
+    if (!linkedConfirm && !officialConfirm) return;
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape" || busyAction !== null) return;
       event.preventDefault();
       setLinkedConfirm(null);
-      setOfficialConfirmPause(false);
+      setOfficialConfirm(null);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [linkedConfirm, officialConfirmPause, busyAction]);
+  }, [linkedConfirm, officialConfirm, busyAction]);
+
+  useEffect(() => {
+    if (!officialAuthUrl) return;
+    let expectedOrigin: string | null = null;
+    try {
+      expectedOrigin = new URL(officialAuthUrl).origin;
+    } catch {
+      expectedOrigin = null;
+    }
+    const refreshFromPopup = async () => {
+      const fresh = await loadSnapshot({ silent: true });
+      if (fresh?.official.available && fresh.official.connected) {
+        setOfficialAuthUrl(null);
+        setStatusNotice(t("Official WhatsApp connected."));
+        changedRef.current?.();
+      }
+    };
+    const onMessage = (event: MessageEvent) => {
+      if (!expectedOrigin || event.origin !== expectedOrigin) return;
+      const data = event.data as { type?: unknown } | null;
+      if (data && typeof data === "object" && data.type === "favcrm:whatsapp-connected") {
+        void refreshFromPopup();
+      }
+    };
+    const onFocus = () => {
+      void refreshFromPopup();
+    };
+    window.addEventListener("message", onMessage);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [officialAuthUrl, loadSnapshot, t]);
 
   const handleSelectMode = async (mode: WhatsAppProvider) => {
     if (!snapshot || busyAction !== null) return;
@@ -286,7 +327,7 @@ export default function WhatsAppSettingsPanel({
     setActionError(null);
     setStatusNotice(null);
     setLinkedConfirm(null);
-    setOfficialConfirmPause(false);
+    setOfficialConfirm(null);
 
     if (snapshot.viewer_role !== "owner" || snapshot.active_provider === mode) return;
 
@@ -360,29 +401,75 @@ export default function WhatsAppSettingsPanel({
     }
   };
 
-  const handleOfficialMutation = async (action: "connect" | "start" | "stop", notice?: string) => {
+  const handleOfficialMutation = async (action: OfficialWhatsAppActionName, notice?: string) => {
     if (!snapshot || snapshot.viewer_role !== "owner") return;
+    const targetCompanyId =
+      action === "link"
+        ? (officialInspectResult?.favcrmCompanyId ?? favcrmCompanyInput.trim())
+        : favcrmCompanyInput.trim();
+    if ((action === "inspect" || action === "link") && !targetCompanyId) {
+      setActionError(t("Enter a FavCRM Company ID first."));
+      return;
+    }
     setBusyAction(`official:${action}`);
     setActionError(null);
     setStatusNotice(null);
-    setOfficialAuthUrl(null);
+    if (action === "connect") setOfficialAuthUrl(null);
     try {
-      const result = await runOfficialWhatsAppAction(installId, action);
+      const result = await runOfficialWhatsAppAction(installId, action, {
+        ...(action === "inspect" || action === "link" ? { favcrmCompanyId: targetCompanyId } : {}),
+      });
       setOfficialUncertain(false);
-      setOfficialConfirmPause(false);
+      setOfficialConfirm(null);
       if (action === "connect" && result.connect?.url) {
         setOfficialAuthUrl(result.connect.url);
-        window.open(result.connect.url, "_blank", "noopener,noreferrer");
-        setStatusNotice(t("Opened FavCRM WhatsApp setup in a new tab."));
+        window.open(result.connect.url, "favcrm-waba-connect", "popup,width=640,height=780");
+        setStatusNotice(t("Opened FavCRM WhatsApp setup window."));
+      } else if (action === "inspect" && result.inspect) {
+        setOfficialInspectResult(result.inspect);
+        setStatusNotice(
+          t("FavCRM workspace ready to link: {name}").replace(
+            "{name}",
+            () => result.inspect!.workspaceName,
+          ),
+        );
       } else if (result.official) {
-        setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
-        if (notice) setStatusNotice(notice);
+        if (action === "disconnect") {
+          if (!result.disconnected) {
+            setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
+            setActionError(t("Could not disconnect Official WhatsApp connection."));
+            return;
+          }
+          setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
+          setOfficialInspectResult(null);
+          if (!result.favcrm_revoked) {
+            setActionError(
+              t("Workspace unlinked locally, but upstream FavCRM revocation could not be confirmed."),
+            );
+            return;
+          }
+          if (notice) setStatusNotice(notice);
+        } else if (
+          action === "link" &&
+          (!result.official.available || result.official.binding_status !== "active")
+        ) {
+          setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
+          setActionError(t("Could not link FavCRM workspace."));
+          return;
+        } else {
+          setSnapshot((prev) => (prev ? { ...prev, official: result.official! } : prev));
+          if (action === "link") {
+            setOfficialInspectResult(null);
+            setFavcrmCompanyInput("");
+          }
+          if (notice) setStatusNotice(notice);
+        }
       }
       changedRef.current?.();
     } catch (err) {
       if (err instanceof WhatsAppActionUncertainError) {
         setOfficialUncertain(true);
-        setOfficialConfirmPause(false);
+        setOfficialConfirm(null);
       } else {
         setActionError(formatError(err, t, "Could not update Official WhatsApp connection."));
       }
@@ -1153,7 +1240,7 @@ export default function WhatsAppSettingsPanel({
                 <span className={`wa-dot ${officialMeta.dot}`} aria-hidden="true" />
                 {t(officialMeta.cardLabel)}
               </span>
-              {isOwner && !officialUncertain && !officialConfirmPause ? (
+              {isOwner && !officialUncertain && !officialConfirm ? (
                 <Button
                   size="sm"
                   variant="ghost"
@@ -1197,7 +1284,7 @@ export default function WhatsAppSettingsPanel({
                 </div>
               ) : null}
             </>
-          ) : isOwner && officialConfirmPause ? (
+          ) : isOwner && officialConfirm === "pause" ? (
             <div
               className="wa-inline-confirm warn"
               role="region"
@@ -1221,7 +1308,39 @@ export default function WhatsAppSettingsPanel({
                 <Button
                   variant="ghost"
                   disabled={busy}
-                  onClick={() => setOfficialConfirmPause(false)}
+                  onClick={() => setOfficialConfirm(null)}
+                >
+                  {t("Cancel")}
+                </Button>
+              </div>
+            </div>
+          ) : isOwner && officialConfirm === "disconnect" ? (
+            <div
+              className="wa-inline-confirm danger"
+              role="region"
+              aria-label={t("Disconnect FavCRM workspace?")}
+            >
+              <strong>{t("Disconnect FavCRM workspace?")}</strong>
+              <p>
+                {t(
+                  "Revokes the FavCRM grant for this workspace and stops Official API access until re-linked.",
+                )}
+              </p>
+              <div className="wa-actions-row">
+                <Button
+                  variant="danger"
+                  loading={busyAction === "official:disconnect"}
+                  disabled={busy}
+                  onClick={() =>
+                    void handleOfficialMutation("disconnect", t("FavCRM workspace disconnected."))
+                  }
+                >
+                  {t("Disconnect FavCRM")}
+                </Button>
+                <Button
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => setOfficialConfirm(null)}
                 >
                   {t("Cancel")}
                 </Button>
@@ -1337,8 +1456,24 @@ export default function WhatsAppSettingsPanel({
               {isOwner ? (
                 <div className="wa-card-footer">
                   <div className="wa-card-footer-left">
-                    <Button disabled={busy} onClick={() => setOfficialConfirmPause(true)}>
+                    <Button disabled={busy} onClick={() => setOfficialConfirm("pause")}>
                       {t("Pause")}
+                    </Button>
+                    <Button
+                      loading={busyAction === "official:rescope"}
+                      disabled={busy}
+                      onClick={() =>
+                        void handleOfficialMutation("rescope", t("FavCRM permissions updated."))
+                      }
+                    >
+                      {t("Rescope")}
+                    </Button>
+                    <Button
+                      variant="danger"
+                      disabled={busy}
+                      onClick={() => setOfficialConfirm("disconnect")}
+                    >
+                      {t("Disconnect")}
                     </Button>
                   </div>
                   <div className="wa-card-footer-right">
@@ -1353,6 +1488,83 @@ export default function WhatsAppSettingsPanel({
                 </div>
               ) : null}
             </>
+          ) : snapshot.official.binding_status !== "active" ? (
+            <>
+              <div className="wa-status-box">
+                <IconConnection size={16} />
+                <div>
+                  <strong>
+                    {snapshot.official.binding_status === "revoked"
+                      ? t("FavCRM workspace link revoked")
+                      : t("Link your FavCRM workspace")}
+                  </strong>
+                  <p>
+                    {t(
+                      "Enter your FavCRM Company ID to check access and link your WhatsApp Business API account.",
+                    )}
+                  </p>
+                </div>
+              </div>
+              {isOwner ? (
+                <>
+                  <div className="wa-rows">
+                    <div className="wa-row">
+                      <label className="wa-row-label" htmlFor={`${titleId}-favcrm-company`}>
+                        {t("FavCRM Company ID")}
+                      </label>
+                      <input
+                        id={`${titleId}-favcrm-company`}
+                        type="text"
+                        className="wa-mono"
+                        value={favcrmCompanyInput}
+                        disabled={busy}
+                        placeholder="cmp_..."
+                        onChange={(e) => {
+                          setFavcrmCompanyInput(e.target.value);
+                          setOfficialInspectResult(null);
+                        }}
+                      />
+                    </div>
+                  </div>
+                  {officialInspectResult ? (
+                    <div className="wa-notice" role="status">
+                      <div className="wa-notice-body">
+                        <IconCheck size={15} />
+                        <div>
+                          <strong>{officialInspectResult.workspaceName}</strong>
+                          <p>
+                            {officialInspectResult.organisationName
+                              ? `${officialInspectResult.organisationName} · ${officialInspectResult.role}`
+                              : officialInspectResult.role}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="wa-card-footer">
+                    <div className="wa-card-footer-left">
+                      <Button
+                        loading={busyAction === "official:inspect"}
+                        disabled={busy || !favcrmCompanyInput.trim()}
+                        onClick={() => void handleOfficialMutation("inspect")}
+                      >
+                        {t("Check workspace")}
+                      </Button>
+                      <Button
+                        variant="primary"
+                        loading={busyAction === "official:link"}
+                        disabled={busy || !favcrmCompanyInput.trim()}
+                        onClick={() =>
+                          void handleOfficialMutation("link", t("FavCRM workspace linked."))
+                        }
+                      >
+                        {t("Link workspace")}
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              ) : null}
+            </>
           ) : (
             <>
               <div className="wa-status-box">
@@ -1360,9 +1572,13 @@ export default function WhatsAppSettingsPanel({
                 <div>
                   <strong>{t("Official API not connected")}</strong>
                   <p>
-                    {t(
-                      "Connect a Meta Business Cloud number through FavCRM to unlock Templates, Broadcasts, and AI Agent.",
-                    )}
+                    {snapshot.official.company_name
+                      ? t(
+                          "Linked to {name}. Connect a Meta Business Cloud number through FavCRM to start messaging.",
+                        ).replace("{name}", () => snapshot.official.available && snapshot.official.company_name ? snapshot.official.company_name : "")
+                      : t(
+                          "Connect a Meta Business Cloud number through FavCRM to unlock Templates, Broadcasts, and AI Agent.",
+                        )}
                   </p>
                 </div>
               </div>
@@ -1376,6 +1592,22 @@ export default function WhatsAppSettingsPanel({
                       onClick={() => void handleOfficialMutation("connect")}
                     >
                       {t("Connect via FavCRM")} ↗
+                    </Button>
+                    <Button
+                      loading={busyAction === "official:rescope"}
+                      disabled={busy}
+                      onClick={() =>
+                        void handleOfficialMutation("rescope", t("FavCRM permissions updated."))
+                      }
+                    >
+                      {t("Rescope")}
+                    </Button>
+                    <Button
+                      variant="danger"
+                      disabled={busy}
+                      onClick={() => setOfficialConfirm("disconnect")}
+                    >
+                      {t("Disconnect")}
                     </Button>
                   </div>
                 </div>
