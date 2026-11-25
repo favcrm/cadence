@@ -1853,11 +1853,11 @@ function MasterHome({
           )}
 
           <div className="chatdock" ref={dockRef} data-chat-dock>
-            {/* The turn bar (CAD-1700) owns the turn's state and its Stop and
-                Cancel; the working presentation itself is the subtle name-row
-                indicator (CAD-1462). */}
+            {/* The transcript already shows Home's pending send and assistant
+                activity. Keep the dock bar for other turn statuses and actions. */}
             <TurnBar
               state={turnBar}
+              hideSending
               reconnecting={streamReconnecting && activeTurn}
               actions={{
                 onCancel: writeBlock === null ? (message) => runTurnCommand("cancel", message) : undefined,

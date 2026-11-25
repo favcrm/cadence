@@ -210,8 +210,8 @@ async function main() {
   const typingTurn = typingRows[0].closest('[data-kind="turn"][data-turn-state="running"]');
   assert(typingTurn !== null && !typingRows[0].closest("[data-turn-bar]"), "the typing bubble paints inside the assistant turn, not the dock status bar");
   assert(
-    host.querySelector('[data-turn-bar][data-state="sending"]') !== null,
-    "the dock bar reports the send as sending, not as a working banner",
+    host.querySelector("[data-chat-dock] [data-turn-bar]") === null,
+    "a pending send leaves no status row above the Home composer",
   );
   assert(host.querySelector('[aria-label="Stop this turn"]') === null, "nothing is stoppable before the daemon runs the turn");
   const listItems = Array.from(host.querySelectorAll("ol[role='log'] > li")) as HTMLElement[];

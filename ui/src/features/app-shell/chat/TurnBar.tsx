@@ -44,6 +44,7 @@ export interface TurnBarProps {
   state: TurnBarState;
   actions: TurnBarActions;
   reconnecting: boolean;
+  hideSending?: boolean;
   permission?: TurnBarPermission | null;
 }
 
@@ -63,6 +64,7 @@ export function TurnBar({
   state,
   actions,
   reconnecting,
+  hideSending = false,
   permission = null,
 }: TurnBarProps) {
   const t = useTranslate();
@@ -94,6 +96,9 @@ export function TurnBar({
   }, []);
 
   if (state.kind === "idle" || state.kind === "working" || state.kind === "writing") return null;
+  // Hide the row, not the component: an in-flight permission decision can
+  // still need its reply callback after the state changes to sending.
+  if (hideSending && state.kind === "sending") return null;
 
   const canDecide =
     state.kind === "approval" &&
