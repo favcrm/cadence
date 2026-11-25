@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { ThreadRef } from "../../lib/types";
-import SharedComposer from "../app-shell/chat/Composer";
+import AssistantComposer, { type AssistantModelPickerProps } from "../app-shell/chat/AssistantComposer";
 import type { SlashCommand } from "./master";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import type { MentionCandidate } from "../mentions/mentions";
@@ -36,6 +36,7 @@ export default function Composer({
   allowNote,
   onDraftChange,
   beforeSend,
+  modelPicker,
   modelControls,
 }: {
   block: string | null;
@@ -55,11 +56,12 @@ export default function Composer({
   allowNote?: boolean;
   onDraftChange?: (draft: string) => void;
   beforeSend?: (body: string) => boolean;
+  modelPicker?: AssistantModelPickerProps | null;
   modelControls?: ReactNode;
 }) {
   const { placeholder, ariaLabel } = useAssistantComposerLabels();
   return (
-    <SharedComposer
+    <AssistantComposer
       density="full"
       storeKey="home"
       block={block}
@@ -78,6 +80,7 @@ export default function Composer({
       allowNote={allowNote}
       onDraftChange={onDraftChange}
       beforeSend={beforeSend}
+      modelPicker={modelPicker}
       modelControls={modelControls}
       attach={{
         enabled: attachEnabled,

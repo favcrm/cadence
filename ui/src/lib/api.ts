@@ -1117,9 +1117,13 @@ export const api = {
   }) => post<MemberAssistHistory>(`/api/member-assistant/history`, { ...page }),
   /** `POST /api/member-assistant/send` — send `text` to the member's own
    *  assistant. `message` is the client-chosen idempotent id a retry
-   *  reuses (one message, not two). */
-  memberAssistSend: (text: string, message: string) =>
-    post<MemberAssistSend>(`/api/member-assistant/send`, { text, message }),
+   *  reuses (one message, not two). Optional `attachments` carry
+   *  retained `chf-` upload ids from `POST /api/chat/upload`. */
+  memberAssistSend: (text: string, message: string, attachments?: { id: string }[]) =>
+    post<MemberAssistSend>(
+      `/api/member-assistant/send`,
+      attachments && attachments.length > 0 ? { text, message, attachments } : { text, message },
+    ),
   /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
    *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */
