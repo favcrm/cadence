@@ -45,6 +45,57 @@ struct ThreadPageFields {
     home: bool,
 }
 
+struct OpaqueThreadQuery<'a> {
+    after: Option<&'a str>,
+    before: Option<&'a str>,
+    backward: bool,
+    limit: i64,
+    wait: u64,
+}
+
+struct OpaqueEmptyPageCheck<'a> {
+    params: &'a Value,
+    peer_pid: u32,
+    context: &'a AgentThreadRead<'a>,
+    principal: &'a str,
+    target_uid: &'a str,
+    backward: bool,
+}
+
+struct OpaqueScanSpec<'a> {
+    alias: &'a str,
+    thread_id: &'a str,
+    peer_pid: u32,
+    start: i64,
+    limit: i64,
+    backward: bool,
+}
+
+struct OpaqueScanPass<'a> {
+    issues: &'a [&'a str],
+    denials: &'a store::PrivateJobDenials,
+    #[cfg_attr(not(feature = "test-seam"), allow(dead_code))]
+    phase: &'a str,
+}
+
+struct OpaqueConfirmCtx<'a> {
+    params: &'a Value,
+    peer_pid: u32,
+    context: &'a AgentThreadRead<'a>,
+    thread: &'a store::Thread,
+    principal: &'a str,
+    target_uid: &'a str,
+    scan_spec: &'a OpaqueScanSpec<'a>,
+}
+
+struct OpaquePageRender<'a> {
+    alias: &'a str,
+    resource: &'a str,
+    principal: &'a str,
+    filters: &'a str,
+    query: &'a OpaqueThreadQuery<'a>,
+}
+
 impl Shared {
     /// The entries as JSON. A message-linked entry whose stored message
     /// belongs to this alias and to the entry's own thread carries
@@ -723,6 +774,137 @@ impl Shared {
         peer_pid: u32,
         mut context: AgentThreadRead<'_>,
     ) -> Result<Value> {
+        let query = Self::parse_opaque_thread_query(params)?;
+        let principal = super::job_events_opaque::agent_read_principal(
+            self,
+            params,
+            peer_pid,
+            None,
+            None,
+            "thread read",
+        )?
+        .ok_or_else(|| Error::rejected("thread read refused: agent identity is unavailable"))?;
+        let target_uid = self.store.agent(context.alias)?.uid;
+        let codec = self.scoped_cursor_codec()?;
+        let filters = super::agent_events_opaque::project_set_filters(&context.scope.0);
+        let deadline = Instant::now() + Duration::from_secs(query.wait);
+        loop {
+            let thread = match context.conversation {
+                Some(thread) => Some(thread.clone()),
+                None => self.store.thread(context.alias)?,
+            };
+            let Some(thread) = thread else {
+                if query.after.is_some() || query.before.is_some() {
+                    return Err(Error::invalid(
+                        "thread_cursor_invalid",
+                        "thread cursor is invalid",
+                    ));
+                }
+                if !query.backward
+                    && Instant::now() < deadline
+                    && !self.closing.load(Ordering::SeqCst)
+                {
+                    self.changed
+                        .wait_until(deadline.min(Instant::now() + Duration::from_secs(1)));
+                    continue;
+                }
+                return self.build_empty_opaque_thread_page(&OpaqueEmptyPageCheck {
+                    params,
+                    peer_pid,
+                    context: &context,
+                    principal: &principal,
+                    target_uid: &target_uid,
+                    backward: query.backward,
+                });
+            };
+            let created = format!("{:016x}", thread.created.to_bits());
+            let resource = super::job_events_opaque::framed(&[
+                "agent-thread",
+                context.alias,
+                &target_uid,
+                &thread.id,
+                &created,
+            ]);
+            let direction = if query.backward {
+                CursorDirection::Backward
+            } else {
+                CursorDirection::Forward
+            };
+            let token = if query.backward {
+                query.before
+            } else {
+                query.after
+            };
+            let binding = CursorBinding {
+                domain: "agent-thread",
+                direction,
+                principal: &principal,
+                resource: &resource,
+                filters: &filters,
+            };
+            let start = token
+                .map(|token| {
+                    codec.open(token, &binding).map_err(|_| {
+                        Error::invalid("thread_cursor_invalid", "thread cursor is invalid")
+                    })
+                })
+                .transpose()?
+                .unwrap_or(if query.backward { i64::MAX } else { 0 });
+
+            let scan_spec = OpaqueScanSpec {
+                alias: context.alias,
+                thread_id: &thread.id,
+                peer_pid,
+                start,
+                limit: query.limit,
+                backward: query.backward,
+            };
+            let (selected, _) = self.scan_opaque_thread_entries(
+                &scan_spec,
+                &mut context.projection,
+                &OpaqueScanPass {
+                    issues: context.issues,
+                    denials: context.denials,
+                    phase: "initial",
+                },
+            )?;
+            if selected.is_empty()
+                && !query.backward
+                && Instant::now() < deadline
+                && !self.closing.load(Ordering::SeqCst)
+            {
+                self.changed
+                    .wait_until(deadline.min(Instant::now() + Duration::from_secs(1)));
+                continue;
+            }
+            let (confirmed, warning) = self.confirm_opaque_thread_entries(
+                &OpaqueConfirmCtx {
+                    params,
+                    peer_pid,
+                    context: &context,
+                    thread: &thread,
+                    principal: &principal,
+                    target_uid: &target_uid,
+                    scan_spec: &scan_spec,
+                },
+                &selected,
+            )?;
+            return self.render_opaque_thread_page(
+                &codec,
+                &OpaquePageRender {
+                    alias: context.alias,
+                    resource: &resource,
+                    principal: &principal,
+                    filters: &filters,
+                    query: &query,
+                },
+                confirmed,
+                warning,
+            );
+        }
+    }
+
+    fn parse_opaque_thread_query(params: &Value) -> Result<OpaqueThreadQuery<'_>> {
         if params.get("cursor_format").and_then(Value::as_str) != Some(THREAD_CURSOR_FORMAT) {
             return Err(Error::invalid(
                 "thread_cursor_format",
@@ -771,369 +953,356 @@ impl Shared {
                 store::THREAD_PAGE_MAX
             )));
         }
-        let principal = super::job_events_opaque::agent_read_principal(
-            self,
-            params,
-            peer_pid,
-            None,
-            None,
-            "thread read",
-        )?
-        .ok_or_else(|| Error::rejected("thread read refused: agent identity is unavailable"))?;
-        let target_uid = self.store.agent(context.alias)?.uid;
-        let codec = self.scoped_cursor_codec()?;
-        let filters = super::agent_events_opaque::project_set_filters(&context.scope.0);
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
-        let deadline = Instant::now() + Duration::from_secs(wait);
+        Ok(OpaqueThreadQuery {
+            after,
+            before,
+            backward,
+            limit,
+            wait,
+        })
+    }
+
+    fn build_empty_opaque_thread_page(&self, check: &OpaqueEmptyPageCheck<'_>) -> Result<Value> {
+        let (current, public) = self.thread_read_scope(check.params, check.peer_pid)?;
+        let current_principal = super::job_events_opaque::agent_read_principal(
+            self,
+            check.params,
+            check.peer_pid,
+            None,
+            public.as_ref(),
+            "thread read",
+        )?;
+        if current.as_ref().map(|scope| &scope.0) != Some(&check.context.scope.0)
+            || current_principal.as_deref() != Some(check.principal)
+            || self.store.agent(check.context.alias)?.uid != check.target_uid
+        {
+            return Err(Error::rejected(
+                "thread read refused: reader access changed",
+            ));
+        }
+        let mut page = json!({
+            "alias": check.context.alias, "thread": null, "entries": [],
+            "cursor_format": THREAD_CURSOR_FORMAT,
+            "cursor": null, "before_cursor": null,
+            "more_before": check.backward.then_some(false),
+            "more_after": (!check.backward).then_some(false),
+        });
+        page[READER_SCOPE_FIELD] = json!(THREAD_OPAQUE_SCOPE_ACK);
+        Ok(page)
+    }
+
+    fn scan_opaque_thread_entries(
+        &self,
+        spec: &OpaqueScanSpec<'_>,
+        projection: &mut super::cloud_agent_rpc::CloudProjection,
+        pass: &OpaqueScanPass<'_>,
+    ) -> Result<(Vec<store::ThreadEntry>, Vec<String>)> {
+        // Select one extra VISIBLE row for exhaustion; a foreign cloud
+        // row can neither consume a page slot nor advance its boundary.
+        let mut selected = Vec::with_capacity(spec.limit as usize + 1);
+        let mut denied = Vec::new();
+        let mut position = spec.start;
         loop {
-            let thread = match context.conversation {
-                Some(thread) => Some(thread.clone()),
-                None => self.store.thread(context.alias)?,
-            };
-            let Some(thread) = thread else {
-                if after.is_some() || before.is_some() {
-                    return Err(Error::invalid(
-                        "thread_cursor_invalid",
-                        "thread cursor is invalid",
-                    ));
-                }
-                if !backward && Instant::now() < deadline && !self.closing.load(Ordering::SeqCst) {
-                    self.changed
-                        .wait_until(deadline.min(Instant::now() + Duration::from_secs(1)));
-                    continue;
-                }
-                let (current, public) = self.thread_read_scope(params, peer_pid)?;
-                let current_principal = super::job_events_opaque::agent_read_principal(
-                    self,
-                    params,
-                    peer_pid,
-                    None,
-                    public.as_ref(),
-                    "thread read",
+            let batch = (spec.limit + 1).clamp(32, store::THREAD_PAGE_MAX);
+            let (raw, more) = if spec.backward {
+                self.store.thread_entries_before_scoped(
+                    spec.thread_id,
+                    Some(position),
+                    batch,
+                    pass.issues,
+                    pass.denials,
+                    false,
+                )?
+            } else {
+                let rows = self.store.thread_entries_after_scoped(
+                    spec.thread_id,
+                    position,
+                    batch,
+                    pass.issues,
+                    pass.denials,
+                    false,
                 )?;
-                if current.as_ref().map(|scope| &scope.0) != Some(&context.scope.0)
-                    || current_principal.as_deref() != Some(principal.as_str())
-                    || self.store.agent(context.alias)?.uid != target_uid
-                {
+                let more = rows.len() as i64 == batch;
+                (rows, more)
+            };
+            if raw.is_empty() {
+                break;
+            }
+            if projection.needs_readmission(
+                &self.store,
+                raw.iter().filter_map(|entry| entry.message_id.as_deref()),
+            )? {
+                // Re-admit this batch without restarting or counting
+                // foreign arrivals. The complete visible selection is
+                // independently re-scanned under fresh authority
+                // before it can be returned.
+                *projection =
+                    self.admit_cloud_projection(spec.alias, spec.peer_pid, "thread read")?;
+                #[cfg(feature = "test-seam")]
+                if let Some(observer) = &self.agent_thread_batch_observer {
+                    let phase = match pass.phase {
+                        "initial" => "initial-refresh",
+                        "confirmation" => "confirmation-refresh",
+                        _ => "recheck-refresh",
+                    };
+                    observer(spec.alias, phase, selected.len());
+                }
+                let retained = selected.len();
+                selected = projection.entries(&self.store, selected)?;
+                if selected.len() != retained {
                     return Err(Error::rejected(
                         "thread read refused: reader access changed",
                     ));
                 }
-                let mut page = json!({
-                    "alias": context.alias, "thread": null, "entries": [],
-                    "cursor_format": THREAD_CURSOR_FORMAT,
-                    "cursor": null, "before_cursor": null,
-                    "more_before": backward.then_some(false),
-                    "more_after": (!backward).then_some(false),
-                });
-                page[READER_SCOPE_FIELD] = json!(THREAD_OPAQUE_SCOPE_ACK);
-                return Ok(page);
-            };
-            let created = format!("{:016x}", thread.created.to_bits());
-            let resource = super::job_events_opaque::framed(&[
-                "agent-thread",
-                context.alias,
-                &target_uid,
-                &thread.id,
-                &created,
-            ]);
-            let binding = |direction| CursorBinding {
-                domain: "agent-thread",
-                direction,
-                principal: &principal,
-                resource: &resource,
-                filters: &filters,
-            };
-            let token = if backward { before } else { after };
-            let direction = if backward {
-                CursorDirection::Backward
-            } else {
-                CursorDirection::Forward
-            };
-            let start = token
-                .map(|token| {
-                    codec.open(token, &binding(direction)).map_err(|_| {
-                        Error::invalid("thread_cursor_invalid", "thread cursor is invalid")
-                    })
-                })
-                .transpose()?
-                .unwrap_or(if backward { i64::MAX } else { 0 });
-
-            // Select one extra VISIBLE row for exhaustion; a foreign cloud
-            // row can neither consume a page slot nor advance its boundary.
-            let scan = |projection: &mut super::cloud_agent_rpc::CloudProjection,
-                        issues: &[&str],
-                        denials: &store::PrivateJobDenials,
-                        _phase: &str|
-             -> Result<(Vec<store::ThreadEntry>, Vec<String>)> {
-                let mut selected = Vec::with_capacity(limit as usize + 1);
-                let mut denied = Vec::new();
-                let mut position = start;
-                loop {
-                    let batch = (limit + 1).clamp(32, store::THREAD_PAGE_MAX);
-                    let (raw, more) = if backward {
-                        self.store.thread_entries_before_scoped(
-                            &thread.id,
-                            Some(position),
-                            batch,
-                            issues,
-                            denials,
-                            false,
-                        )?
-                    } else {
-                        let rows = self.store.thread_entries_after_scoped(
-                            &thread.id, position, batch, issues, denials, false,
-                        )?;
-                        let more = rows.len() as i64 == batch;
-                        (rows, more)
-                    };
-                    if raw.is_empty() {
-                        break;
-                    }
-                    if projection.needs_readmission(
-                        &self.store,
-                        raw.iter().filter_map(|entry| entry.message_id.as_deref()),
-                    )? {
-                        // Re-admit this batch without restarting or counting
-                        // foreign arrivals. The complete visible selection is
-                        // independently re-scanned under fresh authority
-                        // before it can be returned.
-                        *projection =
-                            self.admit_cloud_projection(context.alias, peer_pid, "thread read")?;
-                        #[cfg(feature = "test-seam")]
-                        if let Some(observer) = &self.agent_thread_batch_observer {
-                            let phase = match _phase {
-                                "initial" => "initial-refresh",
-                                "confirmation" => "confirmation-refresh",
-                                _ => "recheck-refresh",
-                            };
-                            observer(context.alias, phase, selected.len());
-                        }
-                        let retained = selected.len();
-                        selected = projection.entries(&self.store, selected)?;
-                        if selected.len() != retained {
-                            return Err(Error::rejected(
-                                "thread read refused: reader access changed",
-                            ));
-                        }
-                    }
-                    for id in raw.iter().filter_map(|entry| entry.message_id.as_deref()) {
-                        if projection.scoped_denial(id).is_some() {
-                            denied.push(id.to_owned());
-                        }
-                    }
-                    let boundary = if backward { raw.first() } else { raw.last() }
-                        .expect("nonempty thread batch")
-                        .seq;
-                    let mut visible = projection.entries(&self.store, raw)?;
-                    if backward {
-                        visible.reverse();
-                    }
-                    for entry in visible {
-                        selected.push(entry);
-                        if selected.len() > limit as usize {
-                            break;
-                        }
-                    }
-                    #[cfg(feature = "test-seam")]
-                    if let Some(observer) = &self.agent_thread_batch_observer {
-                        observer(context.alias, _phase, selected.len());
-                    }
-                    if selected.len() > limit as usize || !more {
-                        break;
-                    }
-                    position = boundary;
+            }
+            for id in raw.iter().filter_map(|entry| entry.message_id.as_deref()) {
+                if projection.scoped_denial(id).is_some() {
+                    denied.push(id.to_owned());
                 }
-                Ok((selected, denied))
-            };
-
-            let (selected, _) = scan(
-                &mut context.projection,
-                context.issues,
-                context.denials,
-                "initial",
-            )?;
-            if selected.is_empty()
-                && !backward
-                && Instant::now() < deadline
-                && !self.closing.load(Ordering::SeqCst)
-            {
-                self.changed
-                    .wait_until(deadline.min(Instant::now() + Duration::from_secs(1)));
-                continue;
             }
-            let (current_scope, current_public) = self.thread_read_scope(params, peer_pid)?;
-            let current_scope = current_scope
-                .ok_or_else(|| Error::rejected("thread read refused: reader access changed"))?;
-            let current_principal = super::job_events_opaque::agent_read_principal(
-                self,
-                params,
-                peer_pid,
-                None,
-                current_public.as_ref(),
-                "thread read",
-            )?;
-            if current_scope.0 != context.scope.0
-                || current_principal.as_deref() != Some(principal.as_str())
-                || self.store.agent(context.alias)?.uid != target_uid
-            {
-                return Err(Error::rejected(
-                    "thread read refused: reader access changed",
-                ));
-            }
-            let current_thread = if context.conversation.is_some() {
-                self.store.thread_by_id(&thread.id)?
+            let boundary = if spec.backward {
+                raw.first()
             } else {
-                self.store.thread(context.alias)?
-            };
-            if current_thread.as_ref().is_none_or(|current| {
-                current.id != thread.id
-                    || current.alias != thread.alias
-                    || current.created.to_bits() != thread.created.to_bits()
-            }) {
-                return Err(Error::rejected("thread read refused: conversation changed"));
+                raw.last()
             }
-            self.authorize_thread_read_target(context.alias, params, None, peer_pid)?;
-            let current_denials =
-                self.private_job_denials_for_read(params, None, None, peer_pid)?;
-            let current_issues: Vec<&str> = current_scope
+            .expect("nonempty thread batch")
+            .seq;
+            let mut visible = projection.entries(&self.store, raw)?;
+            if spec.backward {
+                visible.reverse();
+            }
+            for entry in visible {
+                selected.push(entry);
+                if selected.len() > spec.limit as usize {
+                    break;
+                }
+            }
+            #[cfg(feature = "test-seam")]
+            if let Some(observer) = &self.agent_thread_batch_observer {
+                observer(spec.alias, pass.phase, selected.len());
+            }
+            if selected.len() > spec.limit as usize || !more {
+                break;
+            }
+            position = boundary;
+        }
+        Ok((selected, denied))
+    }
+
+    fn confirm_opaque_thread_entries(
+        &self,
+        ctx: &OpaqueConfirmCtx<'_>,
+        selected: &[store::ThreadEntry],
+    ) -> Result<(Vec<store::ThreadEntry>, Option<String>)> {
+        let (current_scope, current_public) = self.thread_read_scope(ctx.params, ctx.peer_pid)?;
+        let current_scope = current_scope
+            .ok_or_else(|| Error::rejected("thread read refused: reader access changed"))?;
+        let current_principal = super::job_events_opaque::agent_read_principal(
+            self,
+            ctx.params,
+            ctx.peer_pid,
+            None,
+            current_public.as_ref(),
+            "thread read",
+        )?;
+        if current_scope.0 != ctx.context.scope.0
+            || current_principal.as_deref() != Some(ctx.principal)
+            || self.store.agent(ctx.context.alias)?.uid != ctx.target_uid
+        {
+            return Err(Error::rejected(
+                "thread read refused: reader access changed",
+            ));
+        }
+        let current_thread = if ctx.context.conversation.is_some() {
+            self.store.thread_by_id(&ctx.thread.id)?
+        } else {
+            self.store.thread(ctx.context.alias)?
+        };
+        if current_thread.as_ref().is_none_or(|current| {
+            current.id != ctx.thread.id
+                || current.alias != ctx.thread.alias
+                || current.created.to_bits() != ctx.thread.created.to_bits()
+        }) {
+            return Err(Error::rejected("thread read refused: conversation changed"));
+        }
+        self.authorize_thread_read_target(ctx.context.alias, ctx.params, None, ctx.peer_pid)?;
+        let current_denials =
+            self.private_job_denials_for_read(ctx.params, None, None, ctx.peer_pid)?;
+        let current_issues: Vec<&str> = current_scope
+            .1
+            .iter()
+            .filter(|(_, project)| current_scope.0.contains(*project))
+            .map(|(issue, _)| issue.as_str())
+            .collect();
+        let mut final_projection =
+            self.admit_cloud_projection(ctx.context.alias, ctx.peer_pid, "thread read")?;
+        let (mut confirmed, mut denied) = self.scan_opaque_thread_entries(
+            ctx.scan_spec,
+            &mut final_projection,
+            &OpaqueScanPass {
+                issues: &current_issues,
+                denials: &current_denials,
+                phase: "confirmation",
+            },
+        )?;
+        if selected
+            .iter()
+            .map(|entry| entry.seq)
+            .ne(confirmed.iter().map(|entry| entry.seq))
+        {
+            return Err(Error::rejected(
+                "thread read refused: reader access changed",
+            ));
+        }
+        let (last_scope, last_public) = self.thread_read_scope(ctx.params, ctx.peer_pid)?;
+        let last_principal = super::job_events_opaque::agent_read_principal(
+            self,
+            ctx.params,
+            ctx.peer_pid,
+            None,
+            last_public.as_ref(),
+            "thread read",
+        )?;
+        let last_scope = last_scope
+            .ok_or_else(|| Error::rejected("thread read refused: reader access changed"))?;
+        if last_scope.0 != current_scope.0 || last_principal.as_deref() != Some(ctx.principal) {
+            return Err(Error::rejected(
+                "thread read refused: reader access changed",
+            ));
+        }
+        let last_denials =
+            self.private_job_denials_for_read(ctx.params, None, None, ctx.peer_pid)?;
+        if last_scope.1 != current_scope.1 || last_denials != current_denials {
+            // A hidden issue or private job may have appeared while
+            // reading. Refuse only if the VISIBLE page changed.
+            let last_issues: Vec<&str> = last_scope
                 .1
                 .iter()
-                .filter(|(_, project)| current_scope.0.contains(*project))
+                .filter(|(_, project)| last_scope.0.contains(*project))
                 .map(|(issue, _)| issue.as_str())
                 .collect();
-            let mut final_projection =
-                self.admit_cloud_projection(context.alias, peer_pid, "thread read")?;
-            let (mut confirmed, mut denied) = scan(
+            let (rechecked, rechecked_denied) = self.scan_opaque_thread_entries(
+                ctx.scan_spec,
                 &mut final_projection,
-                &current_issues,
-                &current_denials,
-                "confirmation",
+                &OpaqueScanPass {
+                    issues: &last_issues,
+                    denials: &last_denials,
+                    phase: "recheck",
+                },
             )?;
-            if selected
+            if confirmed
                 .iter()
                 .map(|entry| entry.seq)
-                .ne(confirmed.iter().map(|entry| entry.seq))
+                .ne(rechecked.iter().map(|entry| entry.seq))
             {
                 return Err(Error::rejected(
                     "thread read refused: reader access changed",
                 ));
             }
-            let (last_scope, last_public) = self.thread_read_scope(params, peer_pid)?;
-            let last_principal = super::job_events_opaque::agent_read_principal(
-                self,
-                params,
-                peer_pid,
-                None,
-                last_public.as_ref(),
-                "thread read",
-            )?;
-            let last_scope = last_scope
-                .ok_or_else(|| Error::rejected("thread read refused: reader access changed"))?;
-            if last_scope.0 != current_scope.0
-                || last_principal.as_deref() != Some(principal.as_str())
-            {
-                return Err(Error::rejected(
-                    "thread read refused: reader access changed",
-                ));
-            }
-            let last_denials = self.private_job_denials_for_read(params, None, None, peer_pid)?;
-            if last_scope.1 != current_scope.1 || last_denials != current_denials {
-                // A hidden issue or private job may have appeared while
-                // reading. Refuse only if the VISIBLE page changed.
-                let last_issues: Vec<&str> = last_scope
-                    .1
-                    .iter()
-                    .filter(|(_, project)| last_scope.0.contains(*project))
-                    .map(|(issue, _)| issue.as_str())
-                    .collect();
-                let (rechecked, rechecked_denied) = scan(
-                    &mut final_projection,
-                    &last_issues,
-                    &last_denials,
-                    "recheck",
-                )?;
-                if confirmed
-                    .iter()
-                    .map(|entry| entry.seq)
-                    .ne(rechecked.iter().map(|entry| entry.seq))
-                {
-                    return Err(Error::rejected(
-                        "thread read refused: reader access changed",
-                    ));
-                }
-                confirmed = rechecked;
-                denied = rechecked_denied;
-            }
-            // The confirmation scan can take long enough for a grant or
-            // credential to change. Re-prove every selected row, including
-            // the extra exhaustion witness, under one last cloud admission.
-            let proved_projection =
-                self.admit_cloud_projection(context.alias, peer_pid, "thread read")?;
-            let retained = confirmed.len();
-            confirmed = proved_projection.entries(&self.store, confirmed)?;
-            if confirmed.len() != retained
-                || denied
-                    .iter()
-                    .any(|id| proved_projection.scoped_denial(id).is_none())
-            {
-                return Err(Error::rejected(
-                    "thread read refused: reader access changed",
-                ));
-            }
-            let warning = denied
-                .iter()
-                .find_map(|id| proved_projection.scoped_denial(id));
-            let more = confirmed.len() > limit as usize;
-            if more {
-                confirmed.pop();
-            }
-            if backward {
-                confirmed.reverse();
-            }
-            let seal = |seq, direction| {
-                codec
-                    .seal(seq, &binding(direction))
-                    .map_err(|_| super::scoped_cursor_config::unavailable())
-            };
-            let forward = confirmed
-                .last()
-                .map(|row| seal(row.seq, CursorDirection::Forward))
-                .transpose()?
-                .or_else(|| (!backward).then(|| after.map(str::to_owned)).flatten());
-            let previous = confirmed
-                .first()
-                .map(|row| seal(row.seq, CursorDirection::Backward))
-                .transpose()?
-                .or_else(|| backward.then(|| before.map(str::to_owned)).flatten());
-            let rows = self
-                .entries_json(context.alias, &confirmed)?
-                .into_iter()
-                .zip(&confirmed)
-                .map(|(row, entry)| {
-                    let id = codec
-                        .stable_row_id("agent-thread-entry", &resource, &entry.seq.to_be_bytes())
-                        .map_err(|_| super::scoped_cursor_config::unavailable())?;
-                    let mut value = serde_json::to_value(row)?;
-                    let object = value.as_object_mut().expect("thread entry object");
-                    object.remove("seq");
-                    object.insert("id".to_string(), json!(id));
-                    Ok(value)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut page = json!({
-                "alias": context.alias, "thread": null, "entries": rows,
-                "cursor_format": THREAD_CURSOR_FORMAT,
-                "cursor": forward, "before_cursor": previous,
-                "more_before": backward.then_some(more),
-                "more_after": (!backward).then_some(more),
-            });
-            if let Some(reason) = warning {
-                page["cloud_withheld"] = json!(reason);
-            }
-            page[READER_SCOPE_FIELD] = json!(THREAD_OPAQUE_SCOPE_ACK);
-            return Ok(page);
+            confirmed = rechecked;
+            denied = rechecked_denied;
         }
+        // The confirmation scan can take long enough for a grant or
+        // credential to change. Re-prove every selected row, including
+        // the extra exhaustion witness, under one last cloud admission.
+        let proved_projection =
+            self.admit_cloud_projection(ctx.context.alias, ctx.peer_pid, "thread read")?;
+        let retained = confirmed.len();
+        confirmed = proved_projection.entries(&self.store, confirmed)?;
+        if confirmed.len() != retained
+            || denied
+                .iter()
+                .any(|id| proved_projection.scoped_denial(id).is_none())
+        {
+            return Err(Error::rejected(
+                "thread read refused: reader access changed",
+            ));
+        }
+        let warning = denied
+            .iter()
+            .find_map(|id| proved_projection.scoped_denial(id))
+            .map(str::to_owned);
+        Ok((confirmed, warning))
+    }
+
+    fn render_opaque_thread_page(
+        &self,
+        codec: &super::scoped_cursor::ScopedCursorCodec,
+        render: &OpaquePageRender<'_>,
+        mut confirmed: Vec<store::ThreadEntry>,
+        warning: Option<String>,
+    ) -> Result<Value> {
+        let more = confirmed.len() > render.query.limit as usize;
+        if more {
+            confirmed.pop();
+        }
+        if render.query.backward {
+            confirmed.reverse();
+        }
+        let binding = |direction| CursorBinding {
+            domain: "agent-thread",
+            direction,
+            principal: render.principal,
+            resource: render.resource,
+            filters: render.filters,
+        };
+        let seal = |seq, direction| {
+            codec
+                .seal(seq, &binding(direction))
+                .map_err(|_| super::scoped_cursor_config::unavailable())
+        };
+        let forward = confirmed
+            .last()
+            .map(|row| seal(row.seq, CursorDirection::Forward))
+            .transpose()?
+            .or_else(|| {
+                (!render.query.backward)
+                    .then(|| render.query.after.map(str::to_owned))
+                    .flatten()
+            });
+        let previous = confirmed
+            .first()
+            .map(|row| seal(row.seq, CursorDirection::Backward))
+            .transpose()?
+            .or_else(|| {
+                render
+                    .query
+                    .backward
+                    .then(|| render.query.before.map(str::to_owned))
+                    .flatten()
+            });
+        let rows = self
+            .entries_json(render.alias, &confirmed)?
+            .into_iter()
+            .zip(&confirmed)
+            .map(|(row, entry)| {
+                let id = codec
+                    .stable_row_id(
+                        "agent-thread-entry",
+                        render.resource,
+                        &entry.seq.to_be_bytes(),
+                    )
+                    .map_err(|_| super::scoped_cursor_config::unavailable())?;
+                let mut value = serde_json::to_value(row)?;
+                let object = value.as_object_mut().expect("thread entry object");
+                object.remove("seq");
+                object.insert("id".to_string(), json!(id));
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut page = json!({
+            "alias": render.alias, "thread": null, "entries": rows,
+            "cursor_format": THREAD_CURSOR_FORMAT,
+            "cursor": forward, "before_cursor": previous,
+            "more_before": render.query.backward.then_some(more),
+            "more_after": (!render.query.backward).then_some(more),
+        });
+        if let Some(reason) = warning {
+            page["cloud_withheld"] = json!(reason);
+        }
+        page[READER_SCOPE_FIELD] = json!(THREAD_OPAQUE_SCOPE_ACK);
+        Ok(page)
     }
 
     /// `thread_send` — the operator's chat message to an agent: starts
