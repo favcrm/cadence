@@ -248,6 +248,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     "audit_approve_project",
     "review_producer",
     "review_producer_attest",
+    "review_assignments",
+    "review_assignments_write",
     // CAD-2197: the operator's head-pinned acceptance of a workflow revise.
     "audit_accept_revise_project",
     "audit_reviewers_project",
@@ -307,6 +309,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_identities"
         | "delivery_check"
         | "review_producer"
+        | "review_assignments"
         | "audit_scope_project"
         | "audit_designations_project"
         | "audit_digest_project"
@@ -337,9 +340,10 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
         // A delegated approval is the designated agent's own act (`cli.write`),
         // never spending the owner's `audit.approve` token.
-        "audit_verdict" | "audit_verdict_project" | "audit_approve_delegated_project" => {
-            &["cli.write"]
-        }
+        "audit_verdict"
+        | "audit_verdict_project"
+        | "audit_approve_delegated_project"
+        | "review_assignments_write" => &["cli.write"],
         // CAD-1999: creating a project is a workspace-structure write; the
         // board also requires a live human owner. Reading the registry is a
         // plain cli.read above.
@@ -529,6 +533,7 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_identities"
         | "delivery_check"
         | "review_producer"
+        | "review_assignments"
         | "audit_scope_project"
         | "audit_designations_project"
         | "audit_digest_project"
@@ -578,6 +583,7 @@ fn cli_effect(verb: &str) -> Effect {
         "audit_approve" => mutation(RECONCILE_AUDIT_APPROVE),
         "audit_approve_project" => mutation(RECONCILE_AUDIT_APPROVE_PROJECT),
         "review_producer_attest" => mutation(RECONCILE_REVIEW_PRODUCER),
+        "review_assignments_write" => mutation("the assignment change may or may not have been applied — read `delivery review-assignments show` for the same tuple before repeating it"),
         "audit_verdict" | "audit_verdict_project" => mutation(RECONCILE_AUDIT_VERDICT),
         "audit_reviewers_set" => mutation(RECONCILE_AUDIT_REVIEWERS),
         "audit_reviewers_project_set" => mutation(RECONCILE_AUDIT_REVIEWERS_PROJECT),
@@ -2631,6 +2637,8 @@ pub const HOSTED_MERGE_GATE_VERBS: &[&str] = &[
     "delivery_enqueue",
     "review_producer",
     "review_producer_attest",
+    "review_assignments",
+    "review_assignments_write",
     "audit_revoke_project",
     "audit_approve_scope_project",
     "audit_scope_project",
@@ -4024,6 +4032,16 @@ fn call_once(
                 .unwrap_or_default(),
         )],
         Surface::Cli if verb == REMOTE_MASTER_STATUS_VERB => &["settings.read"],
+        Surface::Cli
+            if verb == "review_assignments_write"
+                && arguments.get("action").and_then(Value::as_str) == Some("override")
+                && cred
+                    .capabilities
+                    .iter()
+                    .any(|scope| scope == "audit.approve") =>
+        {
+            &["cli.write", "audit.approve"]
+        }
         Surface::Cli => cli_requested_scopes(verb),
         Surface::Wiki if verb == "write" => &["wiki.write"],
         Surface::Wiki => &["wiki.read"],
@@ -8625,7 +8643,7 @@ pub use actor_credential::{
     valid_profile_id, CliActor, CliActorMode,
 };
 mod agent_credential;
-pub use agent_credential::{bind_managed_session, bound_session, AgentSlot};
+pub use agent_credential::{bind_managed_session, bound_session, managed_publish, AgentSlot};
 // The test seam is absent from a release or CI-profile build; only a debug
 // build or the explicit `test-seam` feature may reset the session binding.
 #[cfg(any(debug_assertions, feature = "test-seam"))]

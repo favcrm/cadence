@@ -85,6 +85,39 @@ fences. A board without preview support will not activate the proposal.
 
 The gate refuses a project with no recorded repository.
 
+### Hosted assigned reviews
+
+On a tenant that supports AOS-744, add `--assigned-reviews-file settings.json`
+to both the preview and the fenced apply. The settings are a JSON object such
+as `{"overridable_slots":["general"]}` with an optional `default_profile`.
+Use JSON `null` to explicitly disable the feature. Absence is not a disable
+request. A tenant that does not echo the exact settings cannot receive an
+apply from this client.
+
+Read the exact head's effective plan before dispatch:
+
+```sh
+cadence --org acme delivery review-assignments show \
+  --project storefront --issue SHOP-12 --repo acme/storefront \
+  --pr 42 --head 1111111111111111111111111111111111111111
+```
+
+Use the same selector with `dispatch`, `cancel`, `retry`, or `override`.
+Cancellation and retry name the assignment and generation. Overrides name the
+policy and override revisions and include a reason. The server chooses the
+reviewers and the count. Only the assigned runner can file its verdict; human
+approval and enqueue still happen separately. Missing capability or a wrong
+head refuses instead of switching to another review route.
+
+The managed writer in a live hosted assignment uses
+`cadence --org acme delivery publish-pr --request-file packet.json`. The
+packet contains `repo`, `expectedHead`, `requestId`, `title`, and regular-file
+changes (`files` with `path` and Base64 `contents`, or `null` for deletion).
+This command uses only that assignment's publication authority, not a GitHub
+login. An uncertain response is not a refusal: reconcile the publication before
+retrying, and use the identical packet and request ID. The receipt is producer
+evidence, not a review, merge approval, or enqueue.
+
 ### Trusted lists
 
 The lists are read from the pull request's anchor, never from the pull request

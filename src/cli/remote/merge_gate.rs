@@ -5,11 +5,11 @@
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 
 use cadence_agent::delivery::hosted_gate::{self, GateBinding};
 use cadence_agent::issue::cli::{IssueAction, ProjectAction};
-use cadence_agent::remote_cli::{saved_capabilities, RemoteTarget};
+use cadence_agent::remote_cli::{managed_publish, saved_capabilities, RemoteTarget};
 use cadence_agent::{audit as core_audit, Error, Result};
 use serde_json::Value;
 
@@ -17,7 +17,7 @@ use super::scope_hint;
 use crate::cli::audit::{
     full_head, identity_pairs, reviewer_subjects, AuditAction, IdentitiesAction, ReviewersAction,
 };
-use crate::cli::delivery::DeliveryAction;
+use crate::cli::delivery::{DeliveryAction, ReviewAssignmentsAction};
 use crate::cli::{print_json, Commands};
 
 /// The explicit project a hosted gate call is scoped to. CAD-2001: the review
@@ -88,6 +88,61 @@ pub(super) fn merge_gate(
         Some(code)
     };
     Ok(match command {
+        Commands::Delivery {
+            action: DeliveryAction::ReviewAssignments { action },
+        } => {
+            let tuple = action.tuple();
+            let binding = GateBinding::new(
+                &tuple.project,
+                &tuple.repo,
+                &tuple.issue,
+                tuple.pr,
+                &full_head(&tuple.head)?,
+            )?;
+            let change = match action {
+                ReviewAssignmentsAction::Show { .. } => None,
+                ReviewAssignmentsAction::Dispatch { .. } => {
+                    Some(serde_json::json!({"action": "dispatch"}))
+                }
+                ReviewAssignmentsAction::Cancel {
+                    assignment_id,
+                    generation,
+                    ..
+                } => Some(
+                    serde_json::json!({"action": "cancel", "assignment_id": assignment_id, "generation": generation}),
+                ),
+                ReviewAssignmentsAction::Retry {
+                    assignment_id,
+                    generation,
+                    ..
+                } => Some(
+                    serde_json::json!({"action": "retry", "assignment_id": assignment_id, "generation": generation}),
+                ),
+                ReviewAssignmentsAction::Override {
+                    expected_revision,
+                    expected_policy_revision,
+                    add,
+                    remove,
+                    reason,
+                    ..
+                } => Some(
+                    serde_json::json!({"action": "override", "expected_revision": expected_revision, "expected_policy_revision": expected_policy_revision, "add": add, "remove": remove, "reason": reason}),
+                ),
+            };
+            printed((
+                hosted_gate::review_assignments::execute(target, wake_timeout, &binding, change)?,
+                0,
+            ))
+        }
+        Commands::Delivery {
+            action: DeliveryAction::PublishPr { request_file },
+        } => {
+            let mut packet = Vec::new();
+            fs::File::open(request_file)?
+                .take(512 * 1024 + 1)
+                .read_to_end(&mut packet)?;
+            printed((managed_publish(target, wake_timeout, &packet)?, 0))
+        }
         Commands::Delivery {
             action: DeliveryAction::Requirements {
                 issue, pr, head, ..
@@ -602,6 +657,7 @@ pub(super) fn merge_gate(
                             key,
                             repos,
                             delivery_file,
+                            assigned_reviews_file,
                             show,
                             preview,
                             expect_rev,
@@ -626,6 +682,14 @@ pub(super) fn merge_gate(
                     })
                 })
                 .transpose()?;
+            let assigned_reviews = assigned_reviews_file
+                .as_ref()
+                .map(|path| {
+                    let bytes = fs::read(path)?;
+                    serde_json::from_slice::<Value>(&bytes)
+                        .map_err(|err| Error::usage(format!("--assigned-reviews-file: {err}")))
+                })
+                .transpose()?;
             let receipt = if *preview {
                 hosted_gate::preview_delivery(
                     target,
@@ -633,6 +697,7 @@ pub(super) fn merge_gate(
                     key,
                     repos,
                     delivery.as_deref(),
+                    assigned_reviews.as_ref(),
                 )?
             } else {
                 hosted_gate::set_delivery(
@@ -642,6 +707,7 @@ pub(super) fn merge_gate(
                     repos,
                     delivery.as_deref(),
                     expect_rev.zip(preview_digest.as_deref()),
+                    assigned_reviews.as_ref(),
                 )?
             };
             printed((receipt, 0))

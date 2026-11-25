@@ -40,6 +40,8 @@ use crate::error::{Error, Result};
 use crate::issue::delivery_policy;
 use crate::remote_cli::{RemoteAnswer, RemoteTarget};
 
+pub mod review_assignments;
+
 fn refuse(why: impl std::fmt::Display) -> Error {
     Error::rejected(format!("hosted merge gate: {why}"))
 }
@@ -455,8 +457,17 @@ pub fn set_delivery(
     repos: &[String],
     delivery: Option<&str>,
     fence: Option<(u64, &str)>,
+    assigned_reviews: Option<&Value>,
 ) -> Result<Value> {
     let repos = checked_delivery_inputs(repos, delivery, fence.is_some())?;
+    if assigned_reviews.is_some() && fence.is_none() {
+        return Err(refuse(
+            "--assigned-reviews-file requires --expect-rev and --preview-digest from --preview",
+        ));
+    }
+    let assigned_reviews = assigned_reviews
+        .map(normalize_assigned_reviews)
+        .transpose()?;
     let mut call_args = args(&[("project", json!(project)), ("repos", json!(repos))]);
     if let Some(section) = delivery {
         call_args.insert("delivery".into(), json!(section));
@@ -467,14 +478,30 @@ pub fn set_delivery(
                 "--preview-digest must be sha256 followed by 64 lowercase hex digits",
             ));
         }
-        call_args.insert(
-            "expected_revision".into(),
-            json!((revision > 0).then_some(revision)),
-        );
+        let expected_revision = json!((revision > 0).then_some(revision));
+        if let Some(settings) = assigned_reviews.as_ref() {
+            let preview = request_delivery_preview(
+                target,
+                wake_timeout,
+                project,
+                &repos,
+                delivery,
+                Some(settings),
+            )?;
+            if preview["expected_revision"] != expected_revision
+                || preview["preview_digest"].as_str() != Some(digest)
+            {
+                return Err(refuse(
+                    "the assigned-review policy preview changed; preview again before applying. Nothing was sent",
+                ));
+            }
+            call_args.insert("assigned_reviews".into(), settings.clone());
+        }
+        call_args.insert("expected_revision".into(), expected_revision);
         call_args.insert("preview_digest".into(), json!(digest));
     }
     let body = call(target, wake_timeout, "delivery_policy_set", call_args)?;
-    set_delivery_answer(&body, project, &repos, delivery)
+    set_delivery_answer(&body, project, &repos, delivery, assigned_reviews.as_ref())
 }
 
 fn policy_preview_digest(digest: &str) -> bool {
@@ -507,12 +534,53 @@ pub fn preview_delivery(
     project: &str,
     repos: &[String],
     delivery: Option<&str>,
+    assigned_reviews: Option<&Value>,
 ) -> Result<Value> {
     let repos = checked_delivery_inputs(repos, delivery, true)?;
+    let assigned_reviews = assigned_reviews
+        .map(normalize_assigned_reviews)
+        .transpose()?;
+    request_delivery_preview(
+        target,
+        wake_timeout,
+        project,
+        &repos,
+        delivery,
+        assigned_reviews.as_ref(),
+    )
+}
+
+fn normalize_assigned_reviews(settings: &Value) -> Result<Value> {
+    if settings.is_null() {
+        return Ok(Value::Null);
+    }
+    let mut settings = settings.clone();
+    let slots = settings
+        .get_mut("overridable_slots")
+        .and_then(Value::as_array_mut)
+        .filter(|slots| slots.iter().all(Value::is_string))
+        .ok_or_else(|| {
+            refuse("--assigned-reviews-file needs a JSON object with overridable_slots or null")
+        })?;
+    slots.sort_unstable_by(|left, right| left.as_str().cmp(&right.as_str()));
+    Ok(settings)
+}
+
+fn request_delivery_preview(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: &str,
+    repos: &[String],
+    delivery: Option<&str>,
+    assigned_reviews: Option<&Value>,
+) -> Result<Value> {
     let repos: Vec<_> = repos.iter().map(|repo| repo.to_ascii_lowercase()).collect();
     let mut proposal = json!({"repos": repos});
     if let Some(section) = delivery {
         proposal["delivery"] = json!(section);
+    }
+    if let Some(settings) = assigned_reviews {
+        proposal["assigned_reviews"] = settings.clone();
     }
     let body = call(
         target,
@@ -520,7 +588,7 @@ pub fn preview_delivery(
         "delivery_policy",
         args(&[("project", json!(project)), ("proposal", proposal)]),
     )?;
-    preview_delivery_answer(body, project, &repos, delivery)
+    preview_delivery_answer(body, project, &repos, delivery, assigned_reviews)
 }
 
 fn preview_delivery_answer(
@@ -528,13 +596,18 @@ fn preview_delivery_answer(
     project: &str,
     repos: &[String],
     delivery: Option<&str>,
+    assigned_reviews: Option<&Value>,
 ) -> Result<Value> {
+    let mut expected = json!({"repos": repos, "delivery": delivery});
+    if let Some(settings) = assigned_reviews {
+        expected["assigned_reviews"] = settings.clone();
+    }
     if body["state"].as_str() != Some("preview")
         || body["project"].as_str() != Some(project)
         || !body
             .get("expected_revision")
             .is_some_and(|rev| rev.is_null() || rev.as_u64().is_some_and(|value| value > 0))
-        || body["proposal"] != json!({"repos": repos, "delivery": delivery})
+        || body["proposal"] != expected
         || !body["preview_digest"]
             .as_str()
             .is_some_and(policy_preview_digest)
@@ -599,6 +672,7 @@ pub(crate) fn set_delivery_answer(
     project: &str,
     repos: &[String],
     delivery: Option<&str>,
+    assigned_reviews: Option<&Value>,
 ) -> Result<Value> {
     check_receipt("delivery_policy_set", || {
         let echoed = body["repos"].as_array().map(|list| {
@@ -612,6 +686,8 @@ pub(crate) fn set_delivery_answer(
             || echoed.as_ref() != Some(&asked)
             || body["delivery"].as_str() != delivery
             || (delivery.is_none() && !body["delivery"].is_null())
+            || assigned_reviews
+                .is_some_and(|settings| body.get("assigned_reviews") != Some(settings))
             || !body["revision"].is_u64()
         {
             return Err(refuse(format!(
@@ -3578,15 +3654,15 @@ mod tests {
         assert_eq!(repos, vec!["favcrm/cadence".to_string()]);
         let ok = json!({"state": "recorded", "project": "cadence", "repos": ["favcrm/cadence"],
                         "delivery": null, "revision": 2});
-        assert!(set_delivery_answer(&ok, "cadence", &repos, None).is_ok());
-        assert!(set_delivery_answer(&ok, "pm", &repos, None).is_err());
-        assert!(set_delivery_answer(&ok, "cadence", &repos, Some("max_revise: 4")).is_err());
+        assert!(set_delivery_answer(&ok, "cadence", &repos, None, None).is_ok());
+        assert!(set_delivery_answer(&ok, "pm", &repos, None, None).is_err());
+        assert!(set_delivery_answer(&ok, "cadence", &repos, Some("max_revise: 4"), None).is_err());
         let mut other = ok.clone();
         other["repos"] = json!(["favcrm/pm"]);
-        assert!(set_delivery_answer(&other, "cadence", &repos, None).is_err());
+        assert!(set_delivery_answer(&other, "cadence", &repos, None, None).is_err());
         let mut refused = ok.clone();
         refused["state"] = json!("refused");
-        assert!(set_delivery_answer(&refused, "cadence", &repos, None).is_err());
+        assert!(set_delivery_answer(&refused, "cadence", &repos, None, None).is_err());
     }
 
     #[test]
@@ -3599,15 +3675,18 @@ mod tests {
             "favcrm/cadence".to_string(),
             "favcrm/social-content".to_string(),
         ];
-        assert!(preview_delivery_answer(preview.clone(), "cadence", &repos, None).is_ok());
-        assert!(preview_delivery_answer(preview.clone(), "cadence", &repos[..1], None).is_err());
+        assert!(preview_delivery_answer(preview.clone(), "cadence", &repos, None, None).is_ok());
         assert!(
-            preview_delivery_answer(preview, "cadence", &repos, Some("max_revise: 4")).is_err()
+            preview_delivery_answer(preview.clone(), "cadence", &repos[..1], None, None).is_err()
+        );
+        assert!(
+            preview_delivery_answer(preview, "cadence", &repos, Some("max_revise: 4"), None)
+                .is_err()
         );
 
         let old = json!({"project":"cadence","revision":null,"repos":{"state":"not_stored"},
                          "delivery":{"state":"not_stored"},"delivery_approval":{"state":"not_stored"}});
-        assert!(preview_delivery_answer(old, "cadence", &repos, None).is_err());
+        assert!(preview_delivery_answer(old, "cadence", &repos, None, None).is_err());
     }
 
     /// The classifier refuses a PR outside the ticket project's declared

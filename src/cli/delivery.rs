@@ -1,6 +1,7 @@
 //! CAD-535: `cadence delivery` — moved verbatim from src/main.rs.
 
 use super::*;
+use clap::Args;
 
 #[derive(Subcommand)]
 pub(crate) enum DeliveryAction {
@@ -193,6 +194,85 @@ pub(crate) enum DeliveryAction {
         #[arg(long = "approve", value_name = "SOURCE")]
         approve: Option<String>,
     },
+    /// Inspect or manage hosted review assignments for an exact PR head.
+    ReviewAssignments {
+        #[command(subcommand)]
+        action: ReviewAssignmentsAction,
+    },
+    /// Publish a managed writer's PR using only its live hosted assignment.
+    PublishPr {
+        /// The exact managed publication JSON packet, including its stable requestId.
+        #[arg(long)]
+        request_file: PathBuf,
+    },
+}
+
+#[derive(Args)]
+pub(crate) struct ReviewAssignmentTuple {
+    #[arg(long)]
+    pub project: String,
+    #[arg(long)]
+    pub issue: String,
+    #[arg(long)]
+    pub repo: String,
+    #[arg(long)]
+    pub pr: u64,
+    #[arg(long)]
+    pub head: String,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ReviewAssignmentsAction {
+    Show {
+        #[command(flatten)]
+        tuple: ReviewAssignmentTuple,
+    },
+    Dispatch {
+        #[command(flatten)]
+        tuple: ReviewAssignmentTuple,
+    },
+    Cancel {
+        #[command(flatten)]
+        tuple: ReviewAssignmentTuple,
+        #[arg(long)]
+        assignment_id: String,
+        #[arg(long)]
+        generation: u64,
+    },
+    Retry {
+        #[command(flatten)]
+        tuple: ReviewAssignmentTuple,
+        #[arg(long)]
+        assignment_id: String,
+        #[arg(long)]
+        generation: u64,
+    },
+    Override {
+        #[command(flatten)]
+        tuple: ReviewAssignmentTuple,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        expected_policy_revision: u64,
+        #[arg(long)]
+        add: Vec<String>,
+        #[arg(long)]
+        remove: Vec<String>,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+impl ReviewAssignmentsAction {
+    pub(super) fn tuple(&self) -> &ReviewAssignmentTuple {
+        match self {
+            Self::Show { tuple }
+            | Self::Dispatch { tuple }
+            | Self::Cancel { tuple, .. }
+            | Self::Retry { tuple, .. }
+            | Self::Override { tuple, .. } => tuple,
+        }
+    }
 }
 
 pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i32> {
@@ -341,6 +421,16 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             "delivery_decline",
             json!({"issue": issue, "reason": reason}),
         )?,
+        DeliveryAction::ReviewAssignments { .. } => {
+            return Err(Error::rejected(
+                "delivery review-assignments is hosted-only; select a hosted org with --org",
+            ));
+        }
+        DeliveryAction::PublishPr { .. } => {
+            return Err(Error::rejected(
+                "delivery publish-pr requires a live hosted managed writer assignment",
+            ));
+        }
         DeliveryAction::Check { .. } => {
             return Err(Error::rejected(
                 "delivery check is hosted-only: select a hosted org with `--org <org>`, \

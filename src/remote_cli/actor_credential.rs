@@ -286,6 +286,8 @@ pub(super) fn is_assistant_allowed_call(
             | "delivery_policy"
             | "delivery_check"
             | "review_producer"
+            | "review_assignments"
+            | "review_assignments_write"
             | "audit_approval"
             | "audit_verdicts"
             | "audit_verdict"
