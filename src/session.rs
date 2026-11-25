@@ -2000,6 +2000,19 @@ pub struct EndOptions {
     pub state_dir: PathBuf,
 }
 
+struct EndCtx<'a> {
+    opts: &'a EndOptions,
+    fl: &'a Fleet,
+    sc: &'a Scope,
+    now: i64,
+}
+
+struct EndHandoffResult {
+    path: PathBuf,
+    preview: Option<String>,
+    md: String,
+}
+
 pub fn run_end(opts: &EndOptions) -> Result<i32> {
     let now = itime::now_epoch();
     let sc = scope(opts.project.as_deref())?;
@@ -2011,10 +2024,38 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         opts.host_report.as_deref(),
     )?;
     let fl = fleet(&opts.state_dir);
+    let ctx = EndCtx {
+        opts,
+        fl: &fl,
+        sc: &sc,
+        now,
+    };
     let mut rows: Vec<Row> = Vec::new();
     let mut done = EndActions::default();
     let mut failures = 0u32;
 
+    rows.push(run_end_finish_sweep(opts, &mut done, &mut failures));
+    let (idle_row, stop_candidates) = run_end_idle_agents(&ctx, &mut done, &mut failures);
+    rows.push(idle_row);
+    rows.push(run_end_agent_gc(&ctx, &mut done, &mut failures));
+    rows.push(run_end_host_sweep(opts, &host_scan, now));
+    let (handoff_row, handoff) = run_end_handoff(&ctx, &done, &mut failures);
+    rows.push(handoff_row);
+
+    let worst = rows.iter().map(|r| r.sev).max().unwrap_or(Sev::Ok);
+    let mut exit = match worst {
+        Sev::Ok => 0,
+        Sev::Warn => 1,
+        Sev::Fail => 2,
+    };
+    if failures > 0 {
+        exit = 2;
+    }
+    emit_end_output(opts, &rows, &stop_candidates, &done, &handoff);
+    Ok(exit)
+}
+
+fn run_end_finish_sweep(opts: &EndOptions, done: &mut EndActions, failures: &mut u32) -> Row {
     // ---- merged-worktree sweep: the library call, not the CLI —
     // nothing prints ahead of a --json report, --project scopes it,
     // and its own dry run is the plan ----
@@ -2085,7 +2126,7 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             }
             Err(e) => {
                 sweep = sweep.fail(format!("issue finish --merged failed: {e}"), "");
-                failures += 1;
+                *failures += 1;
             }
         },
     }
@@ -2104,13 +2145,21 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         done.finish_notes
             .push("--force-finish ignored: issue finish --merged has no --force".to_string());
     }
-    rows.push(sweep);
+    sweep
+}
 
+fn run_end_idle_agents(
+    ctx: &EndCtx<'_>,
+    done: &mut EndActions,
+    failures: &mut u32,
+) -> (Row, Vec<String>) {
+    let opts = ctx.opts;
     // ---- idle agents ----
     // --project scopes the stop sweep to that project's agents: the
     // owners of its issues plus any agent whose cwd lives under one of
     // its repo checkouts — everything else is left running.
-    let owners: HashSet<&str> = sc
+    let owners: HashSet<&str> = ctx
+        .sc
         .views
         .iter()
         .filter_map(|v| v.issue.front.owner.as_deref())
@@ -2125,7 +2174,7 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         }
         let cwd = a["cwd"].as_str().unwrap_or_default();
         !cwd.is_empty()
-            && sc.repos.iter().any(|(_, _, p)| {
+            && ctx.sc.repos.iter().any(|(_, _, p)| {
                 // An empty declared repo path starts_with()s every
                 // cwd — that would scope the whole fleet.
                 !p.as_os_str().is_empty() && Path::new(cwd).starts_with(p)
@@ -2135,8 +2184,8 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     let mut stop_candidates: Vec<String> = Vec::new();
     let mut busy = 0u32;
     let mut out_of_scope = 0u32;
-    if fl.reachable {
-        for a in &fl.agents {
+    if ctx.fl.reachable {
+        for a in &ctx.fl.agents {
             let alias = a["alias"].as_str().unwrap_or_default();
             let provider = a["provider"].as_str().unwrap_or_default();
             let kind = a["endpoint_kind"].as_str().unwrap_or_default();
@@ -2149,15 +2198,15 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
                 }
                 continue;
             }
-            let show = fl.shows.get(alias).cloned().unwrap_or_default();
-            match stoppable(&opts.state_dir, a, &show, opts.idle_secs, now) {
+            let show = ctx.fl.shows.get(alias).cloned().unwrap_or_default();
+            match stoppable(&opts.state_dir, a, &show, opts.idle_secs, ctx.now) {
                 Stop::Yes => stop_candidates.push(alias.to_string()),
                 Stop::Busy => busy += 1,
                 Stop::No => {}
             }
         }
     }
-    if !fl.reachable {
+    if !ctx.fl.reachable {
         idle_row = idle_row.warn("daemon unreachable — nothing stopped", "");
     } else if stop_candidates.is_empty() {
         idle_row = idle_row.ok(format!(
@@ -2202,7 +2251,7 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
                     Ok(_) => done.stopped.push(alias.clone()),
                     Err(e) => {
                         idle_row.items[i] = format!("{alias} — stop failed: {e}");
-                        failures += 1;
+                        *failures += 1;
                     }
                 }
             }
@@ -2214,18 +2263,23 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             opts.project.as_deref().unwrap_or_default()
         ));
     }
-    rows.push(idle_row);
+    (idle_row, stop_candidates)
+}
 
+fn run_end_agent_gc(ctx: &EndCtx<'_>, done: &mut EndActions, failures: &mut u32) -> Row {
+    let opts = ctx.opts;
     // ---- agent gc ----
     let mut gc_row = Row::new("gc");
-    if !fl.reachable {
-        gc_row = gc_row.ok("skipped — daemon unreachable");
-    } else if let Some(p) = opts.project.as_deref() {
+    if !ctx.fl.reachable {
+        return gc_row.ok("skipped — daemon unreachable");
+    }
+    if let Some(p) = opts.project.as_deref() {
         // `agent_gc` has no scope parameter — it sweeps the whole
         // fleet. Under --project that's another project's agents, so
         // skip it and say so rather than overreach.
-        gc_row = gc_row.ok(format!("gc is fleet-wide — skipped under --project {p}"));
-    } else if opts.dry_run {
+        return gc_row.ok(format!("gc is fleet-wide — skipped under --project {p}"));
+    }
+    if opts.dry_run {
         // The daemon's read-only plan applies the caller rule (CAD-149):
         // what this caller may sweep, and what it may not. A daemon
         // without the plan RPC falls back to the listing.
@@ -2248,13 +2302,15 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
                 gc_row.items.splice(0..0, cands);
             }
             Err(_) => {
-                let cands: Vec<String> = fl
+                let cands: Vec<String> = ctx
+                    .fl
                     .agents
                     .iter()
                     .filter(|a| {
                         a["endpoint"].is_null()
                             && matches!(a["state"].as_str(), Some("attention" | "stopped"))
-                            && now - a["updated"].as_f64().unwrap_or(now as f64) as i64 > 3600
+                            && ctx.now - a["updated"].as_f64().unwrap_or(ctx.now as f64) as i64
+                                > 3600
                     })
                     .filter_map(|a| a["alias"].as_str().map(str::to_string))
                     .collect();
@@ -2278,70 +2334,88 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             }
             Err(e) => {
                 gc_row = gc_row.fail(format!("agent gc failed: {e}"), "");
-                failures += 1;
+                *failures += 1;
             }
         }
     }
-    rows.push(gc_row);
+    gc_row
+}
 
+fn run_end_host_sweep(opts: &EndOptions, host_scan: &Value, now: i64) -> Row {
     // ---- host sweep: the CAD-72 watchdog again — orphans are
     // reported, never killed; disk state rides along. A report, not
     // a gate: a full disk is `warn` here — `session start` is where a
     // full host is correctly `fail` — so only this verb's own failures
     // (a sweep RPC error, an unwritable handoff) set exit 2. ----
     let acks = Acks::load(&opts.state_dir);
-    let mut sweep_row = host_row("sweep", &host_scan, opts.host_report.as_deref(), &acks, now);
+    let mut sweep_row = host_row("sweep", host_scan, opts.host_report.as_deref(), &acks, now);
     if sweep_row.sev == Sev::Fail {
         sweep_row.sev = Sev::Warn;
     }
     if sweep_row.detail == "host clean" {
         sweep_row.detail = "clean".to_string();
     }
-    rows.push(sweep_row);
+    sweep_row
+}
 
+fn run_end_handoff(
+    ctx: &EndCtx<'_>,
+    done: &EndActions,
+    failures: &mut u32,
+) -> (Row, EndHandoffResult) {
+    let opts = ctx.opts;
     // ---- handoff: --dry-run writes nothing — the row names the file
     // it would write and the markdown goes to stdout / the json
     // payload. Real runs use a timestamped name and never overwrite.
-    let (_, gh_repos) = gh_open(&opts.state_dir, &sc, opts.dry_run);
-    let md = handoff_md(opts, &fl, &sc, &gh_repos, &done, now);
+    let (_, gh_repos) = gh_open(&opts.state_dir, ctx.sc, opts.dry_run);
+    let md = handoff_md(opts, ctx.fl, ctx.sc, &gh_repos, done, ctx.now);
     let mut handoff_path = PathBuf::new();
     let mut handoff_preview = None;
+    let mut row = None;
     if opts.dry_run {
-        let would = opts.state_dir.join("sessions").join(handoff_name(now, 0));
-        rows.push(Row::new("handoff").ok(format!("would write {}", would.display())));
+        let would = opts
+            .state_dir
+            .join("sessions")
+            .join(handoff_name(ctx.now, 0));
+        row = Some(Row::new("handoff").ok(format!("would write {}", would.display())));
         handoff_preview = Some(md.clone());
     } else {
         let dir = opts.state_dir.join("sessions");
         let path = (0..100u32)
-            .map(|n| dir.join(handoff_name(now, n)))
+            .map(|n| dir.join(handoff_name(ctx.now, n)))
             .find(|p| !p.exists());
         match path {
             None => {
-                rows.push(Row::new("handoff").fail("no free handoff filename", ""));
-                failures += 1;
+                row = Some(Row::new("handoff").fail("no free handoff filename", ""));
+                *failures += 1;
             }
             Some(p) => match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&p, &md)) {
                 Ok(_) => handoff_path = p,
                 Err(e) => {
-                    rows.push(Row::new("handoff").fail(format!("{e}"), ""));
-                    failures += 1;
+                    row = Some(Row::new("handoff").fail(format!("{e}"), ""));
+                    *failures += 1;
                 }
             },
         }
     }
-    if !handoff_path.as_os_str().is_empty() {
-        rows.push(Row::new("handoff").ok(handoff_path.display().to_string()));
-    }
+    let row = row.unwrap_or_else(|| Row::new("handoff").ok(handoff_path.display().to_string()));
+    (
+        row,
+        EndHandoffResult {
+            path: handoff_path,
+            preview: handoff_preview,
+            md,
+        },
+    )
+}
 
-    let worst = rows.iter().map(|r| r.sev).max().unwrap_or(Sev::Ok);
-    let mut exit = match worst {
-        Sev::Ok => 0,
-        Sev::Warn => 1,
-        Sev::Fail => 2,
-    };
-    if failures > 0 {
-        exit = 2;
-    }
+fn emit_end_output(
+    opts: &EndOptions,
+    rows: &[Row],
+    stop_candidates: &[String],
+    done: &EndActions,
+    handoff: &EndHandoffResult,
+) {
     if opts.json {
         println!(
             "{}",
@@ -2354,8 +2428,8 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
                 "stopped": done.stopped,
                 "stop_skipped": done.stop_skipped,
                 "gc_removed": done.gc_removed,
-                "handoff": handoff_path,
-                "handoff_md": if opts.dry_run { Some(md) } else { None },
+                "handoff": handoff.path,
+                "handoff_md": if opts.dry_run { Some(&handoff.md) } else { None },
             }))
             .unwrap_or_default()
         );
@@ -2364,14 +2438,13 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             "session end{}",
             if opts.dry_run { " — dry run" } else { "" }
         );
-        for r in &rows {
+        for r in rows {
             print_row(r);
         }
-        if let Some(preview) = &handoff_preview {
+        if let Some(preview) = &handoff.preview {
             println!("\n{preview}");
         }
     }
-    Ok(exit)
 }
 
 /// What `session end` applied — reported on screen and in the handoff.
