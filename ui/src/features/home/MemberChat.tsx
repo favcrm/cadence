@@ -641,16 +641,19 @@ export default function MemberChat({
     templateList != null ||
     agents.length > 0;
   const handledNoRailActionRef = useRef<string | null>(null);
+  const rosterSettled = roster.data !== undefined || roster.status === "failed";
   useEffect(() => {
     if (!deepLinkActionId) {
       handledNoRailActionRef.current = null;
       return;
     }
-    if (hasRail || handledNoRailActionRef.current === deepLinkActionId) return;
+    if (decisions || hasRail || !rosterSettled || handledNoRailActionRef.current === deepLinkActionId) {
+      return;
+    }
     handledNoRailActionRef.current = deepLinkActionId;
     onToast?.(t("Staged approvals are not available in this view."));
     onClearDeepLinkAction?.();
-  }, [deepLinkActionId, hasRail, onClearDeepLinkAction, onToast, t]);
+  }, [decisions, deepLinkActionId, hasRail, rosterSettled, onClearDeepLinkAction, onToast, t]);
 
   return (
     <AssistantActorProvider actor={actor}>
