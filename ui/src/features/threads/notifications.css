@@ -123,12 +123,15 @@ dialog.notification-popover::backdrop { background: var(--color-scrim); }
 }
 .notification-meta-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: .375rem;
+  gap: .25rem .375rem;
   margin-block-end: .3rem;
 }
 .notification-copy .chip {
   display: inline-block;
+  flex: 0 0 auto;
+  white-space: nowrap;
   padding: .125rem .375rem;
   border-radius: 999px;
   background: color-mix(in srgb, var(--color-accent) 10%, var(--color-ink-850));

@@ -314,6 +314,7 @@
   margin-inline: auto;
 }
 .threads-composer-dock {
+  position: relative;
   flex: none;
   padding: 0.35rem 1rem 0.9rem;
   background: linear-gradient(to bottom, transparent, var(--color-ink-900, transparent) 24%);
@@ -329,14 +330,16 @@
   display: grid;
   gap: 0.3rem;
 }
-.threads-composer-dock {
-  position: relative;
-}
-.threads-jump-wrap {
+.threads-composer-dock > .threads-jump-wrap {
   position: absolute;
   left: 50%;
   bottom: calc(100% + 0.5rem);
   transform: translateX(-50%);
+  width: auto;
+  max-width: calc(100% - 2rem);
+  margin-inline: 0;
+  display: flex;
+  justify-content: center;
   z-index: 15;
   pointer-events: none;
 }
