@@ -3,7 +3,11 @@ import { useTranslate } from "../../lib/locale";
 
 const hostedConversationId = /^tc_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
-export default function ConversationIdCopy({ id, workspaceId }: { id: string; workspaceId?: string }) {
+export default function ConversationIdCopy({
+  id,
+  workspaceId,
+  supportOnly = false,
+}: { id: string; workspaceId?: string; supportOnly?: boolean }) {
   const t = useTranslate();
   const scoped = workspaceId !== undefined && hostedConversationId.test(id);
   const copyLabel = t(scoped ? "Copy support reference" : "Copy ID");
@@ -14,6 +18,8 @@ export default function ConversationIdCopy({ id, workspaceId }: { id: string; wo
     const timeout = window.setTimeout(() => setResult(undefined), 2000);
     return () => window.clearTimeout(timeout);
   }, [result]);
+
+  if (supportOnly && !scoped) return null;
 
   return (
     <div className="home-conversation-id relative flex shrink-0 items-center gap-1.5 whitespace-nowrap">

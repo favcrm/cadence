@@ -631,7 +631,7 @@ export default function MemberChat({
             </div>
             <div className="assistant-heading-actions">
               {available && loaded && conversationId && thread.data?.conversation === conversationId && supportWorkspaceId && (
-                <ConversationIdCopy key={conversationId} id={conversationId} workspaceId={supportWorkspaceId} />
+                <ConversationIdCopy key={conversationId} id={conversationId} workspaceId={supportWorkspaceId} supportOnly />
               )}
               {!readOnly && surface?.bootstrap === "deferred" && identity.state === "ready" && (
                 <button
