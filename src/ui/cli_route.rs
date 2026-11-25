@@ -459,6 +459,14 @@ fn readable_projects(pm: &Pm, actor: &CliActor) -> std::collections::BTreeSet<St
         .unwrap_or_default()
 }
 
+struct DispatchCtx<'a> {
+    args: &'a Value,
+    actor: &'a CliActor,
+    envelope: &'a str,
+    state_dir: &'a Path,
+    pm_dir: &'a Path,
+}
+
 /// The verb → the same call the CLI/board makes for it. `actor` is the
 /// verified envelope identity — `handle` for author/provenance fields.
 /// No request field ever renames it. `envelope` is the raw compact JWS
@@ -475,256 +483,24 @@ fn dispatch(
     pm_dir: &Path,
     _opts: &ServeOpts,
 ) -> HttpResp {
+    let ctx = DispatchCtx {
+        args,
+        actor,
+        envelope,
+        state_dir,
+        pm_dir,
+    };
     match verb {
         // ---- cli.read ----
-        Verb::MyWork => {
-            if !args.as_object().is_some_and(|args| args.is_empty()) {
-                return cli_fail(400, "invalid_request", "my_work accepts no arguments");
-            }
-            // Envelope verification permits `operator` only for an Owner user;
-            // its attribution handle is still derived from that user's sub.
-            if actor.actor != "operator" && !actor.actor.starts_with("users/") {
-                return cli_fail(403, "human_session_required", "my_work requires a user");
-            }
-            if actor.actor != "operator"
-                && (actor.handle != actor.sub
-                    || crate::project_policy::policy_user_actor(&actor.sub)
-                        == "service/unresolved-member")
-            {
-                return cli_fail(
-                    403,
-                    "identity_unresolved",
-                    "My work identity is not unambiguously bound",
-                );
-            }
-            let Some(policy_actor) = actor.policy_actor() else {
-                return cli_fail(
-                    403,
-                    "identity_unresolved",
-                    "My work identity is not unambiguously bound",
-                );
-            };
-            let proof = super::operator::ReadRelayProof::Cli(envelope.to_owned());
-            match super::my_work::Snapshot::load(state_dir, pm_dir, &policy_actor, Some(&proof)) {
-                Ok(snapshot) => {
-                    match snapshot.payload(pm_dir, &actor.handle, Some(&actor.sub), &policy_actor) {
-                        Some(body) => json_ok(body),
-                        None => cli_fail(
-                            403,
-                            "project_access_changed",
-                            "My work project access changed; refresh",
-                        ),
-                    }
-                }
-                Err(error) => write_err(&error),
-            }
-        }
-        Verb::Status => {
-            // The daemon re-verifies the envelope before projecting agents.
-            let health = client::rpc(state_dir, "health", json!({}));
-            let agents = client::rpc(
-                state_dir,
-                "agent_list",
-                json!({"board": true, "cli_envelope": envelope}),
-            );
-            let agents =
-                scoped_agent_reply(agents, actor, cadence_core::board_api::AGENT_LIST_SCOPE_ACK);
-            match (health, agents) {
-                (Ok(h), Ok(a)) => json_ok(json!({
-                    "daemon": h, "agents": a["agents"], "live": a["live"],
-                })),
-                (Err(e), _) => write_err(&e),
-                (_, Err(response)) => response,
-            }
-        }
-        Verb::AgentList => {
-            let mut params = json!({"board": true, "cli_envelope": envelope});
-            for key in ["states", "providers", "kinds"] {
-                match arg_strs(args, key) {
-                    Ok(v) if !v.is_empty() => params[key] = json!(v),
-                    Ok(_) => {}
-                    Err(resp) => return resp,
-                }
-            }
-            match scoped_agent_reply(
-                client::rpc(state_dir, "agent_list", params),
-                actor,
-                cadence_core::board_api::AGENT_LIST_SCOPE_ACK,
-            ) {
-                Ok(reply) => json_ok(reply),
-                Err(response) => response,
-            }
-        }
-        Verb::AgentShow => match arg_str(args, "alias") {
-            Ok(Some(alias)) => {
-                let mut params = json!({"alias": alias, "cli_envelope": envelope});
-                match arg_u64(args, "limit") {
-                    Ok(Some(n)) => params["limit"] = json!(n),
-                    Ok(None) => {}
-                    Err(resp) => return resp,
-                }
-                match client::rpc(state_dir, "agent_show", params) {
-                    Err(crate::error::Error::Rejected(message))
-                        if message == "Unknown managed agent" =>
-                    {
-                        cli_fail(404, "not_found", "Unknown managed agent")
-                    }
-                    result => match scoped_agent_reply(
-                        result,
-                        actor,
-                        cadence_core::board_api::AGENT_SHOW_SCOPE_ACK,
-                    ) {
-                        Ok(reply) => json_ok(reply),
-                        Err(response) => response,
-                    },
-                }
-            }
-            _ => cli_fail(400, "invalid_request", "agent_show needs arguments.alias"),
-        },
-        Verb::IssueLs => match pm_at(pm_dir) {
-            Err(resp) => resp,
-            Ok(pm) => {
-                let filter = board::Filter {
-                    tags: arg_strs(args, "tag").unwrap_or_default(),
-                    epics: arg_strs(args, "epic").unwrap_or_default(),
-                    owners: arg_strs(args, "owner").unwrap_or_default(),
-                    statuses: arg_strs(args, "status").unwrap_or_default(),
-                    components: arg_strs(args, "component").unwrap_or_default(),
-                    priorities: arg_strs(args, "priority").unwrap_or_default(),
-                    types: arg_strs(args, "type").unwrap_or_default(),
-                    milestones: arg_strs(args, "milestone").unwrap_or_default(),
-                    plans: arg_strs(args, "plan").unwrap_or_default(),
-                    open: args.get("open").and_then(Value::as_bool) == Some(true),
-                };
-                if let Err(e) = filter.validate() {
-                    return cli_fail(400, "invalid_request", &e.to_string());
-                }
-                let read = read_model::get(state_dir, pm_dir).board(&pm, None);
-                let by_id = read.by_id();
-                let ctx = read.ctx(&by_id);
-                // AOS-274: a project this caller may not read contributes
-                // no row at all — filtered before the filter and the card.
-                let allowed = readable_projects(&pm, actor);
-                json_ok(json!({
-                    "issues": read.views.iter()
-                        .filter(|v| filter.matches(v) && allowed.contains(&v.issue.project))
-                        .map(|v| read.card(&ctx, v))
-                        .collect::<Vec<_>>(),
-                }))
-            }
-        },
-        Verb::IssueShow => match arg_str(args, "id") {
-            Ok(Some(raw)) => {
-                let Ok(id) = model::check_id(raw) else {
-                    return cli_fail(400, "invalid_request", "bad issue id");
-                };
-                match pm_at(pm_dir) {
-                    Err(resp) => resp,
-                    Ok(pm) => {
-                        if let Some(resp) = restricted_issue(&pm, &id, actor) {
-                            return resp;
-                        }
-                        let read = read_model::get(state_dir, pm_dir).board(&pm, None);
-                        let by_id = read.by_id();
-                        match by_id.get(&id) {
-                            Some(view) => {
-                                if let Some(resp) = restricted(&pm, &view.issue.project, actor) {
-                                    return resp;
-                                }
-                                json_ok(json!({
-                                    "issue": crate::issue::work::detail_json(
-                                        &pm.dir,
-                                        &read.ctx(&by_id),
-                                        view,
-                                    ),
-                                }))
-                            }
-                            None => cli_fail(404, "not_found", "unknown issue"),
-                        }
-                    }
-                }
-            }
-            _ => cli_fail(400, "invalid_request", "issue_show needs arguments.id"),
-        },
-        Verb::IssueHistory => match arg_str(args, "id") {
-            Ok(Some(raw)) => {
-                let Ok(id) = model::check_id(raw) else {
-                    return cli_fail(400, "invalid_request", "bad issue id");
-                };
-                let limit = match arg_u64(args, "limit") {
-                    Ok(Some(n)) => n as usize,
-                    Ok(None) => 50,
-                    Err(resp) => return resp,
-                };
-                match pm_at(pm_dir) {
-                    Err(resp) => resp,
-                    Ok(pm) => {
-                        if let Some(resp) = restricted_issue(&pm, &id, actor) {
-                            return resp;
-                        }
-                        match board::find_issue(&pm.dir, &id) {
-                            Ok(issue) => {
-                                if let Some(resp) = restricted(&pm, &issue.project, actor) {
-                                    return resp;
-                                }
-                                match history::log(&pm.dir, &issue, limit.max(1)) {
-                                    Ok(h) => json_ok(json!({"id": id, "history": h})),
-                                    Err(e) => cli_fail(503, "tracker_unavailable", &e.to_string()),
-                                }
-                            }
-                            Err(e) => cli_fail(404, "not_found", &e.to_string()),
-                        }
-                    }
-                }
-            }
-            _ => cli_fail(400, "invalid_request", "issue_history needs arguments.id"),
-        },
-        // CAD-1568: the message verbs relay the re-verifiable signed
-        // envelope as `cli_envelope` to the daemon's `cli_message_*`
-        // RPCs — the daemon re-verifies it over this proven board
-        // connection and scopes everything by the verified principal;
-        // a bare `agent_inbox`/`message_read` relay would see an
-        // operator-class connection and read any member's mail.
-        Verb::MessageRead => match arg_str(args, "message") {
-            Ok(Some(_)) => {
-                match arg_u64(args, "offset") {
-                    Ok(_) => {}
-                    Err(resp) => return resp,
-                }
-                match arg_u64(args, "limit") {
-                    Ok(_) => {}
-                    Err(resp) => return resp,
-                }
-                let mut params = args.clone();
-                params["cli_envelope"] = json!(envelope);
-                rpc(state_dir, "cli_message_read", params)
-            }
-            _ => cli_fail(
-                400,
-                "invalid_request",
-                "message_read needs arguments.message",
-            ),
-        },
-        Verb::MessageInbox => match arg_str(args, "alias") {
-            Ok(Some(_)) => {
-                match arg_u64(args, "after") {
-                    Ok(_) => {}
-                    Err(resp) => return resp,
-                }
-                match arg_str(args, "reader") {
-                    Ok(_) => {}
-                    Err(resp) => return resp,
-                }
-                let mut params = args.clone();
-                params["cli_envelope"] = json!(envelope);
-                rpc(state_dir, "cli_message_inbox", params)
-            }
-            _ => cli_fail(
-                400,
-                "invalid_request",
-                "message_inbox needs arguments.alias",
-            ),
-        },
+        Verb::MyWork => dispatch_my_work(&ctx),
+        Verb::Status => dispatch_status(&ctx),
+        Verb::AgentList => dispatch_agent_list(&ctx),
+        Verb::AgentShow => dispatch_agent_show(&ctx),
+        Verb::IssueLs => dispatch_issue_ls(&ctx),
+        Verb::IssueShow => dispatch_issue_show(&ctx),
+        Verb::IssueHistory => dispatch_issue_history(&ctx),
+        Verb::MessageRead => dispatch_message_read(&ctx),
+        Verb::MessageInbox => dispatch_message_inbox(&ctx),
         // `team list` has no CLI/RPC counterpart in this build — the
         // contract's v1 list names it, but there is no local call to
         // relay. Refused rather than silently dropped so the worker's
@@ -734,318 +510,619 @@ fn dispatch(
             "cli_verb_refused",
             "team_list has no local counterpart in this build",
         ),
-        // CAD-1586: settings management relays to the daemon's
-        // `cli_settings_command` — the envelope is forwarded verbatim
-        // (`cli_envelope`) and re-verified against the daemon's own
-        // trust root, so a relayed call can never widen into local
-        // operator authority. The op's settings.* scope and the
-        // principal class are enforced daemon-side; this relay carries
-        // no more than the signed envelope proves.
-        Verb::SettingsAgents => {
-            let mut params = args.clone();
-            if params.get("operation").and_then(Value::as_str).is_none() {
-                return cli_fail(
-                    400,
-                    "invalid_request",
-                    "settings_agents needs arguments.operation",
-                );
-            }
-            params["cli_envelope"] = json!(envelope);
-            rpc(state_dir, "cli_settings_command", params)
-        }
-        // CAD-1586: master launch diagnosis — a strict translation
-        // into the shared settings command path (`master.status` in
-        // the op table), never a separate handler. Args admit only an
-        // optional `grant_id`; anything else is refused before relay.
-        // The envelope rides verbatim and is re-verified daemon-side,
-        // so this relay grants no authority the claim lacks.
-        Verb::MasterStatus => {
-            if let Some(object) = args.as_object() {
-                for key in object.keys() {
-                    if key != "grant_id" {
-                        return cli_fail(
-                            400,
-                            "invalid_request",
-                            "master_status arguments admit only 'grant_id'",
-                        );
-                    }
-                }
-            }
-            let mut op_payload = serde_json::Map::new();
-            if let Some(grant) = args.get("grant_id").and_then(Value::as_str) {
-                op_payload.insert("grant_id".to_string(), json!(grant));
-            }
-            rpc(
-                state_dir,
-                "cli_settings_command",
-                json!({
-                    "cli_envelope": envelope,
-                    "operation": "master.status",
-                    "expected_revision": Value::Null,
-                    "payload": Value::Object(op_payload),
-                }),
-            )
-        }
+        Verb::SettingsAgents => dispatch_settings_agents(&ctx),
+        Verb::MasterStatus => dispatch_master_status(&ctx),
         // ---- cli.write ----
-        Verb::IssueNew => match pm_at(pm_dir) {
-            Err(resp) => resp,
-            Ok(pm) => {
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct NewReq {
-                    project: String,
-                    title: String,
-                    priority: Option<String>,
-                    owner: Option<String>,
-                    component: Option<String>,
-                    tags: Option<Vec<String>>,
-                    parent: Option<String>,
-                    blocked_by: Option<Vec<String>>,
-                    body: Option<String>,
-                }
-                let req: NewReq = match serde_json::from_value(args.clone()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return cli_fail(400, "invalid_request", &format!("issue_new: {e}"));
-                    }
-                };
-                let body = req.body.as_deref().map(str::trim).filter(|b| !b.is_empty());
-                if body.is_some_and(|b| b.len() > crate::issue::report::BODY_MAX) {
-                    return cli_fail(
-                        400,
-                        "invalid_request",
-                        "issue body exceeds the 32 KB cap — trim it",
-                    );
-                }
-                if let Some(resp) = restricted(&pm, &req.project, actor) {
-                    return resp;
-                }
-                // A linked id is an issue id the caller names too: one it
-                // may not read, or a malformed one, answers as an absent one
-                // (CAD-2357) and is never linked.
-                let linked = req.parent.iter().chain(req.blocked_by.iter().flatten());
-                for id in linked {
-                    if let Some(resp) = restricted_issue(&pm, id, actor) {
-                        return resp;
-                    }
-                }
-                match issue_write::new_issue(
-                    &pm,
-                    &pm.dir,
-                    Some(&req.project),
-                    &req.title,
-                    req.priority.as_deref(),
-                    req.parent.as_deref(),
-                    &req.blocked_by.unwrap_or_default(),
-                    req.owner.as_deref(),
-                    req.component.as_deref(),
-                    &req.tags.unwrap_or_default(),
-                    None,
-                    body,
-                    &actor.handle,
-                ) {
-                    Ok(out) => {
-                        let id = out["id"].as_str().unwrap_or_default().to_string();
-                        write_reply(&pm, state_dir, &id, out, true)
-                    }
-                    Err(e) => write_err(&e),
-                }
-            }
-        },
-        Verb::IssueComment => match (arg_str(args, "id"), arg_str(args, "body")) {
-            (Ok(Some(raw)), Ok(Some(body))) => {
-                let Ok(id) = model::check_id(raw) else {
-                    return cli_fail(400, "invalid_request", "bad issue id");
-                };
-                let if_rev = match arg_str(args, "if_rev") {
-                    Ok(v) => v,
-                    Err(resp) => return resp,
-                };
-                match pm_at(pm_dir) {
-                    Err(resp) => resp,
-                    Ok(pm) => {
-                        if let Some(resp) = restricted_issue(&pm, &id, actor) {
-                            return resp;
-                        }
-                        match issue_write::add_comment(
-                            &pm,
-                            &id,
-                            body,
-                            Some(&actor.handle),
-                            Some("remote-cli"),
-                            if_rev,
-                            &actor.actor,
-                        ) {
-                            Ok(out) => write_reply(&pm, state_dir, &id, out, false),
-                            Err(e) => write_err(&e),
-                        }
-                    }
-                }
-            }
-            (Err(resp), _) | (_, Err(resp)) => resp,
-            _ => cli_fail(
-                400,
-                "invalid_request",
-                "issue_comment needs arguments.id and arguments.body",
-            ),
-        },
-        Verb::IssueSet => match (arg_strs(args, "ids"), arg_strs(args, "set")) {
-            (Ok(ids), Ok(pairs)) => {
-                // Revisions are per-ticket and optimistic: exactly one
-                // issue, and `if_rev` (the `rev` `issue_show` reports)
-                // is mandatory — a remote field edit is never an
-                // unconditional last-writer-wins write. The check runs
-                // inside `set_fields_if_rev` under the tracker lock, at
-                // the point of write; a stale token answers the
-                // contract's conflict payload instead of a 200.
-                if ids.len() != 1 {
-                    return cli_fail(
-                        400,
-                        "invalid_request",
-                        "issue_set edits exactly one issue — revisions are per-ticket",
-                    );
-                }
-                // No remote override of the `status=done` evidence gate:
-                // the verb never accepted `force` — a caller naming one
-                // is refused, never silently dropped, before any write.
-                if args.get("force").is_some() {
-                    return cli_fail(
-                        400,
-                        "invalid_request",
-                        "issue_set does not accept arguments.force",
-                    );
-                }
-                let if_rev = match arg_str(args, "if_rev") {
-                    Ok(Some(rev)) if !rev.trim().is_empty() => rev,
-                    Ok(_) => {
-                        return cli_fail(
-                            400,
-                            "invalid_request",
-                            "issue_set needs a nonempty arguments.if_rev — re-read the \
-                             issue's rev and send it",
-                        );
-                    }
-                    Err(resp) => return resp,
-                };
-                if model::check_id(&ids[0]).is_err() {
-                    return cli_fail(400, "invalid_request", "bad issue id");
-                }
-                match pm_at(pm_dir) {
-                    Err(resp) => resp,
-                    Ok(pm) => {
-                        if let Some(resp) = restricted_issue(&pm, &ids[0], actor) {
-                            return resp;
-                        }
-                        match issue_write::set_fields_if_rev(
-                            &pm,
-                            &ids,
-                            &pairs,
-                            &actor.handle,
-                            None,
-                            Some(if_rev),
-                        ) {
-                            Ok(out) => write_reply(&pm, state_dir, &ids[0], out, false),
-                            Err(e) => write_err(&e),
-                        }
-                    }
-                }
-            }
-            (Err(resp), _) | (_, Err(resp)) => resp,
-        },
-        // Human Owner only: verified `role_at_issue=owner` AND
-        // `principal_kind=user`. An agent can be minted with the owner
-        // role and must not administer policy. Neither value is an
-        // argument. The record this verb writes decides who may read
-        // the project, so a member must not widen it or grant access.
-        // This arm does not consult the project's own restriction —
-        // administering a policy cannot depend on the policy it is
-        // administering.
-        Verb::ProjectPolicy => {
-            if actor.role_at_issue != "owner" || actor.principal_kind != "user" {
-                return cli_fail(
+        Verb::IssueNew => dispatch_issue_new(&ctx),
+        Verb::IssueComment => dispatch_issue_comment(&ctx),
+        Verb::IssueSet => dispatch_issue_set(&ctx),
+        Verb::ProjectPolicy => dispatch_project_policy(&ctx),
+        Verb::MessageSend => dispatch_message_send(&ctx),
+    }
+}
+
+fn dispatch_my_work(ctx: &DispatchCtx<'_>) -> HttpResp {
+    let DispatchCtx {
+        args,
+        actor,
+        envelope,
+        state_dir,
+        pm_dir,
+    } = *ctx;
+    if !args.as_object().is_some_and(|args| args.is_empty()) {
+        return cli_fail(400, "invalid_request", "my_work accepts no arguments");
+    }
+    // Envelope verification permits `operator` only for an Owner user;
+    // its attribution handle is still derived from that user's sub.
+    if actor.actor != "operator" && !actor.actor.starts_with("users/") {
+        return cli_fail(403, "human_session_required", "my_work requires a user");
+    }
+    if actor.actor != "operator"
+        && (actor.handle != actor.sub
+            || crate::project_policy::policy_user_actor(&actor.sub) == "service/unresolved-member")
+    {
+        return cli_fail(
+            403,
+            "identity_unresolved",
+            "My work identity is not unambiguously bound",
+        );
+    }
+    let Some(policy_actor) = actor.policy_actor() else {
+        return cli_fail(
+            403,
+            "identity_unresolved",
+            "My work identity is not unambiguously bound",
+        );
+    };
+    let proof = super::operator::ReadRelayProof::Cli(envelope.to_owned());
+    match super::my_work::Snapshot::load(state_dir, pm_dir, &policy_actor, Some(&proof)) {
+        Ok(snapshot) => {
+            match snapshot.payload(pm_dir, &actor.handle, Some(&actor.sub), &policy_actor) {
+                Some(body) => json_ok(body),
+                None => cli_fail(
                     403,
-                    "not_permitted",
-                    "project_policy is human-owner only — a member or an agent cannot record project access",
-                );
+                    "project_access_changed",
+                    "My work project access changed; refresh",
+                ),
             }
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct PolicyReq {
-                project: String,
-                visibility: String,
-                grants: Vec<String>,
+        }
+        Err(error) => write_err(&error),
+    }
+}
+
+fn dispatch_status(ctx: &DispatchCtx<'_>) -> HttpResp {
+    // The daemon re-verifies the envelope before projecting agents.
+    let health = client::rpc(ctx.state_dir, "health", json!({}));
+    let agents = client::rpc(
+        ctx.state_dir,
+        "agent_list",
+        json!({"board": true, "cli_envelope": ctx.envelope}),
+    );
+    let agents = scoped_agent_reply(
+        agents,
+        ctx.actor,
+        cadence_core::board_api::AGENT_LIST_SCOPE_ACK,
+    );
+    match (health, agents) {
+        (Ok(h), Ok(a)) => json_ok(json!({
+            "daemon": h, "agents": a["agents"], "live": a["live"],
+        })),
+        (Err(e), _) => write_err(&e),
+        (_, Err(response)) => response,
+    }
+}
+
+fn dispatch_agent_list(ctx: &DispatchCtx<'_>) -> HttpResp {
+    let mut params = json!({"board": true, "cli_envelope": ctx.envelope});
+    for key in ["states", "providers", "kinds"] {
+        match arg_strs(ctx.args, key) {
+            Ok(v) if !v.is_empty() => params[key] = json!(v),
+            Ok(_) => {}
+            Err(resp) => return resp,
+        }
+    }
+    match scoped_agent_reply(
+        client::rpc(ctx.state_dir, "agent_list", params),
+        ctx.actor,
+        cadence_core::board_api::AGENT_LIST_SCOPE_ACK,
+    ) {
+        Ok(reply) => json_ok(reply),
+        Err(response) => response,
+    }
+}
+
+fn dispatch_agent_show(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match arg_str(ctx.args, "alias") {
+        Ok(Some(alias)) => {
+            let mut params = json!({"alias": alias, "cli_envelope": ctx.envelope});
+            match arg_u64(ctx.args, "limit") {
+                Ok(Some(n)) => params["limit"] = json!(n),
+                Ok(None) => {}
+                Err(resp) => return resp,
             }
-            let req: PolicyReq = match serde_json::from_value(args.clone()) {
-                Ok(r) => r,
-                Err(e) => {
-                    return cli_fail(400, "invalid_request", &format!("project_policy: {e}"));
+            match client::rpc(ctx.state_dir, "agent_show", params) {
+                Err(crate::error::Error::Rejected(message))
+                    if message == "Unknown managed agent" =>
+                {
+                    cli_fail(404, "not_found", "Unknown managed agent")
                 }
-            };
-            let visibility = match req.visibility.as_str() {
-                "workspace-visible" => crate::issue::project::Visibility::WorkspaceVisible,
-                "private" => crate::issue::project::Visibility::Private,
-                other => {
-                    return cli_fail(
-                        400,
-                        "invalid_request",
-                        &format!(
-                            "project_policy: unknown visibility `{other}` — \
-                             workspace-visible or private"
-                        ),
-                    );
-                }
-            };
-            match pm_at(pm_dir) {
-                Err(resp) => resp,
-                Ok(pm) => match issue_write::set_project_policy(
-                    &pm,
-                    &req.project,
-                    visibility,
-                    &req.grants,
-                    &format!("users/{}", actor.handle),
+                result => match scoped_agent_reply(
+                    result,
+                    ctx.actor,
+                    cadence_core::board_api::AGENT_SHOW_SCOPE_ACK,
                 ) {
-                    Ok(out) => json_ok(out),
-                    Err(e) => write_err(&e),
+                    Ok(reply) => json_ok(reply),
+                    Err(response) => response,
                 },
             }
         }
-        // CAD-1568: never a bare `agent_send` relay — that connection is
-        // operator-class, so the daemon would record the message as the
-        // operator's. The signed envelope rides as `cli_envelope` and
-        // the daemon's `cli_message_send` re-verifies it, derives the
-        // principal and enforces the remote recipient classes itself.
-        // Arguments are exactly `alias`, `text` and the stable `message`
-        // id; the daemon refuses every other field, so routing
-        // (`reply_to`, `task`) and steering options are rejected, never
-        // silently dropped.
-        Verb::MessageSend => match (arg_str(args, "alias"), arg_str(args, "text")) {
-            (Ok(Some(_)), Ok(Some(text))) => {
-                if text.trim().is_empty() {
-                    return cli_fail(400, "invalid_request", "message_send text is empty");
-                }
-                match arg_str(args, "message") {
-                    Ok(Some(id)) if !id.trim().is_empty() => {}
-                    Ok(_) => {
-                        return cli_fail(
-                            400,
-                            "invalid_request",
-                            "message_send needs a stable arguments.message id — supply one \
-                             so a retry after a lost response dedupes instead of resubmitting blind",
-                        )
-                    }
-                    Err(resp) => return resp,
-                }
-                let mut params = args.clone();
-                params["cli_envelope"] = json!(envelope);
-                rpc(state_dir, "cli_message_send", params)
+        _ => cli_fail(400, "invalid_request", "agent_show needs arguments.alias"),
+    }
+}
+
+fn dispatch_issue_ls(ctx: &DispatchCtx<'_>) -> HttpResp {
+    let args = ctx.args;
+    match pm_at(ctx.pm_dir) {
+        Err(resp) => resp,
+        Ok(pm) => {
+            let filter = board::Filter {
+                tags: arg_strs(args, "tag").unwrap_or_default(),
+                epics: arg_strs(args, "epic").unwrap_or_default(),
+                owners: arg_strs(args, "owner").unwrap_or_default(),
+                statuses: arg_strs(args, "status").unwrap_or_default(),
+                components: arg_strs(args, "component").unwrap_or_default(),
+                priorities: arg_strs(args, "priority").unwrap_or_default(),
+                types: arg_strs(args, "type").unwrap_or_default(),
+                milestones: arg_strs(args, "milestone").unwrap_or_default(),
+                plans: arg_strs(args, "plan").unwrap_or_default(),
+                open: args.get("open").and_then(Value::as_bool) == Some(true),
+            };
+            if let Err(e) = filter.validate() {
+                return cli_fail(400, "invalid_request", &e.to_string());
             }
-            (Err(resp), _) | (_, Err(resp)) => resp,
-            _ => cli_fail(
+            let read = read_model::get(ctx.state_dir, ctx.pm_dir).board(&pm, None);
+            let by_id = read.by_id();
+            let read_ctx = read.ctx(&by_id);
+            // AOS-274: a project this caller may not read contributes
+            // no row at all — filtered before the filter and the card.
+            let allowed = readable_projects(&pm, ctx.actor);
+            json_ok(json!({
+                "issues": read.views.iter()
+                    .filter(|v| filter.matches(v) && allowed.contains(&v.issue.project))
+                    .map(|v| read.card(&read_ctx, v))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+    }
+}
+
+fn dispatch_issue_show(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match arg_str(ctx.args, "id") {
+        Ok(Some(raw)) => {
+            let Ok(id) = model::check_id(raw) else {
+                return cli_fail(400, "invalid_request", "bad issue id");
+            };
+            match pm_at(ctx.pm_dir) {
+                Err(resp) => resp,
+                Ok(pm) => {
+                    if let Some(resp) = restricted_issue(&pm, &id, ctx.actor) {
+                        return resp;
+                    }
+                    let read = read_model::get(ctx.state_dir, ctx.pm_dir).board(&pm, None);
+                    let by_id = read.by_id();
+                    match by_id.get(&id) {
+                        Some(view) => {
+                            if let Some(resp) = restricted(&pm, &view.issue.project, ctx.actor) {
+                                return resp;
+                            }
+                            json_ok(json!({
+                                "issue": crate::issue::work::detail_json(
+                                    &pm.dir,
+                                    &read.ctx(&by_id),
+                                    view,
+                                ),
+                            }))
+                        }
+                        None => cli_fail(404, "not_found", "unknown issue"),
+                    }
+                }
+            }
+        }
+        _ => cli_fail(400, "invalid_request", "issue_show needs arguments.id"),
+    }
+}
+
+fn dispatch_issue_history(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match arg_str(ctx.args, "id") {
+        Ok(Some(raw)) => {
+            let Ok(id) = model::check_id(raw) else {
+                return cli_fail(400, "invalid_request", "bad issue id");
+            };
+            let limit = match arg_u64(ctx.args, "limit") {
+                Ok(Some(n)) => n as usize,
+                Ok(None) => 50,
+                Err(resp) => return resp,
+            };
+            match pm_at(ctx.pm_dir) {
+                Err(resp) => resp,
+                Ok(pm) => {
+                    if let Some(resp) = restricted_issue(&pm, &id, ctx.actor) {
+                        return resp;
+                    }
+                    match board::find_issue(&pm.dir, &id) {
+                        Ok(issue) => {
+                            if let Some(resp) = restricted(&pm, &issue.project, ctx.actor) {
+                                return resp;
+                            }
+                            match history::log(&pm.dir, &issue, limit.max(1)) {
+                                Ok(h) => json_ok(json!({"id": id, "history": h})),
+                                Err(e) => cli_fail(503, "tracker_unavailable", &e.to_string()),
+                            }
+                        }
+                        Err(e) => cli_fail(404, "not_found", &e.to_string()),
+                    }
+                }
+            }
+        }
+        _ => cli_fail(400, "invalid_request", "issue_history needs arguments.id"),
+    }
+}
+
+// CAD-1568: the message verbs relay the re-verifiable signed
+// envelope as `cli_envelope` to the daemon's `cli_message_*`
+// RPCs — the daemon re-verifies it over this proven board
+// connection and scopes everything by the verified principal;
+// a bare `agent_inbox`/`message_read` relay would see an
+// operator-class connection and read any member's mail.
+fn dispatch_message_read(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match arg_str(ctx.args, "message") {
+        Ok(Some(_)) => {
+            match arg_u64(ctx.args, "offset") {
+                Ok(_) => {}
+                Err(resp) => return resp,
+            }
+            match arg_u64(ctx.args, "limit") {
+                Ok(_) => {}
+                Err(resp) => return resp,
+            }
+            let mut params = ctx.args.clone();
+            params["cli_envelope"] = json!(ctx.envelope);
+            rpc(ctx.state_dir, "cli_message_read", params)
+        }
+        _ => cli_fail(
+            400,
+            "invalid_request",
+            "message_read needs arguments.message",
+        ),
+    }
+}
+
+fn dispatch_message_inbox(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match arg_str(ctx.args, "alias") {
+        Ok(Some(_)) => {
+            match arg_u64(ctx.args, "after") {
+                Ok(_) => {}
+                Err(resp) => return resp,
+            }
+            match arg_str(ctx.args, "reader") {
+                Ok(_) => {}
+                Err(resp) => return resp,
+            }
+            let mut params = ctx.args.clone();
+            params["cli_envelope"] = json!(ctx.envelope);
+            rpc(ctx.state_dir, "cli_message_inbox", params)
+        }
+        _ => cli_fail(
+            400,
+            "invalid_request",
+            "message_inbox needs arguments.alias",
+        ),
+    }
+}
+
+// CAD-1586: settings management relays to the daemon's
+// `cli_settings_command` — the envelope is forwarded verbatim
+// (`cli_envelope`) and re-verified against the daemon's own
+// trust root, so a relayed call can never widen into local
+// operator authority. The op's settings.* scope and the
+// principal class are enforced daemon-side; this relay carries
+// no more than the signed envelope proves.
+fn dispatch_settings_agents(ctx: &DispatchCtx<'_>) -> HttpResp {
+    let mut params = ctx.args.clone();
+    if params.get("operation").and_then(Value::as_str).is_none() {
+        return cli_fail(
+            400,
+            "invalid_request",
+            "settings_agents needs arguments.operation",
+        );
+    }
+    params["cli_envelope"] = json!(ctx.envelope);
+    rpc(ctx.state_dir, "cli_settings_command", params)
+}
+
+// CAD-1586: master launch diagnosis — a strict translation
+// into the shared settings command path (`master.status` in
+// the op table), never a separate handler. Args admit only an
+// optional `grant_id`; anything else is refused before relay.
+// The envelope rides verbatim and is re-verified daemon-side,
+// so this relay grants no authority the claim lacks.
+fn dispatch_master_status(ctx: &DispatchCtx<'_>) -> HttpResp {
+    if let Some(object) = ctx.args.as_object() {
+        for key in object.keys() {
+            if key != "grant_id" {
+                return cli_fail(
+                    400,
+                    "invalid_request",
+                    "master_status arguments admit only 'grant_id'",
+                );
+            }
+        }
+    }
+    let mut op_payload = serde_json::Map::new();
+    if let Some(grant) = ctx.args.get("grant_id").and_then(Value::as_str) {
+        op_payload.insert("grant_id".to_string(), json!(grant));
+    }
+    rpc(
+        ctx.state_dir,
+        "cli_settings_command",
+        json!({
+            "cli_envelope": ctx.envelope,
+            "operation": "master.status",
+            "expected_revision": Value::Null,
+            "payload": Value::Object(op_payload),
+        }),
+    )
+}
+
+fn dispatch_issue_new(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match pm_at(ctx.pm_dir) {
+        Err(resp) => resp,
+        Ok(pm) => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct NewReq {
+                project: String,
+                title: String,
+                priority: Option<String>,
+                owner: Option<String>,
+                component: Option<String>,
+                tags: Option<Vec<String>>,
+                parent: Option<String>,
+                blocked_by: Option<Vec<String>>,
+                body: Option<String>,
+            }
+            let req: NewReq = match serde_json::from_value(ctx.args.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    return cli_fail(400, "invalid_request", &format!("issue_new: {e}"));
+                }
+            };
+            let body = req.body.as_deref().map(str::trim).filter(|b| !b.is_empty());
+            if body.is_some_and(|b| b.len() > crate::issue::report::BODY_MAX) {
+                return cli_fail(
+                    400,
+                    "invalid_request",
+                    "issue body exceeds the 32 KB cap — trim it",
+                );
+            }
+            if let Some(resp) = restricted(&pm, &req.project, ctx.actor) {
+                return resp;
+            }
+            // A linked id is an issue id the caller names too: one it
+            // may not read, or a malformed one, answers as an absent one
+            // (CAD-2357) and is never linked.
+            let linked = req.parent.iter().chain(req.blocked_by.iter().flatten());
+            for id in linked {
+                if let Some(resp) = restricted_issue(&pm, id, ctx.actor) {
+                    return resp;
+                }
+            }
+            match issue_write::new_issue(
+                &pm,
+                &pm.dir,
+                Some(&req.project),
+                &req.title,
+                req.priority.as_deref(),
+                req.parent.as_deref(),
+                &req.blocked_by.unwrap_or_default(),
+                req.owner.as_deref(),
+                req.component.as_deref(),
+                &req.tags.unwrap_or_default(),
+                None,
+                body,
+                &ctx.actor.handle,
+            ) {
+                Ok(out) => {
+                    let id = out["id"].as_str().unwrap_or_default().to_string();
+                    write_reply(&pm, ctx.state_dir, &id, out, true)
+                }
+                Err(e) => write_err(&e),
+            }
+        }
+    }
+}
+
+fn dispatch_issue_comment(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match (arg_str(ctx.args, "id"), arg_str(ctx.args, "body")) {
+        (Ok(Some(raw)), Ok(Some(body))) => {
+            let Ok(id) = model::check_id(raw) else {
+                return cli_fail(400, "invalid_request", "bad issue id");
+            };
+            let if_rev = match arg_str(ctx.args, "if_rev") {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            match pm_at(ctx.pm_dir) {
+                Err(resp) => resp,
+                Ok(pm) => {
+                    if let Some(resp) = restricted_issue(&pm, &id, ctx.actor) {
+                        return resp;
+                    }
+                    match issue_write::add_comment(
+                        &pm,
+                        &id,
+                        body,
+                        Some(&ctx.actor.handle),
+                        Some("remote-cli"),
+                        if_rev,
+                        &ctx.actor.actor,
+                    ) {
+                        Ok(out) => write_reply(&pm, ctx.state_dir, &id, out, false),
+                        Err(e) => write_err(&e),
+                    }
+                }
+            }
+        }
+        (Err(resp), _) | (_, Err(resp)) => resp,
+        _ => cli_fail(
+            400,
+            "invalid_request",
+            "issue_comment needs arguments.id and arguments.body",
+        ),
+    }
+}
+
+fn dispatch_issue_set(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match (arg_strs(ctx.args, "ids"), arg_strs(ctx.args, "set")) {
+        (Ok(ids), Ok(pairs)) => {
+            // Revisions are per-ticket and optimistic: exactly one
+            // issue, and `if_rev` (the `rev` `issue_show` reports)
+            // is mandatory — a remote field edit is never an
+            // unconditional last-writer-wins write. The check runs
+            // inside `set_fields_if_rev` under the tracker lock, at
+            // the point of write; a stale token answers the
+            // contract's conflict payload instead of a 200.
+            if ids.len() != 1 {
+                return cli_fail(
+                    400,
+                    "invalid_request",
+                    "issue_set edits exactly one issue — revisions are per-ticket",
+                );
+            }
+            // No remote override of the `status=done` evidence gate:
+            // the verb never accepted `force` — a caller naming one
+            // is refused, never silently dropped, before any write.
+            if ctx.args.get("force").is_some() {
+                return cli_fail(
+                    400,
+                    "invalid_request",
+                    "issue_set does not accept arguments.force",
+                );
+            }
+            let if_rev = match arg_str(ctx.args, "if_rev") {
+                Ok(Some(rev)) if !rev.trim().is_empty() => rev,
+                Ok(_) => {
+                    return cli_fail(
+                        400,
+                        "invalid_request",
+                        "issue_set needs a nonempty arguments.if_rev — re-read the \
+                         issue's rev and send it",
+                    );
+                }
+                Err(resp) => return resp,
+            };
+            if model::check_id(&ids[0]).is_err() {
+                return cli_fail(400, "invalid_request", "bad issue id");
+            }
+            match pm_at(ctx.pm_dir) {
+                Err(resp) => resp,
+                Ok(pm) => {
+                    if let Some(resp) = restricted_issue(&pm, &ids[0], ctx.actor) {
+                        return resp;
+                    }
+                    match issue_write::set_fields_if_rev(
+                        &pm,
+                        &ids,
+                        &pairs,
+                        &ctx.actor.handle,
+                        None,
+                        Some(if_rev),
+                    ) {
+                        Ok(out) => write_reply(&pm, ctx.state_dir, &ids[0], out, false),
+                        Err(e) => write_err(&e),
+                    }
+                }
+            }
+        }
+        (Err(resp), _) | (_, Err(resp)) => resp,
+    }
+}
+
+// Human Owner only: verified `role_at_issue=owner` AND
+// `principal_kind=user`. An agent can be minted with the owner
+// role and must not administer policy. Neither value is an
+// argument. The record this verb writes decides who may read
+// the project, so a member must not widen it or grant access.
+// This arm does not consult the project's own restriction —
+// administering a policy cannot depend on the policy it is
+// administering.
+fn dispatch_project_policy(ctx: &DispatchCtx<'_>) -> HttpResp {
+    if ctx.actor.role_at_issue != "owner" || ctx.actor.principal_kind != "user" {
+        return cli_fail(
+            403,
+            "not_permitted",
+            "project_policy is human-owner only — a member or an agent cannot record project access",
+        );
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PolicyReq {
+        project: String,
+        visibility: String,
+        grants: Vec<String>,
+    }
+    let req: PolicyReq = match serde_json::from_value(ctx.args.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return cli_fail(400, "invalid_request", &format!("project_policy: {e}"));
+        }
+    };
+    let visibility = match req.visibility.as_str() {
+        "workspace-visible" => crate::issue::project::Visibility::WorkspaceVisible,
+        "private" => crate::issue::project::Visibility::Private,
+        other => {
+            return cli_fail(
                 400,
                 "invalid_request",
-                "message_send needs arguments.alias and arguments.text",
-            ),
+                &format!(
+                    "project_policy: unknown visibility `{other}` — \
+                     workspace-visible or private"
+                ),
+            );
+        }
+    };
+    match pm_at(ctx.pm_dir) {
+        Err(resp) => resp,
+        Ok(pm) => match issue_write::set_project_policy(
+            &pm,
+            &req.project,
+            visibility,
+            &req.grants,
+            &format!("users/{}", ctx.actor.handle),
+        ) {
+            Ok(out) => json_ok(out),
+            Err(e) => write_err(&e),
         },
+    }
+}
+
+// CAD-1568: never a bare `agent_send` relay — that connection is
+// operator-class, so the daemon would record the message as the
+// operator's. The signed envelope rides as `cli_envelope` and
+// the daemon's `cli_message_send` re-verifies it, derives the
+// principal and enforces the remote recipient classes itself.
+// Arguments are exactly `alias`, `text` and the stable `message`
+// id; the daemon refuses every other field, so routing
+// (`reply_to`, `task`) and steering options are rejected, never
+// silently dropped.
+fn dispatch_message_send(ctx: &DispatchCtx<'_>) -> HttpResp {
+    match (arg_str(ctx.args, "alias"), arg_str(ctx.args, "text")) {
+        (Ok(Some(_)), Ok(Some(text))) => {
+            if text.trim().is_empty() {
+                return cli_fail(400, "invalid_request", "message_send text is empty");
+            }
+            match arg_str(ctx.args, "message") {
+                Ok(Some(id)) if !id.trim().is_empty() => {}
+                Ok(_) => {
+                    return cli_fail(
+                        400,
+                        "invalid_request",
+                        "message_send needs a stable arguments.message id — supply one \
+                         so a retry after a lost response dedupes instead of resubmitting blind",
+                    )
+                }
+                Err(resp) => return resp,
+            }
+            let mut params = ctx.args.clone();
+            params["cli_envelope"] = json!(ctx.envelope);
+            rpc(ctx.state_dir, "cli_message_send", params)
+        }
+        (Err(resp), _) | (_, Err(resp)) => resp,
+        _ => cli_fail(
+            400,
+            "invalid_request",
+            "message_send needs arguments.alias and arguments.text",
+        ),
     }
 }
 
