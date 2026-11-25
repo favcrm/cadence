@@ -110,6 +110,10 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     if (status === 200) record();
     return json(status === 200 ? { ok: true } : { error: { code: "refused" } }, status);
   }
+  if (/^\/api\/connections\/mcp\/[^/]+\/tools$/.test(url.pathname) && init?.method === "POST") {
+    posts.push({ path: url.pathname + url.search, body: JSON.parse(String(init.body ?? "{}")) });
+    return json({ connection: {} });
+  }
   if (url.pathname === "/api/threads/master/conversations") return json({ conversation: { id: "recruit-conversation" } });
   if (url.pathname === "/api/threads/master/stream") {
     return new Response(new ReadableStream<Uint8Array>({ start(controller) { recruitStream = controller; } }), { headers: { "Content-Type": "text/event-stream" } });
@@ -134,7 +138,7 @@ const sleep = (ms: number) => React.act(async () => { await new Promise((resolve
 async function click(element: Element | undefined | null, opts: { detail?: number; quick?: boolean } = {}) {
   assert(element, "click target exists");
   const label = element.textContent?.trim();
-  if (!opts.quick && element.closest('[data-drawer="staged"]') && (label === "Approve" || label === "Deny")) await sleep(850);
+  if (!opts.quick && element.closest('[data-drawer="staged"]') && (label === "Approve" || label === "Always allow" || label === "Deny")) await sleep(850);
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: opts.detail ?? 1 } as any)); });
   await flush();
 }
@@ -1342,6 +1346,44 @@ listStatus = 200;
     assert(text(w.host.querySelector("[data-fail]")).includes(words), `${code} reads in plain words`);
     await w.done();
   }
+
+  // Custom MCP staged action in Home drawer offers Approve, Always allow, and Deny;
+  // Always allow approves once and updates the tool pin mode to read.
+  const mcpEffect = (id: string) => ({
+    id, tool: "custom_mcp_effect", status: "pending", createdAt: Date.now() - AGO, decidedAt: null,
+    input: {
+      connection_id: "conn_mcp_demo", connection_name: "EMW Wines", endpoint_host: "emw-mcp.simplebuild.site",
+      tool: "cart.add", snapshot_revision: 2, args: JSON.stringify({ sku: "WINE-1" }),
+    },
+    result: null,
+  });
+  actions = [mcpEffect("mcp1")];
+  onDecide = (id) => {
+    actions = actions.map((a: any) =>
+      a.id !== id ? a : { ...a, status: "approved", decidedAt: Date.now(), result: { ok: true } },
+    );
+  };
+  {
+    const w = await render();
+    await settle(() => assert(w.cards().length === 1, "one custom_mcp_effect card"));
+    await click(w.cards()[0].querySelector(".todo-hit"));
+    await settle(() => assert(drawerEl(), "custom_mcp_effect drawer opens"));
+    assert(labelled(drawerEl()!, "Approve") && labelled(drawerEl()!, "Always allow") && labelled(drawerEl()!, "Deny"), "custom_mcp_effect drawer renders Approve, Always allow, and Deny");
+    const postStart = posts.length;
+    await click(labelled(drawerEl()!, "Always allow"));
+    await settle(() => assert(drawerEl() === null, "Always allow closes after approving and updating mode"));
+    const recorded: ReadonlyArray<{ path: string; body: any }> = posts.slice(postStart);
+    assert(
+      recorded.length === 2 &&
+        recorded[0]?.path === "/api/assist/actions/mcp1/approve" &&
+        recorded[1]?.path === "/api/connections/mcp/conn_mcp_demo/tools" &&
+        recorded[1]?.body.tools?.[0]?.tool_name === "cart.add" &&
+        recorded[1]?.body.tools?.[0]?.mode === "read",
+      `Always allow approves then updates tool mode (${JSON.stringify(recorded)})`,
+    );
+    await w.done();
+  }
+  onDecide = null;
 }
 
 console.log("staged decision checks passed");

@@ -148,6 +148,7 @@ equal(customMcpAuthLabel("oauth"), "OAuth 2.1", "auth label");
 equal(customMcpAuthOptionLabel("oauth_static"), "OAuth client ID", "auth option label");
 equal(customMcpAuthOptionLabel("bearer"), "Bearer token", "auth bearer option label");
 equal(customMcpToolModeLabel("approval"), "Ask approval", "mode label");
+equal(customMcpToolModeLabel("read"), "Always allow", "read mode label");
 const statusView = customMcpStatusView(summaryBase);
 assert(statusView.tone === "warn" && statusView.detail.includes("1 tool drifted") && statusView.detail.includes("server instructions changed"), "drift status summary");
 assert(

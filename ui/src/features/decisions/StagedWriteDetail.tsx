@@ -3,6 +3,8 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { useWriteBlock } from "../auth/WriteGate";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
+import { api } from "../../lib/api";
+import { customMcpErrorText } from "../settings/customMcpView";
 import { ageText, approvable, askedBy, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import ShareRequestDrawer from "./ShareRequestDrawer";
@@ -553,6 +555,8 @@ export default function StagedWriteDetail({
   const [tab, setTab] = useState<DetailTabId>("approvals");
   const [denyOpen, setDenyOpen] = useState(false);
   const [denyReason, setDenyReason] = useState("");
+  const [alwaysBusy, setAlwaysBusy] = useState(false);
+  const [alwaysNote, setAlwaysNote] = useState<string | null>(null);
   const alive = useRef(true);
   useEffect(() => {
     alive.current = true;
@@ -567,6 +571,8 @@ export default function StagedWriteDetail({
     setTab("approvals");
     setDenyOpen(false);
     setDenyReason("");
+    setAlwaysBusy(false);
+    setAlwaysNote(null);
     if (first.current) {
       first.current = false;
       return;
@@ -609,17 +615,42 @@ export default function StagedWriteDetail({
     if (clicks > 1 || Date.now() < armedAt.current) return;
     // The click is for the row that was on screen when the handler was made.
     if (forId !== idRef.current) return;
-    if (block !== null || !pending || busy !== undefined || lost || uncertain) return;
+    if (block !== null || !pending || busy !== undefined || alwaysBusy || lost || uncertain) return;
     if (verb === "approve" && write !== null && !approvable(write)) return;
     const reason = verb === "deny" && denyOpen ? denyReason : undefined;
     void run(() => store.decide(forId, verb, reason));
   };
+  const actAlways = async (target: StagedWrite, clicks: number) => {
+    if (clicks > 1 || Date.now() < armedAt.current) return;
+    if (target.id !== idRef.current || !target.customMcp) return;
+    if (block !== null || !pending || busy !== undefined || alwaysBusy || lost || uncertain || !approvable(target)) return;
+    setAlwaysBusy(true);
+    setAlwaysNote(null);
+    mine.current = target.id;
+    const result = await store.decide(target.id, "approve");
+    if (!alive.current) return;
+    if (result !== "decided") {
+      mine.current = null;
+      setAlwaysBusy(false);
+      return;
+    }
+    try {
+      await api.customMcpUpdateTools(target.customMcp.connectionId, [{ tool_name: target.customMcp.tool, mode: "read" }]);
+      if (!alive.current) return;
+      setAlwaysBusy(false);
+      advance();
+    } catch (e: unknown) {
+      if (!alive.current) return;
+      setAlwaysBusy(false);
+      setAlwaysNote(t(customMcpErrorText(e)));
+    }
+  };
   const check = () => {
-    if (busy !== undefined) return;
+    if (busy !== undefined || alwaysBusy) return;
     void run(() => store.checkDecision(idRef.current));
   };
   const skip = () => {
-    if (busy !== undefined) return;
+    if (busy !== undefined || alwaysBusy) return;
     store.clearNotice();
     advance();
   };
@@ -686,6 +717,10 @@ export default function StagedWriteDetail({
     <p className="issue-peek-note err m-0" role="alert">
       {t("Only the workspace owner can decide this request.")}
     </p>
+  ) : alwaysNote !== null ? (
+    <p className="issue-peek-note warn m-0" role="alert">
+      {alwaysNote}
+    </p>
   ) : elsewhere || attempt?.phase === "elsewhere" ? (
     <p className="issue-peek-note warn m-0" role="alert">
       {t("This was already decided elsewhere. The list has been refreshed.")}
@@ -704,7 +739,7 @@ export default function StagedWriteDetail({
   const link = safeLink(write.recordLink);
   const where = [write.app, write.target?.label].filter((p): p is string => !!p).join(" · ");
   const domain = stagedDomain(write);
-  const off = block !== null || busy !== undefined || lost || uncertain || !pending;
+  const off = block !== null || busy !== undefined || alwaysBusy || lost || uncertain || !pending;
   const spin = (verb: Verb) => busy?.phase === "busy" && busy.verb === verb && attempt?.phase === "busy";
 
   return (
@@ -714,7 +749,7 @@ export default function StagedWriteDetail({
       trapFocus
       scrim="board"
       size="md"
-      preventClose={busy !== undefined}
+      preventClose={busy !== undefined || alwaysBusy}
       label={label}
       title={<B>{titleOf(write, t)}</B>}
       subtitle={
@@ -778,7 +813,7 @@ export default function StagedWriteDetail({
       foot={
         <>
           <div className="crm-drawer-actions">
-            {elsewhere || attempt?.phase === "elsewhere" ? (
+            {alwaysNote !== null || elsewhere || attempt?.phase === "elsewhere" ? (
               <button type="button" className="btn btn-sm btn-primary" onClick={advance}>
                 {t("Continue")}
               </button>
@@ -805,6 +840,25 @@ export default function StagedWriteDetail({
                     t("Approve")
                   )}
                 </button>
+                {write.kind === "custom_mcp_effect" && write.customMcp != null && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    aria-disabled={off || !approvable(write) || undefined}
+                    aria-busy={alwaysBusy || undefined}
+                    title={block !== null ? t(READ_ONLY_COPY) : !approvable(write) ? t("This request cannot be reviewed, so it cannot be approved.") : undefined}
+                    onClick={(e) => void actAlways(write, e.detail)}
+                  >
+                    {alwaysBusy ? (
+                      <>
+                        <span className="btn-spin" aria-hidden="true" />
+                        {t("Saving…")}
+                      </>
+                    ) : (
+                      t("Always allow")
+                    )}
+                  </button>
+                )}
                 <button
                   type="button"
                   className="btn btn-sm"
@@ -824,7 +878,7 @@ export default function StagedWriteDetail({
                 </button>
               </>
             )}
-            <button type="button" className="btn btn-sm btn-ghost" aria-disabled={busy !== undefined || undefined} onClick={skip}>
+            <button type="button" className="btn btn-sm btn-ghost" aria-disabled={busy !== undefined || alwaysBusy || undefined} onClick={skip}>
               {t("Not now")}
             </button>
           </div>
