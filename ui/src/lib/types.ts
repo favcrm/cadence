@@ -120,6 +120,8 @@ export interface IssueAssignmentRow {
   action?: "dispatch" | "start" | "resume";
   generation?: number;
   target?: string | null;
+  client_agent_id?: string | null;
+  reported_head_sha?: string | null;
   state: string;
   text?: string | null;
   text_truncated?: boolean;
@@ -574,9 +576,20 @@ export type DocumentFollowUps =
   | { status: "unavailable" };
 
 /** `GET /api/overview` — everything derived, nothing stored. */
+export interface HostedLocalAssignmentTodo {
+  issue_id: string;
+  issue_title: string;
+  project: string;
+  category: "blocked" | "reviews";
+  runner_label?: string | null;
+  assignment: IssueAssignmentRow;
+}
+
 export interface Overview {
   needs_me: NeedsMe[];
   document_follow_ups?: DocumentFollowUps;
+  /** AOS-764 / CAD-2806: owner-only latest blocked/failed/result local assignments per issue. */
+  local_assignment_todos?: HostedLocalAssignmentTodo[];
   drift: Drift;
   projects: OverviewProject[];
   github: {

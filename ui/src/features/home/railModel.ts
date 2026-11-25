@@ -1,6 +1,7 @@
 import type {
   Agent,
   DocumentFollowUp,
+  HostedLocalAssignmentTodo,
   Routine,
   RoutineRun,
   StagedRoutineProposal,
@@ -71,13 +72,53 @@ export function todoPresentation(need: Pick<HomeNeed, "kind" | "agent" | "projec
   return { tone: "fail", kindLabel: "Blocked", cueLabel: "Inspect", sourceLabel };
 }
 
+export interface LocalAssignmentPresentation {
+  tone: "fail" | "info";
+  statusLabel: string;
+  cueLabel: string;
+  sourceLabel: string;
+  metaLabel: string;
+  summaryText: string;
+}
+
+/** Calm presentation for a hosted local assignment surfaced in Home -> To do. */
+export function localAssignmentPresentation(item: HostedLocalAssignmentTodo): LocalAssignmentPresentation {
+  const { assignment } = item;
+  const isBlocked = item.category === "blocked";
+  const statusLabel =
+    assignment.state === "failed"
+      ? "Failed · Local"
+      : isBlocked
+        ? "Blocked · Local"
+        : "Review · Local";
+  const sourceLabel = item.runner_label ?? assignment.client_agent_id ?? "local daemon";
+  const metaParts: string[] = [item.issue_id];
+  if (typeof assignment.generation === "number") metaParts.push(`g${assignment.generation}`);
+  const model = assignment.spawn?.model ?? assignment.resume?.model;
+  if (model) metaParts.push(model);
+  const summaryText =
+    assignment.text?.trim() ||
+    (isBlocked
+      ? "Local worker requires retry or cancellation."
+      : "Local worker finished and is awaiting owner review.");
+  return {
+    tone: isBlocked ? "fail" : "info",
+    statusLabel,
+    cueLabel: isBlocked ? "Inspect" : "Review",
+    sourceLabel,
+    metaLabel: metaParts.join(" · "),
+    summaryText,
+  };
+}
+
 export type UnifiedTodoItem =
   | { kind: "need"; key: string; category: TodoCategoryKey; need: HomeNeed }
   | { kind: "routine_step_hold"; key: string; category: "approvals"; run: RoutineRun }
   | { kind: "routine_proposal"; key: string; category: "approvals"; proposal: StagedRoutineProposal }
   | { kind: "waiting_routine"; key: string; category: "reviews"; routine: Routine }
   | { kind: "document"; key: string; category: "reviews"; doc: DocumentFollowUp }
-  | { kind: "template"; key: string; category: "reviews"; template: TemplateSummary };
+  | { kind: "template"; key: string; category: "reviews"; template: TemplateSummary }
+  | { kind: "local_assignment"; key: string; category: "blocked" | "reviews"; item: HostedLocalAssignmentTodo };
 
 /** Stably sort all pending To do cards by urgency: Approvals -> Reviews -> Blocked. */
 export function sortUnifiedTodos(items: readonly UnifiedTodoItem[]): UnifiedTodoItem[] {

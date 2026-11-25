@@ -1,5 +1,5 @@
 import { useEffect, useSyncExternalStore } from "react";
-import type { NeedsMe, Overview } from "../../lib/types";
+import type { HostedLocalAssignmentTodo, NeedsMe, Overview } from "../../lib/types";
 import { onPrivateSessionReset } from "../../lib/privateSession";
 import { needFingerprint, todoCount, todoSplit, type HomeNeed } from "./needs";
 
@@ -26,18 +26,59 @@ export interface TodoLocal {
   sent: ReadonlyMap<string, string>;
   sending: ReadonlyMap<string, string>;
   decidedRoutines: ReadonlySet<string>;
+  reviewedLocalAssignments: ReadonlyMap<string, string>;
   /** Counts mounts of the Home rail; see `scope`. */
   visit: number;
 }
 
-export type OverviewRoutines = Pick<Overview, "routine_needs" | "routine_proposals" | "routine_step_holds">;
+export type OverviewRoutines = Pick<
+  Overview,
+  "routine_needs" | "routine_proposals" | "routine_step_holds" | "local_assignment_todos"
+>;
 
-const empty = (visit = 0): TodoLocal => ({
+const LOCAL_REVIEWED_STORAGE_KEY = "cadence.home.reviewed_local_assignments.v1";
+
+function loadReviewedLocalAssignments(): ReadonlyMap<string, string> {
+  try {
+    if (typeof localStorage === "undefined") return new Map();
+    const raw = localStorage.getItem(LOCAL_REVIEWED_STORAGE_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Map();
+    const out = new Map<string, string>();
+    for (const pair of parsed) {
+      if (Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "string") {
+        out.set(pair[0], pair[1]);
+      }
+    }
+    return out;
+  } catch {
+    return new Map();
+  }
+}
+
+function saveReviewedLocalAssignments(map: ReadonlyMap<string, string>) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    if (map.size === 0) localStorage.removeItem(LOCAL_REVIEWED_STORAGE_KEY);
+    else localStorage.setItem(LOCAL_REVIEWED_STORAGE_KEY, JSON.stringify([...map.entries()]));
+  } catch {
+    // Best-effort client persistence only.
+  }
+}
+
+export function localAssignmentFingerprint(item: Pick<HostedLocalAssignmentTodo, "issue_id" | "assignment">): string {
+  const { assignment } = item;
+  return `${assignment.assignment_id ?? item.issue_id}:${assignment.generation ?? 0}:${assignment.state}`;
+}
+
+const empty = (visit = 0, reviewed = loadReviewedLocalAssignments()): TodoLocal => ({
   hidden: new Map(),
   done: new Map(),
   sent: new Map(),
   sending: new Map(),
   decidedRoutines: new Set(),
+  reviewedLocalAssignments: reviewed,
   visit,
 });
 let state: TodoLocal = empty();
@@ -71,6 +112,20 @@ export const decideRoutine = (id: string) => {
   next.add(id);
   set({ ...state, decidedRoutines: next });
 };
+
+export const markLocalAssignmentReviewed = (item: Pick<HostedLocalAssignmentTodo, "issue_id" | "assignment">) => {
+  const fp = localAssignmentFingerprint(item);
+  if (state.reviewedLocalAssignments.get(item.issue_id) === fp) return;
+  const next = new Map(state.reviewedLocalAssignments);
+  next.set(item.issue_id, fp);
+  saveReviewedLocalAssignments(next);
+  set({ ...state, reviewedLocalAssignments: next });
+};
+
+export const isLocalAssignmentReviewed = (
+  local: TodoLocal,
+  item: Pick<HostedLocalAssignmentTodo, "issue_id" | "assignment">,
+): boolean => local.reviewedLocalAssignments.get(item.issue_id) === localAssignmentFingerprint(item);
 
 const has = (m: ReadonlyMap<string, string>, need: HomeNeed, fp = needFingerprint(need)) => m.get(need.key) === fp;
 
@@ -107,6 +162,26 @@ export function pendingRoutineCount(routines: OverviewRoutines | null | undefine
   return routineIds(routines).filter((id) => !local.decidedRoutines.has(id)).length;
 }
 
+export function pendingLocalAssignmentCount(
+  items: readonly HostedLocalAssignmentTodo[] | null | undefined,
+  local: TodoLocal,
+): number {
+  if (!items || items.length === 0) return 0;
+  return items.filter((item) => !isLocalAssignmentReviewed(local, item)).length;
+}
+
+/** Forget reviewed local assignment marks whose issue disappeared or changed state/generation. */
+export function reconcileLocalAssignments(items: readonly HostedLocalAssignmentTodo[]) {
+  if (state.reviewedLocalAssignments.size === 0) return;
+  const byIssue = new Map(items.map((item) => [item.issue_id, localAssignmentFingerprint(item)]));
+  const kept = new Map(
+    [...state.reviewedLocalAssignments].filter(([issueId, fp]) => byIssue.get(issueId) === fp),
+  );
+  if (kept.size === state.reviewedLocalAssignments.size) return;
+  saveReviewedLocalAssignments(kept);
+  set({ ...state, reviewedLocalAssignments: kept });
+}
+
 /** Forget decided routine marks whose IDs are no longer in the overview. */
 export function reconcileRoutines(ids: readonly string[]) {
   if (state.decidedRoutines.size === 0) return;
@@ -128,6 +203,7 @@ export function reconcileTodo(current: readonly HomeNeed[]) {
     sent: keep(state.sent, (v) => v, here),
     sending: keep(state.sending, (v) => v, needFingerprint),
     decidedRoutines: state.decidedRoutines,
+    reviewedLocalAssignments: state.reviewedLocalAssignments,
     visit: state.visit,
   };
   const same = (a: ReadonlyMap<string, unknown>, b: ReadonlyMap<string, unknown>) => a.size === b.size;
@@ -136,7 +212,10 @@ export function reconcileTodo(current: readonly HomeNeed[]) {
 }
 
 /** Clears private To do decisions without reusing an earlier visit. */
-export const resetTodoLocal = () => set(empty(state.visit));
+export const resetTodoLocal = () => {
+  saveReviewedLocalAssignments(new Map());
+  set(empty(state.visit, new Map()));
+};
 
 onPrivateSessionReset(resetTodoLocal);
 
@@ -161,6 +240,10 @@ export function useHomeCount(
   const sig = needs?.map((n) => `${n.key}\t${needFingerprint(n)}`).join("\n") ?? null;
   const ids = routines ? routineIds(routines) : null;
   const routineSig = ids ? ids.join("\n") : null;
+  const localAssignments = routines?.local_assignment_todos ?? null;
+  const localSig =
+    localAssignments?.map((item) => `${item.issue_id}\t${localAssignmentFingerprint(item)}`).join("\n") ??
+    null;
   // `sig` stands for `needs`: re-run only when a key or fingerprint changes.
   useEffect(() => {
     if (needs) reconcileTodo(needs);
@@ -168,6 +251,14 @@ export function useHomeCount(
   useEffect(() => {
     if (ids) reconcileRoutines(ids);
   }, [routineSig]);
-  // Staged decisions (CAD-2186) and pending routines (CAD-2317) count alongside `needs_me`.
-  return todoCount(rows, (n) => isSettled(local, n)) + staged + pendingRoutineCount(routines, local);
+  useEffect(() => {
+    if (localAssignments) reconcileLocalAssignments(localAssignments);
+  }, [localSig]);
+  // Staged decisions (CAD-2186), pending routines (CAD-2317), and local assignment todos count together.
+  return (
+    todoCount(rows, (n) => isSettled(local, n)) +
+    staged +
+    pendingRoutineCount(routines, local) +
+    pendingLocalAssignmentCount(localAssignments, local)
+  );
 }
