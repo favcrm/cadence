@@ -107,7 +107,7 @@ fn verb_for(
                     preview_digest,
                 },
         } => {
-            use cadence_agent::delivery::hosted_gate::{valid_project_key, valid_repo};
+            use cadence_agent::delivery::hosted_gate::valid_project_key;
             use std::io::Read;
 
             if !valid_project_key(project) {
@@ -147,19 +147,6 @@ fn verb_for(
                         "delivery policy --file must contain a JSON object — nothing was sent",
                     )
                 })?;
-                let valid_repos =
-                    proposal
-                        .get("repos")
-                        .and_then(Value::as_array)
-                        .is_some_and(|repos| {
-                            !repos.is_empty()
-                                && repos
-                                    .iter()
-                                    .all(|repo| repo.as_str().is_some_and(valid_repo))
-                        });
-                if !valid_repos {
-                    return Err(Error::rejected("delivery policy repos must be a non-empty array of owner/name strings — nothing was sent"));
-                }
                 if *apply {
                     if proposal.contains_key("assigned_reviews") && preview_digest.is_none() {
                         return Err(Error::rejected("delivery policy assigned_reviews requires --preview-digest — nothing was sent"));
@@ -4233,10 +4220,16 @@ mod read_contract_tests {
                 .unwrap_err()
                 .contains("--preview-digest")
         );
-        std::fs::write(&path, r#"{"repos":["invalid"]}"#).unwrap();
+        std::fs::write(&path, "[]").unwrap();
+        assert!(
+            outcome(&policy("project", Some(path.clone()), false, None, None))
+                .unwrap_err()
+                .contains("JSON object")
+        );
+        std::fs::write(&path, "x".repeat(64 * 1024 + 1)).unwrap();
         assert!(outcome(&policy("project", Some(path), false, None, None))
             .unwrap_err()
-            .contains("repos"));
+            .contains("64 KiB"));
     }
 
     fn platform(action: PlatformAction) -> Commands {
