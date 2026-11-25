@@ -170,6 +170,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_comment",
     "issue_attach",
     "issue_review",
+    // AOS-744: the hosted workspace mints and dispatches assigned reviews.
+    "review_assignments_write",
     "issue_message_send",
     "issue_messages_read",
     "issue_set",

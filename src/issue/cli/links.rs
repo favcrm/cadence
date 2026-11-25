@@ -179,6 +179,9 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
         IssueAction::Review { .. } => Err(Error::rejected(
             "reviewing a task artifact needs a hosted org — nothing was written",
         )),
+        IssueAction::RequestReview { .. } => Err(Error::rejected(
+            "requesting an assigned review needs a hosted org — pass `--org <org>`; nothing was sent",
+        )),
         // The tenant store holds them; a local tracker has no equivalent yet.
         IssueAction::Say { .. }
         | IssueAction::Messages { .. }
