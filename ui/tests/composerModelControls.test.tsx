@@ -181,18 +181,18 @@ async function main(): Promise<void> {
   });
   await flush();
 
-  const search = host.querySelector("[data-composer-model-search]") as HTMLInputElement | null;
+  const search = win.document.body.querySelector("[data-composer-model-search]") as HTMLInputElement | null;
   assert(search !== null, "model menu renders sticky search filter");
-  const allItemsText = Array.from(host.querySelectorAll(".composer-pop-item")).map(
-    (b) => b.textContent ?? "",
-  );
+  const allItemsText = (
+    Array.from(win.document.body.querySelectorAll(".composer-pop-item")) as Element[]
+  ).map((b) => b.textContent ?? "");
   assert(allItemsText.length === 2, `renders 2 model rows (got ${allItemsText.length})`);
   assert(
     allItemsText[0].includes("Default") && !allItemsText[1].includes("Default"),
     "renders Default badge only on default model",
   );
   assert(
-    host.querySelectorAll(".composer-default-badge").length === 1,
+    win.document.body.querySelectorAll(".composer-default-badge").length === 1,
     "renders a single Default badge element across model rows",
   );
   for (const forbidden of ["Fast", "Balanced", "Light", "Low cost", "Paid"]) {
@@ -209,7 +209,7 @@ async function main(): Promise<void> {
   });
   await flush();
 
-  const filteredItems = Array.from(host.querySelectorAll(".composer-pop-item")) as HTMLButtonElement[];
+  const filteredItems = Array.from(win.document.body.querySelectorAll(".composer-pop-item")) as HTMLButtonElement[];
   assert(filteredItems.length === 1, `search narrows to 1 model (got ${filteredItems.length})`);
 
   // Click filtered DeepSeek item -> dispatches POST /api/master/command { command: "model", arg: "deepseek/..." }.
@@ -280,7 +280,7 @@ async function main(): Promise<void> {
     currentEffortBtn.click();
   });
   await flush();
-  const effortItems = Array.from(host.querySelectorAll(".composer-pop-item")) as HTMLButtonElement[];
+  const effortItems = Array.from(win.document.body.querySelectorAll(".composer-pop-item")) as HTMLButtonElement[];
   const highBtn = effortItems.find((b) => b.textContent?.includes("High"));
   assert(highBtn !== undefined, "effort menu lists High");
   await React.act(async () => {
