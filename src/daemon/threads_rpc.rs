@@ -17,6 +17,34 @@ struct AgentThreadRead<'a> {
     conversation: Option<&'a store::Thread>,
 }
 
+struct ThreadReadAuth {
+    scope: Option<super::identity::ProjectScope>,
+    principal: Option<super::identity::PublicReadPrincipal>,
+    member_relay: bool,
+    private_denials: store::PrivateJobDenials,
+    member_access: MemberAppAccess,
+}
+
+struct ThreadReadPlan<'a> {
+    alias: &'a str,
+    params: &'a Value,
+    peer_pid: u32,
+    auth: &'a ThreadReadAuth,
+    allowed_issues: Option<Vec<&'a str>>,
+    conversation: Option<&'a store::Thread>,
+}
+
+struct ThreadPageFields {
+    entries: Vec<store::ThreadEntry>,
+    cursor: i64,
+    more_before: Option<bool>,
+    scanned_before: Option<i64>,
+    more_after: Option<bool>,
+    cloud_withheld: Option<String>,
+    reply_seq: i64,
+    home: bool,
+}
+
 impl Shared {
     /// The entries as JSON. A message-linked entry whose stored message
     /// belongs to this alias and to the entry's own thread carries
@@ -221,45 +249,40 @@ impl Shared {
         } else {
             Default::default()
         };
-        let allowed_issues = scope.as_ref().map(|(readable, issues)| {
-            issues
-                .iter()
-                .filter(|(_, project)| readable.contains(*project))
-                .map(|(issue, _)| issue.as_str())
-                .collect::<Vec<_>>()
-        });
         // CAD-1853 review: a cloud target's request/reply text reaches this
         // projection, so it demands the same source/owner authority as the
         // dedicated cloud read — current READ authority for the caller's own
         // source, and only that source's rows — so a peer with no grant is
         // refused and an enrolled peer never sees another source's reply.
-        let mut projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
-        // CAD-1098: `conversation` selects one thread of this alias by
-        // id (validated; unknown answers an error and creates nothing).
-        // Without it the read is the home thread, unchanged.
-        let conversation = match optional_text(params, "conversation")? {
-            None => None,
-            Some(id) => {
-                crate::proto::identifier(id, "conversation ID")?;
-                Some(
-                    self.store
-                        .thread_by_id(id)?
-                        .filter(|t| t.alias == alias)
-                        .ok_or_else(|| Error::rejected("Unknown conversation"))?,
-                )
-            }
-        };
+        let projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
+        let conversation = self.resolve_thread_conversation(&alias, params)?;
         // CAD-2215: exact app conversations this verified member may read.
         // A local agent, `read_as` relay or CLI principal never gets one.
         let member_access = match principal.as_ref() {
             Some(principal) => self.member_app_access(principal)?,
             None => MemberAppAccess::default(),
         };
+        let auth = ThreadReadAuth {
+            scope,
+            principal,
+            member_relay,
+            private_denials,
+            member_access,
+        };
+        let allowed_issues = auth.scope.as_ref().map(|(readable, issues)| {
+            issues
+                .iter()
+                .filter(|(_, project)| readable.contains(*project))
+                .map(|(issue, _)| issue.as_str())
+                .collect::<Vec<_>>()
+        });
         // Direct agent peers have no board relay to hide global thread
         // positions. Their contract is opaque and scoped at the daemon.
-        if let (Some(scope), None, None) =
-            (scope.as_ref(), principal.as_ref(), params.get("read_as"))
-        {
+        if let (Some(scope), None, None) = (
+            auth.scope.as_ref(),
+            auth.principal.as_ref(),
+            params.get("read_as"),
+        ) {
             return self.rpc_agent_thread_opaque(
                 params,
                 peer_pid,
@@ -267,27 +290,14 @@ impl Shared {
                     alias: &alias,
                     scope,
                     issues: allowed_issues.as_deref().unwrap_or(&[]),
-                    denials: &private_denials,
+                    denials: &auth.private_denials,
                     projection,
                     conversation: conversation.as_ref(),
                 },
             );
         }
-        if scope.is_none() && params.get("cursor_format").is_some() {
-            if params.get("cursor_format").and_then(Value::as_str) != Some(THREAD_CURSOR_FORMAT) {
-                return Err(Error::invalid(
-                    "thread_cursor_format",
-                    "unsupported thread cursor format",
-                ));
-            }
-            for field in ["after", "before"] {
-                if params.get(field).is_some_and(|value| !value.is_i64()) {
-                    return Err(Error::invalid(
-                        "thread_cursor_invalid",
-                        "operator thread position must be numeric",
-                    ));
-                }
-            }
+        if auth.scope.is_none() && params.get("cursor_format").is_some() {
+            Self::validate_operator_thread_cursor(params)?;
         }
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
@@ -300,159 +310,20 @@ impl Shared {
                 store::THREAD_PAGE_MAX
             )));
         }
+        let plan = ThreadReadPlan {
+            alias: &alias,
+            params,
+            peer_pid,
+            auth: &auth,
+            allowed_issues,
+            conversation: conversation.as_ref(),
+        };
         // CAD-328: `tail` (the newest page) or `before` (the page below a
         // seq) read backwards for a chat view; neither waits.
         let tail = params.get("tail").and_then(Value::as_bool).unwrap_or(false);
         let before = optional_i64(params, "before");
         if tail || before.is_some() {
-            if params.get("after").is_some() || params.get("wait").is_some() {
-                return Err(Error::rejected(
-                    "Thread read takes either after/wait (forward) or tail/before (backward)",
-                ));
-            }
-            if before.is_some_and(|b| b < 1) {
-                return Err(Error::rejected("Thread 'before' must be a positive seq"));
-            }
-            let thread = match &conversation {
-                Some(thread) => Some(thread.clone()),
-                None => self.store.thread(&alias)?,
-            };
-            Self::require_scoped_app_read(&alias, thread.as_ref(), &member_access, member_relay)?;
-            let home = member_relay
-                && crate::master::is_master(&alias)
-                && thread.as_ref().is_none_or(store::Thread::runs_as_home);
-            let (raw, more) = if home {
-                (Vec::new(), false)
-            } else {
-                match (&thread, allowed_issues.as_deref()) {
-                    (Some(thread), _) if member_access.conversation(&thread.id) => {
-                        self.store.thread_entries_before_granted(
-                            &thread.id,
-                            before,
-                            limit,
-                            allowed_issues.as_deref().unwrap_or(&[]),
-                            &private_denials,
-                            member_relay,
-                        )?
-                    }
-                    (Some(thread), Some(issues)) => self.store.thread_entries_before_scoped(
-                        &thread.id,
-                        before,
-                        limit,
-                        issues,
-                        &private_denials,
-                        member_relay,
-                    )?,
-                    (Some(thread), None) => self
-                        .store
-                        .thread_entries_before_of(&thread.id, before, limit)?,
-                    (None, _) => (Vec::new(), false),
-                }
-            };
-            // The page is observed before it is projected, so anything the
-            // admission snapshot does not cover is re-resolved here — before
-            // the boundary and the rows are decided, never after. A backward
-            // page can carry a routed cloud result or a cloud operation that
-            // resolved after this read was admitted, and authority was never
-            // proven for it.
-            if projection.needs_readmission(
-                &self.store,
-                raw.iter().filter_map(|entry| entry.message_id.as_deref()),
-            )? {
-                projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
-            }
-            // The cursor is the last row this page SCANNED, never the last
-            // row the projection kept. A projection filters another source's
-            // cloud entries out; taking the kept page's last seq would pin
-            // the caller's cursor short of rows it must move past, and the
-            // filtered content is exactly what must not be exposed.
-            let cursor = raw.last().map(|e| e.seq).unwrap_or(0);
-            // A backward scan needs the same honesty in the other direction:
-            // the LOWEST seq this page scanned is the continuation point. A
-            // partially (or wholly) filtered page keeps fewer rows than it
-            // scanned, so `entries[0]` may not move at all; without this
-            // boundary the consumer would re-read the same hidden page
-            // forever and never reach the history below it.
-            let scanned_before = raw.first().map(|e| e.seq);
-            let entries = projection.entries(&self.store, raw)?;
-            // CAD-1700: the complete watermark of the authorized thread,
-            // never just this (bounded) page or the cursor's window.
-            let reply_seq = if home {
-                0
-            } else {
-                match (&thread, allowed_issues.as_deref()) {
-                    (Some(thread), _) if member_access.conversation(&thread.id) => {
-                        self.store.thread_reply_seq_granted(
-                            &thread.id,
-                            allowed_issues.as_deref().unwrap_or(&[]),
-                            &private_denials,
-                        )?
-                    }
-                    (Some(thread), Some(issues)) => {
-                        self.store
-                            .thread_reply_seq_scoped(&thread.id, issues, &private_denials)?
-                    }
-                    (Some(thread), None) => self.store.thread_reply_seq(&thread.id)?,
-                    (None, _) => 0,
-                }
-            };
-            let (current_scope, current_principal) = self.thread_read_scope(params, peer_pid)?;
-            let current_access = match current_principal.as_ref() {
-                Some(principal) => self.member_app_access(principal)?,
-                None => MemberAppAccess::default(),
-            };
-            if current_scope != scope
-                || current_principal != principal
-                || current_access != member_access
-                || (scope.is_some()
-                    && self.private_job_denials_for_read(
-                        params,
-                        None,
-                        current_principal.as_ref(),
-                        peer_pid,
-                    )? != private_denials)
-            {
-                return Err(Error::rejected(
-                    "thread read refused: reader access changed",
-                ));
-            }
-            Self::require_scoped_app_read(&alias, thread.as_ref(), &current_access, member_relay)?;
-            self.authorize_thread_read_target(
-                &alias,
-                params,
-                current_principal.as_ref(),
-                peer_pid,
-            )?;
-            let mut page = serde_json::to_value(ThreadPage {
-                alias: alias.clone(),
-                thread: if scope.is_some() {
-                    None
-                } else {
-                    thread.as_ref().map(store::Thread::info)
-                },
-                entries: self.entries_json(&alias, &entries)?,
-                cursor,
-                more_before: Some(more),
-                scanned_before,
-                more_after: None,
-                cloud_withheld: if private_denials.exclude_cloud {
-                    None
-                } else {
-                    projection.withheld
-                },
-                reply_seq,
-            })
-            .expect("thread page serializes");
-            if member_relay && crate::master::is_master(&alias) && !home {
-                page["_member_app"] = json!(true);
-            }
-            if member_relay {
-                page[READER_SCOPE_FIELD] = json!(THREAD_SCOPE_ACK);
-            }
-            if scope.is_none() && params.get("cursor_format").is_some() {
-                page[READER_SCOPE_FIELD] = json!(THREAD_OPERATOR_SCOPE_ACK);
-            }
-            return Ok(page);
+            return self.read_thread_page_backward(&plan, projection, before, limit);
         }
         // CAD-2215 acceptance seam: a test can pause here after the initial
         // exact grant snapshot and selected conversation are resolved, revoke
@@ -461,42 +332,305 @@ impl Shared {
         // forward reads only, and only for a genuinely admitted selected app
         // conversation.
         #[cfg(any(test, feature = "test-seam"))]
-        if member_relay {
-            if let Some(thread) = conversation
-                .as_ref()
-                .filter(|thread| Self::member_app_thread_admitted(&member_access, Some(*thread)))
-            {
+        if auth.member_relay {
+            if let Some(thread) = conversation.as_ref().filter(|thread| {
+                Self::member_app_thread_admitted(&auth.member_access, Some(*thread))
+            }) {
                 if let Some(hook) = self.app_grant_forward_snapshot_hook.as_ref() {
                     hook(&thread.id);
                 }
             }
         }
-        let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
+        self.read_thread_page_forward(&plan, projection, after, limit)
+    }
+
+    fn resolve_thread_conversation(
+        &self,
+        alias: &str,
+        params: &Value,
+    ) -> Result<Option<store::Thread>> {
+        // CAD-1098: `conversation` selects one thread of this alias by
+        // id (validated; unknown answers an error and creates nothing).
+        // Without it the read is the home thread, unchanged.
+        match optional_text(params, "conversation")? {
+            None => Ok(None),
+            Some(id) => {
+                crate::proto::identifier(id, "conversation ID")?;
+                Ok(Some(
+                    self.store
+                        .thread_by_id(id)?
+                        .filter(|t| t.alias == alias)
+                        .ok_or_else(|| Error::rejected("Unknown conversation"))?,
+                ))
+            }
+        }
+    }
+
+    fn validate_operator_thread_cursor(params: &Value) -> Result<()> {
+        if params.get("cursor_format").and_then(Value::as_str) != Some(THREAD_CURSOR_FORMAT) {
+            return Err(Error::invalid(
+                "thread_cursor_format",
+                "unsupported thread cursor format",
+            ));
+        }
+        for field in ["after", "before"] {
+            if params.get(field).is_some_and(|value| !value.is_i64()) {
+                return Err(Error::invalid(
+                    "thread_cursor_invalid",
+                    "operator thread position must be numeric",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_master_home_read(
+        alias: &str,
+        member_relay: bool,
+        thread: Option<&store::Thread>,
+    ) -> bool {
+        member_relay
+            && crate::master::is_master(alias)
+            && thread.is_none_or(store::Thread::runs_as_home)
+    }
+
+    fn compute_thread_reply_seq(
+        &self,
+        plan: &ThreadReadPlan<'_>,
+        thread: Option<&store::Thread>,
+        home: bool,
+    ) -> Result<i64> {
+        if home {
+            return Ok(0);
+        }
+        match (thread, plan.allowed_issues.as_deref()) {
+            (Some(thread), _) if plan.auth.member_access.conversation(&thread.id) => {
+                self.store.thread_reply_seq_granted(
+                    &thread.id,
+                    plan.allowed_issues.as_deref().unwrap_or(&[]),
+                    &plan.auth.private_denials,
+                )
+            }
+            (Some(thread), Some(issues)) => {
+                self.store
+                    .thread_reply_seq_scoped(&thread.id, issues, &plan.auth.private_denials)
+            }
+            (Some(thread), None) => self.store.thread_reply_seq(&thread.id),
+            (None, _) => Ok(0),
+        }
+    }
+
+    fn reprove_thread_read_access(
+        &self,
+        plan: &ThreadReadPlan<'_>,
+        thread: Option<&store::Thread>,
+    ) -> Result<()> {
+        let (current_scope, current_principal) =
+            self.thread_read_scope(plan.params, plan.peer_pid)?;
+        let current_access = match current_principal.as_ref() {
+            Some(principal) => self.member_app_access(principal)?,
+            None => MemberAppAccess::default(),
+        };
+        if current_scope != plan.auth.scope
+            || current_principal != plan.auth.principal
+            || current_access != plan.auth.member_access
+            || (plan.auth.scope.is_some()
+                && self.private_job_denials_for_read(
+                    plan.params,
+                    None,
+                    current_principal.as_ref(),
+                    plan.peer_pid,
+                )? != plan.auth.private_denials)
+        {
+            return Err(Error::rejected(
+                "thread read refused: reader access changed",
+            ));
+        }
+        Self::require_scoped_app_read(plan.alias, thread, &current_access, plan.auth.member_relay)?;
+        self.authorize_thread_read_target(
+            plan.alias,
+            plan.params,
+            current_principal.as_ref(),
+            plan.peer_pid,
+        )
+    }
+
+    fn build_thread_page_json(
+        &self,
+        plan: &ThreadReadPlan<'_>,
+        thread: Option<&store::Thread>,
+        fields: ThreadPageFields,
+    ) -> Result<Value> {
+        let mut page = serde_json::to_value(ThreadPage {
+            alias: plan.alias.to_owned(),
+            thread: if plan.auth.scope.is_some() {
+                None
+            } else {
+                thread.map(store::Thread::info)
+            },
+            entries: self.entries_json(plan.alias, &fields.entries)?,
+            cursor: fields.cursor,
+            more_before: fields.more_before,
+            scanned_before: fields.scanned_before,
+            more_after: fields.more_after,
+            cloud_withheld: fields.cloud_withheld,
+            reply_seq: fields.reply_seq,
+        })
+        .expect("thread page serializes");
+        if plan.auth.member_relay && crate::master::is_master(plan.alias) && !fields.home {
+            page["_member_app"] = json!(true);
+        }
+        if plan.auth.member_relay {
+            page[READER_SCOPE_FIELD] = json!(THREAD_SCOPE_ACK);
+        }
+        if plan.auth.scope.is_none() && plan.params.get("cursor_format").is_some() {
+            page[READER_SCOPE_FIELD] = json!(THREAD_OPERATOR_SCOPE_ACK);
+        }
+        Ok(page)
+    }
+
+    fn read_thread_page_backward(
+        &self,
+        plan: &ThreadReadPlan<'_>,
+        mut projection: super::cloud_agent_rpc::CloudProjection,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Value> {
+        if plan.params.get("after").is_some() || plan.params.get("wait").is_some() {
+            return Err(Error::rejected(
+                "Thread read takes either after/wait (forward) or tail/before (backward)",
+            ));
+        }
+        if before.is_some_and(|b| b < 1) {
+            return Err(Error::rejected("Thread 'before' must be a positive seq"));
+        }
+        let thread = match plan.conversation {
+            Some(thread) => Some(thread.clone()),
+            None => self.store.thread(plan.alias)?,
+        };
+        Self::require_scoped_app_read(
+            plan.alias,
+            thread.as_ref(),
+            &plan.auth.member_access,
+            plan.auth.member_relay,
+        )?;
+        let home = Self::is_master_home_read(plan.alias, plan.auth.member_relay, thread.as_ref());
+        let (raw, more) = if home {
+            (Vec::new(), false)
+        } else {
+            match (&thread, plan.allowed_issues.as_deref()) {
+                (Some(thread), _) if plan.auth.member_access.conversation(&thread.id) => {
+                    self.store.thread_entries_before_granted(
+                        &thread.id,
+                        before,
+                        limit,
+                        plan.allowed_issues.as_deref().unwrap_or(&[]),
+                        &plan.auth.private_denials,
+                        plan.auth.member_relay,
+                    )?
+                }
+                (Some(thread), Some(issues)) => self.store.thread_entries_before_scoped(
+                    &thread.id,
+                    before,
+                    limit,
+                    issues,
+                    &plan.auth.private_denials,
+                    plan.auth.member_relay,
+                )?,
+                (Some(thread), None) => self
+                    .store
+                    .thread_entries_before_of(&thread.id, before, limit)?,
+                (None, _) => (Vec::new(), false),
+            }
+        };
+        // The page is observed before it is projected, so anything the
+        // admission snapshot does not cover is re-resolved here — before
+        // the boundary and the rows are decided, never after. A backward
+        // page can carry a routed cloud result or a cloud operation that
+        // resolved after this read was admitted, and authority was never
+        // proven for it.
+        if projection.needs_readmission(
+            &self.store,
+            raw.iter().filter_map(|entry| entry.message_id.as_deref()),
+        )? {
+            projection = self.admit_cloud_projection(plan.alias, plan.peer_pid, "thread read")?;
+        }
+        // The cursor is the last row this page SCANNED, never the last
+        // row the projection kept. A projection filters another source's
+        // cloud entries out; taking the kept page's last seq would pin
+        // the caller's cursor short of rows it must move past, and the
+        // filtered content is exactly what must not be exposed.
+        let cursor = raw.last().map(|e| e.seq).unwrap_or(0);
+        // A backward scan needs the same honesty in the other direction:
+        // the LOWEST seq this page scanned is the continuation point. A
+        // partially (or wholly) filtered page keeps fewer rows than it
+        // scanned, so `entries[0]` may not move at all; without this
+        // boundary the consumer would re-read the same hidden page
+        // forever and never reach the history below it.
+        let scanned_before = raw.first().map(|e| e.seq);
+        let entries = projection.entries(&self.store, raw)?;
+        // CAD-1700: the complete watermark of the authorized thread,
+        // never just this (bounded) page or the cursor's window.
+        let reply_seq = self.compute_thread_reply_seq(plan, thread.as_ref(), home)?;
+        self.reprove_thread_read_access(plan, thread.as_ref())?;
+        let cloud_withheld = if plan.auth.private_denials.exclude_cloud {
+            None
+        } else {
+            projection.withheld
+        };
+        self.build_thread_page_json(
+            plan,
+            thread.as_ref(),
+            ThreadPageFields {
+                entries,
+                cursor,
+                more_before: Some(more),
+                scanned_before,
+                more_after: None,
+                cloud_withheld,
+                reply_seq,
+                home,
+            },
+        )
+    }
+
+    fn read_thread_page_forward(
+        &self,
+        plan: &ThreadReadPlan<'_>,
+        mut projection: super::cloud_agent_rpc::CloudProjection,
+        after: i64,
+        limit: i64,
+    ) -> Result<Value> {
+        let wait = optional_u64(plan.params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
         // At most one re-proof per call, so a wait cannot turn a revoked or
         // unsettled operation into a readback loop.
         let mut readmitted = false;
         loop {
-            let thread = match &conversation {
+            let thread = match plan.conversation {
                 Some(thread) => Some(thread.clone()),
-                None => self.store.thread(&alias)?,
+                None => self.store.thread(plan.alias)?,
             };
-            Self::require_scoped_app_read(&alias, thread.as_ref(), &member_access, member_relay)?;
-            let home = member_relay
-                && crate::master::is_master(&alias)
-                && thread.as_ref().is_none_or(store::Thread::runs_as_home);
+            Self::require_scoped_app_read(
+                plan.alias,
+                thread.as_ref(),
+                &plan.auth.member_access,
+                plan.auth.member_relay,
+            )?;
+            let home =
+                Self::is_master_home_read(plan.alias, plan.auth.member_relay, thread.as_ref());
             let raw = if home {
                 Vec::new()
             } else {
-                match (&thread, allowed_issues.as_deref()) {
-                    (Some(thread), _) if member_access.conversation(&thread.id) => {
+                match (&thread, plan.allowed_issues.as_deref()) {
+                    (Some(thread), _) if plan.auth.member_access.conversation(&thread.id) => {
                         self.store.thread_entries_after_granted(
                             &thread.id,
                             after,
                             limit,
-                            allowed_issues.as_deref().unwrap_or(&[]),
-                            &private_denials,
-                            member_relay,
+                            plan.allowed_issues.as_deref().unwrap_or(&[]),
+                            &plan.auth.private_denials,
+                            plan.auth.member_relay,
                         )?
                     }
                     (Some(thread), Some(issues)) => self.store.thread_entries_after_scoped(
@@ -504,8 +638,8 @@ impl Shared {
                         after,
                         limit,
                         issues,
-                        &private_denials,
-                        member_relay,
+                        &plan.auth.private_denials,
+                        plan.auth.member_relay,
                     )?,
                     (Some(thread), None) => {
                         self.store.thread_entries_of(&thread.id, after, limit)?
@@ -528,7 +662,8 @@ impl Shared {
                     raw.iter().filter_map(|entry| entry.message_id.as_deref()),
                 )?
             {
-                projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
+                projection =
+                    self.admit_cloud_projection(plan.alias, plan.peer_pid, "thread read")?;
                 readmitted = true;
             }
             // The cursor is the last row this page SCANNED, never the last
@@ -549,93 +684,31 @@ impl Shared {
             {
                 // CAD-1700: the same complete watermark whatever the
                 // cursor — a cold tail or a long catch-up page carries it.
-                let reply_seq = if home {
-                    0
-                } else {
-                    match (&thread, allowed_issues.as_deref()) {
-                        (Some(thread), _) if member_access.conversation(&thread.id) => {
-                            self.store.thread_reply_seq_granted(
-                                &thread.id,
-                                allowed_issues.as_deref().unwrap_or(&[]),
-                                &private_denials,
-                            )?
-                        }
-                        (Some(thread), Some(issues)) => self.store.thread_reply_seq_scoped(
-                            &thread.id,
-                            issues,
-                            &private_denials,
-                        )?,
-                        (Some(thread), None) => self.store.thread_reply_seq(&thread.id)?,
-                        (None, _) => 0,
-                    }
-                };
+                let reply_seq = self.compute_thread_reply_seq(plan, thread.as_ref(), home)?;
                 // A grant can be revoked or its install/digest/context can
                 // drift while a long poll waits. Re-prove the reader and the
                 // exact grants before any page leaves, exactly like the
                 // backward branch; a changed answer is a refusal.
-                let (current_scope, current_principal) =
-                    self.thread_read_scope(params, peer_pid)?;
-                let current_access = match current_principal.as_ref() {
-                    Some(principal) => self.member_app_access(principal)?,
-                    None => MemberAppAccess::default(),
+                self.reprove_thread_read_access(plan, thread.as_ref())?;
+                let cloud_withheld = if plan.auth.private_denials.exclude_cloud {
+                    None
+                } else {
+                    projection.withheld
                 };
-                if current_scope != scope
-                    || current_principal != principal
-                    || current_access != member_access
-                    || (scope.is_some()
-                        && self.private_job_denials_for_read(
-                            params,
-                            None,
-                            current_principal.as_ref(),
-                            peer_pid,
-                        )? != private_denials)
-                {
-                    return Err(Error::rejected(
-                        "thread read refused: reader access changed",
-                    ));
-                }
-                Self::require_scoped_app_read(
-                    &alias,
+                return self.build_thread_page_json(
+                    plan,
                     thread.as_ref(),
-                    &current_access,
-                    member_relay,
-                )?;
-                self.authorize_thread_read_target(
-                    &alias,
-                    params,
-                    current_principal.as_ref(),
-                    peer_pid,
-                )?;
-                let mut page = serde_json::to_value(ThreadPage {
-                    alias: alias.clone(),
-                    thread: if scope.is_some() {
-                        None
-                    } else {
-                        thread.as_ref().map(store::Thread::info)
+                    ThreadPageFields {
+                        entries,
+                        cursor: scanned,
+                        more_before: None,
+                        scanned_before: None,
+                        more_after: Some(more_after),
+                        cloud_withheld,
+                        reply_seq,
+                        home,
                     },
-                    entries: self.entries_json(&alias, &entries)?,
-                    cursor: scanned,
-                    more_before: None,
-                    scanned_before: None,
-                    more_after: Some(more_after),
-                    cloud_withheld: if private_denials.exclude_cloud {
-                        None
-                    } else {
-                        projection.withheld
-                    },
-                    reply_seq,
-                })
-                .expect("thread page serializes");
-                if member_relay && crate::master::is_master(&alias) && !home {
-                    page["_member_app"] = json!(true);
-                }
-                if member_relay {
-                    page[READER_SCOPE_FIELD] = json!(THREAD_SCOPE_ACK);
-                }
-                if scope.is_none() && params.get("cursor_format").is_some() {
-                    page[READER_SCOPE_FIELD] = json!(THREAD_OPERATOR_SCOPE_ACK);
-                }
-                return Ok(page);
+                );
             }
             let step = deadline.min(Instant::now() + Duration::from_secs(1));
             self.changed.wait_until(step);
