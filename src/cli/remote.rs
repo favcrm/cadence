@@ -97,6 +97,77 @@ fn verb_for(
     }
     let mut args = serde_json::Map::new();
     let verb = match command {
+        Commands::Delivery {
+            action:
+                DeliveryAction::Policy {
+                    project,
+                    file,
+                    apply,
+                    expected_revision,
+                    preview_digest,
+                },
+        } => {
+            use cadence_agent::delivery::hosted_gate::valid_project_key;
+            use std::io::Read;
+
+            if !valid_project_key(project) {
+                return Err(Error::rejected(
+                    "project must be a lowercase project key without a leading hyphen — nothing was sent",
+                ));
+            }
+            args.insert("project".into(), json!(project));
+            if let Some(path) = file {
+                let input = std::fs::File::open(path).map_err(|e| {
+                    Error::rejected(format!(
+                        "delivery policy --file {}: cannot read it locally: {e}; nothing was sent",
+                        path.display()
+                    ))
+                })?;
+                let mut bytes = Vec::new();
+                input
+                    .take(64 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| {
+                        Error::rejected(format!(
+                            "delivery policy --file: cannot read it locally: {e}; nothing was sent"
+                        ))
+                    })?;
+                if bytes.len() > 64 * 1024 {
+                    return Err(Error::rejected(
+                        "delivery policy --file exceeds 64 KiB — nothing was sent",
+                    ));
+                }
+                let proposal: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    Error::rejected(format!(
+                        "delivery policy --file must be valid JSON: {e}; nothing was sent"
+                    ))
+                })?;
+                let proposal = proposal.as_object().ok_or_else(|| {
+                    Error::rejected(
+                        "delivery policy --file must contain a JSON object — nothing was sent",
+                    )
+                })?;
+                if *apply {
+                    if proposal.contains_key("assigned_reviews") && preview_digest.is_none() {
+                        return Err(Error::rejected("delivery policy assigned_reviews requires --preview-digest — nothing was sent"));
+                    }
+                    args.extend(proposal.clone());
+                    args.insert("project".into(), json!(project));
+                    args.insert("expected_revision".into(), json!(expected_revision));
+                    if let Some(digest) = preview_digest {
+                        args.insert("preview_digest".into(), json!(digest));
+                    } else {
+                        args.remove("preview_digest");
+                    }
+                    "delivery_policy_set"
+                } else {
+                    args.insert("proposal".into(), Value::Object(proposal.clone()));
+                    "delivery_policy"
+                }
+            } else {
+                "delivery_policy"
+            }
+        }
         Commands::MyWork => "my_work",
         Commands::Status {
             group,
@@ -4070,6 +4141,95 @@ mod read_contract_tests {
             Ok((verb, args)) => Ok((verb, Value::Object(args))),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn policy(
+        project: &str,
+        file: Option<PathBuf>,
+        apply: bool,
+        expected_revision: Option<u64>,
+        preview_digest: Option<&str>,
+    ) -> Commands {
+        Commands::Delivery {
+            action: DeliveryAction::Policy {
+                project: project.into(),
+                file,
+                apply,
+                expected_revision,
+                preview_digest: preview_digest.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn delivery_policy_read_preview_and_apply_map_exact_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proposal.json");
+        let proposal = json!({"repos": ["owner/repo"], "delivery": "delivery: lean"});
+        std::fs::write(&path, proposal.to_string()).unwrap();
+        assert_eq!(
+            outcome(&policy("project-1", None, false, None, None)).unwrap(),
+            ("delivery_policy", json!({"project": "project-1"}))
+        );
+        assert_eq!(
+            outcome(&policy("project-1", Some(path.clone()), false, None, None)).unwrap(),
+            (
+                "delivery_policy",
+                json!({"project": "project-1", "proposal": proposal})
+            )
+        );
+        assert_eq!(
+            outcome(&policy("project-1", Some(path.clone()), true, None, None)).unwrap(),
+            (
+                "delivery_policy_set",
+                json!({"project": "project-1", "repos": ["owner/repo"], "delivery": "delivery: lean", "expected_revision": null})
+            )
+        );
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            outcome(&policy(
+                "project-1",
+                Some(path),
+                true,
+                Some(7),
+                Some(&digest)
+            ))
+            .unwrap(),
+            (
+                "delivery_policy_set",
+                json!({"project": "project-1", "repos": ["owner/repo"], "delivery": "delivery: lean", "expected_revision": 7, "preview_digest": digest})
+            )
+        );
+    }
+
+    #[test]
+    fn delivery_policy_refuses_invalid_local_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proposal.json");
+        assert!(outcome(&policy("-bad", None, false, None, None))
+            .unwrap_err()
+            .contains("project"));
+        assert!(
+            outcome(&policy("project", Some(path.clone()), false, None, None))
+                .unwrap_err()
+                .contains("--file")
+        );
+        std::fs::write(&path, r#"{"repos":["owner/repo"],"assigned_reviews":{}}"#).unwrap();
+        assert!(
+            outcome(&policy("project", Some(path.clone()), true, None, None))
+                .unwrap_err()
+                .contains("--preview-digest")
+        );
+        std::fs::write(&path, "[]").unwrap();
+        assert!(
+            outcome(&policy("project", Some(path.clone()), false, None, None))
+                .unwrap_err()
+                .contains("JSON object")
+        );
+        std::fs::write(&path, "x".repeat(64 * 1024 + 1)).unwrap();
+        assert!(outcome(&policy("project", Some(path), false, None, None))
+            .unwrap_err()
+            .contains("64 KiB"));
     }
 
     fn platform(action: PlatformAction) -> Commands {

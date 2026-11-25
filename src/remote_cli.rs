@@ -222,6 +222,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
     // approval (`audit.approve`, which only `cadence login --audit-approve`
     // requests; the hosted org admits it for the human owner only).
+    // AOS-744: hosted delivery policy read/preview and owner apply.
     "delivery_policy",
     "delivery_policy_set",
     "audit_approval",

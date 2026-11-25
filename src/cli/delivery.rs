@@ -90,6 +90,23 @@ pub(crate) enum DeliveryAction {
         #[arg(long)]
         attempt: String,
     },
+    /// Read, preview, or apply a hosted project's delivery policy.
+    Policy {
+        /// Project key.
+        project: String,
+        /// JSON proposal to preview or apply.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Apply the proposal instead of previewing it.
+        #[arg(long, requires = "file")]
+        apply: bool,
+        /// Revision to replace; omit for the first record.
+        #[arg(long, requires = "apply")]
+        expected_revision: Option<u64>,
+        /// Digest returned by a policy preview.
+        #[arg(long, requires = "apply")]
+        preview_digest: Option<String>,
+    },
     /// Derive delivery requirements from the ticket, current PR and approved policy.
     Requirements {
         /// The ticket id.
@@ -341,6 +358,11 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             "delivery_decline",
             json!({"issue": issue, "reason": reason}),
         )?,
+        DeliveryAction::Policy { .. } => {
+            return Err(Error::rejected(
+                "delivery policy is hosted-only: select a hosted org with `--org <org>`; nothing was sent",
+            ));
+        }
         DeliveryAction::Check { .. } => {
             return Err(Error::rejected(
                 "delivery check is hosted-only: select a hosted org with `--org <org>`, \
