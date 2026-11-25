@@ -1,4 +1,5 @@
 import { useContext, useEffect, useId, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ApiError, api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { usingPrivateOperation } from "../../lib/privateSession";
@@ -442,16 +443,16 @@ function CustomMcpSetupConfirmModal({
     }
   };
 
-  return (
+  const modal = (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4"
       role="presentation"
       onClick={() => {
         if (!busy) onClose();
       }}
     >
       <div
-        className="card p-5 max-w-md w-full space-y-3 bg-ink-850 border border-ink-700 shadow-xl min-w-0"
+        className="card p-5 max-w-md w-full max-h-[calc(100dvh-2rem)] overflow-y-auto space-y-3 border border-ink-700 shadow-xl min-w-0"
         role="dialog"
         aria-modal="true"
         aria-labelledby={`${baseId}-title`}
@@ -661,6 +662,8 @@ function CustomMcpSetupConfirmModal({
       </div>
     </div>
   );
+
+  return typeof document !== "undefined" ? createPortal(modal, document.body) : modal;
 }
 
 function CustomMcpSetupCard({ entry, setup, density, conversation, canShareWorkspace }: {
