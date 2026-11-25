@@ -297,6 +297,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // is never queried.
   const viewerSub = meta?.session?.user?.sub ?? null;
   const viewerIsMember = meta?.session?.user?.role === "member";
+  const supportWorkspaceId = meta?.support_workspace_id;
   const privateAssistantView = Boolean(
     hostedBoard && viewerSub !== null && (viewerIsMember || (route.screen === "home" && route.privateChat === true)),
   );
@@ -1473,6 +1474,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onToast={(text) => say("ok", text)}
             privateChat={route.screen === "home" && route.privateChat === true}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
+            supportWorkspaceId={
+              meta?.hosted === true &&
+              typeof supportWorkspaceId === "string" &&
+              /^[A-Za-z0-9_-]{1,128}$/.test(supportWorkspaceId)
+                ? supportWorkspaceId
+                : undefined
+            }
             credentialRequestsEnabled={credentialRequestsOn}
             viewerSub={viewerSub}
             viewerIsMember={viewerIsMember}

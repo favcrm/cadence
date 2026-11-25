@@ -1136,6 +1136,8 @@ export type Meta = Api.MetaResponse & {
   human_threads?: boolean;
   credential_requests?: boolean;
   app_automatic_updates?: boolean;
+  /** Authenticated tenant workspace selector for the copyable support reference. */
+  support_workspace_id?: string;
   /** The Settings sections this board serves for this viewer. Absent: not stated. */
   settings_sections?: readonly string[];
 };
