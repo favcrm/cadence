@@ -2458,3 +2458,83 @@ export interface HostedLocalDispatchResponse {
   };
   replayed: boolean;
 }
+
+/** AOS-403 / AOS-750 / CAD-2094: workspace-owned agent incoming endpoints. */
+export type AgentEndpointKind = "email" | "webhook";
+export type AgentEndpointState = "disabled" | "enabled" | "paused";
+export type AgentEndpointAuthMode = "bearer" | "hmac_sha256";
+export type AgentEndpointTargetKind = "routine" | "inbox";
+
+export interface AgentEndpoint {
+  id: string;
+  agent_uid: string;
+  kind: AgentEndpointKind;
+  slug: string;
+  state: AgentEndpointState;
+  verified: boolean;
+  config_revision: number;
+  deleted_at: number | null;
+  sender_allowlist: string[];
+  target_kind: AgentEndpointTargetKind;
+  routine_id: string | null;
+  binding_workflow: string;
+  binding_digest: string;
+  owner_subject_id: string;
+  auth_mode: AgentEndpointAuthMode | null;
+  secret_hint: string | null;
+  secret_rotated_at: number | null;
+  prev_secret_expires_at: number | null;
+  rate_limit_rpm: number;
+  webhook_url: string | null;
+  hold_capacity: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface EndpointDelivery {
+  id: string;
+  endpoint_id: string;
+  event_id: string;
+  mail_id: string | null;
+  r2_key: string | null;
+  sender: string;
+  subject: string | null;
+  spf: string | null;
+  dkim: string | null;
+  dmarc: string | null;
+  auth_withheld: boolean;
+  outcome: "pending" | "admitted" | "held" | "refused";
+  refusal_code: string | null;
+  routine_id: string | null;
+  run_id: string | null;
+  session_object_name: string | null;
+  message_id: string | null;
+  created_at: number;
+  settled_at: number | null;
+}
+
+export interface EndpointsPayload {
+  endpoints: AgentEndpoint[];
+}
+
+export interface EndpointDetailPayload {
+  endpoint: AgentEndpoint;
+  deliveries: EndpointDelivery[];
+}
+
+export interface EndpointDeliveriesPayload {
+  deliveries: EndpointDelivery[];
+}
+
+export interface EndpointCreateResult {
+  ok: boolean;
+  endpoint: AgentEndpoint;
+  secret?: string;
+}
+
+export interface EndpointRotateResult {
+  ok: boolean;
+  endpoint: AgentEndpoint;
+  secret: string;
+  previous_secret_expires_at: number | null;
+}

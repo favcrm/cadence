@@ -266,4 +266,99 @@
   .rtn-row {
     flex-wrap: wrap;
   }
+  .rtn-ep-item {
+    flex-wrap: wrap;
+  }
+  .rtn-ep-item-copy {
+    padding: 0 0.8rem 0.65rem;
+  }
+}
+
+/* CAD-2094: Incoming endpoints (Cloudflare Email + Custom Webhooks) inside RoutinesTab. */
+.rtn-ep-section {
+  display: grid;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.rtn-ep-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.rtn-ep-notice {
+  padding: 0.55rem 0.75rem;
+  border-radius: 0.45rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+}
+
+.rtn-ep-warn {
+  margin-top: 0.25rem;
+  padding: 0.45rem 0.65rem;
+  border-radius: 0.4rem;
+  border: 1px solid color-mix(in srgb, var(--color-warn) 45%, transparent);
+  background: color-mix(in srgb, var(--color-warn) 10%, transparent);
+  color: var(--color-warn);
+  font-size: var(--text-micro);
+}
+
+.rtn-ep-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.rtn-ep-item + .rtn-ep-item {
+  border-top: 1px solid var(--color-ink-700);
+}
+
+.rtn-ep-row-static {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.65rem 0.8rem;
+  min-width: 0;
+}
+
+.rtn-ep-row-right,
+.rtn-ep-actions-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
+}
+
+.rtn-ep-item-copy {
+  padding-right: 0.65rem;
+  flex-shrink: 0;
+}
+
+.rtn-ep-secret-box {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.65rem 0.75rem;
+  border-radius: 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--color-warn) 50%, transparent);
+  background: color-mix(in srgb, var(--color-warn) 8%, var(--color-ink-875));
+  min-width: 0;
+}
+
+.rtn-ep-code {
+  display: block;
+  padding: 0.45rem 0.6rem;
+  border-radius: 0.35rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-900);
+  color: var(--color-ink-100);
+  font-size: var(--text-micro);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: all;
 }

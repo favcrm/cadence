@@ -12,11 +12,11 @@ use super::*;
 
 #[derive(Subcommand)]
 pub(crate) enum EndpointAction {
-    /// Create a disabled, unverified endpoint bound to one workflow. The
-    /// workflow source digest is pinned now; a later workflow edit does not
-    /// silently change this endpoint.
+    /// Create a disabled, unverified endpoint. On a local daemon binds one
+    /// stored workflow (`--project`/`--workflow`); on a hosted org targets
+    /// either an isolated inbox or an approved Event Routine (`--target-kind`).
     Add {
-        /// Agent alias; resolved to the durable uid.
+        /// Agent alias (or agent uid on a hosted org).
         agent: String,
         /// email, webhook or schedule.
         #[arg(long)]
@@ -25,12 +25,30 @@ pub(crate) enum EndpointAction {
         /// letters, digits or hyphens).
         #[arg(long)]
         slug: String,
-        /// Project key that owns the workflow.
+        /// Project key that owns the workflow (required on local daemon).
         #[arg(long)]
-        project: String,
-        /// Stored workflow name under `<project>/workflows/`.
+        project: Option<String>,
+        /// Stored workflow name under `<project>/workflows/` (required on local daemon).
         #[arg(long)]
-        workflow: String,
+        workflow: Option<String>,
+        /// Hosted target kind: `inbox` (default) or `routine`.
+        #[arg(long = "target-kind")]
+        target_kind: Option<String>,
+        /// Hosted Event Routine id when `--target-kind routine`.
+        #[arg(long)]
+        routine: Option<String>,
+        /// Hosted webhook auth mode: `bearer` or `hmac_sha256`.
+        #[arg(long = "auth-mode")]
+        auth_mode: Option<String>,
+        /// Hosted email sender allowlist entries (repeatable).
+        #[arg(long = "allow-sender")]
+        allow_sender: Vec<String>,
+        /// Hosted webhook rate limit (1-600 requests per minute).
+        #[arg(long = "rate-limit-rpm")]
+        rate_limit_rpm: Option<u32>,
+        /// Hosted paused delivery hold capacity (0-500).
+        #[arg(long = "hold-capacity")]
+        hold_capacity: Option<u32>,
     },
     /// Every registered endpoint, optionally filtered by agent or state.
     #[command(visible_alias = "ls")]
@@ -40,14 +58,25 @@ pub(crate) enum EndpointAction {
         #[arg(long)]
         state: Option<String>,
     },
-    /// One endpoint by id.
+    /// One endpoint by id (hosted orgs also return recent deliveries).
     Show { id: String },
     /// Mark the endpoint verified. It stays disabled until `enable`.
     Verify { id: String },
     /// Enable an endpoint. Refuses until `verify` has run.
     Enable { id: String },
+    /// Pause an active hosted endpoint (holds deliveries within hold capacity).
+    Pause { id: String },
     /// Disable an endpoint. Always allowed.
     Disable { id: String },
+    /// Rotate a hosted webhook secret (returns the new secret once with 15m overlap).
+    #[command(name = "rotate-secret")]
+    RotateSecret { id: String },
+    /// Read bounded recent deliveries for a hosted endpoint.
+    Deliveries {
+        id: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
     /// Remove the endpoint row.
     #[command(visible_alias = "rm")]
     Remove { id: String },
@@ -66,16 +95,45 @@ fn run_endpoint(state_dir: &Path, action: &EndpointAction) -> Result<i32> {
             slug,
             project,
             workflow,
-        } => print_json(&rpc(
-            "endpoint_add",
-            serde_json::json!({
-                "agent": agent,
-                "kind": kind,
-                "slug": slug,
-                "project": project,
-                "workflow": workflow,
-            }),
-        )?),
+            target_kind,
+            routine,
+            auth_mode,
+            allow_sender,
+            rate_limit_rpm,
+            hold_capacity,
+        } => {
+            if target_kind.is_some()
+                || routine.is_some()
+                || auth_mode.is_some()
+                || !allow_sender.is_empty()
+                || rate_limit_rpm.is_some()
+                || hold_capacity.is_some()
+            {
+                return Err(Error::usage(
+                    "hosted options (--target-kind, --routine, --auth-mode, --allow-sender, --rate-limit-rpm, --hold-capacity) require `--org <org>`",
+                ));
+            }
+            let Some(project) = project.as_deref() else {
+                return Err(Error::usage(
+                    "local `cadence endpoint add` requires `--project <key>`",
+                ));
+            };
+            let Some(workflow) = workflow.as_deref() else {
+                return Err(Error::usage(
+                    "local `cadence endpoint add` requires `--workflow <name>`",
+                ));
+            };
+            print_json(&rpc(
+                "endpoint_add",
+                serde_json::json!({
+                    "agent": agent,
+                    "kind": kind,
+                    "slug": slug,
+                    "project": project,
+                    "workflow": workflow,
+                }),
+            )?);
+        }
         EndpointAction::List { agent, state } => print_json(&rpc(
             "endpoint_list",
             serde_json::json!({"agent": agent, "state": state}),
@@ -94,6 +152,13 @@ fn run_endpoint(state_dir: &Path, action: &EndpointAction) -> Result<i32> {
         }
         EndpointAction::Remove { id } => {
             print_json(&rpc("endpoint_remove", serde_json::json!({"id": id}))?)
+        }
+        EndpointAction::Pause { .. }
+        | EndpointAction::RotateSecret { .. }
+        | EndpointAction::Deliveries { .. } => {
+            return Err(Error::rejected(
+                "`endpoint pause`, `rotate-secret`, and `deliveries` are supported on hosted orgs (`--org <org>`)",
+            ));
         }
     }
     Ok(0)

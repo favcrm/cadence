@@ -8472,6 +8472,149 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
     )))
 }
 
+fn endpoint_request_once(
+    target: &RemoteTarget,
+    cred: &Credential,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    deadline: Instant,
+) -> Result<(u16, Option<u64>, Option<Value>)> {
+    let origin = target.endpoint.trim_end_matches('/');
+    let url = format!("{origin}{path}");
+    let timeout = request_timeout(deadline, CALL_TIMEOUT)?;
+    let builder = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None);
+    let agent = crate::issuer_transport::agent(builder);
+    let bearer = format!("Bearer {}", cred.access_token);
+    let response = match method {
+        "GET" => agent
+            .get(&url)
+            .header("Authorization", &bearer)
+            .call()
+            .map_err(|_| Error::unknown("remote endpoint request failed; outcome uncertain"))?,
+        "POST" => {
+            let payload = serde_json::to_vec(body.unwrap_or(&Value::Object(Default::default())))
+                .map_err(|_| reject("unable to encode endpoint request body"))?;
+            agent
+                .post(&url)
+                .header("Authorization", &bearer)
+                .header("Content-Type", "application/json")
+                .send(&payload[..])
+                .map_err(|_| Error::unknown("remote endpoint request failed; outcome uncertain"))?
+        }
+        _ => return Err(reject("unsupported endpoint HTTP method")),
+    };
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::unknown("remote endpoint answer could not be read"))?;
+    if bytes.len() as u64 > MAX_BODY {
+        return Err(Error::unknown("remote endpoint answer exceeded size limit"));
+    }
+    Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
+}
+
+/// CAD-2094: owner-only `/api/endpoints/*` request to a hosted tenant board
+/// using the renewed `hct_` bearer token (never cookies or cross-origin headers).
+pub fn endpoint_request(
+    target: &RemoteTarget,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    endpoint_request_in(&dir, target, method, path, body, wake_timeout, note)
+}
+
+pub(crate) fn endpoint_request_in(
+    dir: &Path,
+    target: &RemoteTarget,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    if !matches!(method, "GET" | "POST") {
+        return Err(reject("unsupported endpoint HTTP method"));
+    }
+    if !path.starts_with("/api/endpoints")
+        || path.contains("..")
+        || path
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(reject("endpoint request path is invalid"));
+    }
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    let waking = || {
+        Error::busy_coded(
+            "waking",
+            format!(
+                "org '{}' is still waking after {}s — retry, or pass a larger --wake-timeout",
+                target.org, wake_timeout
+            ),
+        )
+    };
+    loop {
+        request_timeout(deadline, AUTH_TIMEOUT).map_err(|_| waking())?;
+        let cred = renewed_credential(dir, target, deadline)?;
+        if !valid_token(&cred.access_token, "hct_") {
+            return Err(reject("invalid remote credential"));
+        }
+        if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
+            return Err(reject(
+                "endpoint commands need the cli.write capability, which this remote login lacks — nothing was sent",
+            ));
+        }
+        let (status, retry_after, answer) =
+            endpoint_request_once(target, &cred, method, path, body, deadline)?;
+        if status == 501 || (status == 404 && answer.is_none()) {
+            return Err(reject(format!(
+                "this workspace's server does not serve `/api/endpoints` yet (HTTP {status})"
+            )));
+        }
+        if status == 200 && answer.as_ref().is_some_and(|v| v.is_object()) {
+            return Ok(answer.unwrap_or(Value::Null));
+        }
+        match classify(status, retry_after, answer) {
+            Verdict::Done(Ok(value)) => return Ok(value),
+            Verdict::Done(Err(error)) => return Err(error),
+            Verdict::Conflict(value) => return Err(refusal_error(status, Some(&value))),
+            Verdict::Waking(wait) => {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|r| !r.is_zero())
+                    .ok_or_else(waking)?;
+                if wait >= remaining {
+                    return Err(waking());
+                }
+                note(&format!("waking {}… ({}s)", target.org, wait.as_secs()));
+                std::thread::sleep(wait);
+            }
+        }
+    }
+}
+
 mod actor_credential;
 #[doc(hidden)]
 #[cfg(any(debug_assertions, feature = "test-seam"))]

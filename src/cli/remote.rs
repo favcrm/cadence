@@ -3050,6 +3050,9 @@ where
     if let Commands::Document { action } = &command {
         return remote_document(&target, action, wake_timeout);
     }
+    if let Commands::Endpoint { action } = &command {
+        return remote_endpoint(&target, action, wake_timeout);
+    }
     if let Commands::Platform {
         action: PlatformAction::Artifact { reference, out },
     } = &command
@@ -7757,4 +7760,207 @@ mod blob_download_tests {
         .unwrap_err();
         assert!(error.to_string().contains("complete blob range"), "{error}");
     }
+
+    #[test]
+    fn hosted_endpoint_routes_and_managed_refusal_hold() {
+        let (verb, method, path, body) = endpoint_request_plan(&EndpointAction::Add {
+            agent: "sales".into(),
+            kind: "webhook".into(),
+            slug: "orders".into(),
+            project: None,
+            workflow: None,
+            target_kind: Some("inbox".into()),
+            routine: None,
+            auth_mode: Some("hmac_sha256".into()),
+            allow_sender: vec![],
+            rate_limit_rpm: Some(120),
+            hold_capacity: None,
+        })
+        .unwrap();
+        assert_eq!(verb, "endpoint add");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/api/endpoints");
+        let payload = body.unwrap();
+        assert_eq!(payload["agent_uid"], "sales");
+        assert_eq!(payload["auth_mode"], "hmac_sha256");
+        assert_eq!(payload["rate_limit_rpm"], 120);
+
+        let (_, g_method, g_path, _) = endpoint_request_plan(&EndpointAction::Deliveries {
+            id: "ep_abc123".into(),
+            limit: 25,
+        })
+        .unwrap();
+        assert_eq!(g_method, "GET");
+        assert_eq!(g_path, "/api/endpoints/ep_abc123/deliveries?limit=25");
+
+        let bad = endpoint_request_plan(&EndpointAction::Verify {
+            id: "../escape".into(),
+        })
+        .unwrap_err();
+        assert!(bad.to_string().contains("invalid endpoint id"), "{bad}");
+
+        let target = RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://acme.cadencecloud.app".into(),
+            org_id: "ws_1".into(),
+            identity: Some(cadence_agent::remote_cli::CliIdentityPin {
+                subject_id: "agt_1".into(),
+                issuer: "https://api-v2.agenticos.hk".into(),
+            }),
+        };
+        let managed = remote_endpoint(
+            &target,
+            &EndpointAction::List {
+                agent: None,
+                state: None,
+            },
+            10,
+        )
+        .unwrap_err();
+        assert!(managed.to_string().contains("managed caller"), "{managed}");
+    }
+}
+
+fn valid_endpoint_id_param(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+fn endpoint_request_plan(
+    action: &EndpointAction,
+) -> Result<(&'static str, &'static str, String, Option<Value>)> {
+    let id_path = |id: &str, suffix: &str| -> Result<String> {
+        if !valid_endpoint_id_param(id) {
+            return Err(Error::usage("invalid endpoint id"));
+        }
+        Ok(format!("/api/endpoints/{id}{suffix}"))
+    };
+    match action {
+        EndpointAction::Add {
+            agent,
+            kind,
+            slug,
+            project: _,
+            workflow: _,
+            target_kind,
+            routine,
+            auth_mode,
+            allow_sender,
+            rate_limit_rpm,
+            hold_capacity,
+        } => {
+            let mut body = serde_json::Map::new();
+            body.insert("agent_uid".into(), json!(agent));
+            body.insert("kind".into(), json!(kind));
+            body.insert("slug".into(), json!(slug));
+            if let Some(target) = target_kind {
+                body.insert("target_kind".into(), json!(target));
+            }
+            if let Some(routine_id) = routine {
+                body.insert("routine_id".into(), json!(routine_id));
+            }
+            if let Some(mode) = auth_mode {
+                body.insert("auth_mode".into(), json!(mode));
+            }
+            if !allow_sender.is_empty() {
+                body.insert("sender_allowlist".into(), json!(allow_sender));
+            }
+            if let Some(rpm) = rate_limit_rpm {
+                body.insert("rate_limit_rpm".into(), json!(rpm));
+            }
+            if let Some(cap) = hold_capacity {
+                body.insert("hold_capacity".into(), json!(cap));
+            }
+            Ok((
+                "endpoint add",
+                "POST",
+                "/api/endpoints".into(),
+                Some(Value::Object(body)),
+            ))
+        }
+        EndpointAction::List { agent, .. } => {
+            let path = match agent.as_deref() {
+                Some(agent_uid) if !agent_uid.trim().is_empty() => {
+                    format!(
+                        "/api/endpoints?agent={}",
+                        percent_encode_query(agent_uid.trim())
+                    )
+                }
+                _ => "/api/endpoints".into(),
+            };
+            Ok(("endpoint ls", "GET", path, None))
+        }
+        EndpointAction::Show { id } => Ok(("endpoint show", "GET", id_path(id, "")?, None)),
+        EndpointAction::Deliveries { id, limit } => Ok((
+            "endpoint deliveries",
+            "GET",
+            id_path(id, &format!("/deliveries?limit={}", (*limit).clamp(1, 50)))?,
+            None,
+        )),
+        EndpointAction::Verify { id } => {
+            Ok(("endpoint verify", "POST", id_path(id, "/verify")?, None))
+        }
+        EndpointAction::Enable { id } => {
+            Ok(("endpoint enable", "POST", id_path(id, "/enable")?, None))
+        }
+        EndpointAction::Pause { id } => {
+            Ok(("endpoint pause", "POST", id_path(id, "/pause")?, None))
+        }
+        EndpointAction::Disable { id } => {
+            Ok(("endpoint disable", "POST", id_path(id, "/disable")?, None))
+        }
+        EndpointAction::RotateSecret { id } => Ok((
+            "endpoint rotate-secret",
+            "POST",
+            id_path(id, "/rotate-secret")?,
+            None,
+        )),
+        EndpointAction::Remove { id } => Ok(("endpoint rm", "POST", id_path(id, "/delete")?, None)),
+    }
+}
+
+fn remote_endpoint(
+    target: &RemoteTarget,
+    action: &EndpointAction,
+    wake_timeout: u64,
+) -> Result<i32> {
+    let (verb, method, path, body) = endpoint_request_plan(action)?;
+    refuse_managed(target, verb)?;
+    let mut answer = cadence_agent::remote_cli::endpoint_request(
+        target,
+        method,
+        &path,
+        body.as_ref(),
+        wake_timeout,
+        eprint_line,
+    )?;
+    if let EndpointAction::List {
+        state: Some(want_state),
+        ..
+    } = action
+    {
+        if let Some(items) = answer.get_mut("endpoints").and_then(Value::as_array_mut) {
+            items.retain(|item| {
+                item.get("state").and_then(Value::as_str) == Some(want_state.as_str())
+            });
+        }
+    }
+    print_json(&answer);
+    Ok(0)
 }
