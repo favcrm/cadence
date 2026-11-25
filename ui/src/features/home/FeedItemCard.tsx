@@ -69,7 +69,7 @@ export function FeedItemCard({
 }) {
   const t = useTranslate();
   const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
 
   const live = isLiveFeedState(item.state);
   const tone = feedToneForState(item.state);
@@ -84,13 +84,18 @@ export function FeedItemCard({
   const handleCopyCli = async () => {
     const cmd = item.operator_action?.command;
     if (!cmd) return;
-    try {
-      await navigator.clipboard?.writeText(cmd);
-    } catch {
-      // Non-clipboard environments still reflect click feedback cleanly.
+    if (!navigator.clipboard?.writeText) {
+      setCopyState("failed");
+      window.setTimeout(() => setCopyState("idle"), 1600);
+      return;
     }
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1600);
+    try {
+      await navigator.clipboard.writeText(cmd);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+    window.setTimeout(() => setCopyState("idle"), 1600);
   };
 
   return (
@@ -198,7 +203,7 @@ export function FeedItemCard({
                 className="act-btn warn"
                 onClick={() => void handleCopyCli()}
               >
-                {copied ? t("Copied ✓") : t("Copy CLI")}
+                {copyState === "copied" ? t("Copied ✓") : copyState === "failed" ? t("Copy failed") : t("Copy CLI")}
               </button>
             ) : null}
             {hasAdvanced ? (

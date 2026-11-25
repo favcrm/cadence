@@ -3190,4 +3190,118 @@ mod tests {
         assert_eq!(feed[2]["latest_action"], json!("Running UI vitest suite"));
         assert!(feed[0].get("operator_action").is_none());
     }
+
+    #[test]
+    fn project_native_agent_feed_matches_aos759_shared_fixture_contract() {
+        use cadence_core::board_api::AgentRow;
+
+        const REQUIRED_KEYS: [&str; 10] = [
+            "id",
+            "alias",
+            "role",
+            "state",
+            "state_label",
+            "task_title",
+            "action_verb",
+            "latest_action",
+            "updated_at",
+            "category",
+        ];
+        const VALID_STATES: [&str; 7] = [
+            "action_required",
+            "working",
+            "monitoring",
+            "unverifiable",
+            "blocked",
+            "completed",
+            "failed",
+        ];
+        const VALID_CATEGORIES: [&str; 4] = ["working", "uploaded", "completed", "external"];
+
+        let fixture_raw = include_str!("../../ui/tests/fixtures/aos759-agent-feed.fixture.json");
+        let fixture_items: Vec<Value> =
+            serde_json::from_str(fixture_raw).expect("valid AOS-759 shared fixture JSON");
+        assert!(
+            fixture_items.len() >= 4,
+            "shared fixture covers full state spectrum"
+        );
+
+        let mut saw_unverifiable = false;
+        let mut saw_operator_action = false;
+        for item in &fixture_items {
+            for key in REQUIRED_KEYS {
+                assert!(
+                    item.get(key).is_some_and(|v| !v.is_null()),
+                    "fixture item missing {key}: {item}"
+                );
+            }
+            let st = item["state"].as_str().unwrap();
+            let cat = item["category"].as_str().unwrap();
+            assert!(VALID_STATES.contains(&st), "unexpected fixture state {st}");
+            assert!(
+                VALID_CATEGORIES.contains(&cat),
+                "unexpected fixture category {cat}"
+            );
+            if st == "unverifiable" {
+                saw_unverifiable = true;
+            }
+            if let Some(op) = item.get("operator_action").filter(|v| !v.is_null()) {
+                saw_operator_action = true;
+                assert_eq!(op["kind"], json!("delivery_enqueue"));
+                assert_eq!(op["guard"], json!("operator_only_terminal"));
+                assert!(op["title"].as_str().is_some_and(|s| !s.is_empty()));
+                assert!(op["command"].as_str().is_some_and(|s| !s.is_empty()));
+                let sha = op["head_sha"].as_str().unwrap_or_default();
+                assert_eq!(sha.len(), 40, "head_sha must be 40-hex");
+                assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+                let gates = op["gates"].as_array().expect("gates array");
+                assert!(!gates.is_empty());
+                for g in gates {
+                    assert!(g["name"].as_str().is_some_and(|s| !s.is_empty()));
+                    assert!(g["status"].as_str().is_some_and(|s| !s.is_empty()));
+                    assert!(g["ok"].is_boolean());
+                }
+            }
+        }
+        assert!(saw_unverifiable, "fixture includes unverifiable state");
+        assert!(
+            saw_operator_action,
+            "fixture includes read-only operator_action shape"
+        );
+
+        // Native projection emits the same shared core contract fields without leaking operator_action.
+        let mut worker = AgentRow {
+            alias: "codex-runner-1".into(),
+            provider: Some("codex".into()),
+            endpoint_kind: Some("cli".into()),
+            role: json!("Backend Engineer"),
+            running: 1,
+            on: vec!["AOS-759".into()],
+            last_activity: Some(json!("2026-11-24T18:55:10Z")),
+            message: json!({"summary": "Projecting /api/agents feed_items", "created": 1_764_010_200.0}),
+            ..Default::default()
+        };
+        let mut stale = worker.clone();
+        stale.alias = "local-omp-2".into();
+        stale.silent_secs = Some(json!(300.0));
+        worker.stalled = Some(json!(false));
+
+        let projected = project_native_agent_feed(&[worker, stale]);
+        assert_eq!(projected.len(), 2);
+        for item in &projected {
+            for key in REQUIRED_KEYS {
+                assert!(
+                    item.get(key).is_some_and(|v| !v.is_null()),
+                    "native item missing {key}: {item}"
+                );
+            }
+            let st = item["state"].as_str().unwrap();
+            let cat = item["category"].as_str().unwrap();
+            assert!(VALID_STATES.contains(&st));
+            assert!(VALID_CATEGORIES.contains(&cat));
+            assert!(item.get("operator_action").is_none());
+        }
+        assert_eq!(projected[0]["alias"], json!("local-omp-2"));
+        assert_eq!(projected[0]["state"], json!("unverifiable"));
+    }
 }

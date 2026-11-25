@@ -53,11 +53,11 @@ export default function RailFeedDrawer({
   const actor = useAssistantActor();
   const assistantName = displayName(actor.read, actor.scope, t);
   const [showRaw, setShowRaw] = useState(false);
-  const [copiedCli, setCopiedCli] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
 
   useEffect(() => {
     setShowRaw(false);
-    setCopiedCli(false);
+    setCopyState("idle");
   }, [target]);
 
   if (!target) return null;
@@ -74,13 +74,18 @@ export default function RailFeedDrawer({
     const copyCommand = async () => {
       const cmd = item.operator_action?.command;
       if (!cmd) return;
-      try {
-        await navigator.clipboard?.writeText(cmd);
-      } catch {
-        // Non-clipboard environments still reflect click feedback cleanly.
+      if (!navigator.clipboard?.writeText) {
+        setCopyState("failed");
+        window.setTimeout(() => setCopyState("idle"), 1600);
+        return;
       }
-      setCopiedCli(true);
-      window.setTimeout(() => setCopiedCli(false), 1600);
+      try {
+        await navigator.clipboard.writeText(cmd);
+        setCopyState("copied");
+      } catch {
+        setCopyState("failed");
+      }
+      window.setTimeout(() => setCopyState("idle"), 1600);
     };
 
     return (
@@ -171,7 +176,7 @@ export default function RailFeedDrawer({
                     <div className="adv-head">
                       <strong>{t(item.operator_action.title || "Operator-only terminal command")}</strong>
                       <button type="button" className="act-btn warn" onClick={() => void copyCommand()}>
-                        {copiedCli ? t("Copied ✓") : t("Copy CLI")}
+                        {copyState === "copied" ? t("Copied ✓") : copyState === "failed" ? t("Copy failed") : t("Copy CLI")}
                       </button>
                     </div>
                     <pre className="cmd-pre">{item.operator_action.command}</pre>

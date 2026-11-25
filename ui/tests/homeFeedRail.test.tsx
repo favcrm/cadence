@@ -228,7 +228,7 @@ async function main() {
       "expanded CLI box contains exact operator command",
     );
 
-    // Copy CLI writes to clipboard
+    // Copy CLI writes to clipboard cleanly and fails closed on clipboard error
     const copyBtn = Array.from(cards[0].querySelectorAll("button")).find((b) =>
       b.textContent?.includes("Copy CLI"),
     );
@@ -239,6 +239,17 @@ async function main() {
     await flush();
     assert(copiedText.includes("delivery enqueue"), "Copy CLI wrote exact command to clipboard");
     assert(Boolean(copyBtn.textContent?.includes("Copied")), "Copy CLI button reflects Copied state");
+
+    Object.defineProperty(win.navigator, "clipboard", {
+      value: { writeText: async () => { throw new Error("clipboard denied"); } },
+      configurable: true,
+    });
+    await React.act(async () => {
+      copyBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+    assert(copyBtn.textContent?.trim() === "Copy failed", `Copy CLI fails closed on error (got ${copyBtn.textContent})`);
+    assert(!copyBtn.textContent?.includes("Copied"), "Failed clipboard write must never claim Copied");
 
     // Ask button triggers onAskFeedItem on working item
     const workingCard = cards.find((c) => c.getAttribute("data-feed-state") === "working");
