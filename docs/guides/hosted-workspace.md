@@ -1435,6 +1435,31 @@ cadence --org acme artifact submit <art-id>
   submit: update the tenant server first, then this client.
 - A native board refuses both as usage errors (exit 2); they are hosted only.
 
+### Staged project review for issue artifacts
+
+On a workspace that supports staged artifact review, the owner can configure an
+artifact-only project with `delivery policy`. Preview the proposed JSON with
+`--file` before applying the same file with `--apply`, `--preview-digest`, and
+the returned `--expected-revision` when replacing an existing policy.
+
+```sh
+cadence --org acme issue review request <issue-id> --slot commercial \
+  --agent <profile-id> --text "Pay particular attention to renewal terms."
+cadence --org acme delivery ship <issue-id> --target 'artifact:hosted:proposal.pdf@<sha256>'
+```
+
+The project names the profile and required brief for each slot. Selectors can
+be omitted when the request is unambiguous. Eligible slots in a stage can run
+together; a later stage waits for every slot in the preceding stage to pass.
+Requests start isolated, board-managed review sessions. An external CLI
+session cannot claim or submit a staged review by naming its profile.
+
+Only a live workspace owner can accept the exact artifact. An explicit
+`--override --reason <reason>` skips the project reviews, retains any existing
+verdicts and records the exception. Acceptance does not send the artifact,
+publish it or close the issue. Staged reviews for pull requests are not
+available through this path; the software gate below is unchanged.
+
 ### Reviewing software changes
 
 The delivery gate, the policy and trusted lists, the evidence each review takes,
