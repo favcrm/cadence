@@ -326,6 +326,10 @@ export interface NotificationGroup {
   muted: boolean;
   mention: boolean;
   alert_seq: number;
+  latest_sender?: string | null;
+  latest_sender_kind?: "human" | "agent" | null;
+  latest_preview?: string | null;
+  latest_at?: number | null;
 }
 
 export interface NotificationPreferences {

@@ -314,6 +314,7 @@
   margin-inline: auto;
 }
 .threads-composer-dock {
+  position: relative;
   flex: none;
   padding: 0.35rem 1rem 0.9rem;
   background: linear-gradient(to bottom, transparent, var(--color-ink-900, transparent) 24%);
@@ -328,6 +329,42 @@
 .threads-composer-card {
   display: grid;
   gap: 0.3rem;
+}
+.threads-composer-dock > .threads-jump-wrap {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 0.5rem);
+  transform: translateX(-50%);
+  width: auto;
+  max-width: calc(100% - 2rem);
+  margin-inline: 0;
+  display: flex;
+  justify-content: center;
+  z-index: 15;
+  pointer-events: none;
+}
+.threads-jump-pill {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--color-accent);
+  border-radius: 999px;
+  background: var(--color-ink-850);
+  color: var(--color-ink-100);
+  font-size: var(--text-label);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+}
+.threads-jump-pill:hover {
+  background: var(--color-ink-800);
+}
+.threads-jump-pill:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 .threads-composer-card > .card,
 .threads-composer > .card {

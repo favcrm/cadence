@@ -8,7 +8,9 @@ import {
   Alert02Icon,
   Comment01Icon,
   ArrowDown01Icon,
+  ArrowDown02Icon,
   ArrowRight01Icon,
+  BellIcon,
   Cancel01Icon,
   CheckListIcon,
   CircleArrowUp01Icon,
@@ -98,6 +100,14 @@ export const IconAgents = ({ size = 15, ...rest }: IconProps = {}) => (
 /** Threads — agent, operator and group conversations (CAD-818). */
 export const IconThreads = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={Comment01Icon} size={size} {...rest} />
+);
+/** Notification bell — header inbox trigger. */
+export const IconBell = ({ size = 16, ...rest }: IconProps = {}) => (
+  <Glyph icon={BellIcon} size={size} {...rest} />
+);
+/** Down arrow — scroll/jump to latest messages. */
+export const IconArrowDown = ({ size = 13, ...rest }: IconProps = {}) => (
+  <Glyph icon={ArrowDown02Icon} size={size} {...rest} />
 );
 /** Outbox — published local items. */
 export const IconOutbox = ({ size = 15, ...rest }: IconProps = {}) => (
