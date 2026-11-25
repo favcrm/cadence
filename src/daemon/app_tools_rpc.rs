@@ -663,28 +663,19 @@ impl Shared {
         )
     }
 
-    /// The guarded execution core shared by the screen entry above and the
-    /// operator-approved assistant action (CAD-1327): digest pin, approval,
-    /// declared-slot effect, request-id replay, live binding, re-quote,
-    /// exactly-once claim and receipt. The live quote is the provider's
-    /// `max_charge_minor` ceiling (CAD-1141); no confirmed price is compared.
-    pub(super) fn app_tool_execute(
-        self: &Arc<Self>,
+    fn prepare_tool_quote(
+        &self,
+        pm: &crate::issue::Pm,
         ctx: &ToolContext,
-        call: ToolCall<'_>,
-    ) -> Result<Value> {
-        let ToolCall {
-            slot,
-            alias,
-            request_id,
-            input,
-            generation_scope,
-        } = call;
-        let input = input.clone();
-        let pm_dir = self.pm_dir()?;
-        let pm = self.pm_at(&pm_dir)?;
-        let account_actor = self.account_image_actor_for_session(&ctx.session)?;
-        let prepared = workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
+        call: &ToolCall<'_>,
+        account_actor: &Value,
+    ) -> Result<
+        Option<(
+            crate::store::app_bindings::BindingProof,
+            super::app_capabilities_rpc::CapabilityQuoteRequest,
+        )>,
+    > {
+        workspace::with_runtime_snapshot(pm, &ctx.install_id, |bundle, files| {
             let _custody = self
                 .platform_custody_lock
                 .lock()
@@ -709,7 +700,7 @@ impl Shared {
             )?;
             let declaration = manifest
                 .capabilities
-                .get(slot)
+                .get(call.slot)
                 .ok_or_else(|| Error::rejected("tool capability slot is undeclared"))?;
             declaration.validate()?;
             if !matches!(declaration.effect.as_str(), "read" | "draft") {
@@ -719,7 +710,7 @@ impl Shared {
             }
             if self
                 .store
-                .app_tool_result_for_request(request_id)?
+                .app_tool_result_for_request(call.request_id)?
                 .is_some()
             {
                 return Ok(None);
@@ -728,16 +719,644 @@ impl Shared {
                 .app_binding_auto_image(
                     &ctx.install_id,
                     ctx.context_id.as_deref(),
-                    slot,
-                    &account_actor,
+                    call.slot,
+                    account_actor,
                     bundle,
                     files,
                 )?
                 .ok_or_else(|| Error::rejected("tool capability binding is absent"))?;
-            self.app_account_binding_owned(&account_actor, &proof)?;
+            self.app_account_binding_owned(account_actor, &proof)?;
             let request = self.prepare_app_capability_quote(&proof)?;
             Ok(Some((proof, request)))
-        })?;
+        })
+    }
+
+    fn verify_mounted_tool_declaration(
+        &self,
+        ctx: &ToolContext,
+        slot: &str,
+        bundle: &Value,
+        files: &std::collections::BTreeMap<String, String>,
+    ) -> Result<crate::issue::app::CapabilityNeed> {
+        let live_digest = required_str(bundle, "digest")?;
+        if live_digest != ctx.digest {
+            return Err(Error::rejected(
+                "installation digest changed since mount — tool call refused",
+            ));
+        }
+        let status = self
+            .store
+            .app_capability_status(&ctx.install_id, live_digest)?;
+        if status["state"].as_str() != Some("approved") {
+            return Err(Error::rejected(
+                "installation is not approved at its current digest",
+            ));
+        }
+        if status["epoch"].as_i64() != Some(ctx.approval_epoch) {
+            return Err(Error::rejected(
+                "installation was re-approved or revoked since mount — tool call refused",
+            ));
+        }
+        // The declared slot must be a real `needs.capabilities` key of
+        // THIS install (the manifest is the source of truth, not the
+        // screen's own claim).
+        let manifest = crate::issue::app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+        )?;
+        let declaration = manifest
+            .capabilities
+            .get(slot)
+            .ok_or_else(|| Error::rejected("tool resolves to a slot the app does not declare"))?;
+        declaration.validate()?;
+        // A standalone invoke is a read/draft only — never a send.
+        // The slot's declared effect must itself be read/draft, so a
+        // publish alias is refused at the door before any execution.
+        if !matches!(declaration.effect.as_str(), "read" | "draft") {
+            return Err(Error::rejected(
+                "standalone tools never run a send/publish effect",
+            ));
+        }
+        Ok(declaration.clone())
+    }
+
+    fn replay_existing_tool_result(
+        &self,
+        ctx: &ToolContext,
+        call: &ToolCall<'_>,
+        input: &Value,
+    ) -> Result<Option<Value>> {
+        let Some(existing) = self.store.app_tool_result_for_request(call.request_id)? else {
+            return Ok(None);
+        };
+        let same = existing["install_id"] == ctx.install_id
+            && existing["alias"] == json!(call.alias)
+            && existing["input_digest"] == json!(app_runs::material_digest(input));
+        if !same {
+            return Err(Error::rejected(
+                "tool request id was already used for a different intent",
+            ));
+        }
+        if let (Some(context), Some(completed), Some(receipt_id)) = (
+            ctx.context_id.as_deref(),
+            existing["created_at"].as_f64(),
+            existing["id"].as_str(),
+        ) {
+            let scoped =
+                crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?;
+            scoped.app_social_tool_receipt_attach(
+                context,
+                receipt_id,
+                completed,
+                existing["result"]["kind"].as_str().unwrap_or(""),
+            )?;
+            scoped.app_social_generation_complete_request(call.request_id, receipt_id)?;
+            if existing["result"]["kind"] == "social.source.posts" {
+                let handle = existing["result"]["handle"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_start_matches('@')
+                    .to_ascii_lowercase();
+                let configured = scoped.app_social_sources_show(context)?;
+                if configured["handles"]
+                    .as_array()
+                    .is_some_and(|hs| hs.iter().any(|v| v.as_str() == Some(handle.as_str())))
+                {
+                    scoped.app_social_freshness_save(context, &handle, receipt_id, completed)?;
+                }
+            }
+        }
+        Ok(Some(json!({"receipt": existing, "replayed": true})))
+    }
+
+    fn validate_social_read_handle(
+        &self,
+        ctx: &ToolContext,
+        declaration: &crate::issue::app::CapabilityNeed,
+        input: &Value,
+    ) -> Result<Option<String>> {
+        if declaration.capability != "social.read" && declaration.action != "list_posts" {
+            return Ok(None);
+        }
+        let context = ctx
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected("standalone social reads need a mounted context"))?;
+        let requested = input["handle"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("social read needs a configured source handle"))?
+            .trim()
+            .trim_start_matches('@')
+            .to_ascii_lowercase();
+        let saved = crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?
+            .app_social_sources_show(context)?;
+        if !saved["handles"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|h| h.as_str() == Some(requested.as_str())))
+        {
+            return Err(Error::rejected(
+                "social read handle is not saved in this context",
+            ));
+        }
+        Ok(Some(requested))
+    }
+
+    fn verify_quoted_tool_binding<'a>(
+        &self,
+        ctx: &ToolContext,
+        slot: &str,
+        check: &ToolQuoteCheck<'a>,
+    ) -> Result<&'a crate::platform::AppCapabilityQuote> {
+        let (quoted_proof, quote) = check
+            .quoted
+            .as_ref()
+            .ok_or_else(|| Error::rejected("tool receipt changed during price discovery"))?;
+        if quoted_proof.digest != check.proof.digest
+            || quoted_proof.id != check.proof.id
+            || quoted_proof.revision != check.proof.revision
+            || quoted_proof.config != check.proof.config
+        {
+            return Err(Error::rejected(
+                "tool binding changed during price discovery",
+            ));
+        }
+        self.account_image_actor_live(check.account_actor)?;
+        self.app_account_binding_owned(check.account_actor, check.proof)?;
+        self.app_binding_receipt_current(
+            &ctx.install_id,
+            ctx.context_id.as_deref(),
+            slot,
+            check.proof,
+            check.bundle,
+            check.files,
+        )?;
+        self.recheck_app_capability_quote(check.proof, quote)?;
+        if !ctx.session.is_empty()
+            && !self
+                .tool_contexts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .any(|current| {
+                    current.session == ctx.session
+                        && current.install_id == ctx.install_id
+                        && current.tag == ctx.tag
+                        && current.generation == ctx.generation
+                        && current.mount == ctx.mount
+                        && current.mount.is_some()
+                        && current.issued == ctx.issued
+                        && current.issued.elapsed() < TOOL_CTX_TTL
+                })
+        {
+            return Err(Error::rejected("tool mount changed during price discovery"));
+        }
+        Ok(quote)
+    }
+
+    fn resolve_tool_adapter(
+        &self,
+        config: &Value,
+    ) -> Result<(String, Arc<dyn crate::platform::PlatformAdapter>)> {
+        let provider = required_str(config, "provider")?;
+        let tool = required_str(&config["mapping"], "tool")?.to_string();
+        let effect = required_str(&config["mapping"], "effect")?;
+        let adapter = self
+            .platforms
+            .get(provider)
+            .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
+        if !matches!(effect, "read" | "draft")
+            || classify_call(
+                adapter.table(),
+                adapter.reported_manifest_version().as_deref(),
+                &tool,
+            ) != if effect == "read" {
+                Effect::Read
+            } else {
+                Effect::Draft
+            }
+        {
+            return Err(Error::rejected(
+                "bound tool is not a current read/draft action",
+            ));
+        }
+        Ok((tool, Arc::clone(adapter)))
+    }
+
+    fn build_image_generation_plan(
+        &self,
+        ctx: &ToolContext,
+        context: &str,
+        records: &crate::store::app_records::RecordStore,
+        draft: &str,
+        input: &Value,
+    ) -> Result<(Value, Value, Value)> {
+        let image_idea = image_idea(input)?;
+        // Standalone image generation is grounded in the draft's
+        // retained source, never a caller-supplied receipt or facts.
+        let current = records.app_social_draft_show(context, draft)?;
+        let source_ref = &current["source"];
+        if source_ref["kind"] != "tool_receipt" {
+            return Err(Error::rejected(
+                "standalone image generation needs a retained tool-receipt source",
+            ));
+        }
+        let receipt_id = source_ref["receipt_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("draft source receipt is missing"))?;
+        let post_id = source_ref["post_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("draft source post is missing"))?;
+        let receipt = self.store.app_tool_result(receipt_id)?;
+        if receipt["install_id"] != ctx.install_id
+            || receipt["result"]["kind"] != "social.source.posts"
+            || !self
+                .store
+                .app_tool_source_post_exists(&ctx.install_id, receipt_id, post_id)?
+        {
+            return Err(Error::rejected(
+                "draft source post is not present in an owned retained receipt",
+            ));
+        }
+        let posts = receipt["result"]["posts"]
+            .as_array()
+            .ok_or_else(|| Error::rejected("source receipt has no normalized posts"))?;
+        let mut selected = posts.iter().filter(|post| post["id"] == post_id);
+        let post = selected
+            .next()
+            .ok_or_else(|| Error::rejected("draft source post is absent from its receipt"))?;
+        if selected.next().is_some() {
+            return Err(Error::rejected("draft source post is ambiguous"));
+        }
+        let caption = post["caption"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("draft source post has no caption"))?;
+        let frozen_source = crate::issue::workflow::source_input_line(caption)?;
+        let subject = current["caption"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        if subject.trim().is_empty() {
+            return Err(Error::rejected(
+                "draft caption cannot seed an image subject",
+            ));
+        }
+        let plan = json!({
+            "subject": subject,
+            "source": frozen_source,
+            "brand_voice": "",
+            "image_prompt": image_idea,
+        });
+        let authority_source = json!({
+            "receipt_id": receipt_id,
+            "post": post,
+            "post_digest": app_runs::material_digest(post),
+        });
+        Ok((plan, authority_source, current))
+    }
+
+    fn prepare_generation_session(
+        self: &Arc<Self>,
+        ctx: &ToolContext,
+        call: &ToolCall<'_>,
+        declaration: &crate::issue::app::CapabilityNeed,
+        tool: &str,
+        input_digest: &str,
+    ) -> Result<GenerationGateOutcome> {
+        let spec = call
+            .generation_scope
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Error::rejected("generation tool needs a stable draft-operation scope")
+            })?;
+        if !(spec.len() == 3
+            && spec.contains_key("operation")
+            && spec.contains_key("draft_id")
+            && spec.contains_key("revision"))
+        {
+            return Err(Error::rejected("generation scope fields are invalid"));
+        }
+        let operation = spec
+            .get("operation")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("generation scope operation is missing"))?;
+        let expected = if declaration.capability == "text.generate" {
+            "caption"
+        } else {
+            "image"
+        };
+        if operation != expected {
+            return Err(Error::rejected(
+                "generation scope operation differs from the bound tool",
+            ));
+        }
+        let context = ctx
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected("generation needs a mounted active context"))?;
+        let draft = spec
+            .get("draft_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("generation needs a draft id"))?;
+        let revision = spec
+            .get("revision")
+            .and_then(Value::as_i64)
+            .filter(|v| *v > 0)
+            .ok_or_else(|| Error::rejected("generation needs a positive draft revision"))?;
+        crate::proto::identifier(draft, "generation draft ID")?;
+        let records =
+            crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?;
+        if records.app_social_draft_show(context, draft)?["revision"].as_i64() != Some(revision) {
+            return Err(Error::rejected("generation draft revision is stale"));
+        }
+        let scope = json!({"operation": operation, "draft_id": draft, "revision": revision});
+        let intent_digest = app_runs::material_digest(
+            &json!({"context": context, "alias": call.alias, "tool": tool, "scope": scope}),
+        );
+        let mut plan = call.input.clone();
+        let mut adapter_input = call.input.clone();
+        let mut authority_inputs = call.input.clone();
+        let mut authority_source = Value::Null;
+        let mut draft_snapshot: Option<Value> = None;
+        if operation == "image" {
+            let (image_plan, source, snapshot) =
+                self.build_image_generation_plan(ctx, context, &records, draft, call.input)?;
+            plan = image_plan;
+            adapter_input = json!({});
+            authority_inputs = plan.clone();
+            authority_source = source;
+            draft_snapshot = Some(snapshot);
+        }
+        let gate = records.app_social_generation_begin_with(
+            context,
+            &intent_digest,
+            &crate::store::app_social_drafts::GenerationStart {
+                alias: call.alias,
+                tool,
+                caller_input_digest: input_digest,
+                input: &plan,
+                scope: &scope,
+                request: call.request_id,
+            },
+        )?;
+        match gate["mode"].as_str() {
+            Some("existing") => {
+                let mut intent = gate["intent"].clone();
+                // The app validates this reply with `outcome: null`; the
+                // reason code rides the draft listing instead.
+                if operation == "image" {
+                    intent["outcome"] = Value::Null;
+                }
+                Ok(GenerationGateOutcome::Reply(
+                    json!({"generation_intent": intent, "replayed": true}),
+                ))
+            }
+            Some("terminal") => Err(Error::rejected(
+                "generation intent already reached a terminal outcome",
+            )),
+            Some("start" | "retry") => {
+                // On an explicit retry, the retained plan wins over
+                // changed defaults or source projections.
+                if gate["mode"] == "retry" {
+                    plan = gate["intent"]["input"].clone();
+                    if operation == "image" {
+                        adapter_input = json!({});
+                        authority_inputs = plan.clone();
+                        let current = draft_snapshot.as_ref().ok_or_else(|| {
+                            Error::rejected("draft image source snapshot is unavailable")
+                        })?;
+                        let receipt_id = current["source"]["receipt_id"]
+                            .as_str()
+                            .ok_or_else(|| Error::rejected("draft source receipt is missing"))?;
+                        let receipt = self.store.app_tool_result(receipt_id)?;
+                        let post_id = current["source"]["post_id"]
+                            .as_str()
+                            .ok_or_else(|| Error::rejected("draft source post is missing"))?;
+                        let post = receipt["result"]["posts"]
+                            .as_array()
+                            .and_then(|posts| posts.iter().find(|post| post["id"] == post_id))
+                            .ok_or_else(|| {
+                                Error::rejected("retained image source post is unavailable")
+                            })?;
+                        authority_source = json!({
+                            "receipt_id": receipt_id,
+                            "post": post,
+                            "post_digest": app_runs::material_digest(post),
+                        });
+                    }
+                }
+                // CAD-1315: an image intent that already has its job
+                // never submits again from here. An unresolved one is
+                // re-checked under the SAME key; an active one just
+                // gets a worker if none is alive.
+                if operation == "image" {
+                    if let Some(job) = records.app_social_image_job_for_request(call.request_id)? {
+                        if job.state == "uncertain" {
+                            records.app_social_image_job_resume(
+                                &job.call_id,
+                                self.image_job_deadline(),
+                            )?;
+                        }
+                        self.spawn_image_job_worker(&ctx.install_id, &job.call_id);
+                        return Ok(GenerationGateOutcome::Reply(pending_image_reply(
+                            call.request_id,
+                            &scope,
+                            &plan,
+                        )));
+                    }
+                }
+                Ok(GenerationGateOutcome::Proceed(Box::new(
+                    ResolvedGeneration {
+                        session: GenerationSession {
+                            records,
+                            context: context.to_owned(),
+                            intent_digest,
+                            scope,
+                            plan,
+                        },
+                        adapter_input,
+                        authority_inputs,
+                        authority_source,
+                    },
+                )))
+            }
+            _ => Err(Error::rejected("generation intent state is invalid")),
+        }
+    }
+
+    fn enqueue_image_generation_job(
+        self: &Arc<Self>,
+        ctx: &ToolContext,
+        resolved: &ResolvedGeneration,
+        args: &mut ImageJobStartArgs<'_, '_>,
+    ) -> Result<Value> {
+        match crate::platform::agenticos_external::frozen_image_prompt(
+            args.authority,
+            &resolved.adapter_input,
+        ) {
+            Ok(prompt) => args.authority["frozen_prompt"] = json!(prompt),
+            Err(_) => {
+                resolved.session.records.app_social_generation_finish(
+                    &resolved.session.context,
+                    &resolved.session.intent_digest,
+                    args.call.request_id,
+                    "refused",
+                    None,
+                    Some(ImageReason::PlanInvalid.code()),
+                )?;
+                return Err(Error::rejected("image plan is invalid"));
+            }
+        }
+        let spec = json!({
+            "alias": args.call.alias,
+            "slot": args.call.slot,
+            "binding_digest": args.proof.digest,
+            "input_digest": args.input_digest,
+            "input": args.call.input,
+            "authority": args.authority,
+        });
+        resolved.session.records.app_social_image_job_start(
+            &resolved.session.context,
+            &resolved.session.intent_digest,
+            args.call.request_id,
+            args.call_id,
+            &spec,
+            args.claim_receipt,
+            self.image_job_deadline(),
+        )?;
+        self.spawn_image_job_worker(&ctx.install_id, args.call_id);
+        Ok(pending_image_reply(
+            args.call.request_id,
+            &resolved.session.scope,
+            &resolved.session.plan,
+        ))
+    }
+
+    fn settle_generation_failure(
+        resolved: Option<&ResolvedGeneration>,
+        request_id: &str,
+        error: &AppCapabilityError,
+    ) -> Result<Value> {
+        if let Some(resolved) = resolved {
+            let session = &resolved.session;
+            let settlement = generation_settlement(error);
+            if settlement == GenerationSettlement::Refused {
+                session.records.app_social_generation_finish(
+                    &session.context,
+                    &session.intent_digest,
+                    request_id,
+                    "refused",
+                    None,
+                    Some("verified_provider_refusal"),
+                )?;
+                return Err(tool_refusal(error));
+            }
+            let pending = settlement == GenerationSettlement::Pending;
+            let state = if pending { "pending" } else { "uncertain" };
+            let reason = if pending {
+                "upstream_idempotency_in_progress"
+            } else {
+                "upstream_outcome_uncertain"
+            };
+            session.records.app_social_generation_finish(
+                &session.context,
+                &session.intent_digest,
+                request_id,
+                state,
+                None,
+                Some(reason),
+            )?;
+            return Ok(json!({
+                "generation_intent": {
+                    "request_id": request_id,
+                    "operation": session.scope["operation"],
+                    "draft_id": session.scope["draft_id"],
+                    "revision": session.scope["revision"],
+                    "input_digest": app_runs::material_digest(&session.plan),
+                    "input": session.plan,
+                    "state": state,
+                    "updated_at": crate::issue::time::now_epoch()
+                },
+                "replayed": true
+            }));
+        }
+        Err(tool_refusal(error))
+    }
+
+    fn record_tool_side_effects(
+        &self,
+        ctx: &ToolContext,
+        resolved: Option<&ResolvedGeneration>,
+        call: &ToolCall<'_>,
+        receipt: &Value,
+        result: &Value,
+    ) -> Result<()> {
+        if let Some(resolved) = resolved {
+            resolved.session.records.app_social_generation_finish(
+                &resolved.session.context,
+                &resolved.session.intent_digest,
+                call.request_id,
+                "completed",
+                receipt["id"].as_str(),
+                None,
+            )?;
+        }
+        if let Some(context) = ctx.context_id.as_deref() {
+            if let Some(created) = receipt["created_at"].as_f64() {
+                crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?
+                    .app_social_tool_receipt_attach(
+                        context,
+                        required_str(receipt, "id")?,
+                        created,
+                        receipt["result"]["kind"].as_str().unwrap_or(""),
+                    )?;
+            }
+        }
+        if result["kind"].as_str() == Some("social.source.posts") {
+            if let (Some(context), Some(handle), Some(created)) = (
+                ctx.context_id.as_deref(),
+                result["handle"].as_str(),
+                receipt["created_at"].as_f64(),
+            ) {
+                let requested = call.input["handle"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_start_matches('@')
+                    .to_ascii_lowercase();
+                let fetched = handle.trim().trim_start_matches('@').to_ascii_lowercase();
+                if requested == fetched {
+                    crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?
+                        .app_social_freshness_save(
+                            context,
+                            &fetched,
+                            required_str(receipt, "id")?,
+                            created,
+                        )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The guarded execution core shared by the screen entry above and the
+    /// operator-approved assistant action (CAD-1327): digest pin, approval,
+    /// declared-slot effect, request-id replay, live binding, re-quote,
+    /// exactly-once claim and receipt. The live quote is the provider's
+    /// `max_charge_minor` ceiling (CAD-1141); no confirmed price is compared.
+    pub(super) fn app_tool_execute(
+        self: &Arc<Self>,
+        ctx: &ToolContext,
+        call: ToolCall<'_>,
+    ) -> Result<Value> {
+        let input = call.input.clone();
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        let account_actor = self.account_image_actor_for_session(&ctx.session)?;
+        let prepared = self.prepare_tool_quote(&pm, ctx, &call, &account_actor)?;
         let quoted = prepared
             .map(|(proof, request)| -> Result<_> { Ok((proof, request.fetch()?)) })
             .transpose()?;
@@ -755,203 +1374,45 @@ impl Shared {
                 .app_release_lock
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let live_digest = required_str(bundle, "digest")?;
-            if live_digest != ctx.digest {
-                return Err(Error::rejected(
-                    "installation digest changed since mount — tool call refused",
-                ));
-            }
-            let status = self
-                .store
-                .app_capability_status(&ctx.install_id, live_digest)?;
-            if status["state"].as_str() != Some("approved") {
-                return Err(Error::rejected(
-                    "installation is not approved at its current digest",
-                ));
-            }
-            if status["epoch"].as_i64() != Some(ctx.approval_epoch) {
-                return Err(Error::rejected(
-                    "installation was re-approved or revoked since mount — tool call refused",
-                ));
-            }
-            // The declared slot must be a real `needs.capabilities` key of
-            // THIS install (the manifest is the source of truth, not the
-            // screen's own claim).
-            let manifest = crate::issue::app::parse_manifest(
-                files
-                    .get("app.md")
-                    .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
-            )?;
-            let declaration = manifest.capabilities.get(slot).ok_or_else(|| {
-                Error::rejected("tool resolves to a slot the app does not declare")
-            })?;
-            declaration.validate()?;
-            // A standalone invoke is a read/draft only — never a send.
-            // The slot's declared effect must itself be read/draft, so a
-            // publish alias is refused at the door before any execution.
-            if !matches!(declaration.effect.as_str(), "read" | "draft") {
-                return Err(Error::rejected(
-                    "standalone tools never run a send/publish effect",
-                ));
-            }
+            let declaration =
+                self.verify_mounted_tool_declaration(ctx, call.slot, bundle, files)?;
             // Idempotency FIRST: a repeated request id returns its
             // retained receipt without a new provider dispatch/charge.
-            if let Some(existing) = self.store.app_tool_result_for_request(request_id)? {
-                let same = existing["install_id"] == ctx.install_id
-                    && existing["alias"] == json!(alias)
-                    && existing["input_digest"] == json!(app_runs::material_digest(&input));
-                if !same {
-                    return Err(Error::rejected(
-                        "tool request id was already used for a different intent",
-                    ));
-                }
-                if let (Some(context), Some(completed), Some(receipt_id)) = (
-                    ctx.context_id.as_deref(),
-                    existing["created_at"].as_f64(),
-                    existing["id"].as_str(),
-                ) {
-                    let scoped = crate::store::app_records::RecordStore::open(
-                        &self.state_dir,
-                        &ctx.install_id,
-                    )?;
-                    scoped.app_social_tool_receipt_attach(
-                        context,
-                        receipt_id,
-                        completed,
-                        existing["result"]["kind"].as_str().unwrap_or(""),
-                    )?;
-                    scoped.app_social_generation_complete_request(request_id, receipt_id)?;
-                    if existing["result"]["kind"] == "social.source.posts" {
-                        let handle = existing["result"]["handle"]
-                            .as_str()
-                            .unwrap_or("")
-                            .trim()
-                            .trim_start_matches('@')
-                            .to_ascii_lowercase();
-                        let configured = scoped.app_social_sources_show(context)?;
-                        if configured["handles"].as_array().is_some_and(|hs| {
-                            hs.iter().any(|v| v.as_str() == Some(handle.as_str()))
-                        }) {
-                            scoped.app_social_freshness_save(
-                                context, &handle, receipt_id, completed,
-                            )?;
-                        }
-                    }
-                }
-                return Ok(json!({"receipt": existing, "replayed": true}));
+            if let Some(replayed) = self.replay_existing_tool_result(ctx, &call, &input)? {
+                return Ok(replayed);
             }
             // Resolve the current reviewed binding for the declared slot.
             let proof = self
                 .app_binding_live(
                     &ctx.install_id,
                     ctx.context_id.as_deref(),
-                    slot,
+                    call.slot,
                     bundle,
                     files,
                 )?
                 .ok_or_else(|| Error::rejected("tool capability binding is absent"))?;
-            let mut saved_handle = None;
-            if declaration.capability == "social.read" || declaration.action == "list_posts" {
-                let context = ctx.context_id.as_deref().ok_or_else(|| {
-                    Error::rejected("standalone social reads need a mounted context")
-                })?;
-                let requested = input["handle"]
-                    .as_str()
-                    .ok_or_else(|| Error::rejected("social read needs a configured source handle"))?
-                    .trim()
-                    .trim_start_matches('@')
-                    .to_ascii_lowercase();
-                let saved =
-                    crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?
-                        .app_social_sources_show(context)?;
-                if !saved["handles"].as_array().is_some_and(|items| {
-                    items.iter().any(|h| h.as_str() == Some(requested.as_str()))
-                }) {
-                    return Err(Error::rejected(
-                        "social read handle is not saved in this context",
-                    ));
-                }
-                saved_handle = Some(requested);
-            }
+            let saved_handle = self.validate_social_read_handle(ctx, &declaration, &input)?;
             // The live price was fetched outside PM/custody/release locks.
             // Recheck the exact receipt and native session before any claim.
-            let (quoted_proof, quote) = quoted
-                .as_ref()
-                .ok_or_else(|| Error::rejected("tool receipt changed during price discovery"))?;
-            if quoted_proof.digest != proof.digest
-                || quoted_proof.id != proof.id
-                || quoted_proof.revision != proof.revision
-                || quoted_proof.config != proof.config
-            {
-                return Err(Error::rejected(
-                    "tool binding changed during price discovery",
-                ));
-            }
-            self.account_image_actor_live(&account_actor)?;
-            self.app_account_binding_owned(&account_actor, &proof)?;
-            self.app_binding_receipt_current(
-                &ctx.install_id,
-                ctx.context_id.as_deref(),
-                slot,
-                &proof,
-                bundle,
-                files,
+            let quote = self.verify_quoted_tool_binding(
+                ctx,
+                call.slot,
+                &ToolQuoteCheck {
+                    quoted: &quoted,
+                    proof: &proof,
+                    account_actor: &account_actor,
+                    bundle,
+                    files,
+                },
             )?;
-            self.recheck_app_capability_quote(&proof, quote)?;
-            if !ctx.session.is_empty()
-                && !self
-                    .tool_contexts
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .values()
-                    .any(|current| {
-                        current.session == ctx.session
-                            && current.install_id == ctx.install_id
-                            && current.tag == ctx.tag
-                            && current.generation == ctx.generation
-                            && current.mount == ctx.mount
-                            && current.mount.is_some()
-                            && current.issued == ctx.issued
-                            && current.issued.elapsed() < TOOL_CTX_TTL
-                    })
-            {
-                return Err(Error::rejected("tool mount changed during price discovery"));
-            }
             let config = &proof.config;
-            let provider = required_str(config, "provider")?;
-            let tool = required_str(&config["mapping"], "tool")?;
-            let effect = required_str(&config["mapping"], "effect")?;
-            let adapter = self
-                .platforms
-                .get(provider)
-                .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
-            if !matches!(effect, "read" | "draft")
-                || classify_call(
-                    adapter.table(),
-                    adapter.reported_manifest_version().as_deref(),
-                    tool,
-                ) != if effect == "read" {
-                    Effect::Read
-                } else {
-                    Effect::Draft
-                }
-            {
-                return Err(Error::rejected(
-                    "bound tool is not a current read/draft action",
-                ));
-            }
+            let (tool, adapter) = self.resolve_tool_adapter(config)?;
             let input_digest = app_runs::material_digest(&input);
             let generation_capability = matches!(
                 declaration.capability.as_str(),
                 "text.generate" | "media.generate"
             );
-            let mut generation: Option<(
-                crate::store::app_records::RecordStore,
-                String,
-                String,
-                Value,
-                Value,
-            )> = None;
+            let mut resolved_gen: Option<Box<ResolvedGeneration>> = None;
             let mut adapter_input = input.clone();
             let mut authority_inputs = input.clone();
             // The source authority freezes the validated saved handle under
@@ -961,210 +1422,25 @@ impl Shared {
                 authority_inputs = json!({"profile_handle": handle});
             }
             let mut authority_source = Value::Null;
-            let mut draft_snapshot: Option<Value> = None;
-            let generation_caller_digest = input_digest.clone();
             if generation_capability {
-                let spec = generation_scope.and_then(Value::as_object).ok_or_else(|| {
-                    Error::rejected("generation tool needs a stable draft-operation scope")
-                })?;
-                if !(spec.len() == 3
-                    && spec.contains_key("operation")
-                    && spec.contains_key("draft_id")
-                    && spec.contains_key("revision"))
-                {
-                    return Err(Error::rejected("generation scope fields are invalid"));
-                }
-                let operation = spec
-                    .get("operation")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Error::rejected("generation scope operation is missing"))?;
-                let expected = if declaration.capability == "text.generate" {
-                    "caption"
-                } else {
-                    "image"
-                };
-                if operation != expected {
-                    return Err(Error::rejected(
-                        "generation scope operation differs from the bound tool",
-                    ));
-                }
-                let context = ctx
-                    .context_id
-                    .as_deref()
-                    .ok_or_else(|| Error::rejected("generation needs a mounted active context"))?;
-                let draft = spec
-                    .get("draft_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Error::rejected("generation needs a draft id"))?;
-                let revision = spec
-                    .get("revision")
-                    .and_then(Value::as_i64)
-                    .filter(|v| *v > 0)
-                    .ok_or_else(|| Error::rejected("generation needs a positive draft revision"))?;
-                crate::proto::identifier(draft, "generation draft ID")?;
-                let records =
-                    crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?;
-                if records.app_social_draft_show(context, draft)?["revision"].as_i64()
-                    != Some(revision)
-                {
-                    return Err(Error::rejected("generation draft revision is stale"));
-                }
-                let scope = json!({"operation":operation,"draft_id":draft,"revision":revision});
-                let intent_digest = app_runs::material_digest(
-                    &json!({"context":context,"alias":alias,"tool":tool,"scope":scope}),
-                );
-                let mut plan = input.clone();
-                if operation == "image" {
-                    let image_idea = image_idea(&input)?;
-                    // Standalone image generation is grounded in the draft's
-                    // retained source, never a caller-supplied receipt or facts.
-                    let current = records.app_social_draft_show(context, draft)?;
-                    draft_snapshot = Some(current.clone());
-                    let source_ref = &current["source"];
-                    if source_ref["kind"] != "tool_receipt" {
-                        return Err(Error::rejected(
-                            "standalone image generation needs a retained tool-receipt source",
-                        ));
-                    }
-                    let receipt_id = source_ref["receipt_id"]
-                        .as_str()
-                        .ok_or_else(|| Error::rejected("draft source receipt is missing"))?;
-                    let post_id = source_ref["post_id"]
-                        .as_str()
-                        .ok_or_else(|| Error::rejected("draft source post is missing"))?;
-                    let receipt = self.store.app_tool_result(receipt_id)?;
-                    if receipt["install_id"] != ctx.install_id
-                        || receipt["result"]["kind"] != "social.source.posts"
-                        || !self.store.app_tool_source_post_exists(
-                            &ctx.install_id,
-                            receipt_id,
-                            post_id,
-                        )?
-                    {
-                        return Err(Error::rejected(
-                            "draft source post is not present in an owned retained receipt",
-                        ));
-                    }
-                    let posts = receipt["result"]["posts"]
-                        .as_array()
-                        .ok_or_else(|| Error::rejected("source receipt has no normalized posts"))?;
-                    let mut selected = posts.iter().filter(|post| post["id"] == post_id);
-                    let post = selected.next().ok_or_else(|| {
-                        Error::rejected("draft source post is absent from its receipt")
-                    })?;
-                    if selected.next().is_some() {
-                        return Err(Error::rejected("draft source post is ambiguous"));
-                    }
-                    let caption = post["caption"]
-                        .as_str()
-                        .ok_or_else(|| Error::rejected("draft source post has no caption"))?;
-                    let frozen_source = crate::issue::workflow::source_input_line(caption)?;
-                    let subject = current["caption"]
-                        .as_str()
-                        .unwrap_or("")
-                        .chars()
-                        .take(120)
-                        .collect::<String>();
-                    if subject.trim().is_empty() {
-                        return Err(Error::rejected(
-                            "draft caption cannot seed an image subject",
-                        ));
-                    }
-                    plan = json!({
-                        "subject": subject,
-                        "source": frozen_source,
-                        "brand_voice": "",
-                        "image_prompt": image_idea,
-                    });
-                    adapter_input = json!({});
-                    authority_inputs = plan.clone();
-                    authority_source = json!({
-                        "receipt_id": receipt_id,
-                        "post": post,
-                        "post_digest": app_runs::material_digest(post),
-                    });
-                }
-                let gate = records.app_social_generation_begin_with(
-                    context,
-                    &intent_digest,
-                    &crate::store::app_social_drafts::GenerationStart {
-                        alias,
-                        tool,
-                        caller_input_digest: &generation_caller_digest,
-                        input: &plan,
-                        scope: &scope,
-                        request: request_id,
-                    },
-                )?;
-                match gate["mode"].as_str() {
-                    Some("existing") => {
-                        let mut intent = gate["intent"].clone();
-                        // The app validates this reply with `outcome: null`; the
-                        // reason code rides the draft listing instead.
-                        if operation == "image" {
-                            intent["outcome"] = Value::Null;
+                match self.prepare_generation_session(
+                    ctx,
+                    &call,
+                    &declaration,
+                    &tool,
+                    &input_digest,
+                )? {
+                    GenerationGateOutcome::Reply(reply) => return Ok(reply),
+                    GenerationGateOutcome::Proceed(resolved) => {
+                        if resolved.session.scope["operation"] == "image" {
+                            adapter_input = resolved.adapter_input.clone();
+                            authority_inputs = resolved.authority_inputs.clone();
+                            authority_source = resolved.authority_source.clone();
                         }
-                        return Ok(json!({"generation_intent":intent,"replayed":true}));
+                        resolved_gen = Some(resolved);
                     }
-                    Some("terminal") => {
-                        return Err(Error::rejected(
-                            "generation intent already reached a terminal outcome",
-                        ))
-                    }
-                    Some("start" | "retry") => {
-                        // On an explicit retry, the retained plan wins over
-                        // changed defaults or source projections.
-                        if gate["mode"] == "retry" {
-                            plan = gate["intent"]["input"].clone();
-                            if operation == "image" {
-                                adapter_input = json!({});
-                                authority_inputs = plan.clone();
-                                let current = draft_snapshot.as_ref().ok_or_else(|| {
-                                    Error::rejected("draft image source snapshot is unavailable")
-                                })?;
-                                let receipt_id =
-                                    current["source"]["receipt_id"].as_str().ok_or_else(|| {
-                                        Error::rejected("draft source receipt is missing")
-                                    })?;
-                                let receipt = self.store.app_tool_result(receipt_id)?;
-                                let post_id =
-                                    current["source"]["post_id"].as_str().ok_or_else(|| {
-                                        Error::rejected("draft source post is missing")
-                                    })?;
-                                let post = receipt["result"]["posts"]
-                                    .as_array()
-                                    .and_then(|posts| {
-                                        posts.iter().find(|post| post["id"] == post_id)
-                                    })
-                                    .ok_or_else(|| {
-                                        Error::rejected("retained image source post is unavailable")
-                                    })?;
-                                authority_source = json!({"receipt_id":receipt_id,"post":post,"post_digest":app_runs::material_digest(post)});
-                            }
-                        }
-                        // CAD-1315: an image intent that already has its job
-                        // never submits again from here. An unresolved one is
-                        // re-checked under the SAME key; an active one just
-                        // gets a worker if none is alive.
-                        if operation == "image" {
-                            if let Some(job) =
-                                records.app_social_image_job_for_request(request_id)?
-                            {
-                                if job.state == "uncertain" {
-                                    records.app_social_image_job_resume(
-                                        &job.call_id,
-                                        self.image_job_deadline(),
-                                    )?;
-                                }
-                                self.spawn_image_job_worker(&ctx.install_id, &job.call_id);
-                                return Ok(pending_image_reply(request_id, &scope, &plan));
-                            }
-                        }
-                        generation = Some((records, context.to_owned(), intent_digest, scope, plan))
-                    }
-                    _ => return Err(Error::rejected("generation intent state is invalid")),
                 }
-            } else if generation_scope.is_some() {
+            } else if call.generation_scope.is_some() {
                 return Err(Error::rejected(
                     "generation scope is accepted only by reviewed text/image generation tools",
                 ));
@@ -1173,7 +1449,7 @@ impl Shared {
                 "app-tool-{}",
                 uuid::Uuid::new_v5(
                     &uuid::Uuid::NAMESPACE_OID,
-                    format!("{}:{}", ctx.install_id, request_id).as_bytes()
+                    format!("{}:{}", ctx.install_id, call.request_id).as_bytes()
                 )
                 .simple()
             );
@@ -1182,10 +1458,10 @@ impl Shared {
             let claim_receipt =
                 self.store
                     .app_tool_claim_receipt(crate::store::app_tools::AppToolClaim {
-                        request: request_id,
+                        request: call.request_id,
                         install: &ctx.install_id,
-                        alias,
-                        slot,
+                        alias: call.alias,
+                        slot: call.slot,
                         binding_digest: &proof.digest,
                         input_digest: &input_digest,
                         call_id: &call_id,
@@ -1196,7 +1472,7 @@ impl Shared {
                 "schema": 1,
                 "install_id": ctx.install_id,
                 "context_id": ctx.context_id.clone().map(Value::String).unwrap_or(Value::Null),
-                "slot": slot,
+                "slot": call.slot,
                 "binding": proof,
                 "inputs": authority_inputs,
                 "source": authority_source,
@@ -1208,40 +1484,20 @@ impl Shared {
             // prompt (a restart replays a byte-identical body under the same
             // key), write the job row and return; a host worker does the
             // provider I/O outside every lock held here.
-            if let Some((records, context, intent, scope, plan)) = &generation {
-                if scope["operation"] == "image" {
-                    match crate::platform::agenticos_external::frozen_image_prompt(
-                        &authority,
-                        &adapter_input,
-                    ) {
-                        Ok(prompt) => authority["frozen_prompt"] = json!(prompt),
-                        Err(_) => {
-                            records.app_social_generation_finish(
-                                context,
-                                intent,
-                                request_id,
-                                "refused",
-                                None,
-                                Some(ImageReason::PlanInvalid.code()),
-                            )?;
-                            return Err(Error::rejected("image plan is invalid"));
-                        }
-                    }
-                    let spec = json!({
-                        "alias": alias, "slot": slot, "binding_digest": proof.digest,
-                        "input_digest": input_digest, "input": input, "authority": authority,
-                    });
-                    records.app_social_image_job_start(
-                        context,
-                        intent,
-                        request_id,
-                        &call_id,
-                        &spec,
-                        &claim_receipt,
-                        self.image_job_deadline(),
-                    )?;
-                    self.spawn_image_job_worker(&ctx.install_id, &call_id);
-                    return Ok(pending_image_reply(request_id, scope, plan));
+            if let Some(resolved) = &resolved_gen {
+                if resolved.session.scope["operation"] == "image" {
+                    return self.enqueue_image_generation_job(
+                        ctx,
+                        resolved,
+                        &mut ImageJobStartArgs {
+                            call: &call,
+                            proof: &proof,
+                            input_digest: &input_digest,
+                            call_id: &call_id,
+                            claim_receipt: &claim_receipt,
+                            authority: &mut authority,
+                        },
+                    );
                 }
             }
             let credential = self.app_capability_credential(config)?;
@@ -1253,39 +1509,11 @@ impl Shared {
             ) {
                 Ok(output) => output,
                 Err(error) => {
-                    if let Some((records, context, intent, scope, plan)) = &generation {
-                        let settlement = generation_settlement(&error);
-                        if settlement == GenerationSettlement::Refused {
-                            records.app_social_generation_finish(
-                                context,
-                                intent,
-                                request_id,
-                                "refused",
-                                None,
-                                Some("verified_provider_refusal"),
-                            )?;
-                            return Err(tool_refusal(&error));
-                        }
-                        let pending = settlement == GenerationSettlement::Pending;
-                        let state = if pending { "pending" } else { "uncertain" };
-                        let reason = if pending {
-                            "upstream_idempotency_in_progress"
-                        } else {
-                            "upstream_outcome_uncertain"
-                        };
-                        records.app_social_generation_finish(
-                            context,
-                            intent,
-                            request_id,
-                            state,
-                            None,
-                            Some(reason),
-                        )?;
-                        return Ok(
-                            json!({"generation_intent":{"request_id":request_id,"operation":scope["operation"],"draft_id":scope["draft_id"],"revision":scope["revision"],"input_digest":app_runs::material_digest(plan),"input":plan,"state":state,"updated_at":crate::issue::time::now_epoch()},"replayed":true}),
-                        );
-                    }
-                    return Err(tool_refusal(&error));
+                    return Self::settle_generation_failure(
+                        resolved_gen.as_deref(),
+                        call.request_id,
+                        &error,
+                    );
                 }
             };
             crate::platform::refuse_leak(
@@ -1309,54 +1537,13 @@ impl Shared {
                     .as_ref()
                     .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
             )?;
-            if let Some((records, context, intent, _scope, _plan)) = &generation {
-                records.app_social_generation_finish(
-                    context,
-                    intent,
-                    request_id,
-                    "completed",
-                    receipt["id"].as_str(),
-                    None,
-                )?;
-            }
-            if let Some(context) = ctx.context_id.as_deref() {
-                if let Some(created) = receipt["created_at"].as_f64() {
-                    crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?
-                        .app_social_tool_receipt_attach(
-                            context,
-                            required_str(&receipt, "id")?,
-                            created,
-                            receipt["result"]["kind"].as_str().unwrap_or(""),
-                        )?;
-                }
-            }
-            if output.result["kind"].as_str() == Some("social.source.posts") {
-                if let (Some(context), Some(handle), Some(created)) = (
-                    ctx.context_id.as_deref(),
-                    output.result["handle"].as_str(),
-                    receipt["created_at"].as_f64(),
-                ) {
-                    let requested = input["handle"]
-                        .as_str()
-                        .unwrap_or("")
-                        .trim()
-                        .trim_start_matches('@')
-                        .to_ascii_lowercase();
-                    let fetched = handle.trim().trim_start_matches('@').to_ascii_lowercase();
-                    if requested == fetched {
-                        crate::store::app_records::RecordStore::open(
-                            &self.state_dir,
-                            &ctx.install_id,
-                        )?
-                        .app_social_freshness_save(
-                            context,
-                            &fetched,
-                            required_str(&receipt, "id")?,
-                            created,
-                        )?;
-                    }
-                }
-            }
+            self.record_tool_side_effects(
+                ctx,
+                resolved_gen.as_deref(),
+                &call,
+                &receipt,
+                &output.result,
+            )?;
             Ok(json!({"receipt": receipt, "replayed": false}))
         })
     }
@@ -1440,6 +1627,46 @@ impl Shared {
             )),
         }
     }
+}
+
+struct ToolQuoteCheck<'a> {
+    quoted: &'a Option<(
+        crate::store::app_bindings::BindingProof,
+        crate::platform::AppCapabilityQuote,
+    )>,
+    proof: &'a crate::store::app_bindings::BindingProof,
+    account_actor: &'a Value,
+    bundle: &'a Value,
+    files: &'a std::collections::BTreeMap<String, String>,
+}
+
+struct GenerationSession {
+    records: crate::store::app_records::RecordStore,
+    context: String,
+    intent_digest: String,
+    scope: Value,
+    plan: Value,
+}
+
+struct ResolvedGeneration {
+    session: GenerationSession,
+    adapter_input: Value,
+    authority_inputs: Value,
+    authority_source: Value,
+}
+
+enum GenerationGateOutcome {
+    Reply(Value),
+    Proceed(Box<ResolvedGeneration>),
+}
+
+struct ImageJobStartArgs<'a, 'b> {
+    call: &'a ToolCall<'b>,
+    proof: &'a crate::store::app_bindings::BindingProof,
+    input_digest: &'a str,
+    call_id: &'a str,
+    claim_receipt: &'a crate::store::app_tools::AppToolClaimReceipt<'a>,
+    authority: &'a mut Value,
 }
 
 #[cfg(test)]
