@@ -380,7 +380,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     replacePreview(null);
     if (fileInput.current) fileInput.current.value = "";
     if (deleteServer && currentId) {
-      void latestSelection.current.services.deleteStagedWhatsAppMedia(currentId);
+      void latestSelection.current.services.deleteStagedWhatsAppMedia(currentId, latestSelection.current.provider);
     }
   }
 
@@ -394,7 +394,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         URL.revokeObjectURL(previewUrlRef.current);
       }
       if (stagedIdRef.current) {
-        void latestSelection.current.services.deleteStagedWhatsAppMedia(stagedIdRef.current);
+        void latestSelection.current.services.deleteStagedWhatsAppMedia(stagedIdRef.current, latestSelection.current.provider);
       }
     };
   }, []);
@@ -479,9 +479,9 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     }
     setStaging(true);
     setAttachError(null);
-    const res = await selection.services.stageWhatsAppMedia(file);
+    const res = await selection.services.stageWhatsAppMedia(file, provider);
     if (!selection.current()) {
-      if (res.ok) void selection.services.deleteStagedWhatsAppMedia(res.data.attachment_id);
+      if (res.ok) void selection.services.deleteStagedWhatsAppMedia(res.data.attachment_id, provider);
       return;
     }
     if (!res.ok) {

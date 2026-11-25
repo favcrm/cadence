@@ -402,14 +402,17 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         } };
       } catch (error) { return failed(error, operation); }
     },
-    async stageWhatsAppMedia(file: File): Promise<{ ok: true; data: LinkedStagedAttachment } | { ok: false; refusal: ActionRefusal }> {
+    async stageWhatsAppMedia(
+      file: File,
+      provider: "linked" | "official" = "linked",
+    ): Promise<{ ok: true; data: LinkedStagedAttachment } | { ok: false; refusal: ActionRefusal }> {
       if (!permitted("whatsapp.reply.prepare") || !permitted("whatsapp.reply.send")) {
         return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
       }
       const actionToken = receipt.action_token!;
       const form = new FormData();
       form.set("action_token", actionToken);
-      form.set("provider", "linked");
+      form.set("provider", provider);
       form.set("file", file);
       let response: Response;
       try {
@@ -491,6 +494,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     },
     async readStagedWhatsAppMedia(
       attachmentId: string,
+      provider: "linked" | "official" = "linked",
     ): Promise<{ ok: true; blob: Blob; mimeType: string; sha256: string } | { ok: false; refusal: ActionRefusal }> {
       if (!permitted("whatsapp.reply.prepare") || !ATTACHMENT_ID_RE.test(attachmentId)) {
         return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
@@ -502,7 +506,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
           credentials: "same-origin",
           cache: "no-store",
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-          body: JSON.stringify({ action_token: receipt.action_token, provider: "linked", attachment_id: attachmentId }),
+          body: JSON.stringify({ action_token: receipt.action_token, provider, attachment_id: attachmentId }),
         });
       } catch {
         return { ok: false, refusal: { code: "failed", text: "Could not read staged attachment." } };
@@ -545,6 +549,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     },
     async deleteStagedWhatsAppMedia(
       attachmentId: string,
+      provider: "linked" | "official" = "linked",
     ): Promise<{ ok: true } | { ok: false; refusal: ActionRefusal }> {
       if (!permitted("whatsapp.reply.prepare") || !ATTACHMENT_ID_RE.test(attachmentId)) {
         return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
@@ -556,7 +561,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
           credentials: "same-origin",
           cache: "no-store",
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-          body: JSON.stringify({ action_token: receipt.action_token, provider: "linked", attachment_id: attachmentId }),
+          body: JSON.stringify({ action_token: receipt.action_token, provider, attachment_id: attachmentId }),
         });
       } catch {
         return { ok: false, refusal: { code: "failed", text: "Could not remove attachment." } };
@@ -588,6 +593,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
       conversationId: string,
       messageId: string,
       signal?: AbortSignal,
+      provider: "linked" | "official" = "linked",
     ): Promise<WhatsAppMediaDownloadResult> {
       if (!permitted("whatsapp.messages")) {
         return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
@@ -607,7 +613,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
           body: JSON.stringify({
             action_token: receipt.action_token,
-            provider: "linked",
+            provider,
             conversation_id: conversationId,
             message_id: messageId,
           }),

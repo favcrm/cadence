@@ -162,6 +162,60 @@ async function main() {
       if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/connect")) {
         return jsonResponse({ url: "https://portal.favcrm.example.test/wa/connect?token=ok", expires_at: "2026-11-23T12:00:00Z" });
       }
+      if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/inspect")) {
+        return jsonResponse({
+          inspect: {
+            favcrmCompanyId: "cmp_new_1",
+            workspaceName: "Demo Business",
+            organisationName: "Demo Org",
+            role: "owner",
+          },
+        });
+      }
+      if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/link")) {
+        return jsonResponse({
+          official: {
+            available: true,
+            enabled: true,
+            paused: false,
+            connected: false,
+            binding_status: "active",
+            company_name: "Demo Business",
+            display_phone_number: null,
+            verified_name: null,
+            waba_id: null,
+            phone_number_id: null,
+            webhook: null,
+            observed_at: "2026-11-24T00:00:00Z",
+          },
+        });
+      }
+      if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/rescope")) {
+        return jsonResponse({
+          official: {
+            available: true,
+            enabled: true,
+            paused: false,
+            connected: true,
+            binding_status: "active",
+            company_name: "Demo Business",
+          },
+        });
+      }
+      if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/disconnect")) {
+        return jsonResponse({
+          disconnected: true,
+          favcrm_revoked: true,
+          official: {
+            available: true,
+            enabled: true,
+            paused: false,
+            connected: false,
+            binding_status: "revoked",
+            company_name: null,
+          },
+        });
+      }
       return jsonResponse({}, 500);
     }) as typeof fetch;
 
@@ -233,6 +287,18 @@ async function main() {
 
     const officialOk = await runOfficialWhatsAppAction("install_waba", "connect");
     assert(officialOk.connect?.url === "https://portal.favcrm.example.test/wa/connect?token=ok", "valid HTTPS Official connect URL accepted");
+
+    const inspectOk = await runOfficialWhatsAppAction("install_waba", "inspect", { favcrmCompanyId: "cmp_new_1" });
+    assert(inspectOk.inspect?.workspaceName === "Demo Business" && inspectOk.inspect.role === "owner", "Official inspect returns workspace preview");
+
+    const linkOk = await runOfficialWhatsAppAction("install_waba", "link", { favcrmCompanyId: "cmp_new_1" });
+    assert(linkOk.official?.available && linkOk.official.binding_status === "active" && linkOk.official.company_name === "Demo Business", "Official link returns active binding snapshot");
+
+    const rescopeOk = await runOfficialWhatsAppAction("install_waba", "rescope");
+    assert(rescopeOk.official?.available && rescopeOk.official.binding_status === "active", "Official rescope refreshes snapshot");
+
+    const disconnectOk = await runOfficialWhatsAppAction("install_waba", "disconnect");
+    assert(disconnectOk.disconnected === true && disconnectOk.favcrm_revoked === true && disconnectOk.official?.available && disconnectOk.official.binding_status === "revoked", "Official disconnect returns revoked snapshot");
 
     // 3. Idle nudge + ManageApp summary helpers + private session reset
     const runningLinkedOfficialFocus: WhatsAppSettingsSnapshot = {

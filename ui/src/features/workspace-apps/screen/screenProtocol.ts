@@ -258,6 +258,7 @@ export interface WhatsAppMediaRequest {
   conversation_id: string;
   message_id: string;
   disposition?: WhatsAppMediaDisposition;
+  provider?: WhatsAppComposeProvider;
 }
 export type WhatsAppMediaReply =
   | {
@@ -1101,13 +1102,22 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   if (
     d.v === 2 &&
     d.op === "whatsapp-media" &&
-    (Object.keys(d).sort().join() === "conversation_id,id,message_id,op,v" ||
-      (Object.keys(d).sort().join() === "conversation_id,disposition,id,message_id,op,v" &&
-        (d.disposition === "inline" || d.disposition === "download"))) &&
+    Object.keys(d).every(
+      (k) =>
+        k === "v" ||
+        k === "op" ||
+        k === "id" ||
+        k === "conversation_id" ||
+        k === "message_id" ||
+        k === "disposition" ||
+        k === "provider",
+    ) &&
     typeof d.id === "string" &&
     ACTION_ID.test(d.id) &&
     validLinkedMediaId(d.conversation_id) &&
-    validLinkedMediaId(d.message_id)
+    validLinkedMediaId(d.message_id) &&
+    (d.disposition === undefined || d.disposition === "inline" || d.disposition === "download") &&
+    (d.provider === undefined || d.provider === "linked" || d.provider === "official")
   ) {
     return {
       v: 2,
@@ -1116,6 +1126,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       conversation_id: d.conversation_id,
       message_id: d.message_id,
       ...(d.disposition !== undefined ? { disposition: d.disposition as WhatsAppMediaDisposition } : {}),
+      ...(d.provider !== undefined ? { provider: d.provider as WhatsAppComposeProvider } : {}),
     };
   }
   if (

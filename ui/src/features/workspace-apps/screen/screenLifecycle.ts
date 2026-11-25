@@ -68,7 +68,12 @@ export interface ScreenActions {
   onWhatsAppCompose?(conversationId: string | null, nomination: number | null, provider?: WhatsAppComposeProvider): void;
   onWhatsAppReplyLayout?(bounds: WhatsAppReplyBounds | null): void;
   onWhatsAppReplyInsetApplied?(px: number, seq: number): void;
-  onWhatsAppMediaDownload?(conversationId: string, messageId: string, signal: AbortSignal): Promise<WhatsAppMediaDownloadResult>;
+  onWhatsAppMediaDownload?(
+    conversationId: string,
+    messageId: string,
+    signal: AbortSignal,
+    provider?: WhatsAppComposeProvider,
+  ): Promise<WhatsAppMediaDownloadResult>;
   onWhatsAppMediaSave?(bytes: ArrayBuffer, mimeType: string, fileName: string): void;
   onWhatsAppThreadUnread?(conversationId: string, provider: WhatsAppComposeProvider, unread: boolean): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
@@ -734,7 +739,12 @@ export class ScreenChannel extends FrameChannel {
     }
     const retire = new AbortController();
     this.whatsappMediaRetire.add(retire);
-    void download(request.conversation_id, request.message_id, retire.signal)
+    void download(
+      request.conversation_id,
+      request.message_id,
+      retire.signal,
+      request.provider ?? "linked",
+    )
       .catch((): WhatsAppMediaDownloadResult => ({ ok: false, refusal: { code: "failed", text: "Download failed." } }))
       .then(result => {
         this.whatsappMediaRetire.delete(retire);

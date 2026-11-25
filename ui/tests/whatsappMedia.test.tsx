@@ -123,7 +123,10 @@ async function testProtocolAndChannel(): Promise<void> {
   assert(parsedInline && parsedInline.op === "whatsapp-media" && parsedInline.disposition === "inline", "inline whatsapp-media request parses");
   const parsedDownload = parseChild({ v: 2, op: "whatsapp-media", id: "req3", conversation_id: "15550001111@s.whatsapp.net", message_id: "m1", disposition: "download" });
   assert(parsedDownload && parsedDownload.op === "whatsapp-media" && parsedDownload.disposition === "download", "download whatsapp-media request parses");
+  const parsedOfficial = parseChild({ v: 2, op: "whatsapp-media", id: "req5", conversation_id: "conv_off_1", message_id: "m1", disposition: "inline", provider: "official" });
+  assert(parsedOfficial && parsedOfficial.op === "whatsapp-media" && parsedOfficial.provider === "official", "official whatsapp-media request parses");
   assert(parseChild({ v: 2, op: "whatsapp-media", id: "req4", conversation_id: "1555@s.whatsapp.net", message_id: "m1", disposition: "evil" }) === null, "invalid disposition refused");
+  assert(parseChild({ v: 2, op: "whatsapp-media", id: "req6", conversation_id: "conv_off_1", message_id: "m1", provider: "bogus" }) === null, "invalid provider refused");
   assert(parseChild({ v: 2, op: "whatsapp-media", id: "req1", conversation_id: "bad\nid", message_id: "m1" }) === null, "control char id refused");
   assert(parseChild({ v: 2, op: "whatsapp-media", id: "req1", conversation_id: "1555@s.whatsapp.net", message_id: "m1", extra: 1 }) === null, "extra key refused");
 
