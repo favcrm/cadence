@@ -31,6 +31,8 @@ export interface WikiEntry {
   /** Read-only for this caller — the row's lock badge. */
   locked?: boolean;
   read_only?: boolean;
+  /** The hosted server permits moving this path to Trash. */
+  removable?: boolean;
   /** Hosted blobs: the Worker's extraction state (pending, indexed, empty, failed, unsupported). */
   status?: string;
   status_reason?: string;
@@ -47,6 +49,7 @@ export interface WikiListing {
   entries?: WikiEntry[];
   /** The caller may write here (new page, folder, upload). */
   writable?: boolean;
+  removable?: boolean;
   locked?: boolean;
   rev?: string;
   edited_by?: string | null;
@@ -69,6 +72,7 @@ export interface WikiPage {
   sha256?: string;
   status?: string;
   status_reason?: string;
+  removable?: boolean;
   /** Set when this page was read with an explicit `at` selector. */
   historical?: boolean;
 }
@@ -228,6 +232,7 @@ export function blobPage(entry: WikiEntry): WikiPage {
     mtime: entry.mtime ?? null,
     status: entry.status,
     status_reason: entry.status_reason,
+    removable: entry.removable,
   };
 }
 

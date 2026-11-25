@@ -27,6 +27,7 @@ export default function FolderPane({
   onReceipt,
   navHref,
   readOnly,
+  requireRemovalPermission,
   trashHref,
   onRefresh,
   onToast,
@@ -35,6 +36,7 @@ export default function FolderPane({
   entries: WikiEntry[];
   navHref: (route: Route) => string;
   readOnly: boolean;
+  requireRemovalPermission: boolean;
   /** The operator's Trash screen; absent for a non-operator, who gets no
    *  discovery. The landing receipt itself is shown either way. */
   trashHref?: string | null;
@@ -119,7 +121,11 @@ export default function FolderPane({
     }
   };
 
+  const canRemove = (entry: WikiEntry) => !readOnly && !entry.locked && !entry.read_only &&
+    (!requireRemovalPermission || entry.removable === true);
+
   const remove = async (entry: WikiEntry) => {
+    if (!canRemove(entry)) return;
     setBusy(true);
     try {
       // Both hosts answer the landing this delete created. Name it as the
@@ -231,14 +237,13 @@ export default function FolderPane({
               {t("Move")}
             </button>
             {(entry.kind === "page" || entry.kind === "file") && <button type="button" onClick={() => void downloadEntry(entry)}>{t("Download")}</button>}
-            <button
+            {canRemove(entry) && <button
               type="button"
               className="danger"
-              disabled={readOnly}
               onClick={() => { setMenu(null); setConfirm(entry.path); }}
             >
-              {t("Delete")}
-            </button>
+              {t("Move to Trash")}
+            </button>}
           </div>
         </>
       )}
@@ -316,7 +321,7 @@ export default function FolderPane({
 
       {confirm && (
         <div className="wk-dialog card">
-          <h2 className="wk-dialog-title">{t("Delete")} {baseName(confirm)}?</h2>
+          <h2 className="wk-dialog-title">{t("Move to Trash")}: {baseName(confirm)}</h2>
           <div className="text-secondary text-ink-300">
             {t("This item moves to .trash/ with its stored bytes. Restoring it is the operator’s step.")}
           </div>
@@ -326,7 +331,8 @@ export default function FolderPane({
               disabled={busy}
               onClick={() => {
                 const entry = rows.find((r) => r.path === confirm);
-                if (entry) void remove(entry);
+                if (!entry) return;
+                if (canRemove(entry)) void remove(entry);
               }}
             >
               {t("Move to Trash")}

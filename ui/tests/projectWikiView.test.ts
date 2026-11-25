@@ -301,7 +301,7 @@ async function run() {
   transferModule.importFile = originalImport;
 
   const folderErrors: string[] = [];
-  const folderProps = { receipt: null, onReceipt: () => {}, entries: [{ name: "README.md", path: pagePath, kind: "page" as const }], navHref: () => "/", readOnly: false, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
+  const folderProps = { receipt: null, onReceipt: () => {}, entries: [{ name: "README.md", path: pagePath, kind: "page" as const, removable: false }], navHref: () => "/", readOnly: false, requireRemovalPermission: true, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
   const renderFolder = async (readOnly = false) => {
     await React.act(() => renderWithNavigation(React.createElement(WikiScopeContext, { value: { root: "projects/cadence", label: "Cadence" } }, React.createElement(FolderPane, { ...folderProps, readOnly }))));
   };
@@ -315,6 +315,7 @@ async function run() {
   assert(!host.querySelector(".wk-fmenu") && document.activeElement === actions, "Escape closes file actions and returns focus to the trigger");
   await React.act(() => actions.click());
   const rename = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Rename");
+  assert(!Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Move to Trash"), "hosted pages without removal permission do not offer Trash");
   assert(rename, "Rename is offered for a page");
   await React.act(() => rename.click());
   const name = host.querySelector<HTMLInputElement>("input[name='name']");

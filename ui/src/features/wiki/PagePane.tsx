@@ -10,9 +10,10 @@ import { exportOriginal } from "./transfer";
 import { baseName } from "./paths";
 import { whoLabel } from "./hosted";
 import PageText from "./PageText";
+import { movedWikiTarget, wikiReaderHref } from "./ReaderActions";
 
 /** The same document toolbar and reader in Wiki and project Context. */
-export default function PagePane({ page, navHref, readOnly, hosted, section, citedPage, viewerSub }: {
+export default function PagePane({ page, navHref, readOnly, hosted, section, citedPage, viewerSub, actions }: {
   page: WikiPage;
   navHref: (route: Route) => string;
   readOnly: boolean;
@@ -21,9 +22,11 @@ export default function PagePane({ page, navHref, readOnly, hosted, section, cit
   section?: string;
   citedPage?: number;
   viewerSub?: string | null;
+  actions?: React.ReactNode;
 }) {
   const t = useTranslate();
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const moved = page.text ? movedWikiTarget(page.path, page.text) : null;
   // Only the transport that really holds this revision's bytes offers the
   // download: the native daemon's verified export, or the text a hosted pinned
   // read already returned. A hosted historical attachment has no byte route,
@@ -60,6 +63,7 @@ export default function PagePane({ page, navHref, readOnly, hosted, section, cit
       <WikiToolbar path={page.path} navHref={navHref} actions={<>
           <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
           <Button href={navHref({ screen: "wiki", mode: "history", path: page.path, query: null })}>{t("History")}</Button>
+          {actions}
           {page.historical && canDownload && <Button onClick={() => void download()}>{t("Download original")}</Button>}
           {page.historical && <Button href={navHref({ screen: "wiki", mode: "browse", path: page.path, query: null })}>{t("Open the current revision")}</Button>}
           <Button variant="primary" disabled={readOnly}
@@ -70,6 +74,10 @@ export default function PagePane({ page, navHref, readOnly, hosted, section, cit
       {section && <p className="wk-meta">{t("Cited section")}: {section}</p>}
       {citedPage !== undefined && <p className="wk-meta">{t("Cited page")}: {citedPage}</p>}
       {downloadError && <Note warn>{downloadError}</Note>}
+      {moved && <Note>
+        <strong className="mr-3">{t("This document moved")}</strong>
+        <Button href={wikiReaderHref(moved)}>{t("Open document")}</Button>
+      </Note>}
       {(page.edited_by || page.mtime) && <p className="wk-meta mb-4">
         {page.edited_by && <>{t("Edited by")} <b>{whoLabel(page.edited_by, viewerSub, t, hosted)}</b></>}
         {page.edited_by && page.mtime && " · "}{relTime(page.mtime)}
