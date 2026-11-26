@@ -173,8 +173,31 @@ export interface ComposerProps {
   showSilentToggle?: boolean;
   silent?: boolean;
   onSilentChange?: (next: boolean) => void;
+  /** Permit sending an empty text body when at least one ready attachment is queued. */
+  allowEmptyWithAttachments?: boolean;
   /** Optional model and reasoning-effort selector docked inside the footer. */
   modelControls?: ReactNode;
+}
+
+const PASTE_MIME_EXT: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "application/pdf": "pdf",
+};
+
+function normalizePastedFiles(raw: File[]): File[] {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return raw.map((file, idx) => {
+    const trimmed = file.name.trim();
+    if (trimmed !== "" && /\.[a-z0-9]{1,10}$/i.test(trimmed)) return file;
+    const ext = PASTE_MIME_EXT[file.type] ?? "png";
+    const prefix = file.type.startsWith("image/") ? "screenshot" : "pasted-file";
+    const suffix = raw.length > 1 ? `-${idx + 1}` : "";
+    const name = `${prefix}-${stamp}${suffix}.${ext}`;
+    return new File([file], name, { type: file.type || "image/png", lastModified: file.lastModified });
+  });
 }
 
 /** One host action behind the compact composer's More actions menu. */
@@ -458,6 +481,7 @@ export default function Composer({
   showSilentToggle = false,
   silent = false,
   onSilentChange,
+  allowEmptyWithAttachments = false,
   modelControls,
 }: ComposerProps) {
   const { t } = useLocale();
@@ -665,9 +689,10 @@ export default function Composer({
 
   const submit = () => {
     const body = draft.trim();
+    const hasReadyFiles = attachItems.some((item) => item.status === "ready" && item.id !== undefined);
     // `block` is also "not an operator" in an app pane — the box and
     // Send are disabled and no submission leaves the composer.
-    if (!body || block) return;
+    if ((!body && !(allowEmptyWithAttachments && hasReadyFiles)) || block) return;
     if (browse) {
       setSkillsFor(draft);
       setMenuOffFor(draft);
@@ -906,6 +931,19 @@ export default function Composer({
       onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
       onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
       onKeyDown={onKey}
+      onPaste={(e) => {
+        if (block || !attachEnabled || !e.clipboardData) return;
+        const files =
+          e.clipboardData.files.length > 0
+            ? Array.from(e.clipboardData.files)
+            : Array.from(e.clipboardData.items ?? [])
+                .filter((item) => item.kind === "file")
+                .map((item) => item.getAsFile())
+                .filter((file): file is File => file !== null);
+        if (files.length === 0) return;
+        e.preventDefault();
+        addSelected(normalizePastedFiles(files));
+      }}
       rows={1}
       disabled={!!block}
       placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
@@ -960,7 +998,8 @@ export default function Composer({
   // Retry or Discard.
   const reserved = cell.reserved;
   const imagePending = libraryImage?.state === "pending";
-  const sendBlocked = !!block || !draft.trim() || (!browse && (sendHeld !== null || reserved || originalUnresolved || imagePending));
+  const hasReadyAttachments = attachItems.some((item) => item.status === "ready" && item.id !== undefined);
+  const sendBlocked = !!block || (!draft.trim() && !(allowEmptyWithAttachments && hasReadyAttachments)) || (!browse && (sendHeld !== null || reserved || originalUnresolved || imagePending));
   const sendTitle = browse ? "Run command" : imagePending ? "Attaching image reference…" : sendHeld ?? (reserved ? "Sending…" : originalUnresolved ? "Retry or discard the previous message first" : null);
 
   // Drop handling is scoped to the composer surface itself — the same

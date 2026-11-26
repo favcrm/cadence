@@ -28,6 +28,8 @@ export function Turn({
   me,
   showName,
   markdown,
+  inlineFormat,
+  attachments,
   onOpenIssue,
   knownIssue,
   state,
@@ -39,6 +41,9 @@ export function Turn({
   me?: boolean;
   showName?: boolean;
   markdown?: boolean;
+  /** Render safe inline Markdown & fenced code blocks for human channel messages (no raw HTML or remote images). */
+  inlineFormat?: boolean;
+  attachments?: ReactNode;
   /** CAD-2387: opens a known issue id in a Markdown body; absent keeps ids plain. */
   onOpenIssue?: (id: string) => void;
   knownIssue?: (id: string) => boolean;
@@ -46,29 +51,33 @@ export function Turn({
   avatar?: ReactNode;
   children: ReactNode;
 }) {
+  const hasBody = typeof children !== "string" || children.trim() !== "" || !attachments;
   return (
     <Bubble who={who} at={at} me={me} showName={showName} avatar={avatar}>
-      <div
-        className={`text-left text-secondary text-ink-100 [overflow-wrap:anywhere] ${
-          me
-            ? "chat-bubble"
-            : markdown && typeof children === "string"
-              ? "inline-block px-3 py-2 text-ink-200"
-              : "inline-block px-3 py-2 text-ink-200 whitespace-pre-wrap"
-        }`}
-      >
-        {me && typeof children === "string" ? (
-          <OperatorText text={readableAnswer(children)} />
-        ) : markdown && typeof children === "string" ? (
-          <div className="answer">
-            <div className="answer-body issue-reader">
-              <Md text={children} idTokens onOpen={onOpenIssue} knownIssue={knownIssue} />
+      {hasBody && (
+        <div
+          className={`text-left text-secondary text-ink-100 [overflow-wrap:anywhere] ${
+            me
+              ? "chat-bubble"
+              : markdown && typeof children === "string"
+                ? "inline-block px-3 py-2 text-ink-200"
+                : "inline-block px-3 py-2 text-ink-200 whitespace-pre-wrap"
+          }`}
+        >
+          {(me || inlineFormat) && typeof children === "string" ? (
+            <OperatorText text={readableAnswer(children)} />
+          ) : markdown && typeof children === "string" ? (
+            <div className="answer">
+              <div className="answer-body issue-reader">
+                <Md text={children} idTokens onOpen={onOpenIssue} knownIssue={knownIssue} />
+              </div>
             </div>
-          </div>
-        ) : (
-          children
-        )}
-      </div>
+          ) : (
+            children
+          )}
+        </div>
+      )}
+      {attachments}
       {state ? (
         <div className="mt-1">
           <StageLabel state={state} />

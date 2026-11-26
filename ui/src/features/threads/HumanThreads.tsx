@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import { fmtTime } from "../../lib/fmt";
-import { useTranslate } from "../../lib/locale";
+import { useLocaleTag, useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { IconArrowDown } from "../../ui/icons";
 import Link from "../../ui/Link";
@@ -17,7 +17,9 @@ import {
   type MentionCandidate,
   type MentionOutcome,
 } from "../mentions/mentions";
+import ChannelAttachments from "./ChannelAttachments";
 import { Turn } from "./ThreadChatParts";
+import { findFirstUnreadPostId } from "./channelsUnread";
 import {
   HUMAN_LIVE_POLL_MS,
   HUMAN_POLL_MS,
@@ -451,6 +453,7 @@ export function HumanRoomTimeline({
   onChanged,
   isDm,
   roomTitle,
+  initialUnread = 0,
   people,
   boardAgents,
 }: {
@@ -465,10 +468,12 @@ export function HumanRoomTimeline({
   onChanged: () => void;
   isDm: boolean;
   roomTitle?: string;
+  initialUnread?: number | null;
   people?: HumanPerson[] | null;
   boardAgents?: readonly BoardAgentHint[] | null;
 }) {
   const t = useTranslate();
+  const locale = useLocaleTag();
   const [page, setPage] = useState<HumanRoomPage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [denied, setDenied] = useState(false);
@@ -656,6 +661,9 @@ export function HumanRoomTimeline({
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const pinnedToTailRef = useRef(true);
   const [pendingNewCount, setPendingNewCount] = useState(0);
+  const [unreadBoundaryId, setUnreadBoundaryId] = useState<string | null>(null);
+  const boundaryCapturedRef = useRef<{ room: string; done: boolean }>({ room: "", done: false });
+  const initialScrollAppliedRef = useRef<{ room: string; applied: boolean }>({ room: "", applied: false });
   const tailPostRef = useRef<{ room: string; id: string | null; initialized: boolean }>({
     room: "",
     id: null,
@@ -664,6 +672,9 @@ export function HumanRoomTimeline({
   useEffect(() => {
     pinnedToTailRef.current = true;
     tailPostRef.current = { room: id, id: null, initialized: false };
+    boundaryCapturedRef.current = { room: id, done: false };
+    initialScrollAppliedRef.current = { room: id, applied: false };
+    setUnreadBoundaryId(null);
     setPendingNewCount(0);
   }, [id]);
   useEffect(() => {
@@ -680,9 +691,35 @@ export function HumanRoomTimeline({
   useEffect(() => {
     const root = messagesRef.current;
     if (!root || !currentPage || currentPage.room !== id) return;
+    if (!boundaryCapturedRef.current.done && boundaryCapturedRef.current.room === id) {
+      if (initialUnread !== null && initialUnread !== undefined) {
+        const boundaryId = findFirstUnreadPostId(currentPage.posts, initialUnread, me.id);
+        boundaryCapturedRef.current.done = true;
+        if (boundaryId !== null) {
+          setUnreadBoundaryId(boundaryId);
+          return;
+        }
+      }
+    }
     const posts = currentPage.posts;
     const lastId = posts[posts.length - 1]?.id ?? null;
     const prev = tailPostRef.current;
+    if (!initialScrollAppliedRef.current.applied && initialScrollAppliedRef.current.room === id) {
+      if (unreadBoundaryId !== null) {
+        const divider = root.querySelector<HTMLElement>("[data-unread-divider]");
+        if (divider) {
+          const delta = divider.getBoundingClientRect().top - root.getBoundingClientRect().top;
+          root.scrollTop = Math.max(0, root.scrollTop + delta - 16);
+          pinnedToTailRef.current = root.scrollHeight - root.scrollTop - root.clientHeight <= 48;
+          initialScrollAppliedRef.current.applied = true;
+          tailPostRef.current = { room: id, id: lastId, initialized: true };
+          return;
+        }
+      }
+      if (boundaryCapturedRef.current.done || initialUnread === 0) {
+        initialScrollAppliedRef.current.applied = true;
+      }
+    }
     if (prev.initialized && prev.room === id && prev.id === lastId) return;
     tailPostRef.current = { room: id, id: lastId, initialized: true };
     if (pinnedToTailRef.current) {
@@ -696,7 +733,7 @@ export function HumanRoomTimeline({
       const incoming = added.filter((p) => p.sender.id !== me.id).length;
       if (incoming > 0) setPendingNewCount((count) => count + incoming);
     }
-  }, [id, currentPage, me.id]);
+  }, [id, currentPage, me.id, initialUnread, unreadBoundaryId]);
   const jumpToLatest = () => {
     const root = messagesRef.current;
     pinnedToTailRef.current = true;
@@ -985,34 +1022,55 @@ export function HumanRoomTimeline({
             : isAgent
               ? `@${senderClean || p.sender.label}`
               : p.sender.label;
+          const showUnreadDivider = unreadBoundaryId === p.id;
           return (
-            <article key={item.key} className="threads-msg" data-post-id={p.id} data-role={mine ? "operator" : "member"}>
-              {p.silent && (
-                <div className="threads-silent-row">
-                  <span className="threads-silent-badge">{t("Silent note")}</span>
+            <div key={item.key}>
+              {showUnreadDivider && (
+                <div
+                  className="threads-unread-divider"
+                  role="separator"
+                  aria-label={t("New messages")}
+                  data-unread-divider=""
+                >
+                  <span className="threads-unread-divider-label">
+                    {locale === "en" ? "New" : t("New messages")}
+                  </span>
                 </div>
               )}
-              <Turn
-                who={who}
-                at={fmtTime(p.created)}
-                me={mine}
-                showName={!mine}
-                markdown={isAgent && !mine}
-                avatar={
-                  !mine ? (
-                    <MemberAvatar
-                      kind={isAgent ? "agent" : "human"}
-                      label={senderClean || p.sender.label}
-                      look={senderLook}
-                      size={28}
-                    />
-                  ) : undefined
-                }
-              >
-                {p.body}
-              </Turn>
-              <MentionOutcomes outcomes={p.outcomes} />
-            </article>
+              <article className="threads-msg" data-post-id={p.id} data-role={mine ? "operator" : "member"}>
+                {p.silent && (
+                  <div className="threads-silent-row">
+                    <span className="threads-silent-badge">{t("Silent note")}</span>
+                  </div>
+                )}
+                <Turn
+                  who={who}
+                  at={fmtTime(p.created)}
+                  me={mine}
+                  showName={!mine}
+                  markdown={isAgent && !mine}
+                  inlineFormat={!isAgent}
+                  attachments={
+                    p.attachments && p.attachments.length > 0 ? (
+                      <ChannelAttachments attachments={p.attachments} mine={mine} />
+                    ) : undefined
+                  }
+                  avatar={
+                    !mine ? (
+                      <MemberAvatar
+                        kind={isAgent ? "agent" : "human"}
+                        label={senderClean || p.sender.label}
+                        look={senderLook}
+                        size={28}
+                      />
+                    ) : undefined
+                  }
+                >
+                  {p.body}
+                </Turn>
+                <MentionOutcomes outcomes={p.outcomes} />
+              </article>
+            </div>
           );
         })}
         {currentPage && timelineItems.length === 0 && (
@@ -1051,15 +1109,23 @@ export function HumanRoomTimeline({
             showSilentToggle={!isDm}
             silent={silentNote}
             onSilentChange={setSilentNote}
-            onSend={async ({ body }) => {
+            attach={{
+              enabled: !denied,
+              reason: t("You are not a member of this channel"),
+              destination: { humanRoom: id },
+            }}
+            allowEmptyWithAttachments
+            onSend={async ({ body, attachments }) => {
               setSendError(null);
               const isSilent = silentNote || startsWithNote(body);
-              const key = JSON.stringify({ silent: isSilent, body: body.trim() });
+              const attachmentIds = (attachments ?? []).map((att) => att.id);
+              const key = JSON.stringify({ silent: isSilent, body: body.trim(), attachmentIds });
               if (envelope.current?.key !== key) envelope.current = { key, id: crypto.randomUUID() };
               try {
-                await postHumanRoom(id, envelope.current.id, body, isSilent);
+                await postHumanRoom(id, envelope.current.id, body, isSilent, attachmentIds);
                 envelope.current = null;
                 setSilentNote(false);
+                setUnreadBoundaryId(null);
                 pinnedToTailRef.current = true;
                 setPendingNewCount(0);
                 await load();

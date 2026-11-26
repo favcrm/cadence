@@ -32,57 +32,74 @@ export function attachmentHref(id: string, conversation: string): string {
   return `/api/chat/attachments/${encodeURIComponent(id)}?conversation=${encodeURIComponent(conversation)}`;
 }
 
-export function attachmentPreviewKind(mime: string): "image" | "video" | null {
-  if (IMAGE_MIMES[mime] === true) return "image";
+export function attachmentPreviewKind(mime: string, allowSvgRaster = false): "image" | "video" | null {
+  if (IMAGE_MIMES[mime] === true || (allowSvgRaster && mime === "image/svg+xml")) return "image";
   if (VIDEO_MIMES[mime] === true) return "video";
   return null;
 }
 
 /**
- * CAD-2219: open a retained PDF through the board's read, never by navigating
- * to the route. A refused read must leave the chip inert instead of opening a
- * tab that says "not found". The blank tab is opened inside the click so the
- * later fetch cannot be mistaken for a popup; it is closed when the read fails.
+ * CAD-2219: open a retained file (e.g. PDF) through the board's read, never by
+ * navigating directly to the route. A refused read leaves the chip inert
+ * instead of stranding a tab on JSON/error output.
  */
-export function openAttachmentInTab(id: string, conversation: string): void {
+export function openAttachmentUrlInTab(href: string): void {
   const tab = window.open("about:blank", "_blank");
   if (tab === null) return;
-  void fetch(attachmentHref(id, conversation), { credentials: "same-origin" })
+  void fetch(href, { credentials: "same-origin" })
     .then(async (response) => {
       if (!response.ok) throw new Error(`attachment read ${response.status}`);
-      const href = URL.createObjectURL(await response.blob());
-      tab.location.replace(href);
-      window.setTimeout(() => URL.revokeObjectURL(href), 30_000);
+      const objectUrl = URL.createObjectURL(await response.blob());
+      tab.location.replace(objectUrl);
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
     })
     .catch(() => tab.close());
 }
 
+export function openAttachmentInTab(id: string, conversation: string): void {
+  openAttachmentUrlInTab(attachmentHref(id, conversation));
+}
+
 export default function AttachmentMedia({
   files,
-  conversation,
+  conversation = null,
   hosted,
+  hrefFor,
+  allowSvgRaster = false,
+  onMediaError,
 }: {
   files: AttachmentFile[];
-  conversation: string | null;
+  conversation?: string | null;
   /** Only a hosted board serves the attachment read; a local board keeps chips. */
   hosted: boolean;
+  /** Optional custom href resolver (e.g. room-scoped Channels URLs). */
+  hrefFor?: (file: AttachmentFile) => string;
+  /** Allow `image/svg+xml` previews when the server serves rasterized PNG bytes. */
+  allowSvgRaster?: boolean;
+  onMediaError?: (id: string) => void;
 }) {
   const t = useTranslate();
   const [openId, setOpenId] = useState<string | null>(null);
   const [failed, setFailed] = useState<Record<string, true>>({});
-  const shown =
-    hosted && conversation !== null
-      ? files.flatMap((file) => {
-          const kind = attachmentPreviewKind(file.mime);
-          return kind === null || failed[file.id] === true ? [] : [{ file, kind }];
-        })
-      : [];
+  const resolveHref = (file: AttachmentFile) =>
+    hrefFor ? hrefFor(file) : conversation !== null ? attachmentHref(file.id, conversation) : "";
+  const canServe = hosted && (hrefFor !== undefined || conversation !== null);
+  const shown = canServe
+    ? files.flatMap((file) => {
+        const kind = attachmentPreviewKind(file.mime, allowSvgRaster);
+        return kind === null || failed[file.id] === true ? [] : [{ file, kind }];
+      })
+    : [];
   const images = shown.flatMap((entry) => (entry.kind === "image" ? [entry.file] : []));
   const openIndex = openId === null ? -1 : images.findIndex((image) => image.id === openId);
   useEffect(() => {
     if (openId !== null && openIndex < 0) setOpenId(null);
   }, [openId, openIndex]);
-  if (!hosted || conversation === null || shown.length === 0) return null;
+  if (!canServe || shown.length === 0) return null;
+  const markFailed = (id: string) => {
+    setFailed((state) => ({ ...state, [id]: true }));
+    onMediaError?.(id);
+  };
   return (
     <div className="sentmedia" data-entry-media>
       {shown.map(({ file, kind }) =>
@@ -90,11 +107,11 @@ export default function AttachmentMedia({
           <figure key={file.id} className="sentclip">
             <video
               className="sentvideo"
-              src={attachmentHref(file.id, conversation)}
+              src={resolveHref(file)}
               controls
               playsInline
               preload="metadata"
-              onError={() => setFailed((state) => ({ ...state, [file.id]: true }))}
+              onError={() => markFailed(file.id)}
             />
           </figure>
         ) : (
@@ -106,11 +123,11 @@ export default function AttachmentMedia({
             onClick={() => setOpenId(file.id)}
           >
             <img
-              src={attachmentHref(file.id, conversation)}
+              src={resolveHref(file)}
               alt={file.name}
               loading="lazy"
               decoding="async"
-              onError={() => setFailed((state) => ({ ...state, [file.id]: true }))}
+              onError={() => markFailed(file.id)}
             />
           </button>
         ),
@@ -119,7 +136,7 @@ export default function AttachmentMedia({
         <AttachmentLightbox
           images={images}
           index={openIndex}
-          conversation={conversation}
+          hrefFor={resolveHref}
           onSelect={setOpenId}
           onClose={() => setOpenId(null)}
         />
@@ -134,13 +151,13 @@ export default function AttachmentMedia({
 function AttachmentLightbox({
   images,
   index,
-  conversation,
+  hrefFor,
   onSelect,
   onClose,
 }: {
   images: AttachmentFile[];
   index: number;
-  conversation: string;
+  hrefFor: (file: AttachmentFile) => string;
   onSelect: (id: string) => void;
   onClose: () => void;
 }) {
@@ -196,7 +213,7 @@ function AttachmentLightbox({
     };
   }, []);
   const file = images[index];
-  const src = attachmentHref(file.id, conversation);
+  const src = hrefFor(file);
   const multi = images.length > 1;
   useEffect(() => {
     const active = document.activeElement;

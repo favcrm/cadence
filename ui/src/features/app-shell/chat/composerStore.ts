@@ -29,10 +29,11 @@
  * Pure state + network; no React import, so the rules are testable in a
  * plain Node test.
  */
-import { api, ApiError, type ChatFileDestination, type ChatFileRow } from "../../../lib/api";
+import { api, ApiError, type ChatFileDestination } from "../../../lib/api";
 import { beginPrivateOperation, onPrivateSessionReset, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
 import type { ThreadRef } from "../../../lib/types";
 import type { PendingAttachment } from "../../home/thread";
+import { uploadHumanRoomAttachment } from "../../threads/humanThreadsClient";
 import {
   attachFits,
   attachRefusal,
@@ -630,9 +631,12 @@ function startUpload(
       // concurrent upload instead of waiting, so a multi-file drop must
       // queue here. A row removed while it waits never starts.
       operation.assertCurrent();
-      const row: ChatFileRow | null = await oneAtATime(() =>
+      const humanRoom = destination?.humanRoom;
+      const row = await oneAtATime<{ id: string; name: string; mime: string } | null>(() =>
         stillOwned() && !operation.signal.aborted
-          ? api.chatFileUpload(file, operation.signal, uploadDestination(destination))
+          ? humanRoom !== undefined
+            ? uploadHumanRoomAttachment(humanRoom, file, operation.signal)
+            : api.chatFileUpload(file, operation.signal, uploadDestination(destination))
           : Promise.resolve(null),
       );
       operation.assertCurrent();
