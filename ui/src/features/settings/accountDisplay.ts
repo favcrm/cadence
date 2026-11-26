@@ -523,6 +523,9 @@ function parseOffer(value: unknown): HostedBillingOffer | null {
   if (!isNullableString(value.checkout.id) || !isNullableString(value.checkout.url)) return null;
   if (!isNullableString(value.checkout.sessionId) || !isNullableString(value.checkout.expiresAt)) return null;
   if (!isNullableString(value.checkout.blocked)) return null;
+  if (!["none", "active", "past_due", "inactive", "unknown"].includes(String(value.subscription.state))
+    || !["none", "pending", "open", "completed", "settled", "expired", "unknown"].includes(String(value.checkout.state))
+    || (value.checkout.id !== null && !isBillingAttempt("subscription", value.checkout.id))) return null;
   return {
     asOf: value.asOf,
     plan,
@@ -539,6 +542,8 @@ export function parseHostedBilling(value: unknown): HostedBillingSnapshot | null
   if ((value.role !== "owner" && value.role !== "member") || typeof value.canManage !== "boolean") {
     return null;
   }
+  if ((value.role === "member" && (value.canManage || value.account !== null || value.offer !== null))
+    || (value.role === "owner" && !value.canManage)) return null;
   const ws = value.workspace;
   if (
     !isRecord(ws) ||
@@ -988,6 +993,8 @@ export function readBillingReturnParams(
   search: string,
 ): { kind: "subscription" | "topup"; status: "success" | "cancel" } | null {
   const params = new URLSearchParams(search);
+  if (params.getAll("subscription").length > 1 || params.getAll("topup").length > 1
+    || (params.has("subscription") && params.has("topup"))) return null;
   const sub = params.get("subscription");
   if (sub === "success" || sub === "cancel") {
     return { kind: "subscription", status: sub };
@@ -997,6 +1004,43 @@ export function readBillingReturnParams(
     return { kind: "topup", status: topup };
   }
   return null;
+}
+
+export type BillingAttemptKind = "subscription" | "topup";
+export type BillingAttemptState = "pending" | "confirmed" | "closed" | "unknown";
+export interface BillingAttempt { kind: BillingAttemptKind; attemptId: string }
+
+export function isBillingAttempt(kind: unknown, attemptId: unknown): attemptId is string {
+  return typeof attemptId === "string" && (
+    kind === "subscription" ? /^bco_[0-9a-f]{32}$/.test(attemptId)
+      : kind === "topup" && /^tu_[0-9a-f]{32}$/.test(attemptId)
+  );
+}
+
+export type BillingAttemptResult = { state: BillingAttemptState; resumeUrl: string | null };
+
+export function parseBillingAttempt(value: unknown, expected: BillingAttempt): BillingAttemptResult {
+  if (!isRecord(value) || value.kind !== expected.kind || value.attemptId !== expected.attemptId) {
+    return { state: "unknown", resumeUrl: null };
+  }
+  const state = value.state === "pending" || value.state === "confirmed" || value.state === "closed"
+    ? value.state : "unknown";
+  const resumeUrl = expected.kind === "subscription" && state === "pending" ? liveCheckoutUrl(value.resumeUrl) : null;
+  return { state, resumeUrl };
+}
+
+function liveCheckoutUrl(value: unknown): string | null {
+  const safe = typeof value === "string" ? safeStripeCheckoutUrl(value) : null;
+  if (!safe) return null;
+  const url = new URL(safe);
+  return url.origin === "https://checkout.stripe.com" && url.pathname.startsWith("/c/pay/") ? safe : null;
+}
+
+export function parseTrackedCheckout(value: unknown, kind: BillingAttemptKind): { attempt: BillingAttempt; state: "ready" | "blocked"; url: string | null } | null {
+  if (!isRecord(value) || value.kind !== kind || !isBillingAttempt(kind, value.attemptId)
+    || (value.state !== "ready" && value.state !== "blocked")) return null;
+  const url = value.state === "ready" ? liveCheckoutUrl(value.url) : null;
+  return { attempt: { kind, attemptId: value.attemptId }, state: value.state, url };
 }
 
 /** Defense in depth: the only account navigation supported by this board. */

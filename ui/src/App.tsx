@@ -307,6 +307,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // viewer of a hosted board who is not a member is asked; every other board
   // is never queried.
   const viewerSub = meta?.session?.user?.sub ?? null;
+  const accountPrincipal = viewerSub && !viewerSub.startsWith("operator-token:") ? viewerSub : null;
+  const accountPolicyScope = accountPrincipal && meta?.session?.id
+    ? JSON.stringify([meta.session.scope?.organization_id ?? window.location.host, meta.session.id, accountPrincipal])
+    : undefined;
+  const billingScope = accountPolicyScope
+    ? `${accountPolicyScope}:${meta?.session?.user?.role ?? ""}`
+    : undefined;
   const viewerIsMember = meta?.session?.user?.role === "member";
   const supportWorkspaceId = meta?.support_workspace_id;
   const privateAssistantView = Boolean(
@@ -565,7 +572,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // hostname, user or project name. One nonblocking read per page load;
   // a failure or missing name leaves the fallback.
   const [orgName, setOrgName] = useState("Cadence");
-  const [billingSummary, setBillingSummary] = useState<HostedBillingSnapshot | null>(null);
+  const [scopedBillingSummary, setScopedBillingSummary] = useState<{
+    scope: string;
+    snapshot: HostedBillingSnapshot;
+  } | null>(null);
+  const billingSummary = scopedBillingSummary?.scope === billingScope
+    ? scopedBillingSummary?.snapshot ?? null
+    : null;
+  const setBillingSummary = useCallback((snapshot: HostedBillingSnapshot | null) => {
+    setScopedBillingSummary(snapshot && billingScope ? { scope: billingScope, snapshot } : null);
+  }, [billingScope]);
   useEffect(() => {
     if (meta === null) return;
     if (meta.platform_account_configured !== true) {
@@ -598,7 +614,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       setOrgName(name || "Cadence");
     }, abort.signal).catch(() => undefined);
     return () => abort.abort();
-  }, [meta?.platform_account_configured, meta?.hosted, meta?.session?.id, meta === null]);
+  }, [meta?.platform_account_configured, meta?.hosted, setBillingSummary, meta === null]);
   const headerOrgName =
     meta?.hosted === true && billingSummary
       ? (locale === "zh-TW" && billingSummary.workspace.nameZh?.trim()
@@ -2079,7 +2095,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             )}
             {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
             {route.section === "security" && meta?.settings_sections?.includes("security") && (
-              <Security onSessionInvalidated={refresh} />
+              <Security viewer={viewer} hosted={meta.hosted === true} policyScope={accountPolicyScope} onSessionInvalidated={refresh} />
             )}
             {route.section === "general" && <General documentPolicy={
               managedFiles && viewer.operator === true && !readOnly && viewerSub && !viewerSub.startsWith("operator-token:")
@@ -2088,7 +2104,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             } />}
             {route.section === "account" && (
               <PlatformAccount
+                key={billingScope}
                 hosted={meta?.hosted === true}
+                sessionScope={accountPrincipal}
                 onBillingSnapshot={setBillingSummary}
               />
             )}

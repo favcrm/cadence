@@ -28,6 +28,23 @@ explicitly verify your session to return. A fresh hosted sign-in also clears the
 unconfirmed state after the server accepts it; browser notices alone do not
 authorize a view.
 
+## Manage a hosted workspace account
+
+Use **Settings → Billing** for the workspace plan, usage and wallet refills.
+Returning from Stripe does not prove payment. Cadence checks the exact attempt;
+use **Refresh** to check again without starting another purchase. The current
+plan and access stay visible while a payment is being confirmed. An owner can
+resume a subscription checkout only while Stripe still reports it open, or
+explicitly close it before choosing another plan. A different checkout cannot
+resolve a lost or unverified payment. If refresh cannot verify it, leave the
+payment blocked and ask support to reconcile it. Apple and Google subscriptions
+are still managed in their stores.
+
+In **Settings → Security**, personal two-factor enrollment is separate from
+the workspace policy. Only an owner can change the workspace requirement,
+with a current authenticator code and recent verification. Members can still
+manage their own security without seeing billing or the owner’s policy controls.
+
 ## Check your connection
 
 `cadence --org <org> doctor` tells you whether this machine's connection to a
