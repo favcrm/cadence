@@ -1,19 +1,26 @@
 import { canOpenInstall } from "../explorer/installAccess";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
 import { navigate, useHref } from "../../lib/useLocation";
 import { useLocale, useTranslate } from "../../lib/locale";
+import { onPrivateReadsPaused, onPrivateSessionReset } from "../../lib/privateSession";
 import { localizedAppCategory, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
 import {
   appExplorer,
+  catalogUpdateHref,
   notifyAppsChanged,
+  pendingCatalogUpdates,
   prefetchAppScope,
+  readAppCatalogCached,
+  readAppCatalogSnapshot,
   readAppFavoritesFresh,
   readAppFavoritesSnapshot,
   readAppHomeFresh,
   readAppHomeSnapshot,
   writeAppFavoritesSnapshot,
   APPS_CHANGED_EVENT,
+  type CatalogCard,
+  type CatalogUpdateHint,
   type HomeInstallation,
   type FavoritesPayload,
   type Installation,
@@ -53,7 +60,7 @@ function homeAppTagline(h: HomeInstallation, locale: string, t: TranslateFn): st
   );
 }
 
-type FilterKey = "all" | "pinned" | "attention" | `cat:${string}`;
+type FilterKey = "all" | "pinned" | "updates" | "attention" | `cat:${string}`;
 
 /**
  * The Apps home (`/apps`): a macOS Applications-style launcher with bespoke
@@ -86,11 +93,19 @@ export default function Apps({
   };
 
   const isOp = viewer.operator === true && !viewer.readOnly;
+  const [catalogCards, setCatalogCards] = useState<CatalogCard[] | null>(() => (isOp ? readAppCatalogSnapshot() : null));
 
   useEffect(() => {
     const bump = () => setRevision((r) => r + 1);
     window.addEventListener(APPS_CHANGED_EVENT, bump);
-    return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
+    const clearCatalog = () => setCatalogCards(null);
+    const stopPause = onPrivateReadsPaused(clearCatalog);
+    const stopReset = onPrivateSessionReset(clearCatalog);
+    return () => {
+      window.removeEventListener(APPS_CHANGED_EVENT, bump);
+      stopPause();
+      stopReset();
+    };
   }, []);
 
   // CAD-1189: every list here loads with the shared busy backoff, keeps
@@ -141,6 +156,47 @@ export default function Apps({
   const live = useMemo(() => (home ?? []).filter((h) => h.attention.state !== "removed"), [home]);
   const removedList = useMemo(() => (home ?? []).filter((h) => h.attention.state === "removed"), [home]);
 
+  // Operator-only background catalog check (5-min tab cache) so returning from
+  // apps does not re-fetch /api/app-catalog while still surfacing updates on /apps.
+  useEffect(() => {
+    if (!isOp) {
+      setCatalogCards(null);
+      return;
+    }
+    if (live.length === 0) return;
+    const cached = readAppCatalogSnapshot();
+    if (cached !== null) {
+      setCatalogCards(cached);
+      return;
+    }
+    const controller = new AbortController();
+    void readAppCatalogCached(controller.signal)
+      .then((cards) => {
+        if (!controller.signal.aborted) setCatalogCards(cards);
+      })
+      .catch(() => {
+        // Catalog checks are best-effort hints; never block /apps or claim up to date.
+      });
+    return () => controller.abort();
+  }, [isOp, live.length, revision]);
+
+  const updatesByInstallId = useMemo(
+    () => (isOp ? pendingCatalogUpdates(catalogCards, live) : new Map<string, CatalogUpdateHint>()),
+    [isOp, catalogCards, live],
+  );
+  useEffect(() => {
+    if (filter === "updates" && updatesByInstallId.size === 0) {
+      setFilter("all");
+    }
+  }, [filter, updatesByInstallId.size]);
+  const effectiveAttentionState = useCallback(
+    (h: HomeInstallation) =>
+      h.attention.state === "ok" && updatesByInstallId.has(h.install_id) ? "update" : h.attention.state,
+    [updatesByInstallId],
+  );
+
+  // Keep the top attention banner strictly for real blockers/native update flags;
+  // hosted marketplace updates stay quiet via the Updates pill + card footer version link.
   const attention = useMemo(() => live.filter((h) => {
     const s = h.attention.state;
     return s === "setup" || s === "attention" || (s === "update" && isOp) || s === "off";
@@ -187,6 +243,7 @@ export default function Apps({
     const needle = q.trim().toLowerCase();
     let list = live.filter((h) => {
       if (filter === "pinned" && !favoriteIds.has(h.install_id)) return false;
+      if (filter === "updates" && !updatesByInstallId.has(h.install_id)) return false;
       if (filter === "attention" && !attentionIds.has(h.install_id)) return false;
       if (filter.startsWith("cat:")) {
         const wanted = filter.slice(4);
@@ -205,14 +262,16 @@ export default function Apps({
     }
     if (sort === "attention") {
       const rank: Record<string, number> = { attention: 0, setup: 1, update: 2, off: 3, ok: 4 };
-      list = [...list].sort((a, b) => (rank[a.attention.state] ?? 4) - (rank[b.attention.state] ?? 4));
+      list = [...list].sort(
+        (a, b) => (rank[effectiveAttentionState(a)] ?? 4) - (rank[effectiveAttentionState(b)] ?? 4),
+      );
     }
     if (sort === "recent" && favs?.recent) {
       const order = new Map(favs.recent.map((id, i) => [id, i]));
       list = [...list].sort((a, b) => (order.get(a.install_id) ?? 999) - (order.get(b.install_id) ?? 999));
     }
     return list;
-  }, [live, q, filter, sort, favs, favoriteIds, attentionIds, localizedById]);
+  }, [live, q, filter, sort, favs, favoriteIds, attentionIds, updatesByInstallId, localizedById, effectiveAttentionState]);
 
   const pin = (id: string) => {
     const cur = favs?.favorites ?? [];
@@ -250,15 +309,22 @@ export default function Apps({
     isOp ? `/apps/manage/${encodeURIComponent(h.install_id)}` : null;
 
   const attentionRow = (h: HomeInstallation) => {
-    const s = h.attention.state;
+    const s = effectiveAttentionState(h);
+    const update = s === "update" ? updatesByInstallId.get(h.install_id) ?? null : null;
     const label = t(s === "off" ? "Access off" : s === "setup" ? "Finish setup" : s === "update" ? "Update ready" : "Needs attention");
     const title = localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t);
+    const actionHref =
+      s === "update" && update
+        ? catalogUpdateHref(update.catalogId, h.install_id)
+        : (s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)) ?? `/apps/manage/${h.install_id}`;
     return (
       <div key={h.install_id} className="attn-row">
         <AppGlyph name={h.name} icon={h.icon} title={title} size="sm" />
-        <span className="txt"><b>{title}</b> · {h.attention.message ? t(h.attention.message) : label}</span>
+        <span className="txt">
+          <b>{title}</b> · {h.attention.message ? t(h.attention.message) : update ? `${t("Update available")} (v${update.latestVersion})` : label}
+        </span>
         {isOp ? (
-          <Button className="btn-sm" href={(s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)) ?? `/apps/manage/${h.install_id}`}>
+          <Button className="btn-sm" href={actionHref}>
             {t(s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup")}
           </Button>
         ) : (
@@ -411,6 +477,18 @@ export default function Apps({
                       <span aria-hidden>★</span> {t("Favorites")}
                       {favorites.length > 0 && <span className="apps-pill-n num">{favorites.length}</span>}
                     </button>
+                    {updatesByInstallId.size > 0 && (
+                      <button
+                        type="button"
+                        className="apps-filter-pill"
+                        data-tone="info"
+                        aria-pressed={filter === "updates"}
+                        onClick={() => setFilter("updates")}
+                      >
+                        {t("Updates")}
+                        <span className="apps-pill-n num">{updatesByInstallId.size}</span>
+                      </button>
+                    )}
                     {attention.length > 0 && (
                       <button
                         type="button"
@@ -559,6 +637,7 @@ export default function Apps({
                         <InstalledCard
                           key={h.install_id}
                           h={h}
+                          updateHint={updatesByInstallId.get(h.install_id) ?? null}
                           layout={layout}
                           pinned={favoriteIds.has(h.install_id)}
                           canPin={favs !== null}
@@ -647,11 +726,12 @@ export default function Apps({
 
 /**
  * One installed app's launcher tile: bespoke SVG icon, title, real summary,
- * and version/status footer. The card opens the app; quick-pin and operator
- * settings sit outside the main link so cards stay single-link and keyboard-clean.
+ * and version/status footer. Uses a stretched main link so the footer update
+ * version link (`→ vX.Y.Z`), pin button, and Settings gear stay clickable without nested links.
  */
 function InstalledCard({
   h,
+  updateHint,
   layout,
   pinned,
   canPin,
@@ -662,6 +742,7 @@ function InstalledCard({
   onOpen,
 }: {
   h: HomeInstallation;
+  updateHint: CatalogUpdateHint | null;
   layout: "grid" | "list";
   pinned: boolean;
   canPin: boolean;
@@ -673,13 +754,15 @@ function InstalledCard({
 }) {
   const { locale, t } = useLocale();
   const state = h.attention.state;
+  const catalogUpdate = state === "ok" ? updateHint : null;
+  const effectiveState = catalogUpdate ? "update" : state;
   const statusKey =
-    state === "off" ? "Access off"
-    : state === "setup" ? "Finish setup"
-    : state === "update" ? "Update ready"
-    : state === "attention" ? "Needs attention"
+    effectiveState === "off" ? "Access off"
+    : effectiveState === "setup" ? "Finish setup"
+    : effectiveState === "update" ? "Update ready"
+    : effectiveState === "attention" ? "Needs attention"
     : "Installed";
-  const tone = state === "update" ? "info" : state === "setup" || state === "attention" ? "warn" : "";
+  const tone = effectiveState === "update" ? "info" : effectiveState === "setup" || effectiveState === "attention" ? "warn" : "";
   const nameId = `app-card-name-${h.install_id}`;
   const statusId = `app-card-status-${h.install_id}`;
   const listing = h.listing;
@@ -687,46 +770,56 @@ function InstalledCard({
   const title = localized?.title ?? homeAppTitle(h, locale, t);
   const summary = localized?.tagline ?? homeAppTagline(h, locale, t);
   const publisher = listing?.publisher?.name;
-  const body = (
-    <>
-      <div className="app-tile-icon">
-        <AppGlyph name={h.name} icon={h.icon} title={title} size={layout === "list" ? "sm" : "xl"} />
-      </div>
-      <div className="app-card-copy">
-        <div className="app-card-title-group">
-          <h3 className="app-card-name" id={nameId}>{title}</h3>
-          {category && <span className="card-category">{localizedAppCategory(category, locale)}</span>}
-        </div>
-        {summary && <p className="app-card-summary">{summary}</p>}
-        {publisher && <span className="card-publisher">{publisher}</span>}
-        {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
-        <div className="card-footer">
-          <span className="num">{h.version ? `v${h.version}` : t("Installed")}</span>
-          <span className="app-status" id={statusId} data-state={tone}>{t(statusKey)}</span>
-        </div>
-      </div>
-    </>
-  );
   return (
     <article className={`card app-card ${pinned ? "is-pinned" : ""}`}>
-      {href === null ? (
-        <div className="app-card-link">
-          {body}
-          <div className="app-card-copy-note">{t("No unique app page — see Manage")}</div>
+      <div className="app-card-body">
+        <div className="app-tile-icon">
+          <AppGlyph name={h.name} icon={h.icon} title={title} size={layout === "list" ? "sm" : "xl"} />
         </div>
-      ) : (
-        <Link
-          className="app-card-link"
-          href={href}
-          aria-labelledby={nameId}
-          aria-describedby={statusId}
-          onClick={onOpen}
-          onMouseEnter={() => prefetchAppScope(h.install_id)}
-          onFocus={() => prefetchAppScope(h.install_id)}
-        >
-          {body}
-        </Link>
-      )}
+        <div className="app-card-copy">
+          <div className="app-card-title-group">
+            <h3 className="app-card-name" id={nameId}>
+              {href === null ? (
+                title
+              ) : (
+                <Link
+                  className="app-card-link"
+                  href={href}
+                  aria-describedby={statusId}
+                  onClick={onOpen}
+                  onMouseEnter={() => prefetchAppScope(h.install_id)}
+                  onFocus={() => prefetchAppScope(h.install_id)}
+                >
+                  {title}
+                </Link>
+              )}
+            </h3>
+            {category && <span className="card-category">{localizedAppCategory(category, locale)}</span>}
+          </div>
+          {summary && <p className="app-card-summary">{summary}</p>}
+          {publisher && <span className="card-publisher">{publisher}</span>}
+          {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
+          <div className="card-footer">
+            <span className="num">{h.version ? `v${h.version}` : t("Installed")}</span>
+            {catalogUpdate ? (
+              <Link
+                className="app-update-link num"
+                id={statusId}
+                href={catalogUpdateHref(catalogUpdate.catalogId, h.install_id)}
+                aria-label={`${t("Review update")} — ${title} (v${catalogUpdate.latestVersion})`}
+                title={t("Review update")}
+              >
+                → v{catalogUpdate.latestVersion}
+              </Link>
+            ) : (
+              <span className="app-status" id={statusId} data-state={tone}>{t(statusKey)}</span>
+            )}
+          </div>
+          {href === null && (
+            <div className="app-card-copy-note">{t("No unique app page — see Manage")}</div>
+          )}
+        </div>
+      </div>
       <div className="app-card-actions">
         <button
           type="button"

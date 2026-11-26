@@ -62,6 +62,17 @@ const { resources } =
   require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { navigate } =
   require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+const {
+  dropAppCatalogSnapshot,
+  notifyAppsChanged,
+} =
+  require("../src/features/workspace-apps/workspaceApps") as typeof import("../src/features/workspace-apps/workspaceApps");
+const ManageAppComponent = (
+  require("../src/features/explorer/ManageApp") as typeof import("../src/features/explorer/ManageApp")
+).default;
+const ManageApp = (props: React.ComponentProps<typeof ManageAppComponent>) =>
+  React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(ManageAppComponent, props) }));
 const app: import("../src/lib/types").AppDetail = {
   project: "site",
   name: "blog-post",
@@ -97,6 +108,10 @@ const campaignApp = {
 const writes: { path: string; body: unknown }[] = [];
 let failSave = false;
 let failRefresh = false;
+let failCatalog: boolean = false;
+let catalogFetchCount: number = 0;
+const getCatalogFetchCount = () => catalogFetchCount;
+let catalogRows: unknown[] = [];
 let finishSave: (() => void) | null = null;
 let holdSave = false;
 const json = (body: unknown, status = 200) =>
@@ -151,6 +166,7 @@ globalThis.fetch = async (input, init) => {
           install_id: "inst-site",
           name: app.name,
           title: app.title,
+          version: "0.1.0",
           project: "site",
           tagline: "Draft one reviewed post",
           icon: null,
@@ -160,6 +176,7 @@ globalThis.fetch = async (input, init) => {
           install_id: "inst-campaign",
           name: app.name,
           title: app.title,
+          version: "0.1.0",
           project: "campaign",
           tagline: "Draft one reviewed post",
           icon: null,
@@ -169,9 +186,44 @@ globalThis.fetch = async (input, init) => {
     });
   if (url.pathname === "/api/app-favorites")
     return json({ owner: "operator", is_default: false, favorites: [] });
+  if (url.pathname === "/api/app-catalog") {
+    catalogFetchCount += 1;
+    return failCatalog ? json({ error: "Catalog unavailable" }, 503) : json({ catalog: catalogRows });
+  }
   if (url.pathname === "/api/app-requests") return json({ requests: [] });
+  if (url.pathname === "/api/app-installations")
+    return json([
+      {
+        install_id: "inst-site",
+        name: app.name,
+        title: app.title,
+        version: "0.1.0",
+        digest: "sha256:" + "01".repeat(32),
+        catalog_generation: "g-1",
+        approved: true,
+        storage_kind: "workspace",
+        files: ["screens/main/screens.json"],
+        capabilities: {},
+        connection_slots: [],
+      },
+    ]);
   if (url.pathname === "/api/app-installations/inst-site")
-    return json({ install_id: "inst-site", name: app.name, title: app.title, version: "0.1.0", digest: "d-site", catalog_generation: "g-1", approved: true, storage_kind: "workspace", files: ["screens/main/screens.json"], capabilities: {}, connection_slots: [] });
+    return json({
+      install_id: "inst-site",
+      name: app.name,
+      title: app.title,
+      version: "0.1.0",
+      digest: "sha256:" + "01".repeat(32),
+      catalog_generation: "g-1",
+      approved: true,
+      storage_kind: "workspace",
+      files: ["screens/main/screens.json"],
+      capabilities: {},
+      connection_slots: [],
+      source: { kind: "git", url: "https://example.invalid/blog-post" },
+    });
+  if (url.pathname === "/api/app-installations/inst-site/automatic-updates")
+    return json({ install_id: "inst-site", automatic: false });
   if (url.pathname === "/api/app-installations/inst-site/contexts")
     return json({ contexts: [] });
   throw new Error(`Unexpected request ${url.pathname}`);
@@ -456,7 +508,207 @@ async function main() {
       prefetchedScope.includes("/api/app-installations/inst-site/contexts"),
     "hovering/focusing an app card prefetches detail and contexts scope",
   );
+
+  // Operator update hints: cached across mounts, skipped for members, invalidated
+  // on notifyAppsChanged(), and fail-closed on catalog outages.
   await React.act(() => root.unmount());
+  dropAppCatalogSnapshot();
+  catalogFetchCount = 0;
+  catalogRows = [
+    {
+      id: "blog-post",
+      source_kind: "git",
+      name: "blog-post",
+      title: "Blog post",
+      version: "0.2.0",
+      digest: "sha256:" + "ab".repeat(32),
+      trust: "cadence",
+      state: "installed",
+      install_id: "inst-site",
+      update_available: true,
+    },
+    {
+      id: "blog-post-same-version",
+      source_kind: "git",
+      name: "blog-post",
+      title: "Blog post",
+      version: "0.1.0",
+      digest: "sha256:" + "cd".repeat(32),
+      trust: "cadence",
+      state: "installed",
+      install_id: "inst-campaign",
+      update_available: true,
+    },
+  ];
+  const root2 = createRoot(host);
+  await React.act(() =>
+    root2.render(
+      React.createElement(
+        LocaleProvider,
+        null,
+        React.createElement(NavigationProvider, {
+          adapter: hostNavigation,
+          children: React.createElement(AppsComponent, {
+            viewer: { readOnly: false, operator: true },
+            installationsList: [
+              {
+                install_id: "inst-site",
+                name: app.name,
+                title: app.title,
+                version: "0.1.0",
+                digest: "sha256:" + "01".repeat(32),
+                catalog_generation: "g-1",
+                approved: true,
+                executable: true,
+                project_link: "site",
+                storage_kind: "workspace",
+                files: ["screens/main/screens.json"],
+                capabilities: {},
+                connection_slots: [],
+              } as any,
+            ],
+          }),
+        }),
+      ),
+    ),
+  );
+  await flush();
+  await flush();
+  assert(getCatalogFetchCount() === 1, "operator Apps fetches /api/app-catalog once on cold cache");
+  assert(
+    !host.querySelector(".attn"),
+    "clean Pill Only design does not show a warning banner for routine catalog updates",
+  );
+  const siteStatus = host.querySelector("#app-card-status-inst-site");
+  assert(
+    siteStatus?.tagName === "A" &&
+      siteStatus.textContent === "→ v0.2.0" &&
+      siteStatus.getAttribute("href") === "/apps/catalog/blog-post?installation=inst-site",
+    `card footer links directly to catalog update review; got: ${siteStatus?.outerHTML}`,
+  );
+  const campaignStatus = host.querySelector("#app-card-status-inst-campaign");
+  assert(
+    campaignStatus?.textContent === "Installed",
+    "same-version digest mismatch keeps calm Installed status",
+  );
+  const updatesPill = Array.from(host.querySelectorAll(".apps-filter-pill")).find((btn) =>
+    btn.textContent?.includes("Updates"),
+  ) as HTMLButtonElement | undefined;
+  assert(
+    updatesPill?.textContent === "Updates1",
+    `Updates filter pill renders with count; got: ${updatesPill?.textContent}`,
+  );
+  await React.act(() => {
+    updatesPill.click();
+  });
+  assert(
+    host.querySelectorAll(".apps-grid .app-card").length === 1 &&
+      Boolean(host.querySelector("#app-card-status-inst-site")) &&
+      !host.querySelector("#app-card-status-inst-campaign"),
+    "clicking Updates filter pill narrows the grid to apps with pending updates",
+  );
+
+  // Remounting Apps within TTL reuses cached catalog hints without refetching.
+  await React.act(() => root2.unmount());
+  const root3 = createRoot(host);
+  await React.act(() =>
+    root3.render(
+      React.createElement(
+        LocaleProvider,
+        null,
+        React.createElement(NavigationProvider, {
+          adapter: hostNavigation,
+          children: React.createElement(AppsComponent, {
+            viewer: { readOnly: false, operator: true },
+            installationsList: [],
+          }),
+        }),
+      ),
+    ),
+  );
+  await flush();
+  assert(
+    getCatalogFetchCount() === 1 &&
+      host.querySelector("#app-card-status-inst-site")?.textContent === "→ v0.2.0",
+    "remounting Apps within TTL reuses cached update hints with 0 catalog fetches",
+  );
+
+  // Opening ManageApp also reuses the warm catalog cache with 0 extra catalog fetches.
+  await React.act(() =>
+    root3.render(
+      React.createElement(
+        LocaleProvider,
+        null,
+        React.createElement(NavigationProvider, {
+          adapter: hostNavigation,
+          children: React.createElement(ManageApp, {
+            installId: "inst-site",
+            viewer: { readOnly: false, operator: true },
+            appAgentSession: null,
+          }),
+        }),
+      ),
+    ),
+  );
+  await flush();
+  assert(
+    getCatalogFetchCount() === 1 &&
+      host.textContent?.includes("An update is ready to review.") &&
+      host.textContent?.includes("(v0.1.0 → v0.2.0)"),
+    `ManageApp reuses cached update hint without extra /api/app-catalog call; got: ${host.textContent}`,
+  );
+
+  // Non-operator never fetches /api/app-catalog and sees no update hint.
+  await React.act(() =>
+    root3.render(
+      React.createElement(
+        LocaleProvider,
+        null,
+        React.createElement(NavigationProvider, {
+          adapter: hostNavigation,
+          children: React.createElement(AppsComponent, {
+            viewer: { readOnly: false, operator: false },
+          }),
+        }),
+      ),
+    ),
+  );
+  await flush();
+  assert(
+    getCatalogFetchCount() === 1 &&
+      host.querySelector("#app-card-status-inst-site")?.textContent === "Installed",
+    "members never fetch catalog or see update badges",
+  );
+
+  // notifyAppsChanged invalidates the catalog cache; catalog 503 fails silently.
+  failCatalog = true;
+  await React.act(async () => {
+    notifyAppsChanged();
+  });
+  await React.act(() =>
+    root3.render(
+      React.createElement(
+        LocaleProvider,
+        null,
+        React.createElement(NavigationProvider, {
+          adapter: hostNavigation,
+          children: React.createElement(AppsComponent, {
+            viewer: { readOnly: false, operator: true },
+            installationsList: [],
+          }),
+        }),
+      ),
+    ),
+  );
+  await flush();
+  assert(
+    getCatalogFetchCount() === 2 &&
+      !host.querySelector("[role='alert']") &&
+      host.querySelector("#app-card-status-inst-site")?.textContent === "Installed",
+    "catalog failure after cache invalidation fails silently without blocking /apps",
+  );
+
+  await React.act(() => root3.unmount());
   console.log("apps view tests passed");
 }
 main().catch(async (error) => {

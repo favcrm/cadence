@@ -4,7 +4,14 @@ import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import { useLocale } from "../../lib/locale";
 import { useHref, navigate } from "../../lib/useLocation";
-import { appExplorer, workspaceApps, APPS_CHANGED_EVENT, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
+import {
+  appExplorer,
+  compareSemverVersions,
+  workspaceApps,
+  APPS_CHANGED_EVENT,
+  type HomeInstallation,
+  type Installation,
+} from "../workspace-apps/workspaceApps";
 import { extractAccessNoteEntries, isPlainJsonObject, localizedAppCategory, localizedAppSummary, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, parseListingDisplayI18n, pickLocaleEntry, type AppDisplayI18n, type ListingDisplayLocale } from "../workspace-apps/appLocale";
 import { loadFailureMessage, loadWithBackoff } from "../workspace-apps/installationsLoad";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
@@ -508,6 +515,13 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
           const rows = installsByName.get(app.app) ?? [];
           const only = rows.length === 1 ? rows[0] : null;
           const known = installs.rows !== null && !installs.loading && !installs.error;
+          const hasUpdate =
+            known &&
+            only !== null &&
+            canOpenInstall(only.state, only.removed) &&
+            app.installable &&
+            typeof only.version === "string" &&
+            compareSemverVersions(app.version, only.version) === 1;
           const localized = localizedById.get(app.id);
           const displayTitle = localized?.title ?? app.title;
           const displaySummary = localized?.tagline ?? app.listing.tagline ?? app.summary;
@@ -522,8 +536,16 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
                   {app.listing.publisher && <span className="pub-card-publisher">{app.listing.publisher}</span>}
                   <span className="pub-card-footer">
                     <span>v{app.version}</span>
-                    <span id={`pub-state-${app.id}`} className="pub-status" {...(known && rows.length ? { "data-state": "statusInstalled" } : {})}>
-                      {!known ? t("Not checked") : rows.length ? t("Installed") : t("Not installed")}
+                    <span
+                      id={`pub-state-${app.id}`}
+                      className="pub-status"
+                      {...(hasUpdate
+                        ? { "data-state": "statusReady" }
+                        : known && rows.length
+                          ? { "data-state": "statusInstalled" }
+                          : {})}
+                    >
+                      {!known ? t("Not checked") : hasUpdate ? t("Update available") : rows.length ? t("Installed") : t("Not installed")}
                     </span>
                   </span>
                 </span>
