@@ -96,6 +96,8 @@ pub enum WorkflowReviewAction {
     /// Request the configured review workflow for an issue.
     Request {
         issue: String,
+        /// Exact target: `artifact:hosted:NAME@<sha256>` or
+        /// `pr:OWNER/REPO#N@<40-hex head>`, resolved and pinned by the server.
         #[arg(long)]
         target: Option<String>,
         #[arg(long, requires = "agent")]

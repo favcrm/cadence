@@ -1435,12 +1435,14 @@ cadence --org acme artifact submit <art-id>
   submit: update the tenant server first, then this client.
 - A native board refuses both as usage errors (exit 2); they are hosted only.
 
-### Staged project review for issue artifacts
+### Staged project review for issue targets
 
-On a workspace that supports staged artifact review, the owner can configure an
-artifact-only project with `delivery policy`. Preview the proposed JSON with
-`--file` before applying the same file with `--apply`, `--preview-digest`, and
-the returned `--expected-revision` when replacing an existing policy.
+On a workspace that supports staged review, the owner configures a project with
+`delivery policy`. Preview the proposed JSON with `--file` before applying the
+same file with `--apply`, `--preview-digest`, and the returned
+`--expected-revision` when replacing an existing policy. A workflow declares
+`action: accept_artifact` for an artifact-only project, or `enqueue_pr` for a
+repository project.
 
 ```sh
 cadence --org acme issue review request <issue-id> --slot commercial \
@@ -1448,17 +1450,31 @@ cadence --org acme issue review request <issue-id> --slot commercial \
 cadence --org acme delivery ship <issue-id> --target 'artifact:hosted:proposal.pdf@<sha256>'
 ```
 
+For a repository project, request one exact PR head instead of an artifact:
+
+```sh
+cadence --org acme issue review request <issue-id> \
+  --target 'pr:<owner>/<repo>#<number>@<full-head-sha>'
+```
+
+The server resolves the pull, base and merge base itself and refuses a moved
+revision, so the caller never supplies them. Each slot of an `enqueue_pr`
+workflow names its review focus, and a passing verdict is evidence the
+protected delivery gate counts for that exact head — not an approval. Owner
+approval and enqueue still run separately, and no GitHub Actions workflow is
+required.
+
 The project names the profile and required brief for each slot. Selectors can
 be omitted when the request is unambiguous. Eligible slots in a stage can run
 together; a later stage waits for every slot in the preceding stage to pass.
 Requests start isolated, board-managed review sessions. An external CLI
-session cannot claim or submit a staged review by naming its profile.
+session cannot claim or submit a staged review by naming its profile; a review
+job still needs its server-validated grant.
 
 Only a live workspace owner can accept the exact artifact. An explicit
 `--override --reason <reason>` skips the project reviews, retains any existing
 verdicts and records the exception. Acceptance does not send the artifact,
-publish it or close the issue. Staged reviews for pull requests are not
-available through this path; the software gate below is unchanged.
+publish it or close the issue. `delivery ship` refuses a PR target.
 
 ### Reviewing software changes
 
