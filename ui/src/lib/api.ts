@@ -19,6 +19,7 @@ import type {
   AgentProfileBody,
   HiredProfile,
   StoredAgentProfile,
+  WorkspaceSkillDraftResult,
   WorkspaceSkillRead,
   WorkspaceSkillSummary,
   AgentRolesPayload,
@@ -1245,6 +1246,9 @@ export const api = {
     get<WorkspaceSkillRead>(
       `/api/workspace-skills/${encodeURIComponent(name)}${revision === undefined ? "" : `?revision=${revision}`}`,
     ),
+  /** `POST /api/workspace-skills/<name>/draft` - save a new skill (expectedRevision 0) or next draft revision. */
+  draftWorkspaceSkill: (name: string, files: Record<string, string>, expectedRevision: number) =>
+    post<WorkspaceSkillDraftResult>(`/api/workspace-skills/${encodeURIComponent(name)}/draft`, { files, expectedRevision }),
   /** `POST /api/workspace-skills/<name>/approve` - owner only: exactly the revision read, by its digest. */
   approveWorkspaceSkill: (name: string, revision: number, digest: string) =>
     post<{ skill: WorkspaceSkillSummary }>(`/api/workspace-skills/${encodeURIComponent(name)}/approve`, { revision, digest }),

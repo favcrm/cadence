@@ -484,7 +484,7 @@ export function skillsResponder(fx: Fixtures, viewer: () => ViewerPreset) {
       if (probe === "failing") return no(route, 503, "unavailable", "The workspace is unavailable.");
       return answer(route, 200, { skills: library.map(summary) });
     }
-    const one = /^\/api\/workspace-skills\/([^/]+)(?:\/(approve|revoke|delete))?$/.exec(pathname);
+    const one = /^\/api\/workspace-skills\/([^/]+)(?:\/(draft|approve|revoke|delete))?$/.exec(pathname);
     if (!one || (method === "GET") === Boolean(one[2])) return no(`${method} ${pathname}`, 404, "not_found", "Not found.");
     const name = decodeURIComponent(one[1]!);
     const skill = library.find((entry) => entry.name === name);
@@ -497,6 +497,30 @@ export function skillsResponder(fx: Fixtures, viewer: () => ViewerPreset) {
     }
     const verb = one[2]!;
     const route = `POST /api/workspace-skills/:name/${verb}`;
+    if (verb === "draft") {
+      const fields = exact(body, ["files", "expectedRevision"]);
+      if (!fields || !fields.files || typeof fields.files !== "object" || Array.isArray(fields.files) || typeof fields.expectedRevision !== "number") {
+        return no(route, 400, "invalid_request", "Invalid skill draft.");
+      }
+      const files = fields.files as Record<string, string>;
+      if (typeof files["SKILL.md"] !== "string" || "skill.json" in files) {
+        return no(route, 400, "skill_refused", "Invalid skill package.");
+      }
+      const now = Date.now();
+      const actor = boardViewer(fx, viewer()).sub;
+      const revNum = (skill ? latest(skill).revision : 0) + 1;
+      if ((skill ? latest(skill).revision : 0) !== fields.expectedRevision) {
+        return no(route, 409, "revision_conflict", "Reload the skill.");
+      }
+      const digest = `${name}-d${revNum}`;
+      const description = files["SKILL.md"].match(/description:\s*(.+)/)?.[1]?.trim() ?? `Draft ${name}`;
+      const rev = { revision: revNum, digest, description, files: { ...files, "skill.json": JSON.stringify({ schema: 1, name, files: Object.keys(files) }) }, created_by: actor, author: actor, created_at: now };
+      const created = !skill;
+      const target = skill ?? { name, created_by: actor, created_at: now, approved: null, revisions: [], used_by: [] };
+      target.revisions.push(rev);
+      if (created) library.push(target);
+      return answer(route, 200, { skill: summary(target), revision: { name, ...rev }, created });
+    }
     if (!owner) return no(route, 403, "owner_required", "Only owners decide workspace skills.");
     const fields = exact(body, verb === "approve" ? ["revision", "digest"] : verb === "revoke" ? ["digest"] : ["expectedRevision"]);
     if (!fields) return no(route, 400, "invalid_request", "Invalid request.");

@@ -17,6 +17,9 @@ import type * as SkillsModule from "../src/features/agents/workspaceSkills";
 import type { SkillDeps } from "../src/features/agents/workspaceSkills";
 import type * as TabsModule from "../src/features/agents/AgentTabs";
 import type { TabContext } from "../src/features/agents/AgentTabs";
+import type * as LibraryDrawerModule from "../src/features/agents/WorkspaceSkillsDrawer";
+import type * as PickerModule from "../src/features/home/WorkspaceSkillPicker";
+import type * as RichCardsModule from "../src/features/home/TurnRichCards";
 import type * as HookModule from "../src/features/agents/useInstructionsDoc";
 
 declare function require(name: string): unknown;
@@ -48,6 +51,9 @@ async function main() {
   const { createRoot } = require("react-dom/client") as typeof ReactDomClient;
   const { ApiError } = require("../src/lib/apiError") as { ApiError: typeof ApiErrorType };
   const { WorkspaceSkills, default: AgentTabBody } = require("../src/features/agents/AgentTabs") as typeof TabsModule;
+  const { WorkspaceSkillsDrawer } = require("../src/features/agents/WorkspaceSkillsDrawer") as typeof LibraryDrawerModule;
+  const WorkspaceSkillPicker = (require("../src/features/home/WorkspaceSkillPicker") as { default: typeof PickerModule.default }).default;
+  const { SkillDraftReviewContext } = require("../src/features/home/TurnRichCards") as typeof RichCardsModule;
   const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof NavModule;
   const { allowPrivateReads } = require("../src/lib/privateSession") as { allowPrivateReads: () => void };
   const { useInstructionsDoc } = require("../src/features/agents/useInstructionsDoc") as typeof HookModule;
@@ -116,6 +122,8 @@ async function main() {
   let listFails: (() => Error) | null = null;
   const calls: [string, ...unknown[]][] = [];
   let decisionFails: (() => Error) | null = null;
+  let draftFails: (() => Error) | null = null;
+  let draftedRevs: Record<string, Record<number, WorkspaceSkillRead["revision"]>> = {};
   const HOSTILE = "<img src=x onerror=alert(1)> **not bold**";
   const skillDeps: SkillDeps = {
     list: async () => {
@@ -126,16 +134,40 @@ async function main() {
       const skill = library.find((s) => s.name === name);
       if (!skill) throw new ApiError("Unknown skill or revision.", 404, { code: "not_found" });
       const n = revision ?? skill.latest_revision;
+      const custom = draftedRevs[name]?.[n];
       return {
         notice: "Workspace guidance.",
         skill,
-        revision: {
+        revision: custom ?? {
           name, revision: n, digest: `${name}-d${n}`, description: skill.description,
           files: { "references/b.md": "Reference text", "SKILL.md": `---\ndescription: x\n---\n${HOSTILE}`, "skill.json": "{}" },
           created_by: "usr_member", author: "agent:ads-agent", created_at: 1,
         },
         approved: skill.approved?.revision === n,
       };
+    },
+    draft: async (name, files, expectedRevision) => {
+      calls.push(["draft", name, expectedRevision, files]);
+      if (draftFails) throw draftFails();
+      const existing = library.find((s) => s.name === name);
+      const currentRev = existing?.latest_revision ?? 0;
+      if (expectedRevision !== currentRev) {
+        throw new ApiError("Reload the skill.", 409, { code: "revision_conflict" });
+      }
+      const revNum = currentRev + 1;
+      const digest = `${name}-d${revNum}`;
+      const desc = files["SKILL.md"]?.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? `${name} description`;
+      const storedFiles: Record<string, string> = { ...files, "skill.json": JSON.stringify({ schema: 1, name, files: Object.keys(files) }) };
+      const rev: WorkspaceSkillRead["revision"] = {
+        name, revision: revNum, digest, description: desc, files: storedFiles,
+        created_by: "usr_owner", author: "usr_owner", created_at: 10,
+      };
+      draftedRevs[name] = { ...draftedRevs[name], [revNum]: rev };
+      const nextSummary: WorkspaceSkillSummary = existing
+        ? { ...existing, latest_revision: revNum, latest_digest: digest, description: desc, updated_at: 10 }
+        : { name, latest_revision: revNum, latest_digest: digest, description: desc, approved: null, created_by: "usr_owner", created_at: 10, updated_at: 10, used_by: [] };
+      library = existing ? library.map((s) => (s.name === name ? nextSummary : s)) : [...library, nextSummary];
+      return { skill: nextSummary, revision: rev, created: !existing };
     },
     approve: async (name, revision, digest) => {
       calls.push(["approve", name, revision, digest]);
@@ -602,6 +634,213 @@ async function main() {
   await click(menuTrigger("assistant"), "the hired assistant menu");
   await click(items()[0], "open the hired assistant");
   assert(window.location.pathname === "/agents/profile/ap_2" && window.location.search === "?tab=skills", "the row action opens the same profile Skills route");
+
+  // ---- Pure draft helpers & validation ----
+  assert(W.validateSkillName("") === "Enter a skill name.", "empty skill name is rejected");
+  assert(W.validateSkillName("Bad_Name") === "Use lowercase letters, digits and hyphens (max 32 characters).", "invalid skill name is rejected");
+  assert(W.validateSkillName("weekly-report") === null, "valid skill name passes");
+  assert(W.extractDescription("---\ndescription: \"Quoted line\"\n---\nBody") === "Quoted line", "extractDescription reads quoted frontmatter");
+  assert(W.extractDescription("---\ndescription: >\n  Line one\n  line two\n---\nBody") === "Line one line two", "extractDescription reads folded frontmatter");
+  assert(W.composeSkillMd("One line", "# Title") === "---\ndescription: One line\n---\n\n# Title\n", "composeSkillMd formats frontmatter cleanly");
+  assert(JSON.stringify(W.editableReferences({ "SKILL.md": "x", "skill.json": "{}", "references/z.md": "z", "references/a.md": "a" })) === JSON.stringify([{ name: "a.md", content: "a" }, { name: "z.md", content: "z" }]), "editableReferences excludes SKILL.md and skill.json");
+  const validBuilt = W.buildDraftFiles({ description: "Run checks", body: "# Steps\n1. Check", references: [{ name: "notes.md", content: "Notes" }] });
+  assert(validBuilt.ok && validBuilt.files["SKILL.md"] === "---\ndescription: Run checks\n---\n\n# Steps\n1. Check\n" && validBuilt.files["references/notes.md"] === "Notes" && !("skill.json" in validBuilt.files), "buildDraftFiles outputs SKILL.md and references without skill.json");
+  const badDesc = W.buildDraftFiles({ description: "line1\nline2", body: "body", references: [] });
+  assert(!badDesc.ok && badDesc.error === "Description must be a single plain line.", "multiline description rejected");
+  const emptyBody = W.buildDraftFiles({ description: "desc", body: "   ", references: [] });
+  assert(!emptyBody.ok && emptyBody.error === "Enter skill instructions.", "empty body rejected");
+  const badRef = W.buildDraftFiles({ description: "desc", body: "body", references: [{ name: "../bad.md", content: "x" }] });
+  assert(!badRef.ok && badRef.error === "Reference names must be plain filenames (letters, digits, ., _, -).", "bad reference leaf rejected");
+  const tooManyRefs = W.buildDraftFiles({ description: "desc", body: "body", references: Array.from({ length: 16 }, (_, i) => ({ name: `r${i}.md`, content: "x" })) });
+  assert(!tooManyRefs.ok && tooManyRefs.error === "A skill can have at most 15 reference files.", ">15 references rejected");
+  const tooBigFile = W.buildDraftFiles({ description: "desc", body: "body", references: [{ name: "big.md", content: "x".repeat(16 * 1024 + 1) }] });
+  assert(!tooBigFile.ok && tooBigFile.error === "Each reference file must be 16 KiB or smaller.", ">16 KiB reference rejected");
+  const tooBigPkg = W.buildDraftFiles({
+    description: "desc",
+    body: "body",
+    references: [{ name: "a.md", content: "x".repeat(12 * 1024) }, { name: "b.md", content: "x".repeat(12 * 1024) }, { name: "c.md", content: "x".repeat(10 * 1024) }],
+  });
+  assert(!tooBigPkg.ok && tooBigPkg.error === "Total skill package exceeds the 32 KiB limit.", ">32 KiB total package rejected");
+  const uploaded = W.parseUploadedSkillFiles([
+    { name: "my-skill/SKILL.md", content: "---\ndescription: Uploaded desc\n---\n# Uploaded body" },
+    { name: "my-skill/references/guide.md", content: "Guide text" },
+    { name: "my-skill/skill.json", content: "{}" },
+    { name: "my-skill/scripts/run.sh", content: "echo hi" },
+  ]);
+  assert(uploaded.description === "Uploaded desc" && uploaded.body === "# Uploaded body" && uploaded.references.length === 1 && uploaded.references[0]!.name === "guide.md" && uploaded.errors.length === 2, "parseUploadedSkillFiles extracts SKILL.md + references and rejects skill.json & scripts");
+
+  // ---- UI: member cannot create or edit drafts; owner can create, edit, and hit revision_conflict ----
+  reset();
+  draftedRevs = {};
+  await mount(false);
+  assert(!button("New skill"), "a member sees no New skill button");
+  await click(row("weekly-report"), "member opens weekly-report");
+  assert(!button("Edit draft") && !drawer()?.querySelector("footer button"), "a member sees no Edit draft or footer buttons");
+  await closeDrawer();
+
+  const setInputValue = async (el: HTMLInputElement | HTMLTextAreaElement, value: string) => {
+    const proto = el instanceof win.HTMLTextAreaElement ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(proto, "value")!.set!.call(el, value);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flush();
+  };
+  const submitEditForm = async (formId: string) => {
+    const form = document.body.querySelector<HTMLFormElement>(`form#${formId}`);
+    assert(form, `form#${formId} exists`);
+    await React.act(async () => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flush();
+  };
+
+  await mount(true);
+  await click(button("New skill"), "owner clicks New skill");
+  assert(document.body.querySelector("[data-drawer=skill-new]"), "New workspace skill drawer opens");
+  await setInputValue(document.body.querySelector<HTMLInputElement>("form#wskill-create-form input[placeholder='weekly-report']")!, "release-check");
+  await setInputValue(document.body.querySelector<HTMLInputElement>("form#wskill-create-form input[placeholder='When an agent should use this skill']")!, "Verify release checklists");
+  await setInputValue(document.body.querySelector<HTMLTextAreaElement>("form#wskill-create-form textarea")!, "# Release Check\n\n1. Verify checksums.");
+  await click(button("Add reference"), "Add reference");
+  await setInputValue(document.body.querySelector<HTMLInputElement>("form#wskill-create-form input[placeholder='checklist.md']")!, "items.md");
+  await setInputValue(document.body.querySelector<HTMLTextAreaElement>("form#wskill-create-form textarea[placeholder='Reference text...']")!, "- Item 1");
+  await submitEditForm("wskill-create-form");
+  const createdCall = calls.find((c) => c[0] === "draft" && c[1] === "release-check");
+  assert(createdCall && createdCall[2] === 0, "create draft sends expectedRevision 0");
+  assert(!document.body.querySelector("[data-drawer=skill-new]") && drawer()?.getAttribute("aria-label") === "release-check", "create opens SkillDrawer on the new skill");
+  assert(/Saved draft revision 1 of release-check\./.test(lastToast()), "toast confirms saved draft");
+  await click(button("Approve revision 1"), "owner approves the newly created skill");
+  assert(JSON.stringify(calls[calls.length - 1]) === JSON.stringify(["approve", "release-check", 1, "release-check-d1"]), "Approve works immediately after create");
+
+  // Edit draft on an existing skill -> saves rev 2 -> focuses Approve revision 2.
+  await click(button("Edit draft"), "owner clicks Edit draft");
+  const editBody = document.body.querySelector<HTMLTextAreaElement>("form#wskill-edit-form textarea");
+  assert(editBody && /Verify checksums/.test(editBody.value), "Edit draft pre-fills existing instructions");
+  await setInputValue(editBody, "# Release Check\n\n1. Verify checksums.\n2. Verify signatures.");
+  await submitEditForm("wskill-edit-form");
+  const editCall = calls.filter((c) => c[0] === "draft" && c[1] === "release-check").pop();
+  assert(editCall && editCall[2] === 1, "edit draft sends expectedRevision 1");
+  assert(button("Approve revision 2") && focusedId() === "wskill-approve", "drawer updates to rev 2 and focuses Approve revision 2");
+
+  // Revision conflict on Edit draft keeps form open and shows error without losing edits.
+  await click(button("Edit draft"), "owner opens Edit draft again");
+  const conflictBody = document.body.querySelector<HTMLTextAreaElement>("form#wskill-edit-form textarea")!;
+  await setInputValue(conflictBody, "# Unsaved edit");
+  draftFails = () => new ApiError("Reload the skill.", 409, { code: "revision_conflict" });
+  await submitEditForm("wskill-edit-form");
+  draftFails = null;
+  assert(document.body.querySelector("form#wskill-edit-form") && /This skill has a newer revision/.test(drawer()?.textContent ?? ""), "revision_conflict keeps edit form open with clear error");
+  assert(document.body.querySelector<HTMLTextAreaElement>("form#wskill-edit-form textarea")?.value === "# Unsaved edit", "unsaved edits are preserved on conflict");
+  await click(button("Cancel"), "Cancel exits edit mode");
+  assert(!document.body.querySelector("form#wskill-edit-form") && drawer(), "Cancel returns to drawer view mode");
+  await closeDrawer();
+
+  // ---- WorkspaceSkillsDrawer: workspace-level discovery & creation ----
+  reset();
+  draftedRevs = {};
+  const libChanges: WorkspaceSkillSummary[] = [];
+  const mountLibrary = async (writable: boolean) => {
+    await React.act(async () => { root.unmount(); });
+    root = createRoot(host);
+    await React.act(async () => {
+      root.render(
+        React.createElement(
+          NavigationProvider,
+          {
+            adapter: { navigate: () => {}, href: (h: string) => h, modifiedClicks: "browser" },
+            children: React.createElement(WorkspaceSkillsDrawer, {
+              writable,
+              deps: skillDeps,
+              toast: toast as never,
+              onSkillChanged: (s) => libChanges.push(s),
+              onClose: () => {},
+            }),
+          },
+        ),
+      );
+    });
+    await flush();
+  };
+
+  // Member sees drafts sorted before approved skills, no New skill button, and read-only SkillDrawer.
+  await mountLibrary(false);
+  const libCards = [...document.body.querySelectorAll<HTMLButtonElement>("[data-workspace-skill]")].map((b) => b.dataset.workspaceSkill);
+  assert(
+    JSON.stringify(libCards) === JSON.stringify(["pricing-check", "tone-guide", "weekly-report"]),
+    `pending drafts sort before approved skills in library drawer: ${JSON.stringify(libCards)}`,
+  );
+  assert(!button("New skill"), "member sees no New skill button in WorkspaceSkillsDrawer");
+  await click(document.body.querySelector("[data-workspace-skill='pricing-check']"), "member opens draft from WorkspaceSkillsDrawer");
+  assert(
+    drawer()?.getAttribute("aria-label") === "pricing-check" &&
+      !document.body.querySelector("[data-drawer=workspace-skills]") &&
+      !button("Edit draft") &&
+      !drawer()?.querySelector("footer button"),
+    "clicking a skill swaps cleanly into read-only SkillDrawer",
+  );
+  await closeDrawer();
+  assert(
+    Boolean(document.body.querySelector("[data-drawer=workspace-skills]")),
+    "closing SkillDrawer returns to WorkspaceSkillsDrawer",
+  );
+
+  // Owner creates a new skill inside WorkspaceSkillsDrawer -> opens SkillDrawer -> approves rev 1.
+  await mountLibrary(true);
+  await click(button("New skill"), "owner clicks New skill inside WorkspaceSkillsDrawer");
+  assert(document.body.querySelector("form#wskill-lib-create-form"), "create form opens in WorkspaceSkillsDrawer");
+  await setInputValue(document.body.querySelector<HTMLInputElement>("form#wskill-lib-create-form input[placeholder='weekly-report']")!, "board-hygiene");
+  await setInputValue(document.body.querySelector<HTMLInputElement>("form#wskill-lib-create-form input[placeholder='When an agent should use this skill']")!, "Keep ticket queues tidy");
+  await setInputValue(document.body.querySelector<HTMLTextAreaElement>("form#wskill-lib-create-form textarea")!, "# Board Hygiene\n\n1. Check blockers.");
+  await submitEditForm("wskill-lib-create-form");
+  assert(
+    drawer()?.getAttribute("aria-label") === "board-hygiene" && Boolean(button("Approve revision 1")),
+    "saving in WorkspaceSkillsDrawer opens SkillDrawer ready to approve",
+  );
+  await click(button("Approve revision 1"), "owner approves board-hygiene from WorkspaceSkillsDrawer");
+  assert(
+    libChanges.some((s) => s.name === "board-hygiene" && s.approved?.revision === 1),
+    "onSkillChanged notifies caller when approved from WorkspaceSkillsDrawer",
+  );
+
+  // ---- WorkspaceSkillPicker: approved options only + Manage skills shortcut ----
+  reset();
+  let pickerClosed = false;
+  let libraryOpened = 0;
+  await React.act(async () => { root.unmount(); });
+  root = createRoot(host);
+  await React.act(async () => {
+    root.render(
+      React.createElement(
+        SkillDraftReviewContext.Provider,
+        {
+          value: {
+            writable: true,
+            openSkill: () => {},
+            openLibrary: () => { libraryOpened += 1; },
+            subscribe: () => () => {},
+            getSnapshot: () => new Map(),
+          },
+        },
+        React.createElement(WorkspaceSkillPicker, {
+          loadSkills: async () => library,
+          onSelect: () => {},
+          onClose: () => { pickerClosed = true; },
+        }),
+      ),
+    );
+  });
+  await flush();
+  const options = [...host.querySelectorAll("[role=option]")].map((o) => o.textContent ?? "");
+  assert(
+    options.some((t) => t.includes("weekly-report")) && !options.some((t) => t.includes("pricing-check")),
+    `WorkspaceSkillPicker lists only approved skills as slash options: ${JSON.stringify(options)}`,
+  );
+  assert(
+    (host.textContent ?? "").includes("2 drafts waiting"),
+    "WorkspaceSkillPicker footer reports unapproved/pending draft count",
+  );
+  await click(host.querySelector("[data-manage-skills]"), "clicking Manage skills triggers openLibrary");
+  assert(pickerClosed && libraryOpened === 1, "Manage skills closes picker and opens library drawer");
 
   await React.act(async () => { root.unmount(); });
   console.log("workspaceSkills checks passed");

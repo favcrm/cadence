@@ -81,6 +81,8 @@ const TOOL_LABELS: Record<string, string> = {
   wiki_list: "List wiki pages",
   wiki_read: "Read the wiki",
   wiki_search: "Search the wiki",
+  workspace_skill: "Load a workspace skill",
+  workspace_skill_draft: "Draft a workspace skill",
 };
 
 /** The tool name a step's summary starts with (`app_call {…}`, `web_search: q`). */

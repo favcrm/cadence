@@ -3324,6 +3324,14 @@ button.refchip:hover {
   z-index: 20;
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
+/* Step the narrow-viewport floating To-do button aside while a slash menu or
+   workspace-skill picker is open above the composer (matching [data-canvas]). */
+.chatdock:has(.slashmenu) {
+  z-index: 46;
+}
+.home-workspace:has(.slashmenu) .needbtn {
+  display: none;
+}
 .chatdock > [data-composer] {
   border-color: var(--color-edge);
   box-shadow: var(--board-composer-shadow);
@@ -4285,12 +4293,14 @@ button.turnsource:hover {
 
 /* The staged action card: kind and live status in the header, the write's
    title, its key fields (a missing value flagged), Review / Not now. */
-.turncard-staged {
+.turncard-staged,
+.turncard-skill {
   /* CAD-2450: one width for every staged card, not content-sized. */
   width: min(100%, 32rem);
   overflow: hidden;
 }
-.turncard-staged .turncard-body {
+.turncard-staged .turncard-body,
+.turncard-skill .turncard-body {
   display: grid;
   gap: .6rem;
   padding: .75rem;

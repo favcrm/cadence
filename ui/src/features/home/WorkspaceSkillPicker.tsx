@@ -1,32 +1,46 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useContext, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import { api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import type { WorkspaceSkillSummary } from "../../lib/types";
+import { SkillDraftReviewContext } from "./TurnRichCards";
 
 function description(skill: WorkspaceSkillSummary): string {
   // The list describes the latest revision, which may not be the approved one.
   return skill.approved?.digest === skill.latest_digest ? skill.description : "";
 }
 
-export default function WorkspaceSkillPicker({ onSelect, onClose }: {
+const defaultLoadSkills = () => api.workspaceSkills().then(({ skills }) => skills);
+
+export default function WorkspaceSkillPicker({
+  onSelect,
+  onClose,
+  loadSkills = defaultLoadSkills,
+}: {
   onSelect: (name: string) => void;
   onClose: (restoreFocus: boolean) => void;
+  loadSkills?: () => Promise<WorkspaceSkillSummary[]>;
 }) {
   const t = useTranslate();
   const listId = useId();
   const search = useRef<HTMLInputElement>(null);
+  const skillReview = useContext(SkillDraftReviewContext);
   const [skills, setSkills] = useState<WorkspaceSkillSummary[] | null>();
+  const [draftCount, setDraftCount] = useState(0);
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState(0);
   useLayoutEffect(() => { search.current?.focus({ preventScroll: true }); }, []);
   useEffect(() => {
     let current = true;
-    void api.workspaceSkills().then(
-      ({ skills }) => { if (current) setSkills(skills.filter((skill) => skill.approved)); },
+    void loadSkills().then(
+      (all) => {
+        if (!current) return;
+        setSkills(all.filter((skill) => skill.approved));
+        setDraftCount(all.filter((skill) => !skill.approved || skill.latest_revision > skill.approved.revision).length);
+      },
       () => { if (current) setSkills(null); },
     );
     return () => { current = false; };
-  }, []);
+  }, [loadSkills]);
 
   const term = query.trim().toLowerCase();
   const matches = skills?.filter((skill) => skill.name.toLowerCase().includes(term) || description(skill).toLowerCase().includes(term)) ?? [];
@@ -90,6 +104,27 @@ export default function WorkspaceSkillPicker({ onSelect, onClose }: {
         <p className="px-2.5 py-2 text-label text-ink-500" role="status">
           {t(skills === undefined ? "Loading…" : skills === null ? "Workspace skills could not be loaded." : skills.length ? "No matching skills." : "No approved workspace skills.")}
         </p>
+      )}
+      {skillReview?.openLibrary && (
+        <div className="flex items-center justify-between gap-2 border-t border-ink-700 px-2.5 py-1.5 text-micro text-ink-400">
+          <span>
+            {draftCount > 0
+              ? t(draftCount === 1 ? "{n} draft waiting" : "{n} drafts waiting").replace("{n}", String(draftCount))
+              : t("Workspace skills")}
+          </span>
+          <button
+            type="button"
+            className="lnk text-label"
+            data-manage-skills
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={(event) => {
+              onClose(false);
+              skillReview.openLibrary?.(event.currentTarget);
+            }}
+          >
+            {t("Manage skills")}
+          </button>
+        </div>
       )}
     </div>
   );

@@ -1,6 +1,7 @@
 import { useWriteBlock, WriteGate } from "../auth/WriteGate";
 import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { AttachmentNamesContext } from "./TurnRichCards";
+import { AttachmentNamesContext, SkillDraftReviewContext } from "./TurnRichCards";
+import { useHomeSkillReview } from "./HomeSkillReview";
 import { attachmentNames } from "./turnCards";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
@@ -846,6 +847,10 @@ export default function Home({
     requestComposerFocus(composerKey);
   }, [composerKey, readOnly]);
   const review = useHostedTemplateReview({ enabled: templateReviewEnabled, canApprove: templateReviewCanApprove && !readOnly, onCompose: readOnly ? undefined : onCompose });
+  const skillReview = useHomeSkillReview({
+    enabled: hosted === true,
+    writable: hosted === true && operator === true && !viewerIsMember && !readOnly,
+  });
   useEffect(() => {
     if (!templateReviewEnabled) return;
     const openPending = () => {
@@ -861,7 +866,7 @@ export default function Home({
   if (memberChat && viewerSub !== null) {
     const scope = memberScope(sessionId, viewerSub);
     return (
-      <>
+      <SkillDraftReviewContext.Provider value={skillReview.source}>
         <MemberChat
           supportWorkspaceId={supportWorkspaceId}
           key={scope}
@@ -879,11 +884,12 @@ export default function Home({
           onToast={onToast}
         />
         {review.drawer}
-      </>
+        {skillReview.drawer}
+      </SkillDraftReviewContext.Provider>
     );
   }
   return (
-    <>
+    <SkillDraftReviewContext.Provider value={skillReview.source}>
       <MasterHome
         readOnly={readOnly}
         canLocalDispatch={canLocalDispatch}
@@ -909,7 +915,8 @@ export default function Home({
         onClearDeepLinkAction={onClearDeepLinkAction}
       />
       {review.drawer}
-    </>
+      {skillReview.drawer}
+    </SkillDraftReviewContext.Provider>
   );
 }
 

@@ -777,6 +777,13 @@ export interface WorkspaceSkillRead {
   approved: boolean;
 }
 
+/** `POST /api/workspace-skills/<name>/draft`: saved draft revision and updated summary. */
+export interface WorkspaceSkillDraftResult {
+  skill: WorkspaceSkillSummary;
+  revision: WorkspaceSkillRead["revision"];
+  created: boolean;
+}
+
 /** One `/api/agents` row. Generated from the daemon's Rust type, except the
  *  fields re-declared here: a registered agent always reports `provider` and
  *  `endpoint_kind`, the board reads the allowance record as the wider

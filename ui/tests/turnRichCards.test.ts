@@ -3,8 +3,9 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { parseStagedRow, type StagedWrite } from "../src/features/decisions/stagedWrite";
 import type { DecisionsState } from "../src/features/decisions/useDecisions";
-import { TurnSources, TurnStagedCards } from "../src/features/home/TurnRichCards";
+import { SkillDraftReviewContext, TurnSkillDraftCards, TurnSources, TurnStagedCards, type SkillDraftLiveState, type SkillDraftReviewSource } from "../src/features/home/TurnRichCards";
 import type { ThreadEntry } from "../src/features/home/thread";
+import type { WorkspaceSkillSummary } from "../src/lib/types";
 import { turnSources } from "../src/features/home/turnCards";
 import { StagedSourceContext, type StagedSource } from "../src/ui/StagedChip";
 import { NavigationProvider, type NavigationAdapter } from "../screen-ui/src/navigation";
@@ -209,6 +210,111 @@ check(
   check(named.includes("<bdi>Quote Q-0140.pdf</bdi>") && named.includes(`title="${id}"`), `the named chip keeps the full id in its tooltip: ${named}`);
   const bare = sourcesHtml({ sources: turnSources([call(`chat_attachment_read {"id":"${id}"}`)]), artifacts: [] });
   check(bare.includes("<bdi>chf-121800f2…</bdi>") && bare.includes(`title="${id}"`), "the short-id chip keeps the full id in its tooltip");
+}
+
+// Workspace skill draft cards in chat: Review / View draft / Inspect, live status transitions, never inline Approve/Deny.
+{
+  const entries: ThreadEntry[] = [
+    call('workspace_skill_draft {"name":"weekly-report"}'),
+    result(
+      JSON.stringify({
+        created: true,
+        skill: {
+          name: "weekly-report",
+          latest_revision: 1,
+          latest_digest: "sha-1",
+          description: "Summarize weekly board progress.",
+          approved_revision: null,
+        },
+        revision: { revision: 1, digest: "sha-1" },
+      }),
+    ),
+  ];
+  check(
+    renderToStaticMarkup(createElement(TurnSkillDraftCards, { toolEntries: entries, density: "full" })) === "",
+    "without SkillDraftReviewContext, no skill draft card renders",
+  );
+  const renderSkill = (writable: boolean, entriesIn: readonly ThreadEntry[], map: ReadonlyMap<string, SkillDraftLiveState> = new Map()) => {
+    const source: SkillDraftReviewSource = {
+      writable,
+      openSkill: () => {},
+      subscribe: () => () => {},
+      getSnapshot: () => map,
+    };
+    return renderToStaticMarkup(
+      createElement(
+        SkillDraftReviewContext.Provider,
+        { value: source },
+        createElement(TurnSkillDraftCards, { toolEntries: entriesIn, density: "full" }),
+      ),
+    );
+  };
+  check(renderSkill(true, [call("wiki_list"), result("[]")]) === "", "turns without skill drafts render nothing");
+
+  const ownerDraft = renderSkill(true, entries);
+  check(
+    ownerDraft.includes('data-kind="skill-draft"') &&
+      ownerDraft.includes('data-skill-name="weekly-report"') &&
+      ownerDraft.includes('data-skill-state="draft"') &&
+      ownerDraft.includes("Draft · rev 1") &&
+      ownerDraft.includes("data-skill-review") &&
+      ownerDraft.includes(">Review<"),
+    `owner pending draft renders Review card: ${ownerDraft}`,
+  );
+  check(
+    !/button[^>]*>\s*(Approve|Deny|Reject|Accept)\b/i.test(ownerDraft) && !/data-(decide|approve|deny)/.test(ownerDraft),
+    "chat skill draft card never exposes inline Approve or Deny controls",
+  );
+
+  const memberDraft = renderSkill(false, entries);
+  check(
+    memberDraft.includes("data-skill-review") &&
+      memberDraft.includes(">View draft<") &&
+      memberDraft.includes("Ask a workspace owner to review and approve it."),
+    `member pending draft renders View draft copy: ${memberDraft}`,
+  );
+
+  const summary = (extra: Partial<WorkspaceSkillSummary>): WorkspaceSkillSummary => ({
+    name: "weekly-report",
+    description: "Summarize weekly board progress.",
+    latest_revision: 1,
+    latest_digest: "sha-1",
+    approved: null,
+    created_by: "usr_owner",
+    created_at: 1_790_000_000_000,
+    updated_at: 1_790_000_000_000,
+    ...extra,
+  });
+
+  const approvedHtml = renderSkill(
+    true,
+    entries,
+    new Map([["weekly-report", summary({ approved: { revision: 1, digest: "sha-1", at: 1_790_000_100_000, by: "usr_owner" } })]]),
+  );
+  check(
+    approvedHtml.includes('data-skill-state="approved"') &&
+      approvedHtml.includes("Approved · rev 1") &&
+      approvedHtml.includes(">Inspect<"),
+    `approved draft updates card to Approved + Inspect: ${approvedHtml}`,
+  );
+
+  const supersededHtml = renderSkill(
+    true,
+    entries,
+    new Map([["weekly-report", summary({ latest_revision: 2, latest_digest: "sha-2" })]]),
+  );
+  check(
+    supersededHtml.includes('data-skill-state="superseded"') && supersededHtml.includes("Draft · rev 2"),
+    `newer revision transitions card to superseded Draft rev 2: ${supersededHtml}`,
+  );
+
+  const deletedHtml = renderSkill(true, entries, new Map([["weekly-report", "deleted"]]));
+  check(
+    deletedHtml.includes('data-skill-state="deleted"') &&
+      deletedHtml.includes(">Removed<") &&
+      !deletedHtml.includes("data-skill-review"),
+    `deleted skill updates card to Removed without review button: ${deletedHtml}`,
+  );
 }
 
 console.log("turnRichCards: ok");
