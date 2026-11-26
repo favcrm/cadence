@@ -116,8 +116,8 @@ function WorkflowCard({
     <li className="project-summary-card p-0 min-w-0" data-workflow={row.name}>
       <div className="project-card-padding min-w-0">
         {app ? (
-          <div className="w-full text-left flex items-start gap-2 min-w-0">
-            <span className="num text-label text-accent shrink-0 pt-px">{row.name}</span>
+          <div className="w-full text-left flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:gap-2 min-w-0">
+            <span className="num text-label text-accent break-all sm:break-normal shrink-0">{row.name}</span>
             <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
               {row.title ?? row.name}
             </span>
@@ -130,12 +130,14 @@ function WorkflowCard({
             aria-label={`${open ? "close" : "new run of"} ${row.name}`}
             className="w-full text-left flex items-start gap-2 min-w-0 rounded hover:text-accent"
           >
-            <span className="num text-label text-accent shrink-0 pt-px">{row.name}</span>
-            <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
-              {row.title ?? row.name}
+            <span className="flex-1 min-w-0 flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:gap-2">
+              <span className="num text-label text-accent break-all sm:break-normal shrink-0">{row.name}</span>
+              <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
+                {row.title ?? row.name}
+              </span>
             </span>
             <IconChevron
-              className={`shrink-0 mt-1.5 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`}
+              className={`shrink-0 mt-1 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`}
             />
           </button>
         )}
