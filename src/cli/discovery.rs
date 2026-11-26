@@ -197,7 +197,7 @@ fn schema(path: &[String]) -> Result<Value> {
         }
     }
     if canonical.as_slice() == ["issue", "ls"] {
-        let unsupported = remote::hosted_issue_ls_unsupported_flags();
+        let unsupported = remote::issue_query::unsupported_flags();
         for arg in &mut arguments {
             let refused = arg
                 .get("long")
@@ -206,7 +206,7 @@ fn schema(path: &[String]) -> Result<Value> {
             if refused {
                 arg["hosted"] = json!({
                     "client_route": "unsupported",
-                    "reason": remote::HOSTED_ISSUE_LS_REFUSAL,
+                    "reason": remote::issue_query::UNSUPPORTED_FILTER_REASON,
                 });
             }
         }

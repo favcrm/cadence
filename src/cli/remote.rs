@@ -9,6 +9,7 @@
 
 mod blob_cat;
 mod document_template;
+pub(super) mod issue_query;
 mod issue_text;
 mod media_artifact;
 mod merge_gate;
@@ -52,46 +53,6 @@ const TIMELINE_KINDS: [&str; 7] = [
     "created", "status", "owner", "claim", "comment", "message", "review",
 ];
 
-pub(super) const HOSTED_ISSUE_LS_REFUSAL: &str = "the remote route's filter does not implement it";
-
-/// The presence checks and names used by both hosted routing and offline discovery.
-#[derive(Default)]
-struct HostedIssueLsOptions {
-    stage: bool,
-    health: bool,
-    since: bool,
-    until: bool,
-    ready: bool,
-    blocked: bool,
-    at: bool,
-    sort: bool,
-    fields: bool,
-    summary: bool,
-}
-
-impl HostedIssueLsOptions {
-    fn restrictions(self) -> [(&'static str, bool); 10] {
-        [
-            ("--stage", self.stage),
-            ("--health", self.health),
-            ("--since", self.since),
-            ("--until", self.until),
-            ("--ready", self.ready),
-            ("--blocked", self.blocked),
-            ("--at", self.at),
-            ("--sort", self.sort),
-            ("--fields", self.fields),
-            ("--summary", self.summary),
-        ]
-    }
-}
-
-pub(super) fn hosted_issue_ls_unsupported_flags() -> [&'static str; 10] {
-    HostedIssueLsOptions::default()
-        .restrictions()
-        .map(|(flag, _)| flag)
-}
-
 /// `cadence <verb>` → AOS-128 `(verb, arguments)`. Every returned verb is
 /// in `remote_cli::REMOTE_VERBS` or `remote_cli::WIKI_ACTIONS`; every argument value is a primitive the
 /// server's `arguments` object accepts. A command outside the set — or a
@@ -107,6 +68,9 @@ fn verb_for(
     if let Commands::Issue { action } = command {
         if let Some(args) = issue_text::edit_args(action)? {
             return Ok(("issue_set", args));
+        }
+        if let Some(args) = issue_query::args(action)? {
+            return Ok((issue_query::VERB, args));
         }
     }
     let mut args = serde_json::Map::new();
@@ -338,92 +302,6 @@ fn verb_for(
                 );
             }
             "agent_show"
-        }
-        Commands::Issue {
-            action:
-                cadence_agent::issue::cli::IssueAction::Ls {
-                    project,
-                    status,
-                    tags,
-                    epic,
-                    owner,
-                    component,
-                    priority,
-                    types,
-                    milestone,
-                    stage,
-                    health,
-                    plan,
-                    since,
-                    until,
-                    open,
-                    ready,
-                    blocked,
-                    at,
-                    sort,
-                    limit,
-                    fields,
-                    summary,
-                    json: _,
-                },
-        } => {
-            // Refuse list filters that cannot cross the hosted route faithfully.
-            // CAD-1999: `--project` now crosses the wire — the hosted
-            // route filters one registered (or ticket-derived) project,
-            // so a repeated flag refuses rather than silently keeping one.
-            let hosted_options = HostedIssueLsOptions {
-                stage: !stage.is_empty(),
-                health: !health.is_empty(),
-                since: since.is_some(),
-                until: until.is_some(),
-                ready: *ready,
-                blocked: *blocked,
-                at: at.is_some(),
-                sort: sort.is_some(),
-                fields: !fields.is_empty(),
-                summary: *summary,
-            };
-            for (flag, present) in hosted_options.restrictions() {
-                if present {
-                    return Err(unsupported("issue ls", flag, HOSTED_ISSUE_LS_REFUSAL));
-                }
-            }
-            if let Some(n) = limit {
-                if !(1..=5000).contains(n) {
-                    return Err(Error::rejected(
-                        "remote `issue ls` --limit must be 1 to 5000 — nothing was sent",
-                    ));
-                }
-                args.insert("limit".into(), json!(n));
-            }
-            if project.len() > 1 {
-                return Err(Error::rejected(
-                    "remote `issue ls` filters one --project at a time — the \
-                     hosted route takes a single key; nothing was sent",
-                ));
-            }
-            if let Some(key) = project.first() {
-                args.insert("project".into(), json!(key));
-            }
-            for (key, values) in [
-                ("status", status),
-                ("tag", tags),
-                ("epic", epic),
-                ("owner", owner),
-                ("component", component),
-                ("priority", priority),
-                ("type", types),
-                ("milestone", milestone),
-                ("plan", plan),
-            ] {
-                if !values.is_empty() {
-                    args.insert(key.into(), json!(values));
-                }
-            }
-            if *open {
-                args.insert("open".into(), json!(true));
-            }
-            "issue_ls"
         }
         Commands::Issue {
             action: cadence_agent::issue::cli::IssueAction::Show { id, json: _ },
@@ -3591,134 +3469,105 @@ where
         .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
     let edits_issue_text =
         verb == "issue_set" && issue_text::resolve(&target, &mut args, deadline, wake_timeout)?;
-    let issue_ls_fallback = (verb == "issue_ls")
-        .then(|| {
-            let n = args.get("limit").and_then(Value::as_u64)? as usize;
-            let mut without_limit = args.clone();
-            without_limit.remove("limit");
-            Some((n, without_limit))
-        })
-        .flatten();
-    let out = match cadence_agent::remote_cli::call_verb(
-        &target,
-        verb,
-        args,
-        deadline,
-        wake_timeout,
-        eprint_line,
-    ) {
+    let send = |args| {
+        cadence_agent::remote_cli::call_verb(
+            &target,
+            verb,
+            args,
+            deadline,
+            wake_timeout,
+            eprint_line,
+        )
+    };
+    let result = match &command {
+        Commands::Issue { action } if verb == issue_query::VERB => {
+            issue_query::call(action, args, &target.org, send)
+        }
+        _ => send(args),
+    };
+    let out = match result {
         Ok(out) => out,
         Err(error) => {
-            // Hosted wire compatibility: if an older board predates `limit` on
-            // `issue_ls` and answers `400 invalid_request`, retry once without
-            // `limit`, slice locally, and state on stderr what was not applied
-            // server-side. If the retry also refuses (for instance another bad
-            // filter value), surface that refusal unchanged.
-            if let Some((n, without_limit)) = issue_ls_fallback.filter(|_| {
-                error.code() == Some(cadence_agent::remote_cli::ISSUE_LS_LIMIT_UNSUPPORTED)
-            }) {
-                match cadence_agent::remote_cli::call_verb(
-                    &target,
-                    verb,
-                    without_limit,
-                    deadline,
-                    wake_timeout,
-                    eprint_line,
-                ) {
-                    Ok(cadence_agent::remote_cli::RemoteAnswer::Ok(mut body)) => {
-                        truncate_issue_ls_body(&mut body, n);
-                        eprint_line(&format!(
-                            "remote board on `{}` predates server-side `issue_ls` limit; \
-                             truncated to {n} locally.",
-                            target.org
-                        ));
-                        cadence_agent::remote_cli::RemoteAnswer::Ok(body)
-                    }
-                    Ok(other) => other,
-                    Err(retry_err) => return remote_failure(retry_err),
-                }
-            } else {
-                if edits_issue_text && error.code() == Some("invalid_request") {
+            if edits_issue_text && error.code() == Some("invalid_request") {
+                eprint_line(
+                    "The server refused this edit. If this board predates CLI body editing, \
+                     use the issue page's description editor or upgrade the board.",
+                );
+            }
+            if verb == "issue_new" && error.kind() == "unknown" {
+                if keyed_issue_create {
                     eprint_line(
-                        "The server refused this edit. If this board predates CLI body editing, \
-                         use the issue page's description editor or upgrade the board.",
+                        "Issue creation was not confirmed. If the board supports retry IDs, \
+                         repeat the same command with the same --request-id, unchanged \
+                         arguments, and the same user and acting agent or human identity. \
+                         If that identity is unavailable, inspect the board instead. \
+                         Do not remove the ID after an unknown outcome.",
+                    );
+                } else {
+                    eprint_line(
+                        "Issue creation was not confirmed. Inspect the board before \
+                         repeating the create; it may already have succeeded.",
                     );
                 }
-                if verb == "issue_new" && error.kind() == "unknown" {
-                    if keyed_issue_create {
-                        eprint_line(
-                            "Issue creation was not confirmed. If the board supports retry IDs, \
-                             repeat the same command with the same --request-id, unchanged \
-                             arguments, and the same user and acting agent or human identity. \
-                             If that identity is unavailable, inspect the board instead. \
-                             Do not remove the ID after an unknown outcome.",
-                        );
-                    } else {
-                        eprint_line(
-                            "Issue creation was not confirmed. Inspect the board before \
-                             repeating the create; it may already have succeeded.",
-                        );
-                    }
-                }
-                if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
-                    eprint_line(&format!(
-                        "remote send `{id}` was not confirmed — it may or may not have \
-                         been recorded. Reconcile before resubmitting: `cadence message \
-                         read {id} --org {}` returns your durable message and its state. \
-                         If nothing is recorded, retry `send` with the same --message {id} \
-                         — the same id and content does not enqueue another message.",
-                        target.org
-                    ));
-                }
-                if let Some((room, id)) = channel_post_key.filter(|_| error.kind() == "unknown") {
-                    eprint_line(&format!(
-                        "remote channel post `{id}` to `{room}` was not confirmed — it may or \
-                         may not have been recorded. Reconcile before resubmitting: `cadence \
-                         channel read {room} --org {}` checks recent messages, or retry `channel \
-                         post` with the same --id {id}, room and text — an identical retry \
-                         deduplicates without double-posting.",
-                        target.org
-                    ));
-                }
-                if let Some(key) = platform_key
-                    .as_deref()
-                    .filter(|_| error.kind() == "unknown")
-                    .filter(|_| stage_operation)
-                {
-                    eprint_line(&format!(
-                        "remote stage `{key}` on org `{}` was not confirmed — nothing runs \
-                         without an owner's approval, and repeating the same `platform stage` \
-                         with `--request {key}` replays the same staged action instead of \
-                         staging a second one.",
-                        target.org
-                    ));
-                }
-                if let Some(key) = platform_key
-                    .filter(|_| error.kind() == "unknown" && !stage_operation && !app_action)
-                {
-                    eprint_line(&format!(
-                        "remote platform call `{key}` on org `{}` was not confirmed — \
-                         reconcile read-only with `cadence --org {} platform status --request {key}` \
-                         before repeating; replaying `platform call` returns a recorded outcome, \
-                         or starts and charges a new call if `{key}` was not recorded.",
-                        target.org, target.org
-                    ));
-                }
-                let error = if matches!(
-                    verb,
-                    "agent_enroll_list" | "agent_enroll_approve" | "agent_enroll_revoke"
-                ) {
-                    scope_hint(
-                        error,
-                        &cadence_agent::remote_cli::saved_capabilities(&target),
-                        "audit.approve",
-                        "cadence login --audit-approve",
-                    )
-                } else {
-                    error
-                };
-                return remote_failure(error);
             }
+            if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
+                eprint_line(&format!(
+                    "remote send `{id}` was not confirmed — it may or may not have \
+                     been recorded. Reconcile before resubmitting: `cadence message \
+                     read {id} --org {}` returns your durable message and its state. \
+                     If nothing is recorded, retry `send` with the same --message {id} \
+                     — the same id and content does not enqueue another message.",
+                    target.org
+                ));
+            }
+            if let Some((room, id)) = channel_post_key.filter(|_| error.kind() == "unknown") {
+                eprint_line(&format!(
+                    "remote channel post `{id}` to `{room}` was not confirmed — it may or \
+                     may not have been recorded. Reconcile before resubmitting: `cadence \
+                     channel read {room} --org {}` checks recent messages, or retry `channel \
+                     post` with the same --id {id}, room and text — an identical retry \
+                     deduplicates without double-posting.",
+                    target.org
+                ));
+            }
+            if let Some(key) = platform_key
+                .as_deref()
+                .filter(|_| error.kind() == "unknown")
+                .filter(|_| stage_operation)
+            {
+                eprint_line(&format!(
+                    "remote stage `{key}` on org `{}` was not confirmed — nothing runs \
+                     without an owner's approval, and repeating the same `platform stage` \
+                     with `--request {key}` replays the same staged action instead of \
+                     staging a second one.",
+                    target.org
+                ));
+            }
+            if let Some(key) = platform_key
+                .filter(|_| error.kind() == "unknown" && !stage_operation && !app_action)
+            {
+                eprint_line(&format!(
+                    "remote platform call `{key}` on org `{}` was not confirmed — \
+                     reconcile read-only with `cadence --org {} platform status --request {key}` \
+                     before repeating; replaying `platform call` returns a recorded outcome, \
+                     or starts and charges a new call if `{key}` was not recorded.",
+                    target.org, target.org
+                ));
+            }
+            let error = if matches!(
+                verb,
+                "agent_enroll_list" | "agent_enroll_approve" | "agent_enroll_revoke"
+            ) {
+                scope_hint(
+                    error,
+                    &cadence_agent::remote_cli::saved_capabilities(&target),
+                    "audit.approve",
+                    "cadence login --audit-approve",
+                )
+            } else {
+                error
+            };
+            return remote_failure(error);
         }
     };
     match out {
@@ -4069,12 +3918,6 @@ fn migration_outcome_exit_code(receipt: &Value) -> i32 {
         Some("failed") => cadence_agent::error::exit_code_for_kind("rejected"),
         Some("unknown") => cadence_agent::error::exit_code_for_kind("unknown"),
         _ => cadence_agent::error::exit_code_for_kind("busy"),
-    }
-}
-
-fn truncate_issue_ls_body(body: &mut Value, limit: usize) {
-    if let Some(issues) = body.get_mut("issues").and_then(Value::as_array_mut) {
-        issues.truncate(limit);
     }
 }
 
@@ -5561,35 +5404,54 @@ mod read_contract_tests {
 
     #[test]
     fn issue_ls_sends_only_the_filter_the_route_owns() {
-        let (verb, args) = outcome(&issue_ls(|l| {
+        use cadence_agent::remote_cli::{RemoteAnswer, ISSUE_LS_LIMIT_UNSUPPORTED};
+
+        let command = issue_ls(|l| {
             l.project = vec!["ops".into()];
             l.status = vec!["doing".into()];
             l.tags = vec!["t".into()];
             l.owner = vec!["me".into()];
             l.plan = vec!["approved".into()];
             l.open = true;
-            l.limit = Some(10);
-        }))
-        .unwrap();
+            l.limit = Some(2);
+        });
+        let (verb, args) = verb_for(&command, None).unwrap();
         assert_eq!(verb, "issue_ls");
-        assert_eq!(
-            args,
-            json!({
-                "project": "ops",
-                "status": ["doing"], "tag": ["t"], "owner": ["me"],
-                "plan": ["approved"], "open": true, "limit": 10,
-            })
-        );
+        let mut expected_args = json!({
+            "project": "ops",
+            "status": ["doing"], "tag": ["t"], "owner": ["me"],
+            "plan": ["approved"], "open": true, "limit": 2,
+        });
+        assert_eq!(Some(&args), expected_args.as_object());
 
         for bad_limit in [0usize, 5001usize] {
             let err = outcome(&issue_ls(|l| l.limit = Some(bad_limit))).unwrap_err();
             assert!(err.contains("--limit"), "{bad_limit}: {err}");
         }
 
-        let mut legacy_body = json!({
+        let legacy_body = json!({
             "issues": [{"id": "OPS-1"}, {"id": "OPS-2"}, {"id": "OPS-3"}]
         });
-        truncate_issue_ls_body(&mut legacy_body, 2);
+        let Commands::Issue { action } = command else {
+            unreachable!();
+        };
+        let mut replies = [
+            Err(Error::invalid(
+                ISSUE_LS_LIMIT_UNSUPPORTED,
+                "the board does not know `limit` for `issue ls`",
+            )),
+            Ok(RemoteAnswer::Ok(legacy_body)),
+        ]
+        .into_iter();
+        let answer = issue_query::call(&action, args, "ops", |sent| {
+            assert_eq!(Some(&sent), expected_args.as_object());
+            expected_args.as_object_mut().unwrap().remove("limit");
+            replies.next().expect("unexpected issue ls request")
+        })
+        .unwrap();
+        let RemoteAnswer::Ok(legacy_body) = answer else {
+            panic!("expected a successful issue list after the compatibility retry");
+        };
         assert_eq!(
             legacy_body,
             json!({"issues": [{"id": "OPS-1"}, {"id": "OPS-2"}]})
