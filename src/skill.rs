@@ -173,9 +173,17 @@ const CADENCE_APP_DEV: BundledSkill = BundledSkill {
     ],
 };
 
+const ASSISTANT_MEMORY: BundledSkill = BundledSkill {
+    name: "assistant-memory",
+    files: &[(
+        "SKILL.md",
+        include_str!("../skills/assistant-memory/SKILL.md"),
+    )],
+};
+
 pub const REQUIRED_SKILL: &str = CADENCE.name;
 
-pub const SKILL_NAMES: [&str; 7] = [
+pub const SKILL_NAMES: [&str; 8] = [
     CADENCE.name,
     BUSINESS_DOCUMENTS.name,
     COMPANY_OUTPUTS.name,
@@ -183,6 +191,7 @@ pub const SKILL_NAMES: [&str; 7] = [
     INCIDENT_RESPONSE.name,
     DELIVERABLE_QA.name,
     CADENCE_APP_DEV.name,
+    ASSISTANT_MEMORY.name,
 ];
 
 /// Short one-line description for each bundled skill, matching the agent page UI.
@@ -195,6 +204,7 @@ pub fn bundled_line(name: &str) -> &'static str {
         "incident-response" => "Contain and close out incidents across teams",
         "deliverable-qa" => "Independent browser and visual QA before release",
         "cadence-app-dev" => "Build, audit and package sandboxed Cadence apps",
+        "assistant-memory" => "Personal SOUL.md, MEMORY.md and memory search discipline",
         _ => "Bundled skill",
     }
 }
@@ -208,6 +218,7 @@ fn bundle_by_name(name: &str) -> Option<&'static BundledSkill> {
         "incident-response" => Some(&INCIDENT_RESPONSE),
         "deliverable-qa" => Some(&DELIVERABLE_QA),
         "cadence-app-dev" => Some(&CADENCE_APP_DEV),
+        "assistant-memory" => Some(&ASSISTANT_MEMORY),
         _ => None,
     }
 }
@@ -396,6 +407,7 @@ pub(super) fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> 
             INCIDENT_RESPONSE,
             DELIVERABLE_QA,
             CADENCE_APP_DEV,
+            ASSISTANT_MEMORY,
         ]),
         Some("cadence") => Ok(&[CADENCE]),
         Some("business-documents") => Ok(&[BUSINESS_DOCUMENTS]),
@@ -404,6 +416,7 @@ pub(super) fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> 
         Some("incident-response") => Ok(&[INCIDENT_RESPONSE]),
         Some("deliverable-qa") => Ok(&[DELIVERABLE_QA]),
         Some("cadence-app-dev") => Ok(&[CADENCE_APP_DEV]),
+        Some("assistant-memory") => Ok(&[ASSISTANT_MEMORY]),
         Some(name) => Err(Error::rejected(format!(
             "unknown bundled skill {name:?}; expected {}",
             SKILL_NAMES.join(", ")
@@ -804,5 +817,17 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert!(root.join("cadence/SKILL.md").is_file());
         assert!(!root.join("deliverable-qa").exists());
+    }
+
+    #[test]
+    fn assistant_memory_bundle_registers_and_shows() {
+        assert!(SKILL_NAMES.contains(&"assistant-memory"));
+        match show("assistant-memory", Some("SKILL.md")).unwrap() {
+            ShowOutput::File(text) => {
+                assert!(text.contains("cadence assist memory search"));
+                assert!(text.contains("cadence assist soul set"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
     }
 }

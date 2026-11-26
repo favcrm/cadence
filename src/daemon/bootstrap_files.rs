@@ -26,10 +26,13 @@ pub const BOOTSTRAP: &str = "BOOTSTRAP.md";
 pub const IDENTITY: &str = "IDENTITY.md";
 pub const SOUL: &str = "SOUL.md";
 pub const USER: &str = "USER.md";
+/// Personal working memory index inside the principal's private cwd.
+pub const MEMORY: &str = "MEMORY.md";
 /// Platform-managed instructions: seeded once, never rewritten from chat.
 pub const AGENTS: &str = "AGENTS.md";
 /// Byte cap per profile field and for the whole profile object.
 pub const FIELD_MAX: usize = 4096;
+pub const SOUL_MAX: usize = crate::managed_section::SOUL_BODY_MAX;
 pub const PROFILE_MAX: usize = 16384;
 /// Largest existing file read or replaced. Larger files refuse.
 pub const FILE_MAX: u64 = 64 * 1024;
@@ -39,11 +42,14 @@ const IDENTITY_TEMPLATE: &str = include_str!("../../agents/member-assistant/IDEN
 const SOUL_TEMPLATE: &str = include_str!("../../agents/member-assistant/SOUL.md");
 const USER_TEMPLATE: &str = include_str!("../../agents/member-assistant/USER.md");
 const AGENTS_TEMPLATE: &str = include_str!("../../agents/member-assistant/AGENTS.md");
+pub const MEMORY_SEED: &str =
+    "# Memory\n\nOne line per fact, newest first. Longer notes go in memory/<topic>.md.\n";
 
 /// The closed profile object a member may agree to.
 ///
 /// `name` and `tone` are the ASSISTANT's display name and agreed way of
-/// speaking (IDENTITY.md, SOUL.md). `user_name` is how the assistant addresses
+/// speaking (IDENTITY.md, SOUL.md). `soul` is the multi-line Markdown working
+/// norm body inside `SOUL.md`. `user_name` is how the assistant addresses
 /// the USER and lives in its own USER.md section — never IDENTITY.md.
 /// `preferences` holds other agreed user preferences. `look` is the avatar
 /// slug (`params.look`, not a file) and must be one of the catalogue's eleven.
@@ -51,6 +57,7 @@ const AGENTS_TEMPLATE: &str = include_str!("../../agents/member-assistant/AGENTS
 pub struct Profile {
     pub name: Option<String>,
     pub tone: Option<String>,
+    pub soul: Option<String>,
     pub preferences: Option<String>,
     pub user_name: Option<String>,
     pub look: Option<String>,
@@ -59,7 +66,7 @@ pub struct Profile {
 impl Profile {
     /// Refuse unknown fields, non-strings and oversized values before any
     /// effect. Reserved managed-section markers are refused, not stored.
-    /// An empty `name`/`tone`/`user_name` is the explicit clear.
+    /// An empty `name`/`tone`/`user_name`/`soul` is the explicit clear.
     pub fn parse(object: &serde_json::Map<String, serde_json::Value>) -> Result<Self> {
         let mut total = 0usize;
         let mut out = Profile::default();
@@ -67,7 +74,8 @@ impl Profile {
             let text = value
                 .as_str()
                 .ok_or_else(|| Error::rejected("bootstrap profile values must be strings"))?;
-            if text.len() > FIELD_MAX {
+            let cap = if key == "soul" { SOUL_MAX } else { FIELD_MAX };
+            if text.len() > cap {
                 return Err(Error::rejected("bootstrap profile field is too long"));
             }
             if text.contains("cadence:managed-") {
@@ -84,6 +92,17 @@ impl Profile {
                     ))
                 })?;
                 out.look = Some(look.to_string());
+                continue;
+            }
+            if key == "soul" {
+                crate::secret::guard("bootstrap soul", text)?;
+                let cleaned = crate::managed_section::clean_multiline(text);
+                if cleaned.len() > crate::managed_section::MULTILINE_ESCAPED_MAX {
+                    return Err(Error::rejected(
+                        "bootstrap profile field is too long after escaping",
+                    ));
+                }
+                out.soul = Some(cleaned);
                 continue;
             }
             let slot = match key.as_str() {
@@ -134,8 +153,15 @@ pub fn read_identity(root: &Path) -> Result<Identity> {
     })
 }
 
+/// Read the optional multi-line `soul_body` section from `SOUL.md`.
+#[cfg(test)]
+pub fn read_soul_body(root: &Path) -> Result<Option<String>> {
+    let soul = read_profile_file(root, SOUL)?;
+    crate::managed_section::read_multiline(&soul, "soul_body")
+}
+
 /// Open `root` as a directory fd, refusing a symlink at the root itself.
-fn open_root(root: &Path) -> Result<DirFd> {
+pub(super) fn open_root(root: &Path) -> Result<DirFd> {
     DirFd::open_nofollow(root).map_err(|err| {
         if err.kind() == ErrorKind::InvalidInput {
             Error::rejected("bootstrap root contains an interior nul")
@@ -146,7 +172,7 @@ fn open_root(root: &Path) -> Result<DirFd> {
 }
 
 fn literal(name: &str) -> Result<CString> {
-    if !matches!(name, BOOTSTRAP | IDENTITY | SOUL | USER | AGENTS) {
+    if !matches!(name, BOOTSTRAP | IDENTITY | SOUL | USER | AGENTS | MEMORY) {
         return Err(Error::rejected(
             "bootstrap file name is not in the managed set",
         ));
@@ -154,11 +180,10 @@ fn literal(name: &str) -> Result<CString> {
     CString::new(name).map_err(|_| Error::rejected("bad bootstrap file name"))
 }
 
-/// Open a managed file read-only, no-follow, non-blocking, and require a
+/// Open a child entry read-only, no-follow, non-blocking, and require a
 /// regular file. `Ok(None)` only for a genuinely absent file.
-fn open_read(root: &DirFd, name: &str) -> Result<Option<File>> {
-    let cname = literal(name)?;
-    let file = match root.open_readonly_nofollow(&cname) {
+pub(super) fn open_read_child(root: &DirFd, name: &str, cname: &CString) -> Result<Option<File>> {
+    let file = match root.open_readonly_nofollow(cname) {
         Ok(file) => file,
         Err(err) => {
             return match err.raw_os_error() {
@@ -180,11 +205,18 @@ fn open_read(root: &DirFd, name: &str) -> Result<Option<File>> {
     Ok(Some(file))
 }
 
-/// Read at most `FILE_MAX + 1` bytes; a larger file refuses, never truncates.
-fn read_bounded(file: &mut File, name: &str) -> Result<String> {
+/// Open a managed file read-only, no-follow, non-blocking, and require a
+/// regular file. `Ok(None)` only for a genuinely absent file.
+fn open_read(root: &DirFd, name: &str) -> Result<Option<File>> {
+    let cname = literal(name)?;
+    open_read_child(root, name, &cname)
+}
+
+/// Read at most `cap + 1` bytes; a larger file refuses, never truncates.
+pub(super) fn read_bounded_capped(file: &mut File, name: &str, cap: u64) -> Result<String> {
     let mut bytes = Vec::new();
-    Read::take(&mut *file, FILE_MAX + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > FILE_MAX {
+    Read::take(&mut *file, cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
         return Err(Error::rejected(format!(
             "bootstrap file '{name}' is over the size cap"
         )));
@@ -193,17 +225,37 @@ fn read_bounded(file: &mut File, name: &str) -> Result<String> {
         .map_err(|_| Error::rejected(format!("bootstrap file '{name}' is not UTF-8")))
 }
 
+/// Read at most `FILE_MAX + 1` bytes; a larger file refuses, never truncates.
+fn read_bounded(file: &mut File, name: &str) -> Result<String> {
+    read_bounded_capped(file, name, FILE_MAX)
+}
+
 /// Seed the profile files and the platform AGENTS.md when missing. BOOTSTRAP
 /// is created only when `include_bootstrap` is true, which the caller sets
 /// only while the stored state is `pending`. Exclusive create never overwrites
 /// an existing file, including a symlink. Every other error propagates.
 pub fn seed(root: &Path, include_bootstrap: bool) -> Result<()> {
     let dir = open_root(root)?;
+    match dir.mkdir(c"memory", 0o700) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(Error::rejected(format!(
+                "bootstrap seed of 'memory/' failed: {err}"
+            )));
+        }
+    }
+    let _ = dir.open_child_dir(c"memory").map_err(|err| {
+        Error::rejected(format!(
+            "bootstrap 'memory/' directory is invalid or a symlink: {err}"
+        ))
+    })?;
     let mut files = vec![
         (IDENTITY, IDENTITY_TEMPLATE),
         (SOUL, SOUL_TEMPLATE),
         (USER, USER_TEMPLATE),
         (AGENTS, AGENTS_TEMPLATE),
+        (MEMORY, MEMORY_SEED),
     ];
     if include_bootstrap {
         files.push((BOOTSTRAP, BOOTSTRAP_TEMPLATE));
@@ -237,16 +289,19 @@ pub fn seed(root: &Path, include_bootstrap: bool) -> Result<()> {
 /// Flush the trusted root's directory entry (a create or a rename) to disk.
 /// A failure is returned, so the caller never commits state on an unflushed
 /// directory entry.
-fn fsync_dir(root: &DirFd) -> Result<()> {
+pub(super) fn fsync_dir(root: &DirFd) -> Result<()> {
     root.sync_all()
         .map_err(|_| Error::rejected("bootstrap directory sync failed; state is not committed"))
 }
 
-/// Replace one managed file atomically: bounded read, exclusive temp file,
-/// fsync, `renameat` within the trusted root. The temp name is removed on any
-/// failure. Existing content is never truncated in place.
-fn replace_file(root: &DirFd, name: &str, next: &str) -> Result<()> {
-    let cname = literal(name)?;
+/// Replace one child file inside `root` atomically: exclusive temp file,
+/// fsync, `renameat` within `root`, and directory fsync.
+pub(super) fn replace_child_in_dir(
+    root: &DirFd,
+    name: &str,
+    cname: &CString,
+    next: &str,
+) -> Result<()> {
     let temp = format!(".{name}.{}.tmp", std::process::id());
     let ctemp = CString::new(temp).map_err(|_| Error::rejected("bad temp name"))?;
     let mut file = root
@@ -264,13 +319,21 @@ fn replace_file(root: &DirFd, name: &str, next: &str) -> Result<()> {
             "bootstrap write of '{name}' failed"
         )));
     }
-    if root.rename_child(&ctemp, &cname).is_err() {
+    if root.rename_child(&ctemp, cname).is_err() {
         let _ = root.unlink_child(&ctemp);
         return Err(Error::rejected(format!(
             "bootstrap rename of '{name}' failed"
         )));
     }
     fsync_dir(root)
+}
+
+/// Replace one managed file atomically: bounded read, exclusive temp file,
+/// fsync, `renameat` within the trusted root. The temp name is removed on any
+/// failure. Existing content is never truncated in place.
+fn replace_file(root: &DirFd, name: &str, next: &str) -> Result<()> {
+    let cname = literal(name)?;
+    replace_child_in_dir(root, name, &cname, next)
 }
 
 /// Write the agreed profile fields into IDENTITY/SOUL/USER. Each target must
@@ -301,6 +364,19 @@ pub fn write_profile(root: &Path, profile: &Profile) -> Result<()> {
             )));
         }
         replace_file(&dir, name, &next)?;
+    }
+    if let Some(soul_md) = profile.soul.as_ref() {
+        let mut file = open_read(&dir, SOUL)?
+            .ok_or_else(|| Error::rejected("bootstrap file 'SOUL.md' is missing"))?;
+        let current = read_bounded(&mut file, SOUL)?;
+        drop(file);
+        let next = crate::managed_section::set_multiline(&current, "soul_body", soul_md)?;
+        if next.len() as u64 > FILE_MAX {
+            return Err(Error::rejected(
+                "bootstrap file 'SOUL.md' would exceed the cap",
+            ));
+        }
+        replace_file(&dir, SOUL, &next)?;
     }
     Ok(())
 }

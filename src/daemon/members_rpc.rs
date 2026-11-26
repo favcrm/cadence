@@ -357,6 +357,23 @@ impl Shared {
                     )));
                 }
             }
+            // CAD-2832: own personal SOUL.md / MEMORY.md / permitted skills.
+            // Identity is derived strictly from the connection; caller-supplied
+            // target/principal fields are refused.
+            "assistant_context_update"
+            | "assistant_memory_search"
+            | "assistant_memory_read"
+            | "assistant_memory_undo"
+            | "assistant_skill_show" => {
+                for field in ["alias", "to", "agent", "org", "sub", "user", "assistant_id"] {
+                    if params.get(field).is_some() {
+                        return Err(Error::rejected(format!(
+                            "assist agent '{alias}' may not pass '{field}' to {method} — \
+                             identity comes from the connection (CAD-2832)"
+                        )));
+                    }
+                }
+            }
             // Every other method — including broad reads like `health`,
             // `daemon_info`, `agent_list`, `job_list`, issues, wiki,
             // dispatch, register, plans and every operator effect — is
@@ -376,9 +393,13 @@ impl Shared {
         // credential, because this connection carries no member envelope.
         let (operation, scope) = match method {
             "agent_show" | "agent_events" => ("assist_state", "assist.read"),
-            "thread_read" | "message_read" | "message_report" | "message_list" => {
-                ("assist_history", "assist.read")
-            }
+            "thread_read"
+            | "message_read"
+            | "message_report"
+            | "message_list"
+            | "assistant_memory_search"
+            | "assistant_memory_read"
+            | "assistant_skill_show" => ("assist_history", "assist.read"),
             "job_show" | "task_show" => ("job_evidence", "assist.jobs"),
             "job_events" => ("job_events", "assist.jobs"),
             _ => ("assist_send", "assist.write"),
@@ -3492,17 +3513,26 @@ impl Shared {
         }))
     }
 
-    /// CAD-1420: the private profile context for a stamped, interactive member
-    /// turn. Returns `Ok(None)` for ordinary agents, Master, job notices, nudges,
-    /// unstamped work and inactive bindings. An unknown stored state or an
-    /// unreadable profile file is an error, never a silent empty profile. The
-    /// BOOTSTRAP body is included only while the stored state is `pending`. The
-    /// ACK contract is shown in every valid state, so a deferred or completed
-    /// member can still resume or update through the same closed object.
+    /// CAD-1420 / CAD-2832: full Layer-1 profile context for tests & explicit reads.
+    #[cfg(all(test, feature = "test-seam"))]
     pub(super) fn member_profile_context(
         &self,
         message: &store::Message,
     ) -> Result<Option<String>> {
+        Ok(self
+            .member_profile_context_for_turn(message, None, true)?
+            .map(|(text, _)| text))
+    }
+
+    /// CAD-2832: 3-layer personal context loader for a stamped, interactive
+    /// member turn. Returns `Ok(None)` for ordinary agents, Master, job notices,
+    /// nudges, unstamped work, inactive bindings, or unchanged mid-session turns.
+    pub(super) fn member_profile_context_for_turn(
+        &self,
+        message: &store::Message,
+        session_key: Option<&str>,
+        force_full: bool,
+    ) -> Result<Option<(String, Option<MemberDeliveredContext>)>> {
         if message.source == "assist_job_event" || message.is_nudge() {
             return Ok(None);
         }
@@ -3535,10 +3565,11 @@ impl Shared {
         // files are the authority, so an unreadable/malformed profile errors
         // here too rather than briefing the model with a guessed name.
         let identity = super::bootstrap_files::read_identity(&root)?;
-        let pinned = self
-            .store
-            .agent_opt(&binding.alias)?
-            .and_then(|agent| agent.params)
+        let snap = super::assistant_memory::snapshot_for_prompt(&root)?;
+        let agent = self.store.agent_opt(&binding.alias)?;
+        let pinned = agent
+            .as_ref()
+            .and_then(|agent| agent.params.as_ref())
             .and_then(|params| {
                 params
                     .get("look")
@@ -3546,13 +3577,94 @@ impl Shared {
                     .map(str::to_string)
             });
         let look = crate::agent_roles::effective_look(&binding.alias, pinned.as_deref());
+        let skills = allowed_assistant_skills(agent.as_ref());
+        let skills_section = render_available_skills(&skills);
+        let skills_sha = crate::delegation::sha256_hex(skills_section.as_bytes());
+        let next_delivered = MemberDeliveredContext {
+            session_key: session_key.map(str::to_string),
+            snapshot: snap.clone(),
+            skills_sha: skills_sha.clone(),
+            bootstrap_state: state.to_string(),
+            bootstrap_revision: binding.bootstrap_revision,
+        };
+
+        let prior = if force_full {
+            None
+        } else {
+            self.member_context_delivered
+                .lock()
+                .unwrap()
+                .delivered
+                .get(&binding.alias)
+                .cloned()
+                .filter(|prev| prev.session_key.as_deref() == session_key)
+        };
+
+        if let Some(prev) = prior {
+            let mut parts: Vec<String> = Vec::new();
+            if snap.soul_sha != prev.snapshot.soul_sha {
+                parts.push(format!(
+                    "[Your SOUL.md was updated; this replaces your earlier standing instructions. \
+                     They rank below the user's current request.]\n\n{}",
+                    snap.soul_text
+                ));
+            }
+            if snap.identity_sha != prev.snapshot.identity_sha {
+                parts.push(format!(
+                    "[Your IDENTITY.md was updated.]\n\n{}",
+                    snap.identity_text
+                ));
+            }
+            if snap.user_sha != prev.snapshot.user_sha {
+                parts.push(format!("[Your USER.md was updated.]\n\n{}", snap.user_text));
+            }
+            if snap.memory_sha != prev.snapshot.memory_sha {
+                if let Some(delta) = super::assistant_memory::diff_memory(
+                    &prev.snapshot.memory_text,
+                    &snap.memory_text,
+                ) {
+                    parts.push(delta);
+                }
+            }
+            if snap.topics != prev.snapshot.topics {
+                let changed_topics = diff_topic_names(&prev.snapshot.topics, &snap.topics);
+                if !changed_topics.is_empty() {
+                    parts.push(format!(
+                        "[Your memory/ topic files changed outside this turn: {}. Read if relevant \
+                         with `cadence assist memory read memory/<name>`.]",
+                        changed_topics.join(", ")
+                    ));
+                }
+            }
+            if skills_sha != prev.skills_sha {
+                parts.push(skills_section);
+            }
+            if state != prev.bootstrap_state
+                || binding.bootstrap_revision != prev.bootstrap_revision
+            {
+                parts.push(format!(
+                    "[Profile state updated: state={state}, revision={}]",
+                    binding.bootstrap_revision
+                ));
+                if state == "pending" && prev.bootstrap_state != "pending" {
+                    parts.push(format!(
+                        "## Bootstrap (pending)\n\n{}",
+                        super::bootstrap_files::read_profile_file(
+                            &root,
+                            super::bootstrap_files::BOOTSTRAP,
+                        )?
+                    ));
+                }
+            }
+            if parts.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some((parts.join("\n\n"), Some(next_delivered))));
+        }
+
         let mut out = String::from("## Your private assistant profile\n\n");
-        for name in [
-            super::bootstrap_files::IDENTITY,
-            super::bootstrap_files::SOUL,
-            super::bootstrap_files::USER,
-        ] {
-            out.push_str(&super::bootstrap_files::read_profile_file(&root, name)?);
+        for text in [&snap.identity_text, &snap.soul_text, &snap.user_text] {
+            out.push_str(text);
             out.push_str("\n\n");
         }
         out.push_str(&format!(
@@ -3566,14 +3678,25 @@ impl Shared {
             name = identity.name.as_deref().unwrap_or("(unset)"),
             tone = identity.tone.as_deref().unwrap_or("(unset)"),
         ));
+        out.push_str("## Your private memory (MEMORY.md)\n\n");
+        out.push_str(&super::assistant_memory::render_quoted_memory(
+            &snap.memory_text,
+            super::assistant_memory::MEMORY_INDEX_LINE_CAP,
+        ));
+        out.push_str("\n\n");
+        out.push_str(&skills_section);
+        out.push_str("\n\n");
         out.push_str(&format!(
             "## Profile state\n\nstate: {state}\nrevision: {rev}\n\n\
              Your reply already answers the user's request above. Setup is optional.\n\n\
-             To record an agreed change on this turn, ACK with a JSON object on stdin, \
+             To save a memory fact: `cadence assist memory add \"<fact>\"`; to search: \
+             `cadence assist memory search \"<keywords>\"`; to update SOUL.md when the user \
+             asks or agrees: `cadence assist soul set --file -`.\n\
+             To record an agreed bootstrap/identity change on this turn, ACK with a JSON object on stdin, \
              for example: `cadence message ack --bootstrap-file -` with \
              {{\"action\":\"update\",\"expected_revision\":{rev},\"profile\":{{\"name\":\"Ana\"}}}}\n\
              Allowed actions in this state: {allowed}.\n\
-             Profile keys: name (your name), tone, user_name (the user's preferred \
+             Profile keys: name (your name), tone, soul (multi-line Markdown), user_name (the user's preferred \
              address), preferences, look. An empty string clears a value.\n\
              look must be one of: {looks}.\n\n",
             rev = binding.bootstrap_revision,
@@ -3587,6 +3710,578 @@ impl Shared {
             )?);
             out.push_str("\n\n");
         }
-        Ok(Some(out))
+        Ok(Some((out, Some(next_delivered))))
     }
+
+    pub(super) fn record_member_self_refresh(
+        &self,
+        alias: &str,
+        turn_id: &str,
+        root: &std::path::Path,
+        targets: &[MemberRefreshTarget<'_>],
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        let Ok(snap) = super::assistant_memory::snapshot_for_prompt(root) else {
+            return;
+        };
+        let needs_bootstrap = targets
+            .iter()
+            .any(|t| matches!(t, MemberRefreshTarget::BootstrapState));
+        let binding = if needs_bootstrap {
+            self.store.assistant_for_alias(alias).ok().flatten()
+        } else {
+            None
+        };
+        let mut guard = self.member_context_delivered.lock().unwrap();
+        // Stage only the mutated file(s) so external mid-turn edits to any
+        // unrelated file are never swept into `delivered`.
+        let entry = guard.in_turn_refresh.entry(alias.to_string()).or_default();
+        if entry.turn_id != turn_id {
+            *entry = MemberSelfOverlay {
+                turn_id: turn_id.to_string(),
+                ..MemberSelfOverlay::default()
+            };
+        }
+        for target in targets {
+            match target {
+                MemberRefreshTarget::Identity => {
+                    entry.identity = Some((snap.identity_sha.clone(), snap.identity_text.clone()));
+                }
+                MemberRefreshTarget::Soul => {
+                    entry.soul = Some((snap.soul_sha.clone(), snap.soul_text.clone()));
+                }
+                MemberRefreshTarget::User => {
+                    entry.user = Some((snap.user_sha.clone(), snap.user_text.clone()));
+                }
+                MemberRefreshTarget::Memory => {
+                    entry.memory = Some((snap.memory_sha.clone(), snap.memory_text.clone()));
+                }
+                MemberRefreshTarget::Topic(name) => {
+                    let fname = name.strip_prefix("memory/").unwrap_or(name);
+                    entry
+                        .topics
+                        .insert(fname.to_string(), snap.topics.get(fname).cloned());
+                }
+                MemberRefreshTarget::BootstrapState => {
+                    if let Some(b) = binding.as_ref() {
+                        entry.bootstrap_state =
+                            Some((b.bootstrap_state.clone(), b.bootstrap_revision));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn stage_pending_member_delivered(
+        &self,
+        alias: &str,
+        turn_id: &str,
+        delivered: MemberDeliveredContext,
+    ) {
+        let mut guard = self.member_context_delivered.lock().unwrap();
+        guard
+            .pending_turns
+            .insert(alias.to_string(), (turn_id.to_string(), delivered));
+    }
+
+    pub(super) fn commit_member_delivered(
+        &self,
+        alias: &str,
+        turn_id: &str,
+        pending: Option<MemberDeliveredContext>,
+    ) {
+        let mut guard = self.member_context_delivered.lock().unwrap();
+        let staged = guard
+            .pending_turns
+            .remove(alias)
+            .filter(|(t, _)| t == turn_id)
+            .map(|(_, d)| d);
+        let base = pending
+            .or(staged)
+            .or_else(|| guard.delivered.get(alias).cloned());
+        let overlay = guard
+            .in_turn_refresh
+            .remove(alias)
+            .filter(|o| o.turn_id == turn_id);
+        if let Some(mut d) = base {
+            if let Some(ov) = overlay {
+                if let Some((sha, text)) = ov.identity {
+                    d.snapshot.identity_sha = sha;
+                    d.snapshot.identity_text = text;
+                }
+                if let Some((sha, text)) = ov.soul {
+                    d.snapshot.soul_sha = sha;
+                    d.snapshot.soul_text = text;
+                }
+                if let Some((sha, text)) = ov.user {
+                    d.snapshot.user_sha = sha;
+                    d.snapshot.user_text = text;
+                }
+                if let Some((sha, text)) = ov.memory {
+                    d.snapshot.memory_sha = sha;
+                    d.snapshot.memory_text = text;
+                }
+                for (fname, val) in ov.topics {
+                    match val {
+                        Some(sha) => {
+                            d.snapshot.topics.insert(fname, sha);
+                        }
+                        None => {
+                            d.snapshot.topics.remove(&fname);
+                        }
+                    }
+                }
+                if let Some((state, rev)) = ov.bootstrap_state {
+                    d.bootstrap_state = state;
+                    d.bootstrap_revision = rev;
+                }
+            }
+            guard.delivered.insert(alias.to_string(), d);
+        }
+    }
+
+    pub(super) fn discard_member_turn_state(&self, alias: &str, turn_id: &str) {
+        let mut guard = self.member_context_delivered.lock().unwrap();
+        if guard
+            .pending_turns
+            .get(alias)
+            .is_some_and(|(t, _)| t == turn_id)
+        {
+            guard.pending_turns.remove(alias);
+        }
+        if guard
+            .in_turn_refresh
+            .get(alias)
+            .is_some_and(|o| o.turn_id == turn_id)
+        {
+            guard.in_turn_refresh.remove(alias);
+        }
+    }
+
+    pub(super) fn clear_member_delivered(&self, alias: &str) {
+        let mut guard = self.member_context_delivered.lock().unwrap();
+        guard.delivered.remove(alias);
+        guard.pending_turns.remove(alias);
+        guard.in_turn_refresh.remove(alias);
+    }
+
+    fn require_active_member_assistant(
+        &self,
+        method: &str,
+        peer_pid: u32,
+    ) -> Result<(crate::store::AssistantBinding, std::path::PathBuf)> {
+        let verified = match self.caller_identity(peer_pid)? {
+            Caller::Agent(verified) => verified,
+            Caller::NoAgentIdentity => {
+                return Err(Error::rejected(format!(
+                    "{method} refused: requires a live bound member assistant connection"
+                )));
+            }
+        };
+        let binding = self
+            .store
+            .assistant_for_alias(&verified.agent.alias)?
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "{method} refused: caller '{}' is not a bound member assistant",
+                    verified.agent.alias
+                ))
+            })?;
+        if !binding.is_active() {
+            return Err(Error::rejected(format!(
+                "{method} refused: assistant binding is {}",
+                binding.state
+            )));
+        }
+        self.assistant_runtime_cwd_guard(&binding)?;
+        let root = self.assistant_principal_cwd(&binding.org, &binding.sub);
+        Ok((binding, root))
+    }
+
+    fn require_interactive_member_turn(
+        &self,
+        method: &str,
+        binding: &crate::store::AssistantBinding,
+    ) -> Result<store::Message> {
+        let running = self
+            .store
+            .running_message(&binding.alias)?
+            .ok_or_else(|| Error::rejected(format!("{method} requires a live running turn")))?;
+        if running.source == "assist_job_event" || running.is_nudge() {
+            return Err(Error::rejected(format!(
+                "{method} refused: background job notices and nudges cannot mutate SOUL.md or delete/undo memories"
+            )));
+        }
+        let stamp = self
+            .store
+            .message_member_authority(&running.id)?
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "{method} refused: the running turn has no verified member authority"
+                ))
+            })?;
+        if stamp.org != binding.org
+            || stamp.sub != binding.sub
+            || stamp.assistant_id != binding.assistant_id
+        {
+            return Err(Error::rejected(format!(
+                "{method} refused: turn member authority does not match binding"
+            )));
+        }
+        self.member_message_reprove(&running)?;
+        Ok(running)
+    }
+
+    fn require_member_memory_turn(
+        &self,
+        method: &str,
+        binding: &crate::store::AssistantBinding,
+    ) -> Result<(store::Message, Option<&'static str>)> {
+        let running = self
+            .store
+            .running_message(&binding.alias)?
+            .ok_or_else(|| Error::rejected(format!("{method} requires a running turn")))?;
+        if running.is_nudge() {
+            return Err(Error::rejected(format!("{method} refused on a nudge")));
+        }
+        if running.source == "assist_job_event" {
+            self.member_message_reprove(&running)?;
+            return Ok((running, Some("job_event")));
+        }
+        let stamp = self
+            .store
+            .message_member_authority(&running.id)?
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "{method} refused: turn lacks verified member authority"
+                ))
+            })?;
+        if stamp.org != binding.org
+            || stamp.sub != binding.sub
+            || stamp.assistant_id != binding.assistant_id
+        {
+            return Err(Error::rejected(format!(
+                "{method} refused: turn authority does not match binding"
+            )));
+        }
+        self.member_message_reprove(&running)?;
+        Ok((running, None))
+    }
+
+    /// `assistant_context_update`: guarded updates to `SOUL.md`, `MEMORY.md`, and `memory/<topic>.md`.
+    pub(super) fn rpc_assistant_context_update(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let obj = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("assistant_context_update request must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "op",
+            "fact",
+            "query",
+            "topic",
+            "content",
+            "text",
+            "soul",
+            "tone",
+            "expected_sha",
+        ];
+        if let Some(field) = obj.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+            return Err(Error::rejected(format!(
+                "assistant_context_update field '{field}' is not accepted"
+            )));
+        }
+        let (binding, root) =
+            self.require_active_member_assistant("assistant_context_update", peer_pid)?;
+        let op = required_str(params, "op")?;
+        let (running_id, out) = match op {
+            "update_soul" => {
+                let running = self.require_interactive_member_turn(
+                    "assistant_context_update(update_soul)",
+                    &binding,
+                )?;
+                let soul = required_str(params, "soul")?;
+                let tone = optional_str(params, "tone");
+                let expected_sha = optional_str(params, "expected_sha");
+                let res = super::assistant_memory::update_soul(
+                    &root,
+                    soul,
+                    tone,
+                    expected_sha,
+                    &binding.alias,
+                    &running.id,
+                )?;
+                (running.id, res)
+            }
+            "forget" => {
+                let running = self.require_interactive_member_turn(
+                    "assistant_context_update(forget)",
+                    &binding,
+                )?;
+                let query = required_str(params, "query")?;
+                let res =
+                    super::assistant_memory::forget(&root, query, &binding.alias, &running.id)?;
+                (running.id, res)
+            }
+            "remember" => {
+                let (running, source_tag) = self
+                    .require_member_memory_turn("assistant_context_update(remember)", &binding)?;
+                let fact = required_str(params, "fact")?;
+                let res = super::assistant_memory::remember(
+                    &root,
+                    fact,
+                    source_tag,
+                    &binding.alias,
+                    &running.id,
+                )?;
+                (running.id, res)
+            }
+            "write_topic" => {
+                let (running, source_tag) = self.require_member_memory_turn(
+                    "assistant_context_update(write_topic)",
+                    &binding,
+                )?;
+                let topic = required_str(params, "topic")?;
+                let content = params
+                    .get("content")
+                    .or_else(|| params.get("text"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::rejected("write_topic requires content"))?;
+                let res = super::assistant_memory::write_topic(
+                    &root,
+                    topic,
+                    content,
+                    source_tag,
+                    &binding.alias,
+                    &running.id,
+                )?;
+                (running.id, res)
+            }
+            other => {
+                return Err(Error::rejected(format!(
+                    "unsupported assistant_context_update op '{other}'"
+                )));
+            }
+        };
+        let changed = out.get("added").and_then(Value::as_bool).unwrap_or(true)
+            && out.get("forgot").and_then(Value::as_bool).unwrap_or(true);
+        if changed {
+            let path_str = out.get("path").and_then(Value::as_str).unwrap_or_default();
+            let targets = match op {
+                "update_soul" => vec![MemberRefreshTarget::Soul],
+                "remember" | "forget" => vec![MemberRefreshTarget::Memory],
+                "write_topic" => vec![MemberRefreshTarget::Topic(path_str)],
+                _ => Vec::new(),
+            };
+            self.record_member_self_refresh(&binding.alias, &running_id, &root, &targets);
+            let _ = self.store.event_public(
+                &binding.alias,
+                "assistant_context_updated",
+                json!({
+                    "op": op,
+                    "history_id": out.get("history_id"),
+                    "target": out.get("target").or_else(|| out.get("path")),
+                }),
+            );
+        }
+        Ok(out)
+    }
+
+    pub(super) fn rpc_assistant_memory_search(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let obj = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("assistant_memory_search request must be an object"))?;
+        if let Some(field) = obj
+            .keys()
+            .find(|k| !matches!(k.as_str(), "query" | "limit"))
+        {
+            return Err(Error::rejected(format!(
+                "assistant_memory_search field '{field}' is not accepted"
+            )));
+        }
+        let (_binding, root) =
+            self.require_active_member_assistant("assistant_memory_search", peer_pid)?;
+        let query = required_str(params, "query")?;
+        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+        super::assistant_memory::search_memory(&root, query, limit)
+    }
+
+    pub(super) fn rpc_assistant_memory_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let obj = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("assistant_memory_read request must be an object"))?;
+        if let Some(field) = obj.keys().find(|k| k.as_str() != "file") {
+            return Err(Error::rejected(format!(
+                "assistant_memory_read field '{field}' is not accepted"
+            )));
+        }
+        let (_binding, root) =
+            self.require_active_member_assistant("assistant_memory_read", peer_pid)?;
+        let file = required_str(params, "file")?;
+        super::assistant_memory::read_allowed_file(&root, file)
+    }
+
+    pub(super) fn rpc_assistant_memory_undo(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let obj = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("assistant_memory_undo request must be an object"))?;
+        if let Some(field) = obj.keys().find(|k| k.as_str() != "history_id") {
+            return Err(Error::rejected(format!(
+                "assistant_memory_undo field '{field}' is not accepted"
+            )));
+        }
+        let (binding, root) =
+            self.require_active_member_assistant("assistant_memory_undo", peer_pid)?;
+        let running = self.require_interactive_member_turn("assistant_memory_undo", &binding)?;
+        let history_id = required_str(params, "history_id")?;
+        let out = super::assistant_memory::undo(&root, history_id, &binding.alias, &running.id)?;
+        let target = out
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let targets = match target {
+            super::bootstrap_files::SOUL => vec![MemberRefreshTarget::Soul],
+            super::bootstrap_files::MEMORY => vec![MemberRefreshTarget::Memory],
+            super::bootstrap_files::IDENTITY => vec![MemberRefreshTarget::Identity],
+            super::bootstrap_files::USER => vec![MemberRefreshTarget::User],
+            other => other
+                .strip_prefix("memory/")
+                .map(|name| vec![MemberRefreshTarget::Topic(name)])
+                .unwrap_or_default(),
+        };
+        self.record_member_self_refresh(&binding.alias, &running.id, &root, &targets);
+        let _ = self.store.event_public(
+            &binding.alias,
+            "assistant_context_updated",
+            json!({
+                "op": "undo",
+                "history_id": out.get("undo_history_id"),
+                "target": out.get("target"),
+            }),
+        );
+        Ok(out)
+    }
+
+    pub(super) fn rpc_assistant_skill_show(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let obj = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("assistant_skill_show request must be an object"))?;
+        if let Some(field) = obj.keys().find(|k| !matches!(k.as_str(), "name" | "file")) {
+            return Err(Error::rejected(format!(
+                "assistant_skill_show field '{field}' is not accepted"
+            )));
+        }
+        let (binding, _root) =
+            self.require_active_member_assistant("assistant_skill_show", peer_pid)?;
+        let agent = self.store.agent_opt(&binding.alias)?;
+        let allowed = allowed_assistant_skills(agent.as_ref());
+        let name = required_str(params, "name")?;
+        if !allowed.iter().any(|skill| skill == name) {
+            return Err(Error::rejected(format!(
+                "assist agent '{}' is not permitted to read skill '{name}'",
+                binding.alias
+            )));
+        }
+        let file = optional_str(params, "file");
+        match crate::skill::show(name, file)? {
+            crate::skill::ShowOutput::Manifest(manifest) => Ok(manifest),
+            crate::skill::ShowOutput::File(text) => Ok(json!({
+                "name": name,
+                "file": file.unwrap_or("SKILL.md"),
+                "text": text,
+            })),
+        }
+    }
+}
+
+pub(super) enum MemberRefreshTarget<'a> {
+    Identity,
+    Soul,
+    User,
+    Memory,
+    Topic(&'a str),
+    BootstrapState,
+}
+
+#[derive(Default)]
+struct MemberSelfOverlay {
+    turn_id: String,
+    identity: Option<(String, String)>,
+    soul: Option<(String, String)>,
+    user: Option<(String, String)>,
+    memory: Option<(String, String)>,
+    topics: std::collections::BTreeMap<String, Option<String>>,
+    bootstrap_state: Option<(String, i64)>,
+}
+
+#[derive(Default)]
+pub(super) struct MemberContextTracker {
+    delivered: std::collections::HashMap<String, MemberDeliveredContext>,
+    pending_turns: std::collections::HashMap<String, (String, MemberDeliveredContext)>,
+    in_turn_refresh: std::collections::HashMap<String, MemberSelfOverlay>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct MemberDeliveredContext {
+    session_key: Option<String>,
+    snapshot: super::assistant_memory::MemorySnapshot,
+    skills_sha: String,
+    bootstrap_state: String,
+    bootstrap_revision: i64,
+}
+
+fn allowed_assistant_skills(agent: Option<&crate::store::Agent>) -> Vec<String> {
+    let mut skills = vec!["assistant-memory".to_string()];
+    if let Some(list) = agent
+        .and_then(|a| a.params.as_ref())
+        .and_then(|p| p.get("skills"))
+        .and_then(Value::as_array)
+    {
+        for item in list.iter().filter_map(Value::as_str) {
+            if crate::skill::SKILL_NAMES.contains(&item) && !skills.iter().any(|s| s == item) {
+                skills.push(item.to_string());
+            }
+        }
+    }
+    skills
+}
+
+fn render_available_skills(skills: &[String]) -> String {
+    let mut out = String::from(
+        "## Available skills\n\n\
+         Read a skill on demand with `cadence assist skill show <name>` before guessing:\n",
+    );
+    for name in skills {
+        out.push_str(&format!(
+            "- `{name}`: {}\n",
+            crate::skill::bundled_line(name)
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+fn diff_topic_names(
+    before: &std::collections::BTreeMap<String, String>,
+    after: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for (k, v) in after {
+        if before.get(k) != Some(v) {
+            names.insert(k.clone());
+        }
+    }
+    for k in before.keys() {
+        if !after.contains_key(k) {
+            names.insert(k.clone());
+        }
+    }
+    names.into_iter().collect()
 }

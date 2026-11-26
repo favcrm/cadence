@@ -554,6 +554,26 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("member_job_subscribe", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_job_share", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_job_reconcile", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    (
+        "assistant_context_update",
+        Rule::Handler("rpc_assistant_context_update: bound active member assistant on its own running turn (CAD-2832)"),
+    ),
+    (
+        "assistant_memory_search",
+        Rule::Handler("rpc_assistant_memory_search: bound active member assistant on its own private cwd (CAD-2832)"),
+    ),
+    (
+        "assistant_memory_read",
+        Rule::Handler("rpc_assistant_memory_read: bound active member assistant on its own private cwd (CAD-2832)"),
+    ),
+    (
+        "assistant_memory_undo",
+        Rule::Handler("rpc_assistant_memory_undo: bound active member assistant on its own interactive turn (CAD-2832)"),
+    ),
+    (
+        "assistant_skill_show",
+        Rule::Handler("rpc_assistant_skill_show: bound active member assistant for its permitted bundled skills (CAD-2832)"),
+    ),
     ("job_events", Rule::Handler("agent_caller + job project")),
     ("job_cancel", Rule::OnJob(Target::Job)),
     ("job_close", Rule::OnJob(Target::Job)),

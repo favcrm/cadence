@@ -19,18 +19,36 @@ use std::time::{Duration, Instant};
 impl Shared {
     /// Initial submissions and fresh-session retries use the same committed
     /// profile. A provider reset must not discard the actor's current identity.
-    fn prompt_with_profile(&self, message: &Message, mut body: String) -> Result<String> {
+    fn prompt_with_profile_for_turn(
+        &self,
+        alias: &str,
+        message: &Message,
+        force_full: bool,
+        mut body: String,
+    ) -> Result<(String, Option<super::members_rpc::MemberDeliveredContext>)> {
+        let mut pending_member = None;
         let context = if crate::master::is_master(&message.alias) {
             Some(self.master_profile_context()?)
         } else {
-            self.member_profile_context(message)?
+            let thread_id = self
+                .store
+                .agent(alias)
+                .ok()
+                .and_then(|current| current.thread_id);
+            match self.member_profile_context_for_turn(message, thread_id.as_deref(), force_full)? {
+                Some((ctx, delivered)) => {
+                    pending_member = delivered;
+                    Some(ctx)
+                }
+                None => None,
+            }
         };
         if let Some(context) = context {
             body.reserve(2 + context.len());
             body.push_str("\n\n");
             body.push_str(&context);
         }
-        Ok(body)
+        Ok((body, pending_member))
     }
 
     /// Spawn the actor for `alias` unless it is already owned (running or
@@ -147,6 +165,7 @@ impl Shared {
         // The endpoint is gone: its build-slot enrollment admits no
         // more work (holds stay accounted until released or dead).
         self.revoke_endpoint(alias, "endpoint closed");
+        self.clear_member_delivered(alias);
         {
             let mut pending = self.pending.lock().unwrap();
             pending.retain(|_, req| req.alias != alias);
@@ -358,6 +377,7 @@ impl Shared {
                         .lock()
                         .unwrap()
                         .insert(alias.to_string(), reason);
+                    self.clear_member_delivered(alias);
                 }
             }
         }
@@ -569,7 +589,11 @@ impl Shared {
         agent: &Agent,
         message: &Message,
         input: PromptInput,
-    ) -> Result<(String, Option<ContextDelivery>)> {
+    ) -> Result<(
+        String,
+        Option<ContextDelivery>,
+        Option<super::members_rpc::MemberDeliveredContext>,
+    )> {
         let PromptInput {
             base,
             pack,
@@ -579,7 +603,8 @@ impl Shared {
         // The committed actor profile follows the request on every real
         // turn, including after provider `/new`. Missing or unreadable
         // profiles fail closed.
-        let base = self.prompt_with_profile(message, base)?;
+        let (base, pending_member) =
+            self.prompt_with_profile_for_turn(alias, message, after_reset || compacted, base)?;
         // CAD-1822: mandatory task context is planned against
         // the delivery body and actor profile first; optional
         // continuity history is budgeted from what remains.
@@ -613,7 +638,7 @@ impl Shared {
                 text = pack.wrap(&text);
             }
         }
-        Ok((text, pending_context))
+        Ok((text, pending_context, pending_member))
     }
 
     fn settle_turn_outcome(
@@ -627,9 +652,16 @@ impl Shared {
     ) -> Result<()> {
         let message = turn.message;
         let mut pending_context = turn.pending_context.take();
+        if outcome.is_err() {
+            turn.pending_member.take();
+            self.discard_member_turn_state(alias, &message.id);
+        }
         match outcome {
             Ok(result) => {
+                let status = result.status.clone();
                 if let Err(error) = self.complete(message, result) {
+                    turn.pending_member.take();
+                    self.discard_member_turn_state(alias, &message.id);
                     // The provider reported an outcome we could
                     // not persist or classify — ambiguous
                     // post-submission, fence rather than replay.
@@ -650,6 +682,16 @@ impl Shared {
                             json!({"message": message.id, "error": error.to_string()}),
                         );
                     }
+                }
+                if status == "submitted" {
+                    if let Some(delivered) = turn.pending_member.take() {
+                        self.stage_pending_member_delivered(alias, &message.id, delivered);
+                    }
+                } else if status == "completed" {
+                    self.commit_member_delivered(alias, &message.id, turn.pending_member.take());
+                } else {
+                    turn.pending_member.take();
+                    self.discard_member_turn_state(alias, &message.id);
                 }
                 loop_state.gate_notice = None;
                 loop_state.gate_waits = 0;
@@ -934,6 +976,8 @@ impl Shared {
                         self.turn_slot(&lane.agent, &message)
                     };
                     let mut pending_context: Option<ContextDelivery> = None;
+                    let mut pending_member: Option<super::members_rpc::MemberDeliveredContext> =
+                        None;
                     let prompt = if nudge {
                         message.body.clone()
                     } else {
@@ -955,8 +999,9 @@ impl Shared {
                                 compacted,
                             },
                         ) {
-                            Ok((text, context)) => {
+                            Ok((text, context, member_ctx)) => {
                                 pending_context = context;
+                                pending_member = member_ctx;
                                 text
                             }
                             Err(Error::PreWrite(reason)) => {
@@ -1039,7 +1084,7 @@ impl Shared {
                                     slot.as_deref(),
                                     &first,
                                 );
-                                let (prompt, context) = self.compose_context_prompt(
+                                let (prompt, context, member_ctx) = self.compose_context_prompt(
                                     alias,
                                     &lane.agent,
                                     &message,
@@ -1051,6 +1096,7 @@ impl Shared {
                                     },
                                 )?;
                                 pending_context = context;
+                                pending_member = member_ctx;
                                 lane.adapter.run_turn_slotted(
                                     &prompt,
                                     slot.as_deref(),
@@ -1089,6 +1135,7 @@ impl Shared {
                     let mut turn_ctx = TurnOutcomeCtx {
                         message: &message,
                         pending_context,
+                        pending_member,
                     };
                     self.settle_turn_outcome(
                         alias,
@@ -1404,4 +1451,5 @@ struct PromptInput {
 struct TurnOutcomeCtx<'a> {
     message: &'a Message,
     pending_context: Option<ContextDelivery>,
+    pending_member: Option<super::members_rpc::MemberDeliveredContext>,
 }

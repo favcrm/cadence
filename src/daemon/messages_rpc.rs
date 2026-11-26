@@ -2173,6 +2173,7 @@ impl Shared {
                     };
                     match completion {
                         Ok(finished) => {
+                            self.commit_member_delivered(&finished.alias, &finished.id, None);
                             self.notify_routed_target(&finished, &stored);
                             // CAD-2215: the durable completion is the
                             // private ledger's trigger — a member-owned
@@ -2321,6 +2322,19 @@ impl Shared {
                 eprintln!("bootstrap cleanup for {}: {error}", message.alias);
             }
         }
+        let mut targets = vec![super::members_rpc::MemberRefreshTarget::BootstrapState];
+        if let Some(p) = profile.as_ref() {
+            if p.name.is_some() {
+                targets.push(super::members_rpc::MemberRefreshTarget::Identity);
+            }
+            if p.tone.is_some() || p.soul.is_some() {
+                targets.push(super::members_rpc::MemberRefreshTarget::Soul);
+            }
+            if p.user_name.is_some() || p.preferences.is_some() {
+                targets.push(super::members_rpc::MemberRefreshTarget::User);
+            }
+        }
+        self.record_member_self_refresh(&message.alias, &message.id, &root, &targets);
         Ok(())
     }
 

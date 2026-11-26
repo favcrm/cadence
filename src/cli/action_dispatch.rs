@@ -1213,6 +1213,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::McpPermission { .. }
         | Commands::McpAgent
         | Commands::Artifact { .. }
+        | Commands::Assist { .. }
         | Commands::WorkspaceSkill { .. }
         | Commands::Attachment { .. } => agents::dispatch(state_dir, command),
         Commands::Devin { .. }
