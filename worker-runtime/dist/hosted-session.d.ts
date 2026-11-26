@@ -16,6 +16,11 @@ import type { AppScope, AskResult, HostedSessionInspection, HostedSessionOptions
  * projection, the board wire behavior and the execution guards. Only declared
  * tools are installed, and every execution revalidates the live authority.
  */
+/** Keep deferred progress persistence disabled while flushing visible preview text every 40ms. */
+export declare const HOSTED_PROGRESS_POLICY: {
+    readonly persistWithinMs: 0;
+    readonly partialIntervalMs: 40;
+};
 export declare class HostedSession<Env extends object = Record<string, unknown>> extends DurableObject<Env> {
     private readonly models;
     private readonly registry;

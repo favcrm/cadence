@@ -29509,6 +29509,8 @@ async function streamResponse(runtime, model, messages, options, attempt, contex
   let timer;
   let inFlight;
   let stopped = false;
+  let flushedVisibleText = false;
+  const hasVisibleText = (partial) => partial.content.some((part) => part.type === "text" && part.text.length > 0);
   const changes = new PartialChanges;
   const flush = () => {
     timer = undefined;
@@ -29535,8 +29537,14 @@ async function streamResponse(runtime, model, messages, options, attempt, contex
         runtime.report(error);
     }).finally(() => {
       inFlight = undefined;
-      if (pending !== undefined && !stopped)
-        timer = runtime.setTimer(flush, interval);
+      if (pending !== undefined && !stopped) {
+        if (!flushedVisibleText && hasVisibleText(pending)) {
+          flushedVisibleText = true;
+          flush();
+        } else {
+          timer = runtime.setTimer(flush, interval);
+        }
+      }
     });
   };
   try {
@@ -29546,8 +29554,16 @@ async function streamResponse(runtime, model, messages, options, attempt, contex
         continue;
       changes.observe(event);
       pending = event.partial;
-      if (timer === undefined && inFlight === undefined)
+      if (!flushedVisibleText && hasVisibleText(event.partial)) {
+        if (inFlight === undefined) {
+          flushedVisibleText = true;
+          timer?.();
+          timer = undefined;
+          flush();
+        }
+      } else if (timer === undefined && inFlight === undefined) {
         timer = runtime.setTimer(flush, interval);
+      }
     }
     return await events.result();
   } finally {
@@ -58076,6 +58092,10 @@ function engineViewChanges(ops) {
 function failureSentence(reason) {
   return reason === null ? null : compactionFailureText(reason);
 }
+var HOSTED_PROGRESS_POLICY = {
+  persistWithinMs: 0,
+  partialIntervalMs: 40
+};
 
 class HostedSession extends DurableObject {
   models = createModels();
@@ -58187,7 +58207,10 @@ class HostedSession extends DurableObject {
           models: this.models,
           registry: this.registry,
           onWake,
-          settings: { progress: { persistWithinMs: 0 }, compaction: HOSTED_COMPACTION_POLICY },
+          settings: {
+            progress: HOSTED_PROGRESS_POLICY,
+            compaction: HOSTED_COMPACTION_POLICY
+          },
           telemetry: this.modelTaskContext.telemetry
         }, context);
       },
