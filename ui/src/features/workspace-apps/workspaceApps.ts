@@ -509,7 +509,10 @@ export const workspaceApps = {
   imageResults: async (id: string, signal?: AbortSignal) => (await request<{ results: ImageReceipt[] }>(`${run(id)}/capability-results`, signal)).results,
   capabilityResult: (id: string, signal?: AbortSignal) => request<SourceReceipt>(`/api/app-capability-results/${part(id)}`, signal),
   capabilityAsset: (id: string, signal?: AbortSignal) => request<ImageAsset>(`/api/app-capability-results/${part(id)}/asset`, signal),
-  bindingQuote: (id: string, slot: string, contextId?: string, signal?: AbortSignal) => request<CapabilityQuote>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings/${part(slot)}/quote` : `${installation(id)}/bindings/${part(slot)}/quote`, signal),
+  bindingQuote: (id: string, slot: string, contextId?: string, signal?: AbortSignal, model?: string) => {
+    const base = contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings/${part(slot)}/quote` : `${installation(id)}/bindings/${part(slot)}/quote`;
+    return request<CapabilityQuote>(model ? `${base}?model=${encodeURIComponent(model)}` : base, signal);
+  },
   /** CAD-1177: invoke one declared screen tool through the host broker,
    *  bound to the live mount's action context. The frame supplies only
    *  alias/input/request_id; install/digest/slot/binding are server-side. */
