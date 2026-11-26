@@ -66,6 +66,12 @@ pub(crate) enum AuditAction {
         /// the record carries; never `user` or `daemon`.
         #[arg(long)]
         source: String,
+        /// CAD-2843: record a standing approval. The hosted org keeps the
+        /// decision and enqueues exactly this head once when the rest of the
+        /// gate passes, without a second command. Bounded by an expiry; a
+        /// moved head or a revoke voids it. Hosted, owner, merge only.
+        #[arg(long, conflicts_with_all = ["delegated", "id"])]
+        standing: bool,
         /// `owner/name` (default: the cwd checkout's github.com origin).
         #[arg(long)]
         repo: Option<String>,
