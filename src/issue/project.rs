@@ -110,6 +110,24 @@ pub struct Project {
     /// ignoring a policy that hides content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<ProjectPolicy>,
+    /// CAD-2830: archived projects are hidden from active project/issue/my-work
+    /// listings and refuse mutating operations while remaining readable directly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_by: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub archive_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_changed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_changed_by: Option<String>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// `[intake]` on a project — the idea pipeline's budget switch.
@@ -383,6 +401,12 @@ mod tests {
                 intake: None,
                 id: Some(new_id()),
                 policy: Some(ProjectPolicy::workspace_visible()),
+                archived: false,
+                archived_at: None,
+                archived_by: None,
+                archive_revision: 0,
+                archive_changed_at: None,
+                archive_changed_by: None,
             };
             let project_dir = pm_dir.join(key);
             std::fs::create_dir_all(&project_dir).unwrap();
@@ -568,6 +592,12 @@ mod tests {
             intake: None,
             id: Some(new_id()),
             policy: Some(ProjectPolicy::workspace_visible()),
+            archived: false,
+            archived_at: None,
+            archived_by: None,
+            archive_revision: 0,
+            archive_changed_at: None,
+            archive_changed_by: None,
         };
         let yaml = serde_yaml::to_string(&project).unwrap();
         let parsed: Project = serde_yaml::from_str(&yaml).unwrap();

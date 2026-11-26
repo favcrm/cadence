@@ -27,6 +27,7 @@ pub fn create_plan(
                 "Unknown project '{project_key}' — `cadence issue project ls` lists them"
             ))
         })?;
+    require_project_active(&project)?;
     let proposer = actor_who(actor, None);
     let root = pm.dir.join(&project.key);
     let lock = pm.lock_for_paths(std::slice::from_ref(&root))?;
@@ -466,6 +467,7 @@ pub fn create_granted_plan(
                 "Unknown project '{project_key}' — `cadence issue project ls` lists them"
             ))
         })?;
+    require_project_active(&project)?;
     let proposer = actor_who(actor, None);
     let root = pm.dir.join(&project.key);
     let lock = pm.lock_for_paths(std::slice::from_ref(&root))?;
@@ -747,6 +749,7 @@ pub fn decide_plan(
         crate::secret::guard(&format!("{epic}: plan reason"), reason)?;
     }
     let (project, dir) = issue_dir(pm, epic)?;
+    require_project_active(&project)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(&project.key)))?;
     let (mut front, body) = load_front(&dir)?;
     let Some(plan) = front.plan.as_mut() else {

@@ -21,9 +21,29 @@ pub(crate) enum ProjectCmd {
         /// Keep only these keys in each row (comma-joined).
         #[arg(long, value_delimiter = ',')]
         fields: Vec<String>,
+        /// Show archived projects instead of active ones.
+        #[arg(long)]
+        archived: bool,
         /// Output is JSON already — accepted for grammar parity.
         #[arg(long)]
         json: bool,
+    },
+    /// Archive a project locally (hides from active listings and refuses writes).
+    Archive {
+        /// Project key.
+        key: String,
+        /// Exact project key confirmation (`--confirm <key>`).
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// Restore an archived project locally without restarting prior jobs.
+    #[command(visible_alias = "unarchive")]
+    Restore {
+        /// Project key.
+        key: String,
+        /// Optional confirmation (`--confirm <key>`).
+        #[arg(long)]
+        confirm: Option<String>,
     },
     /// Create a local project or register a project in a hosted workspace.
     ///
@@ -90,6 +110,7 @@ pub(super) fn run_project(state_dir: &Path, action: ProjectCmd) -> Result<i32> {
             sort,
             limit,
             fields,
+            archived,
             json,
         } => cadence_agent::issue::cli::run(
             &IssueAction::Project {
@@ -97,8 +118,21 @@ pub(super) fn run_project(state_dir: &Path, action: ProjectCmd) -> Result<i32> {
                     sort,
                     limit,
                     fields,
+                    archived,
                     json,
                 },
+            },
+            state_dir,
+        ),
+        ProjectCmd::Archive { key, confirm } => cadence_agent::issue::cli::run(
+            &IssueAction::Project {
+                action: ProjectAction::Archive { key, confirm },
+            },
+            state_dir,
+        ),
+        ProjectCmd::Restore { key, confirm } => cadence_agent::issue::cli::run(
+            &IssueAction::Project {
+                action: ProjectAction::Restore { key, confirm },
             },
             state_dir,
         ),

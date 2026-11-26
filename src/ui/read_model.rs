@@ -1422,6 +1422,12 @@ impl Model {
         super::projects_payload(pm, &project_counts(&t))
     }
 
+    pub(super) fn archived_projects(&self, pm: &Pm) -> Value {
+        let mut t = lock(&self.tracker);
+        t.refresh(&pm.dir);
+        super::stream::archived_projects_payload(pm, &project_counts(&t))
+    }
+
     // ---------- stream ----------
 
     /// Join the board's stream. The first subscriber starts the watcher

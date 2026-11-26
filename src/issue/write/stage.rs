@@ -80,6 +80,7 @@ pub fn move_stage(
         None => None,
     };
     let (project, dir) = issue_dir(pm, epic)?;
+    require_project_active(&project)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let (mut front, body) = load_front(&dir)?;
     let (cfg, unapproved) = work::effective(

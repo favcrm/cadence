@@ -39,6 +39,7 @@ const ACTIVE: &[&str] = &["doing", "review", "ready", "backlog"];
 pub(super) struct Snapshot {
     pm: Pm,
     readable: BTreeSet<String>,
+    archived: BTreeSet<String>,
     board: read_model::BoardRead,
 }
 
@@ -54,6 +55,12 @@ impl Snapshot {
     ) -> crate::Result<Self> {
         let pm = Pm::at(pm_dir)?;
         let readable = project_policy::readable(&pm, policy_actor);
+        let archived: BTreeSet<String> = crate::issue::project::list(&pm.dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.archived)
+            .map(|p| p.key)
+            .collect();
         let board = if policy_actor == "operator" {
             read_model::get(state_dir, pm_dir).board(&pm, None)
         } else {
@@ -64,6 +71,7 @@ impl Snapshot {
         Ok(Self {
             pm,
             readable,
+            archived,
             board,
         })
     }
@@ -74,10 +82,10 @@ impl Snapshot {
     }
 
     fn mine<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = &'a View> + 'a {
-        self.board
-            .views
-            .iter()
-            .filter(move |view| view.issue.front.owner.as_deref() == Some(owner))
+        self.board.views.iter().filter(move |view| {
+            view.issue.front.owner.as_deref() == Some(owner)
+                && !self.archived.contains(&view.issue.project)
+        })
     }
 
     /// Every owned card with its assignment provenance — the hosted CLI's

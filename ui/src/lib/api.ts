@@ -86,6 +86,8 @@ import type {
   Overview,
   Project,
   ProjectContext,
+  ProjectLifecycle,
+  ArchivedProjectsPayload,
   ContextRole,
   ThreadRef,
   WorkflowPreview,
@@ -786,6 +788,15 @@ export const api = {
   myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
   myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
+  archivedProjects: () => get<ArchivedProjectsPayload>("/api/projects?archived=1"),
+  archivedProjectIssues: (project: string) =>
+    get<{ issues: IssueCard[] }>(`/api/issues?project=${encodeURIComponent(project)}&archived=1`),
+  projectLifecycle: (project: string) =>
+    get<ProjectLifecycle>(`/api/projects/${encodeURIComponent(project)}/lifecycle`),
+  archiveProject: (project: string, req: { confirmation: string; expected_revision: number }) =>
+    post<ProjectLifecycle>(`/api/projects/${encodeURIComponent(project)}/archive`, req),
+  restoreProject: (project: string, req: { confirmation: string; expected_revision: number }) =>
+    post<ProjectLifecycle>(`/api/projects/${encodeURIComponent(project)}/restore`, req),
   /** `GET /api/projects/<key>/policy` — the board's own policy record. The
    *  native and hosted shapes differ (CAD-2255), so this is handed back
    *  untyped and `features/projects/policyContract` validates it. */

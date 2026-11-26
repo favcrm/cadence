@@ -1,6 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import type { ProjectLifecycle } from "../../lib/types";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
@@ -33,11 +34,19 @@ type Draft = PolicyDraft;
  * record is called absent, an unreadable answer is an error, and no capability
  * is defaulted on — a private transition that cannot be proven stays disabled.
  */
+type LifecycleState =
+  | { kind: "loading" }
+  | { kind: "unsupported" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; data: ProjectLifecycle };
+
 export default function ProjectSettings({
   project,
   block,
   hosted,
   onToast,
+  openIssuesCount,
+  onLifecycleChange,
 }: {
   project: string;
   /** Why this session may not change the policy, or null when it may. */
@@ -45,8 +54,10 @@ export default function ProjectSettings({
   /** The board's own claim from `/api/meta`; null when it has not answered. */
   hosted: boolean | null;
   onToast: (text: string) => void;
+  openIssuesCount?: number;
+  onLifecycleChange?: (lifecycle: ProjectLifecycle) => void;
 }) {
-  const { t } = useLocale();
+  const { t, formatNumber } = useLocale();
   const resource = resources.projectPolicy(project);
   const state = useQuery(resource);
   const [edits, setEdits] = useState<Draft | null>(null);
@@ -58,7 +69,14 @@ export default function ProjectSettings({
   const [roster, setRoster] = useState<TeamMember[] | null>(null);
   const [rosterError, setRosterError] = useState<string | null>(null);
   const [rosterAttempt, setRosterAttempt] = useState(0);
+  const [lifecycle, setLifecycle] = useState<LifecycleState>({ kind: "loading" });
+  const [lifecycleAttempt, setLifecycleAttempt] = useState(0);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmInput, setConfirmInput] = useState("");
+  const [lifecycleBusy, setLifecycleBusy] = useState(false);
+  const [lifecycleError, setLifecycleError] = useState<string | null>(null);
   const selectId = useId();
+  const confirmId = useId();
 
   const view: PolicyView = useMemo(
     () => readPolicy(state.data, hosted),
@@ -78,7 +96,37 @@ export default function ProjectSettings({
     setPicked("");
     setAdding(false);
     setBusy(false);
+    setConfirmOpen(false);
+    setConfirmInput("");
+    setLifecycleBusy(false);
+    setLifecycleError(null);
   }, [project]);
+
+  useEffect(() => {
+    let active = true;
+    setLifecycle({ kind: "loading" });
+    setLifecycleError(null);
+    api
+      .projectLifecycle(project)
+      .then((data) => {
+        if (!active) return;
+        setLifecycle({ kind: "ready", data });
+      })
+      .catch((e: unknown) => {
+        if (!active) return;
+        if (e instanceof ApiError && (e.status === 404 || e.status === 501)) {
+          setLifecycle({ kind: "unsupported" });
+          return;
+        }
+        setLifecycle({
+          kind: "error",
+          message: e instanceof Error ? e.message : "Could not read project lifecycle",
+        });
+      });
+    return () => {
+      active = false;
+    };
+  }, [project, lifecycleAttempt]);
 
   // The hosted roster is the only source of verified member subject ids.
   useEffect(() => {
@@ -556,6 +604,198 @@ export default function ProjectSettings({
             </>
           )}
 
+          {lifecycle.kind === "error" && (
+            <section className="card mt-4 max-w-2xl p-5" aria-label={t("Project lifecycle")}>
+              <div className="slabel">{t("Project lifecycle")}</div>
+              <p className="mt-2 text-label text-fail" role="alert">{lifecycle.message}</p>
+              <button
+                type="button"
+                className="btn btn-sm mt-3"
+                onClick={() => setLifecycleAttempt((n) => n + 1)}
+              >
+                {t("Retry")}
+              </button>
+            </section>
+          )}
+
+          {lifecycle.kind === "ready" && (
+            <section className="card mt-4 max-w-2xl p-5" aria-label={t("Project lifecycle")}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="slabel">{t("Project lifecycle")}</div>
+                <span className="num text-micro text-ink-500">
+                  {lifecycle.data.archived ? t("Archived") : t("Active")}
+                </span>
+              </div>
+
+              {lifecycle.data.archived ? (
+                <>
+                  <p className="mt-2 text-secondary text-ink-300">
+                    {t(
+                      "This project is archived and hidden from active boards, sidebars, and search. Its issues remain readable via direct link.",
+                    )}
+                  </p>
+                  {lifecycle.data.archived_at && (
+                    <p className="mt-2 text-label text-ink-400">
+                      {t("Archived at")} {lifecycle.data.archived_at}
+                      {lifecycle.data.archived_by ? ` · ${lifecycle.data.archived_by}` : ""}
+                    </p>
+                  )}
+                  <p className="mt-2 text-label text-ink-500">
+                    {t(
+                      "Restoring returns the project to active listings and re-enables writes. Prior runs are not restarted.",
+                    )}
+                  </p>
+                  {block && <p className="mt-3 text-label text-ink-400">{block}</p>}
+                  {lifecycleError && (
+                    <p className="mt-3 text-secondary text-fail" role="alert">
+                      {lifecycleError}
+                    </p>
+                  )}
+                  {!locked && (
+                    <div className="mt-4">
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={lifecycleBusy}
+                        onClick={() => {
+                          setLifecycleBusy(true);
+                          setLifecycleError(null);
+                          api
+                            .restoreProject(project, {
+                              confirmation: project,
+                              expected_revision: lifecycle.data.revision,
+                            })
+                            .then((next) => {
+                              setLifecycle({ kind: "ready", data: next });
+                              onLifecycleChange?.(next);
+                              onToast(`${project} ${t("restored")}`);
+                            })
+                            .catch((e: unknown) => {
+                              setLifecycleError(
+                                e instanceof Error ? e.message : "Could not restore project",
+                              );
+                            })
+                            .finally(() => setLifecycleBusy(false));
+                        }}
+                      >
+                        {lifecycleBusy ? t("Restoring…") : t("Restore project")}
+                      </button>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p className="mt-2 text-secondary text-ink-300">
+                    {t(
+                      "Archive this project to hide it from active views and freeze writes while keeping existing issues readable.",
+                    )}
+                  </p>
+                  {(openIssuesCount ?? 0) > 0 && (
+                    <p className="mt-3 text-label text-warn" role="status">
+                      {formatNumber(openIssuesCount ?? 0)} {t("open issues remain in this project. Idle open issues will stay read-only while archived.")}
+                    </p>
+                  )}
+                  {lifecycle.data.blockers.length > 0 && (
+                    <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/5 p-3 text-label text-warn">
+                      <div className="font-medium">{t("Active work must settle before archiving:")}</div>
+                      <ul className="mt-1 list-disc pl-5">
+                        {lifecycle.data.blockers.map((item) => (
+                          <li key={item} className="num break-all">{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {block && <p className="mt-3 text-label text-ink-400">{block}</p>}
+                  {lifecycleError && (
+                    <p className="mt-3 text-secondary text-fail" role="alert">
+                      {lifecycleError}
+                    </p>
+                  )}
+                  {!locked && !confirmOpen && (
+                    <div className="mt-4">
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={lifecycleBusy || lifecycle.data.blockers.length > 0}
+                        onClick={() => {
+                          setConfirmOpen(true);
+                          setConfirmInput("");
+                          setLifecycleError(null);
+                        }}
+                      >
+                        {t("Archive project")}
+                      </button>
+                    </div>
+                  )}
+                  {!locked && confirmOpen && (
+                    <div className="mt-4 rounded border border-ink-700 bg-ink-900 p-3">
+                      <label htmlFor={confirmId} className="block text-label text-ink-200">
+                        {t("Type the exact project key to confirm")}:{" "}
+                        <code className="num text-ink-100">{project}</code>
+                      </label>
+                      <input
+                        id={confirmId}
+                        type="text"
+                        className="input mt-2 w-full max-w-xs"
+                        value={confirmInput}
+                        onChange={(e) => setConfirmInput(e.target.value)}
+                        placeholder={project}
+                        autoComplete="off"
+                        disabled={lifecycleBusy}
+                      />
+                      <div className="mt-3 flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          disabled={
+                            lifecycleBusy ||
+                            confirmInput.trim() !== project ||
+                            lifecycle.data.blockers.length > 0
+                          }
+                          onClick={() => {
+                            setLifecycleBusy(true);
+                            setLifecycleError(null);
+                            api
+                              .archiveProject(project, {
+                                confirmation: confirmInput.trim(),
+                                expected_revision: lifecycle.data.revision,
+                              })
+                              .then((next) => {
+                                setLifecycle({ kind: "ready", data: next });
+                                setConfirmOpen(false);
+                                setConfirmInput("");
+                                onLifecycleChange?.(next);
+                                onToast(`${project} ${t("archived")}`);
+                              })
+                              .catch((e: unknown) => {
+                                setLifecycleError(
+                                  e instanceof Error ? e.message : "Could not archive project",
+                                );
+                              })
+                              .finally(() => setLifecycleBusy(false));
+                          }}
+                        >
+                          {lifecycleBusy ? t("Archiving…") : t("Confirm archive")}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          disabled={lifecycleBusy}
+                          onClick={() => {
+                            setConfirmOpen(false);
+                            setConfirmInput("");
+                            setLifecycleError(null);
+                          }}
+                        >
+                          {t("Cancel")}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </section>
+          )}
         </>
       )}
     </main>

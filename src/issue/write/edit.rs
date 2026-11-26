@@ -152,7 +152,11 @@ pub fn set_fields_if_rev(
     }
     let dirs: Vec<PathBuf> = ids
         .iter()
-        .map(|id| issue_dir(pm, id).map(|(_, dir)| dir))
+        .map(|id| {
+            let (project, dir) = issue_dir(pm, id)?;
+            require_project_active(&project)?;
+            Ok(dir)
+        })
         .collect::<Result<_>>()?;
     let lock = pm.lock_for_paths(&dirs)?;
     if let Some(want) = if_rev {
@@ -218,7 +222,11 @@ pub fn tag_edit(pm: &Pm, ids: &[String], add: bool, tags: &[String], actor: &str
     let tags = model::normalize_tags(tags)?;
     let dirs: Vec<PathBuf> = ids
         .iter()
-        .map(|id| issue_dir(pm, id).map(|(_, dir)| dir))
+        .map(|id| {
+            let (project, dir) = issue_dir(pm, id)?;
+            require_project_active(&project)?;
+            Ok(dir)
+        })
         .collect::<Result<_>>()?;
     let lock = pm.lock_for_paths(&dirs)?;
     let staged = stage(pm, ids, |project, front| {
@@ -281,6 +289,7 @@ pub fn patch_issue(
     state_dir: Option<&Path>,
 ) -> Result<Value> {
     let (project, dir) = issue_dir(pm, id)?;
+    require_project_active(&project)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
@@ -418,6 +427,7 @@ pub fn add_comment(
     actor: &str,
 ) -> Result<Value> {
     let (_project, dir) = issue_dir(pm, id)?;
+    require_project_active(&_project)?;
     let author_opt = author;
     let author = comment_author(author_opt)?;
     if body.trim().is_empty() {
@@ -502,6 +512,7 @@ pub fn add_comment_keyed(
     actor: &str,
 ) -> Result<Value> {
     let (_initial_project, initial_dir) = issue_dir(pm, id)?;
+    require_project_active(&_initial_project)?;
     let author_opt = author;
     let author = comment_author(author_opt)?;
     if body.trim().is_empty() {
@@ -523,6 +534,7 @@ pub fn add_comment_keyed(
     // project/directory, or a policy that no longer admits the operator,
     // must never receive this write.
     let (project, dir) = issue_dir(pm, id)?;
+    require_project_active(&project)?;
     if dir != initial_dir || project.key != expected_project {
         return Err(Error::rejected(format!(
             "{id}: issue moved from project {expected_project} to {} while publishing — \
@@ -828,6 +840,7 @@ pub fn add_report(
 ) -> Result<Value> {
     use crate::issue::task_report::DIR;
     let (_project, dir) = issue_dir(pm, id)?;
+    require_project_active(&_project)?;
     let agent = front.agent.clone().unwrap_or_default();
     let kind = front.kind.map(|k| k.as_str()).unwrap_or_default();
     let text = parse::render(front, body)?;
@@ -919,6 +932,7 @@ pub fn attach_bytes(
     actor: &str,
 ) -> Result<Value> {
     let (_project, dir) = issue_dir(pm, id)?;
+    require_project_active(&_project)?;
     if !model::valid_artifact_name(name) {
         return Err(Error::rejected(format!(
             "Bad artifact name '{name}' — [A-Za-z0-9._-]{{1,120}}, no leading dot"

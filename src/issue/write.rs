@@ -60,13 +60,14 @@ pub use projects::load_front;
 pub use projects::save_front;
 #[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) use projects::save_front;
+pub use projects::{
+    archive_project, private_available, project_add, project_lifecycle, read_project_policy,
+    require_project_active, restore_project, set_acceptance, set_project_policy,
+    set_project_remote, PRIVATE_UNAVAILABLE,
+};
 pub(crate) use projects::{check_tags, split_tags};
 #[doc(hidden)]
 pub use projects::{checked_project_dirs, issue_dir};
-pub use projects::{
-    private_available, project_add, read_project_policy, set_acceptance, set_project_policy,
-    set_project_remote, PRIVATE_UNAVAILABLE,
-};
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use rev::blocked_warnings;
 use rev::check_rev;

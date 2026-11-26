@@ -3,7 +3,7 @@
 //! fans out to, plus the shared response plumbing (`send`, `coded_response`,
 //! `write_reply`) the read side reuses.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -484,6 +484,94 @@ fn project_policy_write(request: &mut Request, pm_dir: &Path, key: &str, actor: 
     }
 }
 
+/// CAD-2830: active or queued daemon jobs bound to issues in `key`.
+pub(crate) fn project_blockers(pm: &Pm, state_dir: &Path, key: &str) -> Vec<String> {
+    let Ok(issues) = crate::issue::board::load_all(&pm.dir, Some(key)) else {
+        return Vec::new();
+    };
+    let project_ids: HashSet<&str> = issues.iter().map(|i| i.front.id.as_str()).collect();
+    if project_ids.is_empty() {
+        return Vec::new();
+    }
+    let Ok(reply) = crate::client::rpc_deadline(
+        state_dir,
+        "job_list",
+        json!({"all": true}),
+        std::time::Duration::from_secs(2),
+    ) else {
+        return Vec::new();
+    };
+    let Some(jobs) = reply["jobs"].as_array() else {
+        return Vec::new();
+    };
+    jobs.iter()
+        .filter_map(|job| {
+            let issue_id = job.get("issue").and_then(Value::as_str)?;
+            if !project_ids.contains(issue_id) {
+                return None;
+            }
+            let state = job.get("state").and_then(Value::as_str).unwrap_or_default();
+            if matches!(state, "done" | "failed" | "cancelled" | "completed") {
+                return None;
+            }
+            let job_id = job.get("id").and_then(Value::as_str).unwrap_or("job");
+            Some(format!("{issue_id}: {job_id} ({state})"))
+        })
+        .collect()
+}
+
+fn project_archive_write(
+    request: &mut Request,
+    state_dir: &Path,
+    pm_dir: &Path,
+    key: &str,
+    actor: &str,
+    archive: bool,
+) -> HttpResp {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ArchiveReq {
+        confirmation: String,
+        expected_revision: u64,
+    }
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: ArchiveReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let pm = match Pm::at(pm_dir) {
+        Ok(pm) => pm,
+        Err(e) => return err_response(503, &e.to_string()),
+    };
+    let result = if archive {
+        let blockers = project_blockers(&pm, state_dir, key);
+        issue_write::archive_project(
+            &pm,
+            key,
+            &req.confirmation,
+            Some(req.expected_revision),
+            &blockers,
+            actor,
+        )
+    } else {
+        issue_write::restore_project(
+            &pm,
+            key,
+            &req.confirmation,
+            Some(req.expected_revision),
+            actor,
+        )
+    };
+    match result {
+        Ok(out) => json_response(out),
+        Err(Error::Rejected(m)) if m.starts_with("no project ") => err_response(404, &m),
+        Err(e) => write_err(&e),
+    }
+}
+
 /// Map a writer error to an HTTP status: unknown ids are 404, rejections
 /// are 400, internals are 500.
 pub(crate) fn write_err(e: &Error) -> HttpResp {
@@ -493,7 +581,20 @@ pub(crate) fn write_err(e: &Error) -> HttpResp {
         // A coded refusal (`Error::invalid`) keeps its stable code on the wire
         // so the board can branch on it instead of showing raw text.
         Error::Structured(_) if e.kind() == "rejected" && e.code().is_some() => {
-            coded_response(400, e.code().unwrap_or_default(), &e.to_string(), None)
+            let code = e.code().unwrap_or_default();
+            let status = if matches!(
+                code,
+                "project_archived"
+                    | "blocked"
+                    | "revision_conflict"
+                    | "already_archived"
+                    | "not_archived"
+            ) {
+                409
+            } else {
+                400
+            };
+            coded_response(status, code, &e.to_string(), None)
         }
         other => err_response(500, &other.to_string()),
     }
@@ -1312,6 +1413,17 @@ pub(crate) fn write_route(
                 ),
                 None => err_response(500, "unadmitted write"),
             },
+            RouteId::ProjectArchive | RouteId::ProjectRestore => match caller.as_ref() {
+                Some(caller) => project_archive_write(
+                    &mut request,
+                    state_dir,
+                    pm_dir,
+                    bound.get("key").unwrap_or_default(),
+                    caller.actor(),
+                    bound.endpoint.id == RouteId::ProjectArchive,
+                ),
+                None => err_response(500, "unadmitted write"),
+            },
             RouteId::CatalogInstall => explorer_write(
                 &mut request,
                 state_dir,
@@ -1908,6 +2020,14 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
+        if let Ok(pm) = Pm::at(pm_dir) {
+            if let Ok((proj, _)) = crate::issue::write::issue_dir(&pm, id) {
+                if let Err(e) = crate::issue::write::require_project_active(&proj) {
+                    send(request, write_err(&e));
+                    return;
+                }
+            }
+        }
         let resp = home::post_kickoff(&mut request, state_dir, pm_dir, id);
         send(request, resp);
         return;
@@ -2072,6 +2192,14 @@ pub(crate) fn write_route(
             if *method != Method::Post {
                 send(request, err_response(405, "method not allowed"));
                 return;
+            }
+            if let Ok(pm) = Pm::at(pm_dir) {
+                if let Ok((proj, _)) = crate::issue::write::issue_dir(&pm, id) {
+                    if let Err(e) = crate::issue::write::require_project_active(&proj) {
+                        send(request, write_err(&e));
+                        return;
+                    }
+                }
             }
             let resp = lane::post(&mut request, state_dir, id, verb);
             send(request, resp);

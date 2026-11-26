@@ -176,6 +176,7 @@ where
     F: FnOnce() -> Result<Option<Value>>,
 {
     let project = project::resolve(&pm.dir, project_flag, cwd)?;
+    require_project_active(&project)?;
     let priority = priority.unwrap_or("P2");
     model::check_priority(priority)?;
     if let Some(id) = explicit_id {

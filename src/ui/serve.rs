@@ -2694,7 +2694,14 @@ fn handle(
             };
             match Pm::at(pm_dir) {
                 Ok(pm) => {
-                    let readable = super::project_policy::readable(&pm, &actor);
+                    let mut readable = super::project_policy::readable(&pm, &actor);
+                    if let Ok(list) = project::list(&pm.dir) {
+                        for proj in list {
+                            if proj.archived {
+                                readable.remove(&proj.key);
+                            }
+                        }
+                    }
                     super::project_policy::retain_overview(&mut overview, &readable);
                     if actor == "operator"
                         && operator::admit_operator_read(&request, state_dir, opts).is_ok()
@@ -2779,7 +2786,12 @@ fn handle(
                 // AOS-274: a project this caller may not read contributes
                 // no row, and no issue count, to the listing.
                 let readable = super::project_policy::readable(&pm, &actor);
-                let mut payload = read_model::get(state_dir, pm_dir).projects(&pm);
+                let model = read_model::get(state_dir, pm_dir);
+                let mut payload = if query("archived").as_deref() == Some("1") {
+                    model.archived_projects(&pm)
+                } else {
+                    model.projects(&pm)
+                };
                 if let Some(rows) = payload.get_mut("projects").and_then(|v| v.as_array_mut()) {
                     rows.retain(|row| {
                         row.get("key")
@@ -2836,6 +2848,13 @@ fn handle(
                 // AOS-274: filter before the slice and the card, so a
                 // restricted project contributes no row or count.
                 let readable = super::project_policy::readable(&pm, &actor);
+                let want_archived = query("archived").as_deref() == Some("1");
+                let archived_keys: HashSet<String> = project::list(&pm.dir)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|p| p.archived)
+                    .map(|p| p.key)
+                    .collect();
                 let model = read_model::get(state_dir, pm_dir);
                 let read = if actor == "operator" {
                     model.board(&pm, filter.as_deref())
@@ -2862,7 +2881,15 @@ fn handle(
                     issues: read
                         .views
                         .iter()
-                        .filter(|v| slice.matches(v) && readable.contains(&v.issue.project))
+                        .filter(|v| {
+                            slice.matches(v)
+                                && readable.contains(&v.issue.project)
+                                && if want_archived && filter.is_some() {
+                                    archived_keys.contains(&v.issue.project)
+                                } else {
+                                    !archived_keys.contains(&v.issue.project)
+                                }
+                        })
                         .map(|v| read.card_item(&ctx, v))
                         .collect(),
                     freshness: read.freshness.clone(),
@@ -3197,6 +3224,44 @@ fn handle(
                             },
                             Err(error) => send(request, err_response(503, &error.to_string())),
                         },
+                        Err(error) => send(request, err_response(503, &error.to_string())),
+                    }
+                    return;
+                }
+                if sub == Some("lifecycle") && segs.next().is_none() {
+                    if !model::valid_key(key) {
+                        send(request, err_response(400, "bad project key"));
+                        return;
+                    }
+                    let actor = match read_admission
+                        .as_ref()
+                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                    {
+                        Some(Ok(actor)) => actor,
+                        Some(Err(resp)) => {
+                            send(request, resp);
+                            return;
+                        }
+                        None => {
+                            send(request, err_response(503, "read admission is missing"));
+                            return;
+                        }
+                    };
+                    match Pm::at(pm_dir) {
+                        Ok(pm) => {
+                            if super::project_policy::refused(&pm, key, &actor) {
+                                send(request, err_response(404, "unknown project"));
+                                return;
+                            }
+                            let blockers = super::write_path::project_blockers(&pm, state_dir, key);
+                            match crate::issue::write::project_lifecycle(&pm, key, blockers) {
+                                Ok(out) => send(request, json_response(out)),
+                                Err(Error::Rejected(m)) if m.starts_with("no project ") => {
+                                    send(request, err_response(404, "unknown project"))
+                                }
+                                Err(e) => send(request, err_response(503, &e.to_string())),
+                            }
+                        }
                         Err(error) => send(request, err_response(503, &error.to_string())),
                     }
                     return;

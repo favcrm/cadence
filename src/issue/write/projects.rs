@@ -146,6 +146,7 @@ pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<V
     })?;
     let items = parse::parse_acceptance_input(&input)?;
     let (_project, dir) = issue_dir(pm, id)?;
+    require_project_active(&_project)?;
     let file = dir.join("issue.md");
     let lock = pm.lock_for_paths(std::slice::from_ref(&file))?;
     let (front, body) = load_front(&dir)?;
@@ -280,6 +281,12 @@ pub fn project_add(
         // isolation gate passes.
         id: Some(project::new_id()),
         policy: Some(project::ProjectPolicy::workspace_visible()),
+        archived: false,
+        archived_at: None,
+        archived_by: None,
+        archive_revision: 0,
+        archive_changed_at: None,
+        archive_changed_by: None,
     };
     let dir = project_dir(pm, key)?;
     std::fs::create_dir_all(&dir)?;
@@ -385,6 +392,7 @@ pub fn set_project_policy(
         )));
     }
     let mut project = project::load(&yaml_path)?;
+    require_project_active(&project)?;
     let grants = members
         .iter()
         .map(|member| project::Grant::parse(member))
@@ -465,6 +473,7 @@ pub fn set_project_remote(pm: &Pm, key: &str, from: &str, to: &str, actor: &str)
         )));
     }
     let mut project = project::load(&yaml_path)?;
+    require_project_active(&project)?;
     let matches: Vec<usize> = project
         .repos
         .iter()
@@ -540,4 +549,175 @@ pub fn set_project_remote(pm: &Pm, key: &str, from: &str, to: &str, actor: &str)
     });
     attach_foreign(&mut out, &foreign);
     Ok(out)
+}
+
+/// CAD-2830: refuse mutations targeting an archived project with a stable
+/// coded error (`project_archived`, mapped to HTTP 409 on the board).
+pub fn require_project_active(project: &project::Project) -> Result<()> {
+    if project.archived {
+        return Err(Error::invalid(
+            "project_archived",
+            format!(
+                "Project '{}' is archived — restore it before making changes.",
+                project.key
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn lifecycle_payload(project: &project::Project, blockers: &[String]) -> Value {
+    json!({
+        "archive_capability": "cad2255.project-archive.v1",
+        "project": project.key,
+        "archived": project.archived,
+        "revision": project.archive_revision,
+        "archived_at": project.archived_at,
+        "archived_by": project.archived_by,
+        "changed_at": project.archive_changed_at,
+        "changed_by": project.archive_changed_by,
+        "blockers": blockers,
+    })
+}
+
+/// CAD-2830: read one project's archive lifecycle state.
+pub fn project_lifecycle(pm: &Pm, key: &str, blockers: Vec<String>) -> Result<Value> {
+    let key = crate::issue::model::check_key(key)?;
+    let dir = project_dir(pm, &key)?;
+    let yaml_path = dir.join("project.yaml");
+    if !crate::issue::board::is_real_file(&yaml_path) {
+        return Err(Error::rejected(format!(
+            "no project '{key}' — register it with `cadence issue project add`"
+        )));
+    }
+    let project = project::load(&yaml_path)?;
+    let blockers = if project.archived {
+        Vec::new()
+    } else {
+        blockers
+    };
+    Ok(lifecycle_payload(&project, &blockers))
+}
+
+fn transition_project_archive(
+    pm: &Pm,
+    key: &str,
+    archive: bool,
+    confirmation: &str,
+    expected_revision: Option<u64>,
+    blockers: &[String],
+    actor: &str,
+) -> Result<Value> {
+    let key = crate::issue::model::check_key(key)?;
+    let dir = project_dir(pm, &key)?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
+    let yaml_path = dir.join("project.yaml");
+    if !crate::issue::board::is_real_file(&yaml_path) {
+        return Err(Error::rejected(format!(
+            "no project '{key}' — register it with `cadence issue project add`"
+        )));
+    }
+    let mut project = project::load(&yaml_path)?;
+    if confirmation != key {
+        return Err(Error::invalid(
+            "confirmation_mismatch",
+            "Type the exact project key to confirm.",
+        ));
+    }
+    if let Some(expected) = expected_revision {
+        if expected != project.archive_revision {
+            return Err(Error::invalid(
+                "revision_conflict",
+                "The project state changed; reload before trying again.",
+            ));
+        }
+    }
+    if archive {
+        if project.archived {
+            return Err(Error::invalid(
+                "already_archived",
+                "The project state changed; reload before trying again.",
+            ));
+        }
+        if !blockers.is_empty() {
+            return Err(Error::invalid(
+                "blocked",
+                "Work is active, queued, or unverified; nothing was archived.",
+            ));
+        }
+    } else if !project.archived {
+        return Err(Error::invalid(
+            "not_archived",
+            "The project state changed; reload before trying again.",
+        ));
+    }
+    let now = time::iso(time::now_epoch());
+    let who = if actor.trim().is_empty() {
+        "operator"
+    } else {
+        actor.trim()
+    };
+    project.archived = archive;
+    project.archive_revision = project.archive_revision.saturating_add(1);
+    if archive {
+        project.archived_at = Some(now.clone());
+        project.archived_by = Some(who.to_string());
+    }
+    project.archive_changed_at = Some(now);
+    project.archive_changed_by = Some(who.to_string());
+    let prev = file_preimage(&yaml_path);
+    write_project_yaml(&yaml_path, &project)?;
+    let verb = if archive { "archived" } else { "restored" };
+    let foreign = match commit_scoped(
+        pm,
+        &lock,
+        std::slice::from_ref(&yaml_path),
+        &format!(
+            "project {key} {verb} (revision {})",
+            project.archive_revision
+        ),
+        &[],
+        actor,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            restore_preimage(&yaml_path, prev);
+            return Err(e);
+        }
+    };
+    let mut out = lifecycle_payload(&project, &[]);
+    out["committed"] = json!(true);
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
+/// CAD-2830: archive a project behind exact-key confirmation and CAS revision.
+pub fn archive_project(
+    pm: &Pm,
+    key: &str,
+    confirmation: &str,
+    expected_revision: Option<u64>,
+    blockers: &[String],
+    actor: &str,
+) -> Result<Value> {
+    transition_project_archive(
+        pm,
+        key,
+        true,
+        confirmation,
+        expected_revision,
+        blockers,
+        actor,
+    )
+}
+
+/// CAD-2830: restore an archived project without restarting prior jobs.
+pub fn restore_project(
+    pm: &Pm,
+    key: &str,
+    confirmation: &str,
+    expected_revision: Option<u64>,
+    actor: &str,
+) -> Result<Value> {
+    transition_project_archive(pm, key, false, confirmation, expected_revision, &[], actor)
 }

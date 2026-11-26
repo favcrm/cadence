@@ -69,13 +69,39 @@ pub(crate) fn value_fp(value: &Value) -> u64 {
 /// not re-parse every folder to learn that the counts did not move.
 pub(crate) fn projects_payload(pm: &Pm, counts: &HashMap<String, usize>) -> Value {
     let projects = project::list(&pm.dir).unwrap_or_default();
-    let payload: Vec<Value> = projects.iter().map(|p| json!({
-        "key": p.key, "prefix": p.prefix, "components": p.components,
-        "tags": p.tags, "default_owner": p.default_owner,
-        "repos": p.repos.iter().map(|r| json!({"path": r.path, "remote": r.remote})).collect::<Vec<_>>(),
-        "issues": counts.get(&p.key).copied().unwrap_or(0),
-    })).collect();
+    let payload: Vec<Value> = projects
+        .iter()
+        .filter(|p| !p.archived)
+        .map(|p| json!({
+            "key": p.key, "prefix": p.prefix, "components": p.components,
+            "tags": p.tags, "default_owner": p.default_owner,
+            "repos": p.repos.iter().map(|r| json!({"path": r.path, "remote": r.remote})).collect::<Vec<_>>(),
+            "issues": counts.get(&p.key).copied().unwrap_or(0),
+        }))
+        .collect();
     json!({"projects": payload})
+}
+
+/// CAD-2830: archived projects payload (`GET /api/projects?archived=1`).
+pub(crate) fn archived_projects_payload(pm: &Pm, counts: &HashMap<String, usize>) -> Value {
+    let projects = project::list(&pm.dir).unwrap_or_default();
+    let payload: Vec<Value> = projects
+        .iter()
+        .filter(|p| p.archived)
+        .map(|p| json!({
+            "key": p.key,
+            "prefix": p.prefix,
+            "components": p.components,
+            "tags": p.tags,
+            "default_owner": p.default_owner,
+            "repos": p.repos.iter().map(|r| json!({"path": r.path, "remote": r.remote})).collect::<Vec<_>>(),
+            "issues": counts.get(&p.key).copied().unwrap_or(0),
+            "archived": true,
+            "archived_at": p.archived_at,
+            "archived_by": p.archived_by,
+        }))
+        .collect();
+    json!({"archive_supported": true, "projects": payload})
 }
 
 /// The board resources one stream event invalidates, sent as the frame's

@@ -17,6 +17,14 @@ export default function ProjectsOverview({
   onRetry,
   milestonesEnabled = true,
   workflowsEnabled = true,
+  archivedTab = false,
+  activeHref,
+  archivedHref,
+  archivedProjects = null,
+  archivedLoading = false,
+  archivedError = null,
+  archivedSupported = false,
+  onRetryArchived,
 }: {
   project: string;
   projects: Project[];
@@ -25,6 +33,14 @@ export default function ProjectsOverview({
   onRetry: () => void;
   milestonesEnabled?: boolean;
   workflowsEnabled?: boolean;
+  archivedTab?: boolean;
+  activeHref?: string;
+  archivedHref?: string;
+  archivedProjects?: Project[] | null;
+  archivedLoading?: boolean;
+  archivedError?: string | null;
+  archivedSupported?: boolean;
+  onRetryArchived?: () => void;
 }) {
   const { t, formatNumber } = useLocale();
   const cards = issues.data ?? [];
@@ -33,17 +49,91 @@ export default function ProjectsOverview({
   const selected = projects.find((item) => item.key === project);
   return <main className="project-overview px-4 lg:px-8 py-6 min-w-0">
     <header className="project-page-heading">
-      <div><div className="slabel">{t(all ? "Your workspace" : "Project overview")}</div><h1>{all ? t("Projects") : project}</h1><p>{t(all ? "See where work is moving and choose a project to explore." : "Current work, larger outcomes, and the next things to inspect.")}</p></div>
+      <div><div className="slabel">{t(all ? "Your workspace" : "Project overview")}</div><h1>{all ? t("Projects") : project}</h1><p>{t(all ? (archivedTab ? "Archived projects are hidden from active views and keep their issues read-only." : "See where work is moving and choose a project to explore.") : "Current work, larger outcomes, and the next things to inspect.")}</p></div>
       <Link className="project-action" href={path(project, "issues")}>{t(all ? "All issues" : "Browse issues")} <span aria-hidden>↗</span></Link>
     </header>
-    <ResourceGate state={issues} loading="Reading project work…" failed="Project work could not be loaded" onRetry={onRetry} />
-    <StaleChip state={issues} />
-    <dl className="project-stats">
-      {[[t("Open issues"), summary.open], [t("In progress"), summary.doing], [t("In review"), summary.review], [t("Blocked"), summary.blocked]].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{issues.data ? value : "—"}</dd></div>)}
-    </dl>
-    <p className="text-micro text-ink-500 mb-6">{t("Issue counts exclude epics. In progress reflects tracker status; it does not mean an agent is currently running.")}</p>
+    {all && archivedSupported && activeHref && archivedHref && (
+      <div className="flex flex-wrap items-center gap-2 mb-5" role="tablist" aria-label={t("Project status")}>
+        <Link
+          href={activeHref}
+          role="tab"
+          aria-selected={!archivedTab}
+          className={`btn btn-sm ${!archivedTab ? "btn-primary" : "btn-ghost"}`}
+        >
+          {t("Active")} ({formatNumber(projects.length)})
+        </Link>
+        <Link
+          href={archivedHref}
+          role="tab"
+          aria-selected={archivedTab}
+          className={`btn btn-sm ${archivedTab ? "btn-primary" : "btn-ghost"}`}
+        >
+          {t("Archived")}{archivedProjects !== null ? ` (${formatNumber(archivedProjects.length)})` : ""}
+        </Link>
+      </div>
+    )}
+    {(!all || !archivedTab) && (
+      <>
+        <ResourceGate state={issues} loading="Reading project work…" failed="Project work could not be loaded" onRetry={onRetry} />
+        <StaleChip state={issues} />
+        <dl className="project-stats">
+          {[[t("Open issues"), summary.open], [t("In progress"), summary.doing], [t("In review"), summary.review], [t("Blocked"), summary.blocked]].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{issues.data ? value : "—"}</dd></div>)}
+        </dl>
+        <p className="text-micro text-ink-500 mb-6">{t("Issue counts exclude epics. In progress reflects tracker status; it does not mean an agent is currently running.")}</p>
+      </>
+    )}
     {!all && milestonesEnabled && <ProjectMilestoneSummary project={project} issuesAsOf={issues.asOf} />}
-    {all ? <section aria-label={t("Projects")}><div className="flex items-center justify-between mb-3"><h2 className="text-section font-semibold text-ink-100">{t("Your projects")}</h2><span className="text-label text-ink-500">{formatNumber(projects.length)} {t("projects")}</span></div>
+    {all && archivedTab ? (
+      <section aria-label={t("Archived projects")}>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-section font-semibold text-ink-100">{t("Archived projects")}</h2>
+          {archivedProjects !== null && (
+            <span className="text-label text-ink-500">{formatNumber(archivedProjects.length)} {t("projects")}</span>
+          )}
+        </div>
+        {archivedLoading && archivedProjects === null && (
+          <p className="card p-6 text-ink-400">{t("Reading archived projects…")}</p>
+        )}
+        {archivedError && archivedProjects === null && (
+          <div className="card p-6 text-ink-300">
+            <p className="text-fail">{archivedError}</p>
+            {onRetryArchived && (
+              <button type="button" className="btn btn-sm mt-3" onClick={onRetryArchived}>
+                {t("Retry")}
+              </button>
+            )}
+          </div>
+        )}
+        {archivedProjects !== null && archivedProjects.length > 0 && (
+          <div className="project-grid">
+            {archivedProjects.map((item) => (
+              <article key={item.key} className="project-summary-card">
+                <div className="flex items-center justify-between gap-3">
+                  <Link href={path(item.key)} className="project-name">{item.key} <span aria-hidden>↗</span></Link>
+                  <span className="num text-micro text-ink-500">{item.prefix}</span>
+                </div>
+                <p className="text-label text-ink-400 mt-2">
+                  {formatNumber(item.issues)} {t("issues")} · {t("Read-only")}
+                </p>
+                {item.archived_at && (
+                  <p className="text-micro text-ink-500 mt-1">
+                    {t("Archived at")} {item.archived_at}
+                    {item.archived_by ? ` · ${item.archived_by}` : ""}
+                  </p>
+                )}
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Link href={path(item.key)} className="btn btn-sm">{t("Browse read-only")}</Link>
+                  <Link href={path(item.key, "settings")} className="btn btn-sm btn-ghost">{t("Restore in settings")}</Link>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+        {archivedProjects !== null && archivedProjects.length === 0 && (
+          <p className="card p-6 text-ink-400">{t("No archived projects.")}</p>
+        )}
+      </section>
+    ) : all ? <section aria-label={t("Projects")}><div className="flex items-center justify-between mb-3"><h2 className="text-section font-semibold text-ink-100">{t("Your projects")}</h2><span className="text-label text-ink-500">{formatNumber(projects.length)} {t("projects")}</span></div>
       <div className="project-grid">{projects.map((item) => {
         const work = projectSummary(cards, item.key);
         return <article key={item.key} className="project-summary-card">
