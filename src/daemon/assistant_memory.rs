@@ -17,7 +17,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::bootstrap_files::{
+pub(super) use super::bootstrap_files::{
     fsync_dir, open_read_child, open_root, read_bounded_capped, read_profile_file,
     replace_child_in_dir, FIELD_MAX, FILE_MAX, IDENTITY, MEMORY, MEMORY_SEED, SOUL, SOUL_MAX, USER,
 };
@@ -59,6 +59,15 @@ pub struct MemorySnapshot {
     pub topics: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionSnapshot {
+    pub target: String,
+    pub before_exists: bool,
+    pub before_sha: String,
+    pub after_sha: String,
+    pub before_text: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: String,
@@ -75,6 +84,8 @@ pub struct HistoryEntry {
     pub added: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub companion_snapshots: Vec<CompanionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undone_by: Option<String>,
 }
@@ -91,7 +102,7 @@ pub fn valid_topic_slug(slug: &str) -> bool {
         && !slug.contains("--")
 }
 
-fn check_topic_slug(slug: &str) -> Result<String> {
+pub(super) fn check_topic_slug(slug: &str) -> Result<String> {
     if valid_topic_slug(slug) {
         Ok(slug.to_string())
     } else {
@@ -101,11 +112,11 @@ fn check_topic_slug(slug: &str) -> Result<String> {
     }
 }
 
-fn c_name(name: &str) -> Result<CString> {
+pub(super) fn c_name(name: &str) -> Result<CString> {
     CString::new(name).map_err(|_| Error::rejected("invalid filename"))
 }
 
-fn open_memory_dir(root_fd: &DirFd, create: bool) -> Result<Option<DirFd>> {
+pub(super) fn open_memory_dir(root_fd: &DirFd, create: bool) -> Result<Option<DirFd>> {
     if create {
         match root_fd.mkdir(c"memory", 0o700) {
             Ok(()) => {}
@@ -126,7 +137,31 @@ fn open_memory_dir(root_fd: &DirFd, create: bool) -> Result<Option<DirFd>> {
     }
 }
 
-fn read_child_text(dir: &DirFd, name: &str, cap: u64) -> Result<Option<String>> {
+pub(super) fn open_journal_dir(root_fd: &DirFd, create: bool) -> Result<Option<DirFd>> {
+    let Some(mem_dir) = open_memory_dir(root_fd, create)? else {
+        return Ok(None);
+    };
+    if create {
+        match mem_dir.mkdir(c"journal", 0o700) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(Error::rejected(format!(
+                    "could not create 'memory/journal/' directory: {err}"
+                )));
+            }
+        }
+    }
+    match mem_dir.open_child_dir(c"journal") {
+        Ok(dir) => Ok(Some(dir)),
+        Err(err) if !create && err.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(err) => Err(Error::rejected(format!(
+            "memory/journal directory is invalid or a symlink: {err}"
+        ))),
+    }
+}
+
+pub(super) fn read_child_text(dir: &DirFd, name: &str, cap: u64) -> Result<Option<String>> {
     let cname = c_name(name)?;
     let Some(mut file) = open_read_child(dir, name, &cname)? else {
         return Ok(None);
@@ -134,7 +169,7 @@ fn read_child_text(dir: &DirFd, name: &str, cap: u64) -> Result<Option<String>> 
     read_bounded_capped(&mut file, name, cap).map(Some)
 }
 
-fn sorted_md_entries(dir: &DirFd) -> Result<Vec<String>> {
+pub(super) fn sorted_md_entries(dir: &DirFd) -> Result<Vec<String>> {
     let mut names = Vec::new();
     let iter = dir
         .read_dir()
@@ -295,7 +330,7 @@ pub fn diff_memory(before: &str, after: &str) -> Option<String> {
     }
 }
 
-fn load_history(root_fd: &DirFd) -> Result<Vec<HistoryEntry>> {
+pub(super) fn load_history(root_fd: &DirFd) -> Result<Vec<HistoryEntry>> {
     let Some(raw) = read_child_text(root_fd, HISTORY_FILE, HISTORY_FILE_MAX)? else {
         return Ok(Vec::new());
     };
@@ -308,7 +343,7 @@ fn load_history(root_fd: &DirFd) -> Result<Vec<HistoryEntry>> {
     Ok(rows)
 }
 
-fn append_history(root_fd: &DirFd, entry: HistoryEntry) -> Result<()> {
+pub(super) fn append_history(root_fd: &DirFd, entry: HistoryEntry) -> Result<()> {
     let mut rows = load_history(root_fd)?;
     rows.push(entry);
     if rows.len() > HISTORY_MAX_ROWS {
@@ -330,17 +365,21 @@ fn write_history(root_fd: &DirFd, rows: &[HistoryEntry]) -> Result<()> {
     replace_child_in_dir(root_fd, HISTORY_FILE, &cname, &out)
 }
 
-fn next_history_id(rows: &[HistoryEntry], op: &str, seed: &str) -> String {
+pub(super) fn next_history_id(rows: &[HistoryEntry], op: &str, seed: &str) -> String {
     let digest = sha256_hex(format!("{}|{}|{seed}", rows.len(), op).as_bytes());
     format!("mem_{}", &digest[..12])
 }
 
 fn current_date_utc() -> String {
-    let iso = time::iso(time::now_epoch());
+    current_date_utc_at(time::now_epoch())
+}
+
+fn current_date_utc_at(epoch: i64) -> String {
+    let iso = time::iso(epoch);
     iso.get(..10).unwrap_or("1970-01-01").to_string()
 }
 
-fn normalize_fact_body(line: &str) -> String {
+pub(super) fn normalize_fact_body(line: &str) -> String {
     let trimmed = line.trim();
     let without_bullet = trimmed
         .strip_prefix("- ")
@@ -371,7 +410,7 @@ fn normalize_fact_body(line: &str) -> String {
         .to_lowercase()
 }
 
-fn insert_fact_newest_first(current: &str, new_line: &str) -> String {
+pub(super) fn insert_fact_newest_first(current: &str, new_line: &str) -> String {
     let mut lines: Vec<String> = current.lines().map(str::to_string).collect();
     if lines.is_empty() {
         return format!("{MEMORY_SEED}{new_line}\n");
@@ -410,10 +449,33 @@ fn clean_source_tag(source_tag: Option<&str>) -> Option<&str> {
 }
 
 /// Add a single dated fact line to `MEMORY.md`, deduplicating and secret-scanning.
+#[cfg(test)]
 pub fn remember(
     root: &Path,
     fact: &str,
     source_tag: Option<&str>,
+    actor: &str,
+    turn_id: &str,
+) -> Result<Value> {
+    remember_with_context(
+        root,
+        fact,
+        source_tag,
+        None,
+        time::now_epoch(),
+        actor,
+        turn_id,
+    )
+}
+
+/// Add a single dated fact line to `MEMORY.md`, consulting the 14-day re-add guard
+/// against `current_user_turn` so stale sessions cannot silently re-insert tidied facts.
+pub fn remember_with_context(
+    root: &Path,
+    fact: &str,
+    source_tag: Option<&str>,
+    current_user_turn: Option<&str>,
+    now_epoch: i64,
     actor: &str,
     turn_id: &str,
 ) -> Result<Value> {
@@ -453,10 +515,28 @@ pub fn remember(
         }));
     }
     let clean_source = clean_source_tag(source_tag);
-    let mut bullet = format!("- {}: {}", current_date_utc(), cleaned);
+    let mut bullet = format!("- {}: {}", current_date_utc_at(now_epoch), cleaned);
     if let Some(src) = clean_source {
         bullet.push_str(SOURCE_SEPARATOR);
         bullet.push_str(src);
+    }
+    if let Some(reason) = super::assistant_memory_tidy::check_readd_guard(
+        &root_fd,
+        cleaned,
+        current_user_turn,
+        now_epoch,
+    )? {
+        super::assistant_memory_tidy::append_to_archive(&root_fd, &bullet)?;
+        return Ok(json!({
+            "added": false,
+            "duplicate": false,
+            "readd_guarded": true,
+            "guard_reason": reason,
+            "diverted_to": "memory/archive.md",
+            "line": bullet,
+            "revision_sha": before_sha,
+            "line_count": before_text.lines().count(),
+        }));
     }
     let next = insert_fact_newest_first(&before_text, &bullet);
     if next.len() as u64 > MEMORY_FILE_MAX {
@@ -473,7 +553,7 @@ pub fn remember(
         &root_fd,
         HistoryEntry {
             id: history_id.clone(),
-            at: time::iso(time::now_epoch()),
+            at: time::iso(now_epoch),
             op: "remember".to_string(),
             target: MEMORY.to_string(),
             actor: actor.to_string(),
@@ -484,6 +564,7 @@ pub fn remember(
             before_text,
             added: vec![bullet.clone()],
             removed: Vec::new(),
+            companion_snapshots: Vec::new(),
             undone_by: None,
         },
     )?;
@@ -556,6 +637,7 @@ pub fn forget(root: &Path, query: &str, actor: &str, turn_id: &str) -> Result<Va
             before_text,
             added: Vec::new(),
             removed: removed.clone(),
+            companion_snapshots: Vec::new(),
             undone_by: None,
         },
     )?;
@@ -635,6 +717,7 @@ pub fn write_topic(
                 .map(|src| vec![format!("from: {src}")])
                 .unwrap_or_default(),
             removed: Vec::new(),
+            companion_snapshots: Vec::new(),
             undone_by: None,
         },
     )?;
@@ -723,6 +806,7 @@ pub fn update_soul(
             before_text,
             added: Vec::new(),
             removed: Vec::new(),
+            companion_snapshots: Vec::new(),
             undone_by: None,
         },
     )?;
@@ -767,6 +851,30 @@ pub fn undo(root: &Path, history_id: &str, actor: &str, turn_id: &str) -> Result
             ),
         ));
     }
+    let mut verified_companions = Vec::with_capacity(entry.companion_snapshots.len());
+    for snap in &entry.companion_snapshots {
+        let (comp_dir, comp_name, comp_cap) = resolve_target_dir(&root_fd, &snap.target)?;
+        let comp_cur = read_child_text(&comp_dir, &comp_name, comp_cap)?.ok_or_else(|| {
+            Error::conflict_coded(
+                "revision_conflict",
+                format!(
+                    "cannot undo '{history_id}': '{}' no longer exists",
+                    snap.target
+                ),
+            )
+        })?;
+        let comp_sha = sha256_hex(comp_cur.as_bytes());
+        if comp_sha != snap.after_sha {
+            return Err(Error::conflict_coded(
+                "revision_conflict",
+                format!(
+                    "cannot undo '{history_id}': '{}' changed since that edit",
+                    snap.target
+                ),
+            ));
+        }
+        verified_companions.push((comp_dir, comp_name, snap));
+    }
     let cname = c_name(&filename)?;
     if entry.before_exists {
         replace_child_in_dir(&dir_fd, &filename, &cname, &entry.before_text)?;
@@ -775,6 +883,19 @@ pub fn undo(root: &Path, history_id: &str, actor: &str, turn_id: &str) -> Result
             .unlink_child(&cname)
             .map_err(|e| Error::rejected(format!("could not remove '{}': {e}", entry.target)))?;
         fsync_dir(&dir_fd)?;
+    }
+    let mut restored_companions = Vec::with_capacity(verified_companions.len());
+    for (comp_dir, comp_name, snap) in verified_companions {
+        let comp_cname = c_name(&comp_name)?;
+        if snap.before_exists {
+            replace_child_in_dir(&comp_dir, &comp_name, &comp_cname, &snap.before_text)?;
+        } else {
+            comp_dir
+                .unlink_child(&comp_cname)
+                .map_err(|e| Error::rejected(format!("could not remove '{}': {e}", snap.target)))?;
+            fsync_dir(&comp_dir)?;
+        }
+        restored_companions.push(snap.target.clone());
     }
     let undo_id = next_history_id(&rows, "undo", &entry.before_sha);
     rows[idx].undone_by = Some(undo_id.clone());
@@ -791,6 +912,7 @@ pub fn undo(root: &Path, history_id: &str, actor: &str, turn_id: &str) -> Result
         before_text: current,
         added: entry.removed.clone(),
         removed: entry.added.clone(),
+        companion_snapshots: Vec::new(),
         undone_by: None,
     });
     if rows.len() > HISTORY_MAX_ROWS {
@@ -798,6 +920,7 @@ pub fn undo(root: &Path, history_id: &str, actor: &str, turn_id: &str) -> Result
         rows.drain(..drop_n);
     }
     write_history(&root_fd, &rows)?;
+    super::assistant_memory_tidy::clear_guard_for_history(&root_fd, history_id)?;
     Ok(json!({
         "undone": history_id,
         "undo_history_id": undo_id,
@@ -807,11 +930,12 @@ pub fn undo(root: &Path, history_id: &str, actor: &str, turn_id: &str) -> Result
         "revision_sha": entry.before_sha,
         "added": entry.removed,
         "removed": entry.added,
+        "restored_companions": restored_companions,
         "applies": "next_turn",
     }))
 }
 
-fn line_diff(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
+pub(super) fn line_diff(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
     let before_lines: Vec<String> = before
         .lines()
         .map(str::trim)
@@ -1004,6 +1128,7 @@ pub fn edit_member_file(
                 before_text: before_text.clone(),
                 added,
                 removed,
+                companion_snapshots: Vec::new(),
                 undone_by: None,
             },
         )?;
@@ -1061,6 +1186,7 @@ pub fn edit_member_file(
                 before_text,
                 added,
                 removed,
+                companion_snapshots: Vec::new(),
                 undone_by: None,
             },
         )?;
@@ -1123,6 +1249,7 @@ pub fn edit_member_file(
                 before_text,
                 added,
                 removed,
+                companion_snapshots: Vec::new(),
                 undone_by: None,
             },
         )?;

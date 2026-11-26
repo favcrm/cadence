@@ -4135,10 +4135,16 @@ impl Shared {
                 let (running, source_tag) = self
                     .require_member_memory_turn("assistant_context_update(remember)", &binding)?;
                 let fact = required_str(params, "fact")?;
-                let res = super::assistant_memory::remember(
+                let res = super::assistant_memory::remember_with_context(
                     &root,
                     fact,
                     source_tag,
+                    if source_tag.is_none() {
+                        Some(running.body.as_str())
+                    } else {
+                        None
+                    },
+                    crate::issue::time::now_epoch(),
                     &binding.alias,
                     &running.id,
                 )?;
@@ -4212,7 +4218,7 @@ impl Shared {
             if let Some(conv_id) = binding.conversation_id.as_deref() {
                 self.append_context_receipt_entry(
                     conv_id,
-                    &running_id,
+                    Some(&running_id),
                     op,
                     target_str,
                     &out,
@@ -4323,7 +4329,7 @@ impl Shared {
                 .unwrap_or_default();
             self.append_context_receipt_entry(
                 conv_id,
-                &running.id,
+                Some(&running.id),
                 "undo",
                 target,
                 &out,
@@ -4344,10 +4350,10 @@ impl Shared {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn append_context_receipt_entry(
+    pub(super) fn append_context_receipt_entry(
         &self,
         conv_id: &str,
-        running_id: &str,
+        running_id: Option<&str>,
         op: &str,
         target: &str,
         out: &Value,
@@ -4370,6 +4376,15 @@ impl Shared {
             "update_soul" => "Updated SOUL.md".to_string(),
             "write_topic" => format!("Updated {target}"),
             "undo" => format!("Undid change to {target}"),
+            "status_sweep" => format!(
+                "Swept {removed_count} status {} to monthly journal",
+                if removed_count == 1 {
+                    "snapshot"
+                } else {
+                    "snapshots"
+                }
+            ),
+            "tidy_up" => format!("Tidied {target}"),
             _ => format!("Updated {target}"),
         };
         let payload = json!({
@@ -4389,7 +4404,7 @@ impl Shared {
                 kind: crate::store::KIND_CONTEXT_RECEIPT,
                 text: &summary_text,
                 payload: Some(payload),
-                message_id: Some(running_id),
+                message_id: running_id,
             },
         );
     }

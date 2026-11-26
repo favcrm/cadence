@@ -381,6 +381,16 @@ impl Store {
         }
     }
 
+    /// List all currently active member-assistant bindings.
+    pub fn list_active_assistant_bindings(&self) -> Result<Vec<AssistantBinding>> {
+        let conn = self.conn();
+        Ok(conn.query_vec(
+            "SELECT * FROM assistants WHERE state='active' ORDER BY created, assistant_id",
+            [],
+            row_binding,
+        )?)
+    }
+
     /// Provision or refresh the binding. Daemon-only (the `member_as` proof
     /// gates the caller). Idempotent per `(org, sub)`: re-provisioning a live
     /// binding returns the existing row; a `revoked`/`archived` one returns

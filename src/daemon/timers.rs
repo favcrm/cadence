@@ -198,6 +198,158 @@ impl Shared {
         }
     }
 
+    /// CAD-2835: Periodically run deterministic status sweeping and tool-less
+    /// memory tidy-up for idle bound personal assistants (at most every 5 minutes).
+    pub(super) fn assistant_memory_tidy_tick(&self) {
+        const TIDY_CHECK_EVERY: Duration = Duration::from_secs(300);
+        let now_inst = Instant::now();
+        {
+            let mut last = self.memory_tidy_at.lock().unwrap();
+            if last.is_some_and(|at| now_inst.duration_since(at) < TIDY_CHECK_EVERY) {
+                return;
+            }
+            *last = Some(now_inst);
+        }
+        let bindings = match self.store.list_active_assistant_bindings() {
+            Ok(list) => list,
+            Err(_) => return,
+        };
+        if bindings.is_empty() {
+            return;
+        }
+        let now_epoch = crate::issue::time::now_epoch();
+        let cfg = super::assistant_memory_tidy::TidyScheduleConfig::default();
+        for binding in bindings {
+            if self
+                .store
+                .running_message(&binding.alias)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+            let Ok(Some(agent)) = self.store.agent_opt(&binding.alias) else {
+                continue;
+            };
+            let root = Path::new(&agent.cwd);
+            if !root.is_dir() {
+                continue;
+            }
+            let (recent_turns, total_turns) = match binding.conversation_id.as_deref() {
+                Some(conv_id) => match self.store.member_thread_entries_before(conv_id, None, 20) {
+                    Ok((entries, _)) => {
+                        let last_seq = entries
+                            .last()
+                            .and_then(|e| u64::try_from(e.seq).ok())
+                            .unwrap_or(0);
+                        let lines = entries
+                            .into_iter()
+                            .filter(|e| {
+                                !e.text.trim().is_empty()
+                                    && matches!(
+                                        e.kind.as_str(),
+                                        crate::store::KIND_MESSAGE
+                                            | crate::store::KIND_ASSISTANT_TEXT
+                                    )
+                            })
+                            .map(|e| format!("{}: {}", e.role, e.text.trim()))
+                            .collect();
+                        (lines, last_seq)
+                    }
+                    Err(_) => (Vec::new(), 0),
+                },
+                None => (Vec::new(), 0),
+            };
+            let res = super::assistant_memory_tidy::run_tidy_cycle_for_root(
+                root,
+                now_epoch,
+                &recent_turns,
+                total_turns,
+                &cfg,
+                &binding.alias,
+                |sys, usr| match self.tidy_completer.as_ref() {
+                    Some(completer) => completer(sys, usr),
+                    None => Ok(None),
+                },
+            );
+            let Ok(out) = res else {
+                continue;
+            };
+            if out["sweep"]["swept"].as_bool().unwrap_or(false) {
+                let removed = out["sweep"]["moved"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(conv_id) = binding.conversation_id.as_deref() {
+                    self.append_context_receipt_entry(
+                        conv_id,
+                        None,
+                        "status_sweep",
+                        super::bootstrap_files::MEMORY,
+                        &out["sweep"],
+                        Vec::new(),
+                        removed,
+                    );
+                }
+                let _ = self.store.event_public(
+                    &binding.alias,
+                    "assistant_context_updated",
+                    json!({
+                        "op": "status_sweep",
+                        "history_id": out["sweep"]["history_id"],
+                        "target": super::bootstrap_files::MEMORY,
+                    }),
+                );
+            }
+            if out["tidy"]["applied"].as_bool().unwrap_or(false) {
+                let added = out["tidy"]["added"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let removed = out["tidy"]["removed"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(conv_id) = binding.conversation_id.as_deref() {
+                    self.append_context_receipt_entry(
+                        conv_id,
+                        None,
+                        "tidy_up",
+                        super::bootstrap_files::MEMORY,
+                        &out["tidy"],
+                        added,
+                        removed,
+                    );
+                }
+                let _ = self.store.event_public(
+                    &binding.alias,
+                    "assistant_context_updated",
+                    json!({
+                        "op": "tidy_up",
+                        "history_id": out["tidy"]["history_id"],
+                        "target": super::bootstrap_files::MEMORY,
+                    }),
+                );
+            }
+        }
+    }
+
     /// The manual `agent gc` candidate rule, narrowed: never an enabled
     /// agent, a lifecycle-owned alias, a pty row whose pane is still up,
     /// or a row with an open or `unknown` message. The store re-checks
