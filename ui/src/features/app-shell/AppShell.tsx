@@ -1233,14 +1233,19 @@ export default function AppShell({
     !wabaHostFallback &&
     ((viewer.operator === true && !viewer.readOnly) || viewer.screenReader === true);
   const isNativeBackdoor = query.get("screen") === "native";
+  const canMountScreen = isSocial
+    ? Boolean(children) && viewer.operator !== null
+    : (viewer.operator === true && !viewer.readOnly) || viewer.screenReader === true;
   const expectsScreen =
     receiptReady &&
+    contextAdoptionReady &&
     installation !== null &&
     !needsSetup &&
     previewKey === null &&
     loadError === null &&
     !isWabaSettingsActive &&
     !isNativeBackdoor &&
+    canMountScreen &&
     screenTag(installation) !== null;
   const showUnifiedLoading =
     loading ||

@@ -1086,9 +1086,27 @@ export function readInstallationsSnapshot(): Installation[] | null {
   return installationsSnapshot.rows;
 }
 
-export function writeInstallationsSnapshot(rows: Installation[]): void {
-  if (!privateReadsAllowed()) return;
-  installationsSnapshot = { at: Date.now(), session: sessionKey(), rows };
+/**
+ * Guarded `/api/app-installations` read: passes `signal` directly to the caller's
+ * fetch so disable/unmount abort propagates immediately, while enforcing the same
+ * session/epoch fence before storing or returning results.
+ */
+export async function readInstallationsGuarded(signal?: AbortSignal): Promise<Installation[]> {
+  const requestSession = sessionKey();
+  const generation = privateSessionGeneration();
+  const epoch = snapshotEpoch;
+  const rows = await workspaceApps.installations(signal);
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  if (
+    epoch !== snapshotEpoch ||
+    requestSession !== sessionKey() ||
+    generation !== privateSessionGeneration() ||
+    !privateReadsAllowed()
+  ) {
+    throw new ApiError("The session changed while loading this app", 401);
+  }
+  if (Array.isArray(rows)) installationsSnapshot = { at: Date.now(), session: requestSession, rows };
+  return rows;
 }
 
 export function dropInstallationsSnapshot(): void {

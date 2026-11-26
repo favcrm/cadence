@@ -3,9 +3,8 @@ import { loadFailureMessage, loadWithBackoff } from "./installationsLoad";
 import {
   appExplorer,
   dropInstallationsSnapshot,
+  readInstallationsGuarded,
   readInstallationsSnapshot,
-  workspaceApps,
-  writeInstallationsSnapshot,
   type Installation,
 } from "./workspaceApps";
 
@@ -69,10 +68,7 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
     loadWithBackoff(
       () => source === "home"
         ? memberRows(controller.signal)
-        : workspaceApps.installations(controller.signal).then((rows) => {
-            if (Array.isArray(rows)) writeInstallationsSnapshot(rows);
-            return rows;
-          }),
+        : readInstallationsGuarded(controller.signal),
       {
         signal: controller.signal,
         onRetry: () => { if (!controller.signal.aborted) setRetrying(true); },

@@ -801,6 +801,14 @@ equal(reads.filter((p) => p === "/api/app-installations/install-second/contexts"
       screenArg?.onScreenState?.("ready");
     });
     assert(!unifiedSurface.querySelector(".wa-shell-loading-overlay"), "unified loading overlay clears after onScreenState('ready')");
+    await React.act(async () => {
+      screenArg?.onScreenState?.("loading");
+    });
+    assert(unifiedSurface.querySelector(".wa-shell-loading-overlay"), "unified loading overlay can re-enter loading state cleanly");
+    await React.act(async () => {
+      screenArg?.onScreenState?.("fallback");
+    });
+    assert(!unifiedSurface.querySelector(".wa-shell-loading-overlay"), "unified loading overlay clears when child reports fallback before mounting");
   } finally {
     social.files = prevFiles;
     (social as any).executable = prevExec;

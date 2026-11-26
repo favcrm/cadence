@@ -1143,6 +1143,27 @@ export default function WorkspaceApp({
       ),
     },
   ];
+  const tag = effectiveTag;
+  const waitingForProjection =
+    viewer.operator === true &&
+    Boolean(tag) &&
+    !isNativeBackdoor &&
+    !accessDenied &&
+    !loadError &&
+    loading &&
+    !data &&
+    !useScreenFastPath;
+  let projection = null;
+  if (viewer.operator === true && effectiveInstallation && tag && !accessDenied && !loadError && (data || useScreenFastPath)) {
+    try { projection = screenProjection(effectiveInstallation, tag, contextId, effectiveContexts, data?.runs ?? [], data?.effects ?? [], intentRead, screenExtras.extras); }
+    catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
+  }
+  const screenHostActive = Boolean(projection);
+  useEffect(() => {
+    if (!screenHostActive && !waitingForProjection) {
+      onScreenState?.("fallback");
+    }
+  }, [screenHostActive, waitingForProjection, onScreenState]);
   if (viewer.operator === null) {
     // CAD-1193: "checking" only while a probe is in flight; a completed
     // unanswered probe is unavailable, with a retry wired to the real
@@ -1164,12 +1185,6 @@ export default function WorkspaceApp({
     );
   }
   if (!viewer.operator) return <main className="workspace-app" aria-label={t("Workspace app")}><h1>{t("Workspace app")}</h1><p className="wa-alert">{t("Sign in as the operator to inspect this installation.")}</p><Button href="/apps">{t("All apps")}</Button></main>;
-  const tag = effectiveTag;
-  let projection = null;
-  if (effectiveInstallation && tag && !accessDenied && !loadError && (data || useScreenFastPath)) {
-    try { projection = screenProjection(effectiveInstallation, tag, contextId, effectiveContexts, data?.runs ?? [], data?.effects ?? [], intentRead, screenExtras.extras); }
-    catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
-  }
   const contextPicker = () => (
     <Select
       value={contextId}
