@@ -5,7 +5,7 @@ import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
 import { api } from "../../lib/api";
 import { customMcpErrorText } from "../settings/customMcpView";
-import { ageText, approvable, askedBy, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
+import { ageText, approvable, askedBy, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, visible, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import ShareRequestDrawer from "./ShareRequestDrawer";
 import "./decisions.css";
@@ -108,6 +108,7 @@ function ApprovalsTab({
   onToggleDenyOpen,
   denyReason,
   onDenyReasonChange,
+  homeTool,
   t,
 }: {
   write: StagedWrite;
@@ -119,6 +120,7 @@ function ApprovalsTab({
   onToggleDenyOpen: () => void;
   denyReason: string;
   onDenyReasonChange: (next: string) => void;
+  homeTool: boolean;
   t: Say;
 }) {
   // An incomplete summary opens the raw call: that is the source of truth.
@@ -142,6 +144,27 @@ function ApprovalsTab({
         </p>
       )}
       {state}
+      {homeTool && (
+        <section aria-label={t("Request details")}>
+          <h4 className="rv-h">{t("Request details")}</h4>
+          <div className="dx-kv-card">
+            <dl className="dx-kv-list">
+              <div className="dx-kv-line">
+                <dt>{t("Connection")}</dt>
+                <dd><B>{write.app ?? ""}</B></dd>
+              </div>
+              <div className="dx-kv-line">
+                <dt>{t("Tool")}</dt>
+                <dd><B>{write.customMcp?.tool ?? write.connected?.slug ?? write.title}</B></dd>
+              </div>
+              <div className="dx-kv-line">
+                <dt>{t("Allow once")}</dt>
+                <dd>{t("This request only")}</dd>
+              </div>
+            </dl>
+          </div>
+        </section>
+      )}
       {write.whatsapp?.providerLabel && (
         <p className="rv-note m-0" data-whatsapp-provider={write.whatsapp.provider ?? undefined}>
           {t("WhatsApp mode")}: <B>{t(write.whatsapp.providerLabel)}</B>
@@ -210,7 +233,7 @@ function ApprovalsTab({
               )}
             </>
           ) : (
-            <p className="rv-note">{t("No fields change.")}</p>
+            <p className="rv-note">{homeTool ? t("No arguments.") : t("No fields change.")}</p>
           )}
           {unchanged > 0 && (
             <p className="rv-note">
@@ -521,6 +544,7 @@ export default function StagedWriteDetail({
   queue,
   at,
   readOnly,
+  home = false,
   onAt,
   onClose,
 }: {
@@ -530,6 +554,7 @@ export default function StagedWriteDetail({
   queue: readonly string[];
   at: number;
   readOnly: boolean;
+  home?: boolean;
   onAt: (index: number) => void;
   onClose: () => void;
 }) {
@@ -740,6 +765,8 @@ export default function StagedWriteDetail({
   const where = [write.app, write.target?.label].filter((p): p is string => !!p).join(" · ");
   const domain = stagedDomain(write);
   const off = block !== null || busy !== undefined || alwaysBusy || lost || uncertain || !pending;
+  const homeTool = home && (write.kind === "connected_effect" || write.kind === "custom_mcp_effect");
+  const previewTitle = write.customMcp?.preview?.title ?? write.connected?.preview?.title;
   const spin = (verb: Verb) => busy?.phase === "busy" && busy.verb === verb && attempt?.phase === "busy";
 
   return (
@@ -751,7 +778,7 @@ export default function StagedWriteDetail({
       size="md"
       preventClose={busy !== undefined || alwaysBusy}
       label={label}
-      title={<B>{titleOf(write, t)}</B>}
+      title={<B>{homeTool ? visible(previewTitle ?? write.customMcp?.tool ?? write.connected?.slug ?? write.title) : titleOf(write, t)}</B>}
       subtitle={
         <>
           <B>{where}</B>
@@ -790,6 +817,7 @@ export default function StagedWriteDetail({
               onToggleDenyOpen={toggleDenyOpen}
               denyReason={denyReason}
               onDenyReasonChange={setDenyReason}
+              homeTool={homeTool}
               t={t}
             />
           ),
@@ -837,7 +865,7 @@ export default function StagedWriteDetail({
                       {t("Approving…")}
                     </>
                   ) : (
-                    t("Approve")
+                    t(homeTool ? "Allow once" : "Approve")
                   )}
                 </button>
                 {write.kind === "custom_mcp_effect" && write.customMcp != null && (
@@ -873,7 +901,7 @@ export default function StagedWriteDetail({
                       {t("Denying…")}
                     </>
                   ) : (
-                    t("Deny")
+                    t(homeTool ? "Don’t allow" : "Deny")
                   )}
                 </button>
               </>

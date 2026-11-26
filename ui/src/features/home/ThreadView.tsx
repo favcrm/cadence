@@ -37,8 +37,10 @@ import {
 import { carriesSecret } from "../app-shell/chat/directive";
 import { useConversationPreview } from "../app-shell/chat/conversationPreview";
 import { fileKind } from "./fileKind";
-import { AttachmentNamesContext, TurnSkillDraftCards, TurnSources, TurnStagedCards } from "./TurnRichCards";
+import { AttachmentNamesContext, HomeTurnStagedCards, TurnSkillDraftCards, TurnSources, TurnStagedCards } from "./TurnRichCards";
 import { turnSources } from "./turnCards";
+import type { StagedSource } from "../../ui/StagedChip";
+import type { StagedWrite } from "../decisions/stagedWrite";
 
 /**
  * The one renderer for master-thread entries (CAD-1029). Home renders at
@@ -525,7 +527,7 @@ export function ThreadItemView({
           <span className="h-px flex-1 bg-ink-700" />
           <span className="min-w-0 max-w-[85%] whitespace-pre-wrap break-words text-center">
             {typeof item.entry.payload?.from === "string" ? `${item.entry.payload.from}: ` : ""}
-            {item.entry.text}
+            {e.kind === "tool_approval_decision" ? t("Tool decision recorded.") : e.text}
           </span>
           <span className="h-px flex-1 bg-ink-700" />
         </div>
@@ -895,10 +897,8 @@ function runningTool(trace: ThreadItem[], t: (english: string) => string): strin
   for (let i = trace.length - 1; i >= 0; i--) {
     const item = trace[i];
     if (item.type === "tools") {
-      const calls = toolSteps(item.entries).filter((s) => s.call.kind === "tool_call");
-      const newest = calls[calls.length - 1];
-      if (newest === undefined) continue;
-      if (carriesSecret(newest.summary)) return "";
+      const newest = toolSteps(item.entries).findLast((step) => step.call.kind === "tool_call" && !step.done);
+      if (newest === undefined || carriesSecret(newest.summary)) return "";
       // CAD-2363: a known tool reads as its own label ("Search the web…");
       // any other keeps "Running bash".
       const label = toolLabel(newest.summary);
@@ -1213,6 +1213,7 @@ export function ThreadTurn({
   previewTransform,
   startedAt = null,
   clock = true,
+  homeTools,
 }: {
   items: ThreadItem[];
   /** CAD-2363: when this turn started (ms) — the stamp of the row just before
@@ -1246,6 +1247,7 @@ export function ThreadTurn({
   /** False in a pane that copies from its header: refused directives stay
    *  inert, with no control in the row. */
   copy?: boolean;
+  homeTools?: { source: StagedSource; all: readonly StagedWrite[]; visible: readonly StagedWrite[]; continuing: boolean };
 }) {
   const t = useTranslate();
   const actor = useAssistantActor();
@@ -1262,10 +1264,17 @@ export function ThreadTurn({
   const legacy =
     allowLegacy && !answer && !running && lastNote?.type === "commentary" ? lastNote : null;
   const trace = legacy ? traceItems.filter((item) => item.key !== legacy.key) : traceItems;
+  const toolEntries = trace.flatMap((item) => (item.type === "tools" ? item.entries : []));
+  const stagedTools = homeTools?.all;
   const shown = answer ?? legacy;
   // Streaming is a turn the host says is running AND that has no answer yet:
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
+  const preview = useConversationPreview(previewConversation, streaming);
+  // Staging pauses that tool. A newer trace step or live preview can prove
+  // that independent work has started while the review card is still pending.
+  const generating = streaming && (!stagedTools?.length || homeTools?.continuing || preview !== null);
+  const paused = !generating && (stagedTools?.some((write) => write.status === "pending") ?? false);
   // CAD-2548 / CAD-2838: data cards (record, view, connect, artifact, ticket) wait for the
   // answer like TurnSources and TurnStagedCards. Image and video job cards
   // show their own progress and forms are unchanged, so both stay live.
@@ -1284,7 +1293,6 @@ export function ThreadTurn({
   // The assistant's actual in-flight words (CAD-2228), replaced frame by
   // frame. It paints only while this turn is still generating and has no
   // committed answer, and it is never presented as a stored reply.
-  const preview = useConversationPreview(previewConversation, streaming);
   const previewText =
     preview === null || previewTransform === undefined ? preview : previewTransform(preview);
   const hasPreview = previewText !== null && previewText.trim() !== "";
@@ -1292,12 +1300,11 @@ export function ThreadTurn({
   // its tool call starts. Until the next step has live text, the latest note
   // stays where the preview was, so the words do not vanish between steps.
   const interim =
-    streaming && !hasPreview
+    generating && !hasPreview
       ? [...trace].reverse().find((item) => item.type === "commentary")
       : undefined;
   const interimText =
     interim && !carriesSecret(interim.entry.text) ? interimLine(interim.entry.text) : null;
-  const toolEntries = trace.flatMap((item) => (item.type === "tools" ? item.entries : []));
   const attachmentNames = useContext(AttachmentNamesContext);
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
@@ -1311,18 +1318,18 @@ export function ThreadTurn({
   const elapsedFor = streaming ? null : elapsedSecs(startMs, stampMs(shown?.entry.created));
   const elapsed = elapsedFor === null ? null : formatElapsed(elapsedFor, t);
   const headAt = shown?.entry.created ?? lastCreated(items);
-  const tool = runningTool(trace, t);
+  const tool = generating ? runningTool(trace, t) : "";
   const typingLabel = tool !== "" ? tool : t("Thinking…");
   return (
-    <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"} data-turn-continued={continued || undefined}>
+    <div className="turn min-w-0" data-kind="turn" data-turn-state={paused ? "awaiting-approval" : generating ? "running" : "complete"} data-turn-continued={continued || undefined}>
       {head && (
         <div className="turn-head">
           <AssistantFace size={16} />
           <span className="turn-name">{displayName(actor.read, actor.scope, t)}</span>
-          {streaming && clock && startMs !== null ? (
+          {generating && clock && startMs !== null ? (
             <TurnClock since={startMs} />
           ) : (
-            <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>
+            <span className="turn-time num">{generating ? t("now") : time(headAt)}</span>
           )}
           {copy && shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
         </div>
@@ -1331,7 +1338,7 @@ export function ThreadTurn({
         <TurnTrace
           items={trace}
           steps={steps}
-          running={streaming}
+          running={generating}
           summary={digest.summary}
           errors={digest.errors}
           elapsed={elapsed}
@@ -1359,7 +1366,7 @@ export function ThreadTurn({
       {/* Dots, then the current step. Under the trace once steps exist,
           so the disclosure names the turn and the bubble names what is
           running now. */}
-      {streaming && (!hasPreview || tool !== "") && <TypingDots label={typingLabel} />}
+      {generating && (!hasPreview || tool !== "") && <TypingDots label={typingLabel} />}
       {shown && (
         <div data-item-key={shown.key}>
           <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />
@@ -1374,7 +1381,9 @@ export function ThreadTurn({
           artifacts={artifacts.flatMap((item) => (item.type === "artifact" ? [item.entry] : []))}
         />
       )}
-      {!streaming && <TurnStagedCards toolEntries={toolEntries} density={density} />}
+      {homeTools
+        ? <HomeTurnStagedCards toolEntries={toolEntries} density={density} source={homeTools.source} tools={homeTools.visible} streaming={streaming} />
+        : !streaming && <TurnStagedCards toolEntries={toolEntries} density={density} />}
       {!streaming && <TurnSkillDraftCards toolEntries={toolEntries} density={density} />}
       {shownCards.length > 0 && (
         <div className="turn-artifacts">

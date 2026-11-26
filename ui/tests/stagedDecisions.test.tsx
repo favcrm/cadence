@@ -138,7 +138,7 @@ const sleep = (ms: number) => React.act(async () => { await new Promise((resolve
 async function click(element: Element | undefined | null, opts: { detail?: number; quick?: boolean } = {}) {
   assert(element, "click target exists");
   const label = element.textContent?.trim();
-  if (!opts.quick && element.closest('[data-drawer="staged"]') && (label === "Approve" || label === "Always allow" || label === "Deny")) await sleep(850);
+  if (!opts.quick && element.closest('[data-drawer="staged"]') && (label === "Approve" || label === "Allow once" || label === "Always allow" || label === "Deny" || label === "Don’t allow")) await sleep(850);
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: opts.detail ?? 1 } as any)); });
   await flush();
 }
@@ -1293,10 +1293,10 @@ listStatus = 200;
   assert(rows.includes("cc: Empty") && rows.includes("n: 3"), "null and numbers read as data");
   assert(text(d.querySelector(".crm-drawer-sub")).includes("ops@example.com (gmail)") && /Asked by Atlas \(agent\), via mcp/.test(text(d)), "account, toolkit and asker in the detail");
   assert(text(d).includes("Nothing has been sent yet"), "pending says nothing was sent");
-  await click(labelled(d, "Approve"));
-  await settle(() => assert(text(drawerEl()!.querySelector(".crm-drawer-title")) === "Draft · gmail_create_email_draft", "advanced"));
+  await click(labelled(d, "Allow once"));
+  await settle(() => assert(text(drawerEl()!.querySelector(".crm-drawer-title")) === "gmail_create_email_draft", "advanced"));
   assert(text(drawerEl()!).includes("Sent · gmail_send_email"), "ok:true reads Sent");
-  await click(labelled(drawerEl()!, "Approve"));
+  await click(labelled(drawerEl()!, "Allow once"));
   await settle(() => assert(!drawerEl(), "closed"));
   assert(/unconfirmed/.test(text(v.host)) && /may have acted/.test(text(v.host)) && !/Drafted/.test(text(v.host)), `uncertain is not success (${text(v.host)})`);
   await click(labelled(v.host, "Feed"));
@@ -1338,7 +1338,7 @@ listStatus = 200;
     await settle(() => assert(w.cards().length === 1, "one card"));
     await click(w.cards()[0].querySelector(".todo-hit"));
     await settle(() => assert(drawerEl(), "open"));
-    await click(labelled(drawerEl()!, "Approve"));
+    await click(labelled(drawerEl()!, "Allow once"));
     await settle(() => assert(labelled(drawerEl()!, "Check again"), "unsure after a pending reply"));
     assert(sent() === 1, "one submit");
     await click(labelled(drawerEl()!, "Check again"));
@@ -1357,7 +1357,7 @@ listStatus = 200;
     await w.done();
   }
 
-  // Custom MCP staged action in Home drawer offers Approve, Always allow, and Deny;
+  // Custom MCP staged action in Home drawer offers Allow once, Always allow, and Don’t allow;
   // Always allow approves once and updates the tool pin mode to read.
   const mcpEffect = (id: string) => ({
     id, tool: "custom_mcp_effect", status: "pending", createdAt: Date.now() - AGO, decidedAt: null,
@@ -1378,7 +1378,7 @@ listStatus = 200;
     await settle(() => assert(w.cards().length === 1, "one custom_mcp_effect card"));
     await click(w.cards()[0].querySelector(".todo-hit"));
     await settle(() => assert(drawerEl(), "custom_mcp_effect drawer opens"));
-    assert(labelled(drawerEl()!, "Approve") && labelled(drawerEl()!, "Always allow") && labelled(drawerEl()!, "Deny"), "custom_mcp_effect drawer renders Approve, Always allow, and Deny");
+    assert(labelled(drawerEl()!, "Allow once") && labelled(drawerEl()!, "Always allow") && labelled(drawerEl()!, "Don’t allow"), "custom_mcp_effect drawer renders Allow once, Always allow, and Don’t allow");
     const postStart = posts.length;
     await click(labelled(drawerEl()!, "Always allow"));
     await settle(() => assert(drawerEl() === null, "Always allow closes after approving and updating mode"));

@@ -5,7 +5,7 @@
  * source or a write. No React, so the UI tests load it directly.
  */
 import type { StagedOutcome, StagedWrite } from "../decisions/stagedWrite";
-import { toolSteps, type ThreadEntry } from "./thread";
+import { toolApprovalDecisionId, toolSteps, type ThreadEntry } from "./thread";
 
 export type TurnSourceKind = "wiki" | "issue" | "attachment" | "artifact" | "web" | "app";
 
@@ -277,6 +277,30 @@ export function stagedInTurn(entries: readonly ThreadEntry[], rows: readonly Sta
   const ids = new Set(entries.filter((entry) => entry.kind === "tool_result").flatMap(stagedActionIds));
   if (ids.size === 0) return [];
   return rows.filter((row) => ids.has(norm(row.id)));
+}
+
+/** A staged action or its receipt does not start work or stop an open sibling. */
+export function activityAfterStagedTool(entries: readonly ThreadEntry[], actions: readonly StagedWrite[]): {
+  continuing: boolean;
+  continuation: string | null;
+} {
+  let newerWork = false;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    const decision = toolApprovalDecisionId(entry);
+    const isReceipt = decision !== null && actions.some((action) => norm(action.id) === decision);
+    const isStage = entry.role === "agent" && entry.kind === "tool_result" &&
+      stagedActionIds(entry).some((id) => actions.some((action) => norm(action.id) === id));
+    if (isReceipt || isStage) {
+      // Same-round calls can finish separately. Keep any sibling still open.
+      return {
+        continuing: newerWork || toolSteps(entries).some((step) => step.id !== undefined && !step.done),
+        continuation: isReceipt ? entry.message ?? null : null,
+      };
+    }
+    if (entry.role === "agent" && (entry.kind === "tool_call" || entry.kind === "thinking" || entry.kind === "assistant_text")) newerWork = true;
+  }
+  return { continuing: false, continuation: null };
 }
 
 export interface StagedField {

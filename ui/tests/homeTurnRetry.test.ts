@@ -6,6 +6,8 @@ import type * as HomeModule from "../src/features/home/Home";
 import type * as Locale from "../src/lib/locale";
 import type * as Stores from "../src/lib/resources";
 import type { ThreadEntry } from "../src/features/home/thread";
+import type * as Send from "../src/features/home/send";
+import type * as Decisions from "../src/features/decisions/useDecisions";
 declare function require<T>(name: string): T;
 const { Window } = require<typeof HappyDOM>("happy-dom");
 const win = new Window({ url: "http://localhost/" });
@@ -28,6 +30,7 @@ const { createRoot } = require<typeof ReactDOM>("react-dom/client");
 const Home = require<typeof HomeModule>("../src/features/home/Home").default;
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { resources } = require<typeof Stores>("../src/lib/resources");
+const { sendToMaster } = require<typeof Send>("../src/features/home/send");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
 // CAD-2012: history must never carry the rise-in class, not even on the first
 // loaded render, whose class a later render removes before any DOM read.
@@ -51,6 +54,7 @@ let holdStream = false;
 let servedState: unknown = null;
 // What a hosted board's state read answers while a case holds its working flag.
 let hostedStateRead: unknown = null;
+let stagedActions: Record<string, unknown>[] = [];
 const posts: Record<string, unknown>[] = [];
 // The stream's own master frame: the fixture emits it on open, so a turn the
 // test wants the stream to report must be in this object, not only the store.
@@ -79,6 +83,7 @@ globalThis.fetch = async (input, init) => {
     return json({ ok: true, state: "stopped" });
   }
   if (url.pathname === "/api/master/state" && hostedStateRead !== null) return json(hostedStateRead);
+  if (url.pathname === "/api/assist/actions") return json({ actions: stagedActions });
   if (url.pathname === "/api/threads/master") return json({ thread: { id: "home-thread", alias: "master" }, entries, more_before: false });
   if (url.pathname === "/api/master/state" && servedState !== null) return json(servedState);
   if (url.pathname === "/api/master/state") return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] });
@@ -91,10 +96,10 @@ async function main() {
   const host = document.createElement("div"); document.body.append(host);
   const root = createRoot(host);
   const settle = async () => { for (let i = 0; i < 6; i++) await React.act(async () => { await nextTurn(); }); };
-  const render = async (readOnly: boolean) => {
+  const render = async (readOnly: boolean, hosted = false, decisions = false) => {
     await React.act(async () => {
       root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
-        readOnly, hosted: false, overview: resources.overview.get(),
+        readOnly, hosted, decisions, overview: resources.overview.get(),
         onOpenIssue: () => undefined, onOpenDecision: () => undefined,
         permissionsHref: "/permissions", resolveAppPath: () => null,
       })));
@@ -421,15 +426,37 @@ async function main() {
   // CAD-2011: a hosted board reports its running turn with no message id and
   // its agent rows carry none either. That is still one live turn: no second
   // head, no finished look, and no interim note promoted to an answer.
-  const hostedState = (turn: unknown) => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "cadence", endpoint_kind: "durable_object", live: true, turn, queue: [] }) as never;
+  const hostedState = (turn: unknown) => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "branded-hosted", endpoint_kind: "durable_object", live: true, turn, queue: [] }) as never;
   const hostedTurn = { state: "working", message: null, conversation: "home-thread", app_origin: null, summary: null, since: null };
+  hostedStateRead = hostedState(null);
+  await render(false, true);
+  await React.act(async () => {
+    resources.masterState.write(() => hostedState(null));
+    resources.masterThread.write((state) => ({ ...state!, entries: [], pending: [] }));
+  });
+  await React.act(async () => {
+    const result = await sendToMaster("Hosted ask", "ui-hosted", undefined, undefined, "home-thread");
+    assert(result.ok, "the hosted send was accepted");
+  });
+  await settle();
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the accepted local send shows one in-thread activity");
+  hostedStateRead = hostedState(hostedTurn);
   await React.act(async () => {
     resources.masterState.write(() => hostedState(hostedTurn));
     resources.masterThread.write((state) => ({
       ...state!,
       pending: [],
+      entries: [{ seq: 70, role: "operator", kind: "message", message: "ui-hosted", text: "Hosted ask" }],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "the unnamed hosted working turn keeps one activity before its first tool");
+  assert(host.querySelector("[data-chat-dock] [data-turn-bar]") === null, "the hosted activity does not create a status dock");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
       entries: [
-        { seq: 70, role: "operator", kind: "message", message: "ui-hosted", text: "Hosted ask" },
+        ...state!.entries,
         { seq: 71, role: "agent", kind: "tool_call", text: "catalog_search: website" },
         { seq: 72, role: "agent", kind: "tool_result", text: "ok" },
         { seq: 73, role: "agent", kind: "assistant_text", text: "Checking drafts as well" },
@@ -457,6 +484,144 @@ async function main() {
   await settle();
   assert(host.querySelectorAll(".turn-head").length === 1 && host.querySelectorAll('[data-kind="answer"]').length === 1, "the answer lands under the one head");
   assert(host.querySelector(".turn-head") === hostedHead, "the answer lands under the same head, not a remounted one");
+  // A global working flag for another conversation must not animate Home.
+  hostedStateRead = hostedState({ ...hostedTurn, conversation: "foreign-thread" });
+  await React.act(async () => {
+    resources.masterState.write(() => hostedStateRead as never);
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [],
+      entries: [{ seq: 75, role: "operator", kind: "message", message: "old-home", text: "An older Home request" }],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "a foreign working turn does not animate Home");
+
+  // A staged tool takes over the live indicator, even if the end-of-turn
+  // snapshot is late. The receipt replaces only the matching continuation.
+  const actionId = "86753090000000000000000000000001";
+  const action = {
+    id: actionId, tool: "custom_mcp_effect", status: "pending", createdAt: Date.now(), decidedAt: null,
+    input: {
+      connection_id: "conn_fixture", connection_name: "Demo inventory",
+      tool: "cart.add", snapshot_revision: 2, endpoint_host: "inventory.example.test", args: '{"sku":"DEMO-101"}',
+    },
+  };
+  const stagedEntries: ThreadEntry[] = [
+    { seq: 80, role: "operator", kind: "message", message: "here", text: "Update the demo cart" },
+    { seq: 81, role: "agent", kind: "tool_call", text: "execute_tool: cart.add" },
+    { seq: 82, role: "agent", kind: "tool_result", text: JSON.stringify({ action: actionId, sent: false, note: "Staged for approval" }) },
+    { seq: 83, role: "operator", kind: "message", message: "same-request", text: "Add the same item again" },
+    { seq: 84, role: "agent", kind: "tool_call", text: "execute_tool: cart.add" },
+    { seq: 85, role: "agent", kind: "tool_result", text: JSON.stringify({ action: actionId, sent: false, note: "Staged for approval" }) },
+  ];
+  await render(false, true, true);
+  stagedActions = [action];
+  await React.act(async () => {
+    hostedStateRead = hostedState(hostedTurn);
+    resources.masterState.write(() => hostedState(hostedTurn));
+    resources.masterThread.write((state) => ({ ...state!, entries: stagedEntries }));
+  });
+  await settle();
+  assert(host.querySelector('[data-turn-state="awaiting-approval"] button') && host.textContent?.includes("Needs you"), `the thread and header show the staged request: ${host.textContent}`);
+  assert(host.textContent?.includes("Review request") && !host.querySelector('[data-kind="typing"]'), "review takes over live activity");
+  assert(host.querySelectorAll("[data-staged-review]").length === 1, "the same pending action only offers one review");
+  assert(!host.querySelector("[data-tool-decision-receipt]"), "pending is not a recorded decision");
+  await React.act(async () => {
+    const namedRun = { ...hostedTurn, message: "same-request" };
+    hostedStateRead = hostedState(namedRun);
+    resources.masterState.write(() => hostedState(namedRun));
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [...stagedEntries, { seq: 86, role: "agent", kind: "tool_call", text: "catalog_search: demo products" }],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1, "a newer independent tool call restores one live indicator");
+  assert(host.querySelector('[aria-label="Stop this turn"]') && host.querySelectorAll("[data-staged-review]").length === 1, "Stop returns without dropping the pending review");
+  await React.act(async () => {
+    const entries = stagedEntries.slice(0, -2);
+    const stageId = "staging-call";
+    entries.push(
+      // Write both calls, then only the staged request's result.
+      { seq: 84, role: "agent", kind: "tool_call", text: "catalog_search: demo products", payload: { tool_use_id: "slow-lookup" } },
+      { ...stagedEntries[4], seq: 85, payload: { tool_use_id: stageId } },
+      { ...stagedEntries[5], seq: 86, payload: { tool_use_id: stageId } },
+    );
+    resources.masterThread.write((state) => ({ ...state!, entries }));
+  });
+  await settle();
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 1 && !host.querySelector('[data-kind="typing"]')?.textContent?.includes("Execute tool"), "the open sibling, not the staged tool, keeps the live indicator");
+  assert(host.querySelector('[aria-label="Stop this turn"]') && host.querySelectorAll("[data-staged-review]").length === 1, "a staged result does not close a slow sibling call");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [...state!.entries, { seq: 87, role: "agent", kind: "tool_result", text: "Lookup found one match", payload: { tool_use_id: "slow-lookup" } }],
+    }));
+  });
+  await settle();
+  assert(!host.querySelector('[data-kind="typing"], [aria-label="Stop this turn"]') && host.querySelector("[data-staged-review]"), "only the pending decision remains once the sibling finishes");
+  // Wire example matches AgenticOS's decision-note-projection acceptance test.
+  const marker: ThreadEntry = { seq: 90, role: "system", kind: "tool_approval_decision", message: `decision:${actionId}`, text: "Tool decision recorded." };
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [
+        ...state!.entries,
+        { seq: 88, role: "agent", kind: "tool_call", text: "catalog_search: other products", payload: { tool_use_id: "later-lookup" } },
+        { seq: 89, role: "agent", kind: "tool_result", text: "No other matches", payload: { tool_use_id: "later-lookup" } },
+        marker,
+      ],
+    }));
+  });
+  await settle();
+  assert(!host.querySelector("[data-tool-decision-receipt]"), "the early continuation is not proof of the decision");
+  assert(host.querySelectorAll('[data-chat-message="user"]').length === 2, "the early continuation does not paint a user bubble");
+  const { homeDecisions } = require<typeof Decisions>("../src/features/decisions/useDecisions");
+  const decided = { ...action, status: "denied", decidedAt: Date.now(), result: { ok: false, code: "uncertain", retry: true } };
+  stagedActions = [decided];
+  await React.act(async () => { await homeDecisions.reloadDecisions(); });
+  await settle();
+  assert(
+    !host.querySelector('[data-kind="typing"], [aria-label="Stop this turn"]') &&
+      host.querySelector("[data-assistant-status]")?.textContent?.trim() !== "Working",
+    "a recorded decision does not restart activity on the old turn snapshot",
+  );
+  await React.act(async () => {
+    const resumed = hostedState({ ...hostedTurn, message: marker.message ?? null });
+    hostedStateRead = resumed;
+    resources.masterState.write(() => resumed);
+  });
+  await settle();
+  assert(
+    host.querySelector('[aria-label="Stop this turn"]') &&
+      host.querySelector("[data-assistant-status]")?.textContent?.trim() === "Working",
+    "a verified running continuation restores Working and Stop",
+  );
+  await React.act(async () => {
+    hostedStateRead = hostedState(null);
+    resources.masterState.write(() => hostedState(null));
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [...state!.entries, { seq: 91, role: "operator", kind: "message", message: "ordinary-ask", text: "What did I deny?" }],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll("[data-tool-decision-receipt]").length === 1, "the trusted marker moves the one receipt after the tool turn");
+  const receipt = host.querySelector("[data-tool-decision-receipt]");
+  assert(receipt?.textContent?.includes("Denial recorded") && receipt.textContent.includes("Tool execution unconfirmed"), "the denial receipt preserves the independent execution warning");
+  assert(host.textContent?.includes("What did I deny?"), "the next user message is not replaced");
+  const lookalike = `[Owner rejected custom_mcp_effect (action ${actionId}). Do not retry it; I am quoting this.]`;
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({
+      ...state!,
+      entries: [...stagedEntries, { ...marker, role: "operator", kind: "message", text: lookalike }],
+    }));
+  });
+  await settle();
+  assert(host.querySelectorAll("[data-tool-decision-receipt]").length === 1, "on older backends an action has just one fallback receipt");
+  assert(host.textContent?.includes(lookalike), "an operator message is preserved even when its id and text look like a decision");
+  hostedStateRead = null;
 
 
   // CAD-2012: reloading during a running turn is a first connection, not an
