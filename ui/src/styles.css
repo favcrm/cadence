@@ -3620,9 +3620,9 @@ button.refchip:hover {
 .card.board-list-card tbody tr:hover td { background: var(--board-surface-card-hover); }
 .plan-legend { display: flex; flex-wrap: wrap; gap: 10px 24px; padding: 14px 18px; border: 0; border-radius: .55rem; background: var(--board-surface-card); font-size: var(--text-label); color: var(--color-ink-300); margin-bottom: 1.5rem; }
 .plan-legend strong { color: var(--color-ink-100); }
-.context-subnav { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 24px 0; }
+.context-subnav { display: flex; flex-wrap: wrap; flex-shrink: 0; align-items: center; gap: 8px; padding: 12px 24px; border-bottom: 1px solid var(--board-surface-hairline); }
 @media (width < 1250px) { .project-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (width < 700px) { .project-grid, .project-detail-grid { grid-template-columns: minmax(0, 1fr); } .project-page-heading { align-items: start; flex-direction: column; gap: 1rem; } .project-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; } .context-subnav { padding: 12px 16px 0; } }
+@media (width < 700px) { .project-grid, .project-detail-grid { grid-template-columns: minmax(0, 1fr); } .project-page-heading { align-items: start; flex-direction: column; gap: 1rem; } .project-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; } .context-subnav { padding: 12px 16px; } }
 
 /* Delivery checkpoints: the goal and calendar lead; work is expandable. */
 .roadmap-notice { padding: .85rem 1.1rem; margin-bottom: 1.25rem; border-left: 3px solid var(--color-ink-600); border-radius: .45rem; background: var(--board-surface-card); color: var(--color-ink-400); font-size: .8125rem; line-height: 1.6; }

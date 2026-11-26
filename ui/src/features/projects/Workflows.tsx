@@ -56,7 +56,7 @@ export default function Workflows({
 
   const Wrap = embedded ? "section" : "main";
   return (
-    <Wrap className="px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={t("Workflows")}>
+    <Wrap className={embedded ? "flex-1 overflow-y-auto px-4 lg:px-8 pt-4 pb-9 min-w-0" : "px-4 lg:px-8 pt-4 pb-9 min-w-0"} aria-label={t("Workflows")}>
       <div className="flex flex-wrap items-center gap-2 mb-3">
         {embedded ? (
           <h2 className="text-section font-semibold text-ink-100 m-0">{t("Workflows")}</h2>
