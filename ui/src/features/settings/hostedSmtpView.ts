@@ -30,11 +30,11 @@ export const PRESETS: readonly Preset[] = [
   },
   {
     id: "microsoft",
-    label: "Microsoft 365",
+    label: "Microsoft 365 (legacy SMTP)",
     host: "smtp.office365.com",
     port: 587,
     tls: "starttls",
-    hint: "Use your Microsoft 365 address. If your account asks for one, use an app password. SMTP sending must be on for the mailbox.",
+    hint: "Your organization and mailbox must allow password-based SMTP AUTH. OAuth is not supported for app senders.",
   },
   {
     id: "other",

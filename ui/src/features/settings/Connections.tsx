@@ -3,7 +3,7 @@ import { api, ApiError } from "../../lib/api";
 import { routinesApi } from "../agents/routinesApi";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
-import { routePath, type ConnectionPage } from "../../lib/router";
+import { EMAIL_CONNECTIONS_HREF, routePath, type ConnectionPage } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import type {
   Connection,
@@ -196,9 +196,11 @@ export default function Connections({
   viewer,
   page,
   hostedBoard = false,
+  emailAvailable = true,
 }: {
   /** A hosted board manages keys for you, and only serves the actions it can do. */
   hostedBoard?: boolean;
+  emailAvailable?: boolean;
   viewer: {
     operator: boolean | null;
     readOnly: boolean;
@@ -213,7 +215,7 @@ export default function Connections({
   // Unknown access grants nothing on any Connections route. Reuse the
   // index's checking/unavailable state until the bounded proof answers.
   if (viewer.operator === null) {
-    return <ConnectionsIndex viewer={viewer} canWrite={false} hostedBoard={hostedBoard} />;
+    return <ConnectionsIndex viewer={viewer} canWrite={false} hostedBoard={hostedBoard} emailAvailable={emailAvailable} />;
   }
   const provenViewer = { ...viewer, operator: viewer.operator };
   if (page?.kind === "add" || page?.kind === "addProvider") {
@@ -222,9 +224,9 @@ export default function Connections({
   if (page?.kind === "detail") {
     // Keyed to the id: an id change remounts the page so a stale
     // per-mount `answered` flag can never carry the proof across ids.
-    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} hostedBoard={hostedBoard} />;
+    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} hostedBoard={hostedBoard} emailAvailable={emailAvailable} />;
   }
-  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} hostedBoard={hostedBoard} />;
+  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} hostedBoard={hostedBoard} emailAvailable={emailAvailable} />;
 }
 
 /**
@@ -312,8 +314,10 @@ function ConnectionsIndex({
   viewer,
   canWrite,
   hostedBoard,
+  emailAvailable,
 }: {
   hostedBoard: boolean;
+  emailAvailable: boolean;
   viewer: {
     operator: boolean | null;
     readOnly: boolean;
@@ -408,7 +412,7 @@ function ConnectionsIndex({
     if (providersRes) void providersRes.revalidate();
     loadCustomMcp();
   };
-  const visibleRows = mcpLoaded ? rows.filter((row) => row.provider !== "custom_mcp") : rows;
+  const visibleRows = rows.filter((row) => !(emailAvailable && isSmtpSender(row)) && (!mcpLoaded || row.provider !== "custom_mcp"));
   const groups = serviceGroups(providers, visibleRows);
   const [openId, setOpenId] = useState<string | null>(null);
   const open = visibleRows.find((row) => row.id === openId) ?? null;
@@ -660,6 +664,17 @@ function ConnectionsIndex({
               <RecentCredentialRequestList />
             </div>
           )}
+          {emailAvailable && <div className="space-y-1.5 min-w-0 mb-4">
+            <h2 className="slabel">{t("Connectors")}</h2>
+            <div className="settings-rows">
+              <Link href={EMAIL_CONNECTIONS_HREF} className="settings-row">
+                <span className="settings-row-text">
+                  <b>{t("Email")}</b>
+                  <small>{t("Sending accounts and app senders")}</small>
+                </span>
+              </Link>
+            </div>
+          </div>}
           <ResourceGate
             state={listState ?? emptyGate}
             loading="loading connections…"
@@ -668,7 +683,7 @@ function ConnectionsIndex({
           />
           {catalogUnavailable ? (
             <p className="text-label text-ink-500 break-words" data-state="catalogue-unavailable">
-              {t("The service catalogue is not available on this board. Email accounts from this workspace are shown below.")}
+              {t("The service catalogue is not available on this board.")}
             </p>
           ) : (
             <ResourceGate
@@ -1163,8 +1178,10 @@ function ConnectionsDetail({
   canWrite,
   id,
   hostedBoard,
+  emailAvailable,
 }: {
   hostedBoard: boolean;
+  emailAvailable: boolean;
   viewer: { operator: boolean; readOnly: boolean };
   canWrite: boolean;
   id: string;
@@ -1201,6 +1218,8 @@ function ConnectionsDetail({
     if (providersRes) void providersRes.revalidate();
   };
   const row = rows.find((r) => r.id === id) ?? null;
+  const emailSender = emailAvailable && row !== null && isSmtpSender(row);
+  const backHref = emailSender ? EMAIL_CONNECTIONS_HREF : connectionsIndexHref();
   const provider = row ? providers.find((p) => p.provider === row.provider) ?? null : null;
   // The provider's descriptor is unknown while its resource is still
   // loading or failed — distinct from a loaded answer that genuinely
@@ -1219,7 +1238,9 @@ function ConnectionsDetail({
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connection-detail-title">
       <div className="flex flex-wrap gap-2 items-center justify-between mb-4">
-        <Link href={connectionsIndexHref()} className="lnk text-label">{t("← Connections")}</Link>
+        <Link href={backHref} className="lnk text-label">
+          {emailSender ? t("← Email") : t("← Connections")}
+        </Link>
         {viewer.operator && (
           <div className="flex flex-wrap gap-2 items-center ms-auto">
             <StaleChip state={listState ?? emptyGate} />
@@ -1272,7 +1293,7 @@ function ConnectionsDetail({
                 onChanged={refresh}
                 onRevoked={() => {
                   refresh();
-                  navigate(connectionsIndexHref());
+                  navigate(backHref);
                 }}
               />
             </>

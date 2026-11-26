@@ -3,7 +3,7 @@ import type { Meta } from "../../lib/types";
 import { sessionAdmissible } from "../auth/gate";
 
 export type SettingsIcon =
-  | "preferences" | "security" | "connections" | "email" | "templates" | "general"
+  | "preferences" | "security" | "connections" | "templates" | "general"
   | "status" | "daemons" | "agents" | "memory" | "permissions" | "custody" | "account" | "members" | "documents";
 
 export type SettingsNavEntry = { section: SettingsSection; label: string; icon: SettingsIcon };
@@ -14,7 +14,6 @@ const ENTRIES = {
   /** CAD-2578: hosted only — offered when the board names `security` in its sections. */
   security: { section: "security", label: "Security", icon: "security" },
   connections: { section: "connections", label: "Connections", icon: "connections" },
-  email: { section: "email", label: "Email sending", icon: "email" },
   templates: { section: "templates", label: "Templates", icon: "templates" },
   general: { section: "general", label: "General", icon: "general" },
   daemons: { section: "daemons", label: "Daemons", icon: "daemons" },
@@ -65,7 +64,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   if (!listed) {
     return [
       { label: "You", items: [ENTRIES.preferences] },
-      { label: "Workspace", items: [ENTRIES.agents, ENTRIES.connections, ENTRIES.email, ...(!meta?.hosted ? [ENTRIES.templates] : []), ENTRIES.general, ENTRIES.memory] },
+      { label: "Workspace", items: [ENTRIES.agents, ENTRIES.connections, ...(!meta?.hosted ? [ENTRIES.templates] : []), ENTRIES.general, ENTRIES.memory] },
       { label: "System", items: [ENTRIES.status, ...account, ENTRIES.permissions, ENTRIES.custody] },
     ];
   }
@@ -76,7 +75,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
     // CAD-2115: Members leads the workspace pages, as the approved mockup shows.
     // CAD-2286: Documents follows Members; Members stays first, where
     // `settingsRedirect` lands a request for a page this board does not serve.
-    { label: "Workspace", items: pick("members", ...(meta?.wiki_managed_files ? [] : ["documents" as const]), "connections", "email", ...(!meta?.hosted ? ["templates" as const] : []), "general") },
+    { label: "Workspace", items: pick("members", ...(meta?.wiki_managed_files ? [] : ["documents" as const]), "connections", ...(!meta?.hosted ? ["templates" as const] : []), "general") },
     { label: "System", items: [...pick("daemons", "status"), ...account] },
   ].filter((group) => group.items.length > 0);
 }
@@ -96,6 +95,7 @@ const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents", "securi
 export function settingsRedirect(section: SettingsSection, meta: SettingsMeta): SettingsSection | null {
   if (!meta || section === "templates") return null;
   if (section === "documents" && meta.wiki_managed_files && meta.settings_sections?.includes("general")) return "general";
+  if (section === "email" && meta.settings_sections?.includes("email")) return null;
   const groups = settingsNavGroups(meta);
   if (groups.some((group) => group.items.some((item) => item.section === section))) return null;
   if (!meta.settings_sections && !HOSTED_ONLY.includes(section)

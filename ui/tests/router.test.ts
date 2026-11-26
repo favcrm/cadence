@@ -65,7 +65,8 @@ const paths: [string, Route][] = [
   ["/settings/connections/new", { screen: "settings", section: "connections", page: { kind: "add" } }],
   ["/settings/connections/new/smtp", { screen: "settings", section: "connections", page: { kind: "addProvider", provider: "smtp" } }],
   ["/settings/connections/account/c-1", { screen: "settings", section: "connections", page: { kind: "detail", id: "c-1" } }],
-  ["/settings/email", { screen: "settings", section: "email" }],
+  ["/settings/connections/email", { screen: "settings", section: "connections", page: { kind: "email", focusSenders: false } }],
+  ["/settings/connections/email/senders", { screen: "settings", section: "connections", page: { kind: "email", focusSenders: true } }],
   ["/settings/security", { screen: "settings", section: "security" }],
   ["/outbox", { screen: "outbox" }],
   ["/login", { screen: "login" }],
@@ -323,6 +324,10 @@ equal(scopeRedirect("/settings/memory", "?project=cadence"), null, "memory keeps
 equal(legacyRedirect("/projects/cadence", "?view=list"), null, "a routed URL is not legacy");
 equal(legacyRedirect("/index.html", "?tab=agents"), "/agents", "index.html with a tab");
 equal(legacyRedirect("/index.html", ""), "/", "bare index.html");
+equal(legacyRedirect("/settings/email", "?issue=CAD-7&custom=1"), "/settings/connections/email/senders?custom=1&issue=CAD-7", "legacy email opens App senders and keeps query state");
+equal(scopeRedirect("/settings/email", "?project=cadence&custom=1"), "/settings/connections/email/senders?custom=1", "legacy email applies normal scope rules");
+equal(matchRoute("/settings/connections/email/extra").screen, "notFound", "email rejects unknown subpages");
+equal(matchRoute("/settings/connections/email//senders").screen, "notFound", "email rejects empty internal segments");
 
 console.log("router checks passed");
 

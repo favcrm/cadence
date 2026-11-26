@@ -1,13 +1,17 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { api } from "../../lib/api";
+import { resources } from "../../lib/resources";
+import { EMAIL_CONNECTIONS_HREF, routePath } from "../../lib/router";
 import type { Connection } from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import PageState from "../../ui/PageState";
+import { IconOutbox } from "../../ui/icons";
 import type { Viewer } from "../projects/work";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import SettingsDrawer from "./SettingsDrawer";
+import EmailSetup from "./EmailSetup";
 import { newAudienceId } from "../app-shell/segmentGrammar";
 import {
   friendlySendError,
@@ -18,9 +22,11 @@ import {
   type SmtpBinding,
 } from "../app-shell/sendClient";
 import type { HostScope } from "../app-shell/hostActions";
+import { isSmtpSender } from "./connectionsView";
 import { HOSTED_ACCOUNT } from "./hostedSmtpView";
 import { workspaceApps, type Installation } from "../workspace-apps/workspaceApps";
 import {
+  isHostedSender,
   isHostedTransport,
   senderChoices,
   senderLine,
@@ -28,13 +34,7 @@ import {
 } from "./emailSendingView";
 import { useTranslate } from "../../lib/locale";
 
-/**
- * Settings → Email sending (CAD-1059, CAD-1063 slice 2, CAD-1797): the
- * workspace-wide email policy. Every installed app/context whose bundle
- * declares `smtp.bind` is listed with its current sender and status; each
- * one keeps its own binding. The accounts themselves live in Connections
- * — this page never duplicates the add/replace SMTP form.
- */
+/** Connections → Email: enroll sending accounts and choose a sender per app context. */
 
 interface Target {
   scope: HostScope;
@@ -93,44 +93,88 @@ function appContextLabel(app: string, context: string): string {
 export default function EmailSending({
   viewer,
   fixedUnsubscribeAddress = false,
+  focusSenders = false,
 }: {
   viewer: Viewer;
   /** A hosted board's links always use its own address, so there's nothing to set. */
   fixedUnsubscribeAddress?: boolean;
+  focusSenders?: boolean;
 }) {
   const t = useTranslate();
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [rows, setRows] = useState<Connection[] | null>(null);
   const [hostedSmtp, setHostedSmtp] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [attempt, setAttempt] = useState(0);
+  const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [targetsError, setTargetsError] = useState<string | null>(null);
+  const [partial, setPartial] = useState(false);
+  const [accountsAttempt, setAccountsAttempt] = useState(0);
+  const [targetsAttempt, setTargetsAttempt] = useState(0);
   // One drawer at a time: rows stay reachable by keyboard behind an open one.
   const [openRow, setOpenRow] = useState<string | null>(null);
+  const sendersHeading = useRef<HTMLHeadingElement>(null);
+  const accountsHeading = useRef<HTMLHeadingElement>(null);
+  const accountAdded = useRef(false);
+  const sendersFocused = useRef(false);
+  const accountsLoaded = rows !== null;
+  useEffect(() => {
+    if (!focusSenders || viewer.operator !== true) sendersFocused.current = false;
+    if (viewer.operator !== true) return;
+    if (accountAdded.current && accountsLoaded) {
+      accountAdded.current = false;
+      accountsHeading.current?.focus();
+    } else if (!accountAdded.current && focusSenders && !sendersFocused.current) {
+      sendersHeading.current?.focus();
+      sendersFocused.current = true;
+    }
+  }, [focusSenders, accountsLoaded, viewer.operator]);
+
+  const canAdd = viewer.operator === true && !viewer.readOnly && rows !== null && !partial
+    && !(hostedSmtp && rows.some((row) => row.provider === "smtp" && row.account === HOSTED_ACCOUNT));
 
   useEffect(() => {
-    // CAD-1193: unresolved role (null) waits; only a proven operator
-    // issues the sender-target and account reads.
     if (viewer.operator !== true) return;
     const controller = new AbortController();
-    Promise.all([loadTargets(controller.signal), api.connections()]).then(
-      ([nextTargets, list]) => {
+    api.connections().then(
+      (list) => {
         if (controller.signal.aborted) return;
-        setTargets(nextTargets);
         setRows(list.connections ?? []);
         setHostedSmtp(list.hosted_smtp === true);
-        setError(null);
+        setPartial(list.connections_unavailable !== undefined);
+        setAccountsError(null);
       },
       (e: unknown) => {
-        if (!controller.signal.aborted) setError(friendlySendError(e));
+        if (!controller.signal.aborted) setAccountsError(friendlySendError(e));
       },
     );
     return () => controller.abort();
-  }, [viewer.operator, attempt]);
+  }, [viewer.operator, accountsAttempt]);
+
+  useEffect(() => {
+    if (viewer.operator !== true) return;
+    const controller = new AbortController();
+    loadTargets(controller.signal).then(
+      (nextTargets) => {
+        if (controller.signal.aborted) return;
+        setTargets(nextTargets);
+        setTargetsError(null);
+      },
+      (e: unknown) => {
+        if (!controller.signal.aborted) setTargetsError(friendlySendError(e));
+      },
+    );
+    return () => controller.abort();
+  }, [viewer.operator, targetsAttempt]);
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="email-sending-title">
-      <h1 id="email-sending-title" className="text-section font-medium text-ink-100">{t("Email sending")}</h1>
-      <p className="text-label text-ink-400 mt-1 mb-4 break-words">{t("Choose the account your apps send email from. An app can use the workspace account or a sender of its own.")}</p>
+      <Link href="/settings/connections" className="lnk text-label">{t("← Connections")}</Link>
+      <header className="flex items-center gap-3 mt-3 pb-4 mb-4 border-b border-ink-700">
+        <span className="inline-flex items-center justify-center rounded-lg bg-accent/10 text-accent size-10 shrink-0" aria-hidden="true"><IconOutbox size={21} /></span>
+        <div className="min-w-0">
+          <h1 id="email-sending-title" className="text-section font-medium text-ink-100">{t("Email")}</h1>
+          <p className="text-label text-ink-400 mt-1 break-words">{t("Manage sending accounts and choose which one each app uses.")}</p>
+        </div>
+      </header>
       {viewer.operator === null ? (
         <PageState title={viewer.access === "unavailable" ? t("Access could not be confirmed") : t("Checking access…")}>
           {viewer.access === "unavailable" ? (
@@ -146,47 +190,74 @@ export default function EmailSending({
         </PageState>
       ) : !viewer.operator ? (
         <PageState title={t("Operator access required")}>{t("Email sending is available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
-      ) : error !== null ? (
-        <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
-          {error}
-          <Button
-            size="sm"
-            onClick={() => {
-              setError(null);
-              setAttempt((n) => n + 1);
-            }}
-          >{t("Retry")}</Button>
-        </p>
-      ) : targets === null || rows === null ? (
-        <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
       ) : (
-        <div className="grid gap-3 min-w-0">
-          <WorkspaceAccountCard rows={rows} hostedSmtp={hostedSmtp} />
-          {targets.length === 0 ? (
-            <p className="text-label text-ink-400" data-state="no-apps">{t("No installed app sends email, so there is nothing to choose yet.")}</p>
+        <div className="grid gap-6 min-w-0">
+          <EmailAccounts headingRef={accountsHeading} rows={rows ?? []} complete={rows !== null && !partial && accountsError === null} canAdd={canAdd} hostedSmtp={hostedSmtp} onAdd={() => setOpenRow("add")} />
+          {accountsError !== null ? (
+            <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
+              {accountsError}
+              <Button size="sm" onClick={() => { setAccountsError(null); setRows(null); setAccountsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+            </p>
+          ) : rows === null ? (
+            <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
+          ) : partial ? (
+            <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert" data-state="connections-partial">
+              {t("Some connected accounts couldn't be loaded, so this list may be incomplete.")}
+              <Button size="sm" onClick={() => { setRows(null); setAccountsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+            </p>
           ) : null}
-          <div className="settings-rows" aria-label={t("Apps that send email")}>
-            {targets.map((target) => (
-              <SenderRow
-                key={`${target.scope.installId}:${target.scope.contextId}`}
-                open={openRow === `${target.scope.installId}:${target.scope.contextId}`}
-                onOpen={() => setOpenRow(`${target.scope.installId}:${target.scope.contextId}`)}
-                onClose={() => setOpenRow(null)}
-                target={target}
-                rows={rows}
-                hostedSmtp={hostedSmtp}
-                viewer={viewer}
-              />
-            ))}
-            {!fixedUnsubscribeAddress && (
-              <OriginRow
-                viewer={viewer}
-                open={openRow === "origin"}
-                onOpen={() => setOpenRow("origin")}
-                onClose={() => setOpenRow(null)}
-              />
+          <section aria-labelledby="app-senders">
+            <h2 ref={sendersHeading} id="app-senders" tabIndex={-1} className="text-cardtitle font-medium text-ink-100">{t("App senders")}</h2>
+            <p className="text-label text-ink-400 mt-1 mb-2">{t("Choose the account each app sends from.")}</p>
+            {targetsError !== null ? (
+              <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
+                {targetsError}
+                <Button size="sm" onClick={() => { setTargetsError(null); setTargets(null); setTargetsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+              </p>
+            ) : targets === null ? (
+              <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
+            ) : targets.length === 0 && (
+              <p className="text-label text-ink-400 mb-2" data-state="no-apps">{t("No installed app sends email, so there is nothing to choose yet.")}</p>
             )}
-          </div>
+            {((targets?.length ?? 0) > 0 || !fixedUnsubscribeAddress) && (
+              <div className="settings-rows" aria-label={t("Apps that send email")}>
+                {(targets ?? []).map((target) => (
+                  <SenderRow
+                    key={`${target.scope.installId}:${target.scope.contextId}`}
+                    open={openRow === `${target.scope.installId}:${target.scope.contextId}`}
+                    onOpen={() => setOpenRow(`${target.scope.installId}:${target.scope.contextId}`)}
+                    onClose={() => setOpenRow(null)}
+                    target={target}
+                    rows={rows !== null && !partial && accountsError === null ? rows : null}
+                    hostedSmtp={hostedSmtp}
+                    viewer={viewer}
+                  />
+                ))}
+                {!fixedUnsubscribeAddress && (
+                  <OriginRow
+                    viewer={viewer}
+                    open={openRow === "origin"}
+                    onOpen={() => setOpenRow("origin")}
+                    onClose={() => setOpenRow(null)}
+                  />
+                )}
+              </div>
+            )}
+          </section>
+          {canAdd && rows !== null && openRow === "add" && (
+            <EmailSetup
+              rows={rows}
+              hostedSmtp={hostedSmtp}
+              onClose={() => setOpenRow(null)}
+              onSaved={() => {
+                accountAdded.current = true;
+                setOpenRow(null);
+                setRows(null);
+                setAccountsAttempt((n) => n + 1);
+                void resources.connections.invalidate();
+              }}
+            />
+          )}
         </div>
       )}
     </section>
@@ -199,7 +270,7 @@ function SenderRow({ target, rows, hostedSmtp, viewer, open, onOpen, onClose }: 
   onOpen: () => void;
   onClose: () => void;
   target: Target;
-  rows: Connection[];
+  rows: Connection[] | null;
   hostedSmtp: boolean;
   viewer: Viewer;
 }) {
@@ -238,7 +309,7 @@ function SenderRow({ target, rows, hostedSmtp, viewer, open, onOpen, onClose }: 
       </button>
       {open && (
         <SettingsDrawer title={target.label} onClose={onClose}>
-          <SenderCard target={target} rows={rows} hostedSmtp={hostedSmtp} viewer={viewer} />
+          <SenderCard target={target} rows={rows} hostedSmtp={hostedSmtp} viewer={viewer} onClose={onClose} />
         </SettingsDrawer>
       )}
     </>
@@ -280,43 +351,56 @@ function OriginRow({ viewer, open, onOpen, onClose }: {
   );
 }
 
-/** The one workspace account: stored once in Connections, chosen per app. */
-function WorkspaceAccountCard({ rows, hostedSmtp }: { rows: Connection[]; hostedSmtp: boolean }) {
+function EmailAccounts({ headingRef, rows, complete, canAdd, hostedSmtp, onAdd }: {
+  headingRef: React.Ref<HTMLHeadingElement>;
+  rows: Connection[];
+  complete: boolean;
+  canAdd: boolean;
+  hostedSmtp: boolean;
+  onAdd: () => void;
+}) {
   const t = useTranslate();
-  const email = hostedSmtp
-    ? rows.find((r) => r.provider === "smtp" && r.account === HOSTED_ACCOUNT) ?? null
-    : null;
-  if (!hostedSmtp) {
-    return (
-      <section className="card px-4 py-4 grid gap-2 min-w-0" aria-labelledby="email-accounts-title">
-        <div className="flex flex-wrap items-start gap-x-3 gap-y-1">
-          <div className="min-w-0 flex-1">
-            <p className="text-micro uppercase tracking-wide text-ink-500">{t("Accounts")}</p>
-            <h2 id="email-accounts-title" className="text-cardtitle font-medium text-ink-100">{t("Email accounts")}</h2>
-            <p className="text-label text-ink-300 mt-1 break-words">{t("Email accounts are managed in Connections. Each app chooses the account it sends from.")}</p>
-          </div>
-          <Link href="/settings/connections" className="lnk text-label shrink-0">{t("Manage in Connections")}</Link>
-        </div>
-      </section>
-    );
-  }
-  const address = email?.smtp?.sender ?? null;
-  const unreadable = email !== null && (email.smtp ?? null) === null;
+  const accounts = rows.filter(isSmtpSender);
   return (
-    <section className="card px-4 py-4 grid gap-2 min-w-0" aria-labelledby="workspace-account-title">
-      <div className="flex flex-wrap items-start gap-x-3 gap-y-1">
-        <div className="min-w-0 flex-1">
-          <p className="text-micro uppercase tracking-wide text-ink-500">{t("Sending account")}</p>
-          <h2 id="workspace-account-title" className="text-cardtitle font-medium text-ink-100">{t("Workspace email account")}</h2>
-          <p className="text-body text-ink-100 mt-1 break-words" data-state={address ? "connected" : unreadable ? "unreadable" : "none"}>
-            {address ?? (unreadable ? t("The saved email account can't be read. Replace it in Connections.") : t("No workspace email account connected yet."))}
-          </p>
-          <p className="text-label text-ink-400 mt-1 break-words">{t("Apps can use this account or choose another connected account.")}</p>
+    <section aria-labelledby="email-accounts-title">
+      <header className="flex flex-wrap items-end justify-between gap-2 mb-2">
+        <div>
+          <h2 ref={headingRef} id="email-accounts-title" tabIndex={-1} className="text-cardtitle font-medium text-ink-100">{t("Accounts")}</h2>
+          <p className="text-label text-ink-400 mt-1">{t("Adding an account doesn’t change any app’s sender.")}</p>
         </div>
-        <Link href="/settings/connections" className="lnk text-label shrink-0">
-          {address || unreadable ? t("Manage in Connections") : t("Add one in Connections")}
-        </Link>
-      </div>
+        {canAdd && <Button variant="primary" onClick={onAdd}>{t("Add email")}</Button>}
+      </header>
+      {accounts.length === 0 ? (
+        complete && <p className="settings-rows p-3 text-label text-ink-400">{t("No email accounts connected")}</p>
+      ) : (
+        <ul className="settings-rows" aria-label={t("Sending accounts")}>
+          {accounts.map((row) => {
+            const usable = row.smtp != null && row.status.custody_available;
+            let label = row.account;
+            if (isHostedSender(row)) label = t("AgenticOS sender");
+            else if (hostedSmtp && row.account === HOSTED_ACCOUNT) label = t("Workspace email account");
+            return (
+              <li key={row.id}>
+                <div className="settings-row flex-wrap">
+                  <span className="inline-flex items-center justify-center rounded bg-ink-800 text-ink-400 size-8 shrink-0" aria-hidden="true"><IconOutbox /></span>
+                  <span className="settings-row-text">
+                    <b>{label}</b>
+                    {row.smtp?.sender && <small>{row.smtp.sender}</small>}
+                  </span>
+                  <span className={`chip ${usable ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"}`}>{usable ? t("Ready") : t("Needs attention")}</span>
+                  {row.kind === "enrolled" && (
+                    <Link
+                      className="settings-quiet"
+                      href={routePath({ screen: "settings", section: "connections", page: { kind: "detail", id: row.id } })}
+                      aria-label={t("Manage {name}").replace("{name}", () => label)}
+                    >{t("Manage")}</Link>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </section>
   );
 }
@@ -326,11 +410,13 @@ function SenderCard({
   rows,
   hostedSmtp,
   viewer,
+  onClose,
 }: {
   target: Target;
-  rows: Connection[];
+  rows: Connection[] | null;
   hostedSmtp: boolean;
   viewer: Viewer;
+  onClose: () => void;
 }) {
   const t = useTranslate();
   const selectId = useId();
@@ -358,7 +444,7 @@ function SenderCard({
     return () => controller.abort();
   }, [target.scope.installId, target.scope.contextId, attempt]);
 
-  const { usable, unusable } = senderChoices(rows);
+  const { usable, unusable } = senderChoices(rows ?? []);
   const choice = usable.find((r) => r.id === picked) ?? usable.find((r) => binding && r.id === binding.connectionId) ?? usable[0];
   const chosenId = choice?.id ?? "";
 
@@ -383,7 +469,7 @@ function SenderCard({
       )}
       {binding === null && (
         <p className="text-label text-ink-400" data-state="unbound">
-          {hostedSmtp ? t("No sender chosen yet.") : t("No sender chosen yet. Pick one below.")}
+          {hostedSmtp || rows === null ? t("No sender chosen yet.") : t("No sender chosen yet. Pick one below.")}
         </p>
       )}
       {binding && live !== null && (
@@ -395,7 +481,7 @@ function SenderCard({
         </p>
       )}
       {binding && live === null && (
-        <p className="text-label text-fail" role="alert" data-state="stale">{t("The chosen sender needs re-checking. Choose it again below to continue sending.")}</p>
+        <p className="text-label text-fail" role="alert" data-state="stale">{rows === null ? t("The chosen sender needs re-checking") : t("The chosen sender needs re-checking. Choose it again below to continue sending.")}</p>
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
@@ -414,15 +500,15 @@ function SenderCard({
         <ul className="grid gap-1" aria-label={t("Senders that cannot be used")}>
           {unusable.map(({ row, reason }) => (
             <li key={row.id} className="text-label text-fail break-words" data-state="sender-unusable">
-              {t("{account} can't be used yet. {reason}").replace("{account}", () => String(row.account ?? "")).replace("{reason}", () => String(reason ?? ""))} <Link href="/settings/connections">{t("Fix it in Settings → Connections")}</Link>.
+              {t("{account} can't be used yet. {reason}").replace("{account}", () => String(row.account ?? "")).replace("{reason}", () => String(reason ?? ""))} <Link href={EMAIL_CONNECTIONS_HREF} onClick={onClose}>{t("Manage email accounts")}</Link>.
             </li>
           ))}
         </ul>
       )}
-      {usable.length === 0 && (
+      {rows !== null && usable.length === 0 && (
         <p className="text-label text-ink-500">
           {hostedSmtp ? t("No workspace email account is available.") : t("No email sender is available.")}{" "}
-          <Link href="/settings/connections">{t("Add one in Settings → Connections")}</Link>.
+          <Link href={EMAIL_CONNECTIONS_HREF} onClick={onClose}>{t("Manage email accounts")}</Link>.
         </p>
       )}
       {canWrite && usable.length > 0 && (

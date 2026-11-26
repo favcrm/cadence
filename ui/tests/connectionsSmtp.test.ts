@@ -512,7 +512,7 @@ async function main() {
   });
   await settle(() => {
     const names = accountRows().map((row) => row.querySelector("b")?.textContent);
-    assert(names.includes("Email (SMTP)"), "an smtp account is named by its service");
+    assert(!names.includes("Email (SMTP)"), "SMTP accounts live behind the Email connector, not among other services");
     assert(names.includes("Ghost_provider"), "an unregistered provider's account is never dropped");
   }, 30000);
 
@@ -526,6 +526,15 @@ async function main() {
     (byTextIn(host5, "a", "+ Add") as HTMLAnchorElement)?.getAttribute("href") === "/settings/connections/new",
     "add goes to the chooser",
   );
+
+  // Boards that do not advertise Email settings keep their generic account rows.
+  await act(async () => {
+    root5.render(withLocale(React.createElement(ConnectionsPage, {
+      viewer: { operator: true, readOnly: false },
+      emailAvailable: false,
+    })));
+  });
+  assert(!host5.querySelector('a[href="/settings/connections/email"]'), "no Email link when that settings surface is unavailable");
 
   // A row opens one drawer holding the account's details and actions, and Esc
   // gives focus back to the row. The /account/<id> page stays for old links.

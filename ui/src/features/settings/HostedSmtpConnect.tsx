@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
+import Select from "../../ui/Select";
 import {
   PRESETS,
   connectErrorText,
@@ -35,17 +36,22 @@ export default function HostedSmtpConnect({
   connected,
   onConnect,
   onCancel,
+  accountLabel,
+  onAccountLabelChange,
 }: {
   /** The address already connected, if any: the form then replaces it. */
   connected: string | null;
   onConnect: (details: ConnectDetails, acceptRisk: boolean) => Promise<void>;
   onCancel?: () => void;
+  accountLabel?: string;
+  onAccountLabelChange?: (value: string) => void;
 }) {
   const t = useTranslate();
   const [preset, setPreset] = useState<Preset>(PRESETS[0]);
   const [host, setHost] = useState(PRESETS[0].host);
   const [tls, setTls] = useState<TlsMode>(PRESETS[0].tls);
   const [address, setAddress] = useState(connected ?? "");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [consent, setConsent] = useState(false);
@@ -58,11 +64,18 @@ export default function HostedSmtpConnect({
     setPreset(next);
     setHost(next.host);
     setTls(next.tls);
+    setPassword("");
+    setConsent(false);
+    setRiskNeeded(false);
     setError(null);
   };
 
   const submit = () => {
     if (pending) return;
+    if (onAccountLabelChange && !accountLabel?.trim()) {
+      setError("Name this email account.");
+      return;
+    }
     if (address.trim() === "" || password === "" || host.trim() === "") {
       setError(UI_MISSING_FIELDS);
       return;
@@ -77,7 +90,7 @@ export default function HostedSmtpConnect({
       host: host.trim(),
       port: portFor(tls),
       tls_mode: tls,
-      username: address.trim(),
+      username: username.trim() || address.trim(),
       password,
       sender: address.trim(),
       sender_name: name.trim(),
@@ -100,29 +113,23 @@ export default function HostedSmtpConnect({
     <form
       className="grid gap-3 min-w-0"
       aria-label={t("Connect your email")}
+      autoComplete="off"
       onSubmit={(e) => {
         e.preventDefault();
         submit();
       }}
     >
-      <div role="group" aria-label={t("Email provider")} className="crm-toolbar">
-        {PRESETS.map((p) => (
-          <Button
-            key={p.id}
-            size="sm"
-            variant={p.id === preset.id ? "primary" : "secondary"}
-            aria-pressed={p.id === preset.id}
-            disabled={pending}
-            onClick={() => choose(p)}
-          >
-            {t(p.label)}
-          </Button>
-        ))}
+      <div className="crm-field">
+        <label className="text-label text-ink-300" htmlFor="hs-preset">{t("Email provider")}</label>
+        <Select id="hs-preset" full value={preset.id} disabled={pending}
+          options={PRESETS.map((p) => ({ value: p.id, label: t(p.label) }))}
+          onChange={(value) => { const next = PRESETS.find((p) => p.id === value); if (next) choose(next); }} />
       </div>
       <p className="text-label text-ink-400 break-words" data-hint={preset.id}>
         {t(preset.hint)}
       </p>
-      <div className="crm-field-row">
+      <h3 className="text-cardtitle font-medium text-ink-100 mt-2">{t("Sender details")}</h3>
+      <div>
         <div className="crm-field">
           <label className="text-label text-ink-300" htmlFor="hs-address">{t("Your email address")}</label>
           <input
@@ -137,20 +144,13 @@ export default function HostedSmtpConnect({
             disabled={pending}
           />
         </div>
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="hs-password">{t("App password")}</label>
-          <input
-            id="hs-password"
-            className="field"
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            disabled={pending}
-          />
-        </div>
       </div>
+      {onAccountLabelChange && (
+        <div className="crm-field">
+          <label className="text-label text-ink-300" htmlFor="hs-account">{t("Account label")}</label>
+          <input id="hs-account" className="field" value={accountLabel ?? ""} onChange={(e) => onAccountLabelChange(e.target.value)} disabled={pending} />
+        </div>
+      )}
       <div className="crm-field">
         <label className="text-label text-ink-300" htmlFor="hs-name">{t("From name (optional)")}</label>
         <input
@@ -164,7 +164,7 @@ export default function HostedSmtpConnect({
           disabled={pending}
         />
       </div>
-      {preset.id === "other" && (
+      <h3 className="text-cardtitle font-medium text-ink-100 mt-2">{t("Server settings")}</h3>
         <div className="crm-field-row">
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="hs-host">{t("Mail server")}</label>
@@ -181,24 +181,22 @@ export default function HostedSmtpConnect({
           </div>
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="hs-security">{t("Port and security")}</label>
-            <select
-              id="hs-security"
-              className="field"
-              value={tls}
-              onChange={(e) => setTls(e.target.value as TlsMode)}
-              disabled={pending}
-            >
-              <option value="implicit">{t("465 · SSL/TLS")}</option>
-              <option value="starttls">{t("587 · STARTTLS")}</option>
-            </select>
+            <Select id="hs-security" full value={tls} disabled={pending}
+              options={[{ value: "implicit", label: t("465 · SSL/TLS") }, { value: "starttls", label: t("587 · STARTTLS") }]}
+              onChange={(value) => setTls(value as TlsMode)} />
           </div>
         </div>
-      )}
-      {preset.id !== "other" && (
-        <p className="text-micro text-ink-500 num" data-server>
-          {t("{host} · port {portFor} · {mode}").replace("{host}", () => String(host ?? "")).replace("{portFor}", () => String(portFor(tls) ?? "")).replace("{mode}", () => tls === "implicit" ? "SSL/TLS" : "STARTTLS")}
-        </p>
-      )}
+      <div className="crm-field">
+        <label className="text-label text-ink-300" htmlFor="hs-username">{t("SMTP username (optional)")}</label>
+        <input id="hs-username" className="field" autoComplete="off" spellCheck={false} value={username} onChange={(e) => setUsername(e.target.value)} disabled={pending} />
+        <p className="text-micro text-ink-500">{t("Leave blank to use your email address.")}</p>
+      </div>
+      <div className="crm-field">
+        <label className="text-label text-ink-300" htmlFor="hs-password">{preset.id === "gmail" ? t("App password") : t("SMTP password")}</label>
+        {/* This secret is for another service, not the signed-in board account. */}
+        <input id="hs-password" className="field" type="password" autoComplete="new-password" spellCheck={false}
+          value={password} onChange={(e) => setPassword(e.target.value)} disabled={pending} />
+      </div>
       {riskNeeded && (
         <label className="flex items-start gap-2 text-label text-ink-300" data-consent>
           <input
@@ -213,7 +211,7 @@ export default function HostedSmtpConnect({
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
-          {error === UI_MISSING_FIELDS || error === UI_CONSENT_NEEDED ? t(error) : error}
+          {t(error)}
         </p>
       )}
       <div className="crm-toolbar">

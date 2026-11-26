@@ -1,6 +1,6 @@
 export {};
 /**
- * CAD-1059 / CAD-1063 slice 2: Settings -> Email sending, mounted.
+ * Settings → Connections → Email, mounted.
  * One page chooses the CRM sender (SMTP or hosted AgenticOS), binds or
  * rebinds it with the existing crm_smtp verbs, and sets the unsubscribe
  * origin once. Link/auth revisions stay behind Details.
@@ -17,6 +17,7 @@ function equal(actual: unknown, expected: unknown, why: string): void {
 
 interface World {
   connections: any[];
+  hostedSmtp?: boolean;
   binding: any | null;
   /** Per-context bindings; a missing key falls back to `binding`. */
   bindings?: Record<string, any | null>;
@@ -25,6 +26,9 @@ interface World {
   origin: { unsubscribe_origin: string | null; stored: boolean };
   posts: { path: string; body: any }[];
   failConnectionsOnce?: boolean;
+  connectionsPartial?: boolean;
+  failContextsOnce?: boolean;
+  reads?: string[];
   failShowOnce?: boolean;
 }
 
@@ -49,7 +53,7 @@ const bindingFor = (row: any, over: any = {}) => ({
 
 async function mount(world: World, viewer = { operator: true, readOnly: false }, fixedUnsubscribeAddress = false) {
   const { Window } = require("happy-dom");
-  const win = new Window({ url: "http://localhost/settings/email" });
+  const win = new Window({ url: "http://localhost/settings/connections/email" });
   for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLSelectElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
     Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
   for (const name of ["addEventListener", "removeEventListener"])
@@ -75,17 +79,26 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
     const url = new URL(String(input), "http://localhost");
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    if (method === "GET") world.reads?.push(url.pathname);
     if (method === "POST") world.posts.push({ path: url.pathname, body });
     switch (`${method} ${url.pathname}`) {
       case "GET /api/app-installations":
         return json(world.installations ?? [{ install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true }, { install_id: "install-social", name: "social-content", title: "Social" }]);
-      case "GET /api/app-installations/install-crm/contexts": return json({ contexts: world.contexts });
+      case "GET /api/app-installations/install-crm/contexts":
+        if (world.failContextsOnce) {
+          world.failContextsOnce = false;
+          return json({ error: "contexts are unavailable" }, 503);
+        }
+        return json({ contexts: world.contexts });
       case "GET /api/connections":
         if (world.failConnectionsOnce) {
           world.failConnectionsOnce = false;
           return json({ error: "connections are unavailable" }, 503);
         }
-        return json({ connections: world.connections });
+        return json({
+          connections: world.connections, hosted_smtp: world.hostedSmtp,
+          ...(world.connectionsPartial ? { connections_unavailable: { code: "unavailable" } } : {}),
+        });
       case "POST /api/crm-smtp/show": {
         if (world.failShowOnce) {
           world.failShowOnce = false;
@@ -145,7 +158,10 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
   };
   const button = (label: string) =>
     Array.from(document.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === label) as HTMLButtonElement | undefined;
-  await React.act(async () => { root.render(React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress })); });
+  const render = async (focusSenders = false) => {
+    await React.act(async () => { root.render(React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress, focusSenders })); });
+  };
+  await render();
   // A row is a name and one line; everything else is in the drawer it opens.
   const open = async (name: string) => {
     await settle(() => assert(rowFor(name), `row ${name}`));
@@ -175,6 +191,7 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
     flush,
     React,
     mainText,
+    render,
     unmount: async () => {
       await React.act(async () => root.unmount());
       host.remove();
@@ -201,8 +218,8 @@ async function main() {
     equal(Object.keys(bind.body).sort(), ["connection_id", "context_id", "install_id", "request_id"], "bind body carries ids only, no revisions");
     await m.unmount();
   }
-  // CAD-1797: every eligible app/context is listed; each keeps its own
-  // binding. The page does not re-implement the Connections account form.
+  // Every eligible context keeps its own binding. Account credentials
+  // are only entered after opening Add email.
   {
     const a = smtpRow("conn-a"), b = smtpRow("conn-b");
     const world = fresh({
@@ -218,8 +235,7 @@ async function main() {
       assert(m.rowFor("CRM · Acme")?.textContent?.includes("conn-a@example.com"), "the bound context names its sender");
       assert(m.rowFor("CRM · Billing")?.textContent?.includes("No sender chosen"), "the other context is unbound");
     });
-    assert(!m.host.querySelector("#email-sending-target"), "no single-target selector");
-    assert(!m.host.querySelector("[data-section=connect-email]"), "no duplicate SMTP account form");
+    assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "a listed SMTP account can be managed");
     assert(!m.host.querySelector("input[type=password]"), "no password field on the policy page");
     await m.open("CRM · Billing");
     await m.settle(() => assert(m.button("Use this sender"), "bind button"));
@@ -262,7 +278,7 @@ async function main() {
     assert(m.host.querySelector("input[type=password]") === null, "no password field");
     await m.unmount();
   }
-  // Unusable SMTP sender: never bindable, typed reason, link to Connections.
+  // Unusable SMTP sender: never bindable, typed reason, link to Email accounts.
   {
     const bad = smtpRow("conn-bad", { smtp: null, smtp_error: "withheld_leak" });
     const m = await mount(fresh({ connections: [bad] }));
@@ -270,7 +286,7 @@ async function main() {
     await m.settle(() => assert(m.host.querySelector("[data-state=sender-unusable]"), "unusable row"));
     const li = m.host.querySelector("[data-state=sender-unusable]")!;
     assert(li.textContent!.includes("password shares characters"), "typed smtp_error reason");
-    assert(li.querySelector('a[href="/settings/connections"]'), "link to Connections");
+    assert(li.querySelector('a[href="/settings/connections/email"]'), "link to Email accounts");
     assert(m.button("Use this sender") === undefined, "an unusable sender cannot be bound");
     await m.unmount();
   }
@@ -341,12 +357,70 @@ async function main() {
     assert(!m.button("Save") && !m.host.querySelector("#email-origin"), "no origin write controls");
     await m.unmount();
   }
-  // A failed read offers Retry, and Retry recovers.
+  // An account failure leaves app bindings and unsubscribe policy independent.
   {
-    const m = await mount(fresh({ failConnectionsOnce: true }));
-    await m.settle(() => assert(m.button("Retry"), "a failed read offers Retry"));
+    const a = smtpRow("conn-a");
+    const world = fresh({ failConnectionsOnce: true, binding: bindingFor(a), reads: [] });
+    const m = await mount(world);
+    await m.settle(() => {
+      assert(m.button("Retry"), "account read offers Retry");
+      assert(m.rowFor("CRM · Acme")?.textContent?.includes("conn-a@example.com"), "binding remains truthful");
+      assert(m.rowFor("Unsubscribe links"), "unsubscribe remains available");
+    });
+    assert(!m.button("Add email") && !m.host.textContent!.includes("No email accounts connected"), "failed list is not empty");
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "drawer still shows binding"));
+    assert(!m.host.querySelector('[role="combobox"]') && !m.button("Switch to this sender"), "failed list cannot assign");
+    const appReads = world.reads!.filter((p) => p === "/api/app-installations").length;
     await m.click(m.button("Retry"));
-    await m.settle(() => assert(m.rowFor("CRM · Acme"), "Retry loads the page"));
+    await m.settle(() => assert(m.button("Add email"), "account retry recovers"));
+    equal(world.reads!.filter((p) => p === "/api/app-installations").length, appReads, "account retry does not reload apps");
+    assert(m.host.querySelector("[data-state=live]"), "account retry preserves the open sender drawer");
+    await m.unmount();
+  }
+  // A partial response retains known account management but cannot authorize adds or assignment.
+  {
+    const a = smtpRow("conn-a");
+    const world = fresh({ connectionsPartial: true, binding: bindingFor(a), reads: [] });
+    const m = await mount(world);
+    await m.settle(() => assert(m.host.querySelector("[data-state=connections-partial]"), "partial list notice"));
+    assert(m.host.textContent!.includes("Some connected accounts couldn't be loaded"), "partial notice explains the list");
+    assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "known account remains manageable");
+    assert(!m.button("Add email") && !m.host.textContent!.includes("No email accounts connected"), "partial list does not imply empty or permit Add");
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "known binding is displayed"));
+    assert(!m.host.querySelector('[role="combobox"]') && !m.button("Switch to this sender"), "partial list cannot assign");
+    world.connectionsPartial = false;
+    const appReads = world.reads!.filter((p) => p === "/api/app-installations").length;
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.host.querySelector('[role="combobox"]'), "complete retry restores sender controls"));
+    equal(world.reads!.filter((p) => p === "/api/app-installations").length, appReads, "partial retry only reloads accounts");
+    await m.unmount();
+  }
+  {
+    const m = await mount(fresh({ connections: [], connectionsPartial: true }));
+    await m.settle(() => assert(m.host.querySelector("[data-state=connections-partial]"), "empty partial response"));
+    assert(!m.host.textContent!.includes("No email accounts connected") && !m.button("Add email"), "empty partial response does not assert empty");
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.host.querySelector("[data-state=unbound]"), "unbound status remains visible"));
+    assert(!m.host.textContent!.includes("No email sender is available.") && !m.button("Use this sender"), "partial response cannot imply no sender or bind");
+    await m.unmount();
+  }
+  // Context discovery can fail independently without hiding account management.
+  {
+    const world = fresh({ failContextsOnce: true, reads: [] });
+    const m = await mount(world);
+    await m.settle(() => {
+      assert(m.button("Retry"), "context discovery offers Retry");
+      assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "account remains manageable");
+      assert(m.button("Add email"), "account add remains available");
+      assert(m.rowFor("Unsubscribe links"), "unsubscribe remains available");
+    });
+    assert(!m.host.querySelector("[data-state=no-apps]"), "failed discovery is not empty");
+    const accountReads = world.reads!.filter((p) => p === "/api/connections").length;
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.rowFor("CRM · Acme"), "context retry recovers"));
+    equal(world.reads!.filter((p) => p === "/api/connections").length, accountReads, "discovery retry does not reload accounts");
     await m.unmount();
   }
   // A failed sender read inside the drawer offers Retry too.
@@ -360,6 +434,28 @@ async function main() {
     await m.settle(() => assert(m.button("Retry"), "the drawer offers Retry"));
     await m.click(m.button("Retry"));
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "Retry recovers"));
+    await m.unmount();
+  }
+  // The two Email routes share a mounted page; returning still focuses App senders.
+  {
+    const m = await mount(fresh());
+    await m.render(true);
+    assert(document.activeElement?.id === "app-senders", "first deep link focuses App senders");
+    await m.render(false);
+    await m.settle(() => assert(m.button("Add email"), "Accounts loaded after leaving App senders"));
+    m.button("Add email")?.focus();
+    assert(document.activeElement?.textContent?.trim() === "Add email", "focus moved within Accounts");
+    await m.render(true);
+    assert(document.activeElement?.id === "app-senders", "returning deep link refocuses App senders");
+    await m.unmount();
+  }
+  // A hosted workspace can manage its enrolled sender, not add a duplicate.
+  {
+    const m = await mount(fresh({
+      hostedSmtp: true, connections: [smtpRow("conn-hosted", { account: "email" })],
+    }), { operator: true, readOnly: false }, true);
+    await m.settle(() => assert(m.host.querySelector('a[href="/settings/connections/account/conn-hosted"]'), "existing hosted account can be managed"));
+    assert(!m.button("Add email"), "the single hosted SMTP account cannot be replaced through Add email");
     await m.unmount();
   }
   // A hosted board's links always use its own address: there is no setting to show.

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { navigate, useHref } from "../../lib/useLocation";
+import { EMAIL_SENDING_HREF } from "../../lib/router";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
@@ -1159,7 +1160,7 @@ export default function AppShell({
   };
   const screenCommand = (command: HostCommand) => {
     if (!receiptReady || !contextAdoptionReady || !scope.contextId || viewer.operator !== true || viewer.readOnly) return;
-    if (command.operation === "smtp.manage") { navigate("/settings/email"); return; }
+    if (command.operation === "smtp.manage") { navigate(EMAIL_SENDING_HREF); return; }
     if (command.operation === "connections.connect") {
       const url = hostedConnectCommandUrl(command.args);
       if (url) window.location.assign(url);
