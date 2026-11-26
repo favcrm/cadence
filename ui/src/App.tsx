@@ -414,7 +414,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     loading: boolean;
     error: string | null;
   }>({ supported: true, projects: null, loading: false, error: null });
-  const [viewedArchivedKey, setViewedArchivedKey] = useState<string | null>(null);
   const [archivedIssuesState, setArchivedIssuesState] = useState<ResourceState<IssueCard[]>>({
     status: "loading",
     data: null,
@@ -426,9 +425,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const onProjectsIndex = route.screen === "projects" && route.slug === null && route.section === "overview";
   const viewedProjectSlug =
     route.screen === "issue" ? route.project : route.screen === "projects" ? route.slug : null;
+  const viewedProjectMissingFromActive =
+    viewedProjectSlug !== null &&
+    (projectsState.status === "ok" || projectsState.status === "empty") &&
+    !projects.some((p) => p.key === viewedProjectSlug);
+  const needsArchivedLookup =
+    viewedProjectMissingFromActive &&
+    !(archivedProjectsState.projects?.some((p) => p.key === viewedProjectSlug) ?? false);
 
   useEffect(() => {
-    if (!onProjectsIndex && lifecycleVersion === 0) return;
+    if (!onProjectsIndex && !needsArchivedLookup && lifecycleVersion === 0) return;
     if (archivedProjectsState.supported === false) return;
     let active = true;
     setArchivedProjectsState((prev) => ({ ...prev, loading: true, error: null }));
@@ -458,39 +464,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     return () => {
       active = false;
     };
-  }, [onProjectsIndex, lifecycleVersion]);
+  }, [onProjectsIndex, needsArchivedLookup, lifecycleVersion, archivedProjectsState.supported]);
 
-  useEffect(() => {
-    if (!viewedProjectSlug) {
-      setViewedArchivedKey(null);
-      return;
-    }
-    if (projects.some((p) => p.key === viewedProjectSlug)) {
-      setViewedArchivedKey(null);
-      return;
-    }
-    if (archivedProjectsState.projects?.some((p) => p.key === viewedProjectSlug)) {
-      setViewedArchivedKey(viewedProjectSlug);
-      return;
-    }
-    if (projectsState.status !== "ok" && projectsState.status !== "empty") return;
-    let active = true;
-    api
-      .projectLifecycle(viewedProjectSlug)
-      .then((life) => {
-        if (!active) return;
-        setViewedArchivedKey(life.archived ? viewedProjectSlug : null);
-      })
-      .catch(() => {
-        if (!active) return;
-        setViewedArchivedKey(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, [viewedProjectSlug, projects, projectsState.status, archivedProjectsState.projects, lifecycleVersion]);
-
-  const viewedProjectArchived = viewedProjectSlug !== null && viewedArchivedKey === viewedProjectSlug;
+  const viewedProjectArchived =
+    viewedProjectMissingFromActive &&
+    (archivedProjectsState.projects?.some((p) => p.key === viewedProjectSlug) ?? false);
 
   useEffect(() => {
     if (!viewedProjectArchived || !viewedProjectSlug) return;
