@@ -13,6 +13,10 @@ use crate::error::{Error, Result};
 /// persisted values readable without truncation or a profile migration.
 pub const VALUE_MAX: usize = 2 * 4_096;
 
+/// Raw multi-line `SOUL.md` body cap (8 KiB), plus its post-escaping ceiling.
+pub const SOUL_BODY_MAX: usize = 8 * 1024;
+pub const MULTILINE_ESCAPED_MAX: usize = 2 * SOUL_BODY_MAX;
+
 /// Values the seeded templates use to mean "nothing agreed yet".
 pub const UNSET_PLACEHOLDERS: [&str; 2] = ["(not set yet)", "(none recorded yet)"];
 
@@ -127,6 +131,51 @@ pub fn line(label: &str, value: &str) -> String {
     format!("{label}: {}", clean(value))
 }
 
+/// Multi-line Markdown cleaner: normalizes CRLF, strips control chars other
+/// than `\n` and `\t`, neutralises HTML comment delimiters so a value can never
+/// close or forge a managed block, and trims surrounding whitespace.
+pub fn clean_multiline(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect::<String>()
+        .replace("<!--", "&lt;!--")
+        .replace("-->", "--&gt;")
+        .trim()
+        .to_string()
+}
+
+/// Replace one multi-line managed block (or append it), keeping all other text.
+/// Empty cleaned text writes the seeded placeholder so the block reads unset.
+pub fn set_multiline(text: &str, marker: &str, body: &str) -> Result<String> {
+    let cleaned = clean_multiline(body);
+    if cleaned.len() > MULTILINE_ESCAPED_MAX {
+        return Err(malformed(marker, "the value is over the cap"));
+    }
+    let payload = if cleaned.is_empty() {
+        UNSET_PLACEHOLDERS[0]
+    } else {
+        cleaned.as_str()
+    };
+    set(text, marker, payload)
+}
+
+/// Read a multi-line managed block body; `None` when absent, empty, or unset
+/// placeholder.
+pub fn read_multiline(text: &str, marker: &str) -> Result<Option<String>> {
+    let Some(raw) = body(text, marker)? else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || UNSET_PLACEHOLDERS.contains(&trimmed) {
+        return Ok(None);
+    }
+    if trimmed.len() > MULTILINE_ESCAPED_MAX {
+        return Err(malformed(marker, "the value is over the cap"));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +230,25 @@ mod tests {
             value(&next, "name").unwrap().as_deref(),
             Some("No&lt;!--vame")
         );
+    }
+
+    #[test]
+    fn multiline_round_trips_and_neutralizes_markers() {
+        let before = "# Soul\n\n<!-- cadence:managed-begin soul_body -->\n(not set yet)\n\
+                      <!-- cadence:managed-end soul_body -->\n";
+        assert_eq!(read_multiline(before, "soul_body").unwrap(), None);
+        let next = set_multiline(
+            before,
+            "soul_body",
+            "## How I work\n- Concise bullets\n<!-- sneaky -->\x07\n",
+        )
+        .unwrap();
+        let read = read_multiline(&next, "soul_body").unwrap().unwrap();
+        assert_eq!(
+            read,
+            "## How I work\n- Concise bullets\n&lt;!-- sneaky --&gt;"
+        );
+        let cleared = set_multiline(&next, "soul_body", "   \n").unwrap();
+        assert_eq!(read_multiline(&cleared, "soul_body").unwrap(), None);
     }
 }

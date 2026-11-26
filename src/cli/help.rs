@@ -113,6 +113,7 @@ const OPERATOR: &[&str] = &[
 /// Visible verbs that are neither core nor operator.
 const ADVANCED: &[&str] = &[
     "agent-uid",
+    "assist",
     "attach",
     "artifact",
     "attachment",

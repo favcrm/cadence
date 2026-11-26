@@ -105,6 +105,8 @@ mod cad2215_member_scope_acceptance;
 mod cad2215_private_completion_acceptance;
 #[path = "team_assistants_refusal/cad2215_private_delivery_native_acceptance.rs"]
 mod cad2215_private_delivery_native_acceptance;
+#[path = "team_assistants_refusal/cad2832_assistant_memory_acceptance.rs"]
+mod cad2832_assistant_memory_acceptance;
 
 pub use super::AssistantFlagOn;
 

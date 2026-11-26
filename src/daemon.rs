@@ -239,6 +239,8 @@ pub use credential_entry_fixture::configure_credential_entry_fixture;
 mod protected_management_rpc;
 // the frozen acceptance check and its genuine fixture.
 // Both compile only under `test-seam`; production carries neither.
+#[path = "daemon/assistant_memory.rs"]
+mod assistant_memory;
 #[cfg(all(test, feature = "test-seam"))]
 #[path = "daemon/automatic_upgrade_consent.rs"]
 mod automatic_upgrade_consent;
@@ -976,6 +978,9 @@ pub struct Shared {
     /// compaction is not kept here but as a thread note
     /// ([`Store::compaction_pending`]), so it survives a restart.
     continuity_due: Mutex<HashMap<String, crate::continuity::Reason>>,
+    /// CAD-2832: per-session delivered Layer-1/2 personal context fingerprints
+    /// and in-turn self-edit refresh state for member assistants.
+    member_context_delivered: Mutex<members_rpc::MemberContextTracker>,
     /// CAD-313: login links and board sessions ([`crate::operator_auth`]).
     operator_auth: Mutex<crate::operator_auth::Auth>,
     /// CAD-313: the clock links and sessions expire by (epoch seconds) —
@@ -1593,6 +1598,7 @@ impl Shared {
             idea_lock: Mutex::new(()),
             wake_lock: Mutex::new(()),
             continuity_due: Mutex::new(HashMap::new()),
+            member_context_delivered: Mutex::new(members_rpc::MemberContextTracker::default()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
             idle_poll: opts.idle_poll.unwrap_or(IDLE_POLL),
             recover_lock: Mutex::new(()),
@@ -4955,6 +4961,11 @@ impl Shared {
             "member_job_subscribe" => self.rpc_member_job_subscribe(params, peer_pid),
             "member_job_share" => self.rpc_member_job_share(params, peer_pid),
             "member_job_reconcile" => self.rpc_member_job_reconcile(params, peer_pid),
+            "assistant_context_update" => self.rpc_assistant_context_update(params, peer_pid),
+            "assistant_memory_search" => self.rpc_assistant_memory_search(params, peer_pid),
+            "assistant_memory_read" => self.rpc_assistant_memory_read(params, peer_pid),
+            "assistant_memory_undo" => self.rpc_assistant_memory_undo(params, peer_pid),
+            "assistant_skill_show" => self.rpc_assistant_skill_show(params, peer_pid),
             "job_list" => {
                 // CAD-2215 acceptance scaffolding: the real handler, with the
                 // relayed proof removed, exactly as a pre-CAD-2215 daemon that

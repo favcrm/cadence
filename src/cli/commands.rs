@@ -1922,6 +1922,11 @@ pub(crate) enum Commands {
         #[arg(required = true, num_args = 1.., value_name = "COMMAND_PATH")]
         path: Vec<String>,
     },
+    /// Personal assistant memory, SOUL.md updates, and permitted skill reads.
+    Assist {
+        #[command(subcommand)]
+        action: AssistAction,
+    },
 }
 
 /// Workspace role requested for an invite or a role change. This is the
