@@ -4,7 +4,8 @@ import { subscribeSse, type SseErrorState } from "../../../lib/sse";
 import { resources } from "../../../lib/resources";
 import type { MasterState } from "../../../lib/types";
 import { privateSessionGeneration } from "../../../lib/privateSession";
-import { EMPTY_THREAD, applyEarlier, fetchEarlier, reduceFrame, resumeSeq, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
+import { EMPTY_THREAD, applyEarlier, fetchEarlier, reduceFrame, resumeSeq, threadItems, toolApprovalDecisionId, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
+import { stagedActionId } from "../../home/turnCards";
 import { applyPreviewFrame, setConversationPreview } from "./conversationPreview";
 import { writeMasterStreamSnapshot } from "./assistantModelState";
 
@@ -74,6 +75,7 @@ export function useThreadStream(
   onSnapshot?: () => void,
   graceMs: number = FIRST_CONNECT_GRACE_MS,
   previewConversation: string | null = null,
+  clearPreviewOnStaging = false,
 ): void {
   useEffect(() => {
     if (!enabled || url === null) {
@@ -175,9 +177,13 @@ export function useThreadStream(
               : data ?? EMPTY_THREAD;
           }
           const next = reduceFrame(data, event, (entry) => {
-            // The committed result ends the turn: the live text it replaces
-            // must not outlive it, even if the server's clear frame is lost.
-            if (entry.role === "agent" && entry.kind === "turn_result") {
+            // Committed results and approval boundaries replace the live text
+            // that came before them, even if the clear frame is lost.
+            if ((entry.role === "agent" && entry.kind === "turn_result") ||
+                (clearPreviewOnStaging && (
+                  (entry.role === "agent" && entry.kind === "tool_result" && stagedActionId(entry) !== null) ||
+                  toolApprovalDecisionId(entry) !== null
+                ))) {
               setConversationPreview(previewConversation, null);
             }
           });
@@ -215,7 +221,7 @@ export function useThreadStream(
     // never be attributed to the new conversation, and the new stream sends
     // its own preview snapshot.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [store, url, enabled, previewConversation]);
+  }, [store, url, enabled, previewConversation, clearPreviewOnStaging]);
 }
 
 /** What one "Load earlier" press does. */

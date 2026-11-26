@@ -1801,6 +1801,32 @@ textarea.agentform-input { height: auto; width: 100%; }
 .form-receipt-line {
   color: var(--color-ink-200);
 }
+.tool-decision-receipt {
+  padding: .5rem .75rem;
+  font-size: var(--text-label);
+}
+.tool-decision-receipt > summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  column-gap: .45rem;
+  list-style: none;
+  cursor: pointer;
+}
+.tool-decision-receipt > summary::-webkit-details-marker { display: none; }
+.tool-decision-receipt > summary::after {
+  content: "";
+  grid-area: 1 / 4;
+  place-self: center;
+  width: .35rem;
+  height: .35rem;
+  border: solid currentColor;
+  border-width: 0 1px 1px 0;
+  transform: rotate(45deg);
+}
+.tool-decision-receipt[open] > summary::after { transform: rotate(225deg); }
+.tool-decision-receipt > summary strong { color: var(--color-ink-100); }
+.tool-decision-subject { grid-column: 2 / -1; }
+.tool-decision-receipt > dl { margin-top: .5rem; padding-top: .5rem; border-top: 1px solid var(--color-ink-700); }
 /* Markdown drops its trailing margin inside the padded surface, so the
    last line and the bubble edge stay even. */
 .chat-bubble > :last-child {

@@ -7,6 +7,7 @@ import {
   cloneElement,
   isValidElement,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -15,8 +16,8 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { AttachmentNamesContext } from "../../home/TurnRichCards";
-import { attachmentNames } from "../../home/turnCards";
+import { AttachmentNamesContext, HomeToolReceipt, isExternalToolDecision } from "../../home/TurnRichCards";
+import { activityAfterStagedTool, attachmentNames, stagedInTurn } from "../../home/turnCards";
 import { api, ApiError } from "../../../lib/api";
 import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../../lib/privateSession";
 import { resources, threadReader } from "../../../lib/resources";
@@ -61,6 +62,7 @@ import {
   clockRuns,
   threadItems,
   threadRuns,
+  toolApprovalDecisionId,
   turnStartMs,
   visibleWindow,
   type PendingAttachment,
@@ -113,6 +115,7 @@ import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations, { matchesPrepareReceipt, notifyAssistantOperationWrite, type PrepareCapability } from "./AssistantOperations";
 import ConversationDecisions from "./ConversationDecisions";
+import type { StagedWrite } from "../../decisions/stagedWrite";
 import { conversationDecisions, type DecisionsStore } from "../../decisions/useDecisions";
 import { StagedSourceContext } from "../../../ui/StagedChip";
 import {
@@ -191,6 +194,8 @@ const COMPOSER_ID = "app-shell-chat-box";
 export interface HomeListProps {
   mode: { kind: "home" };
   highlightSkillCommand?: boolean;
+  /** Hosted operator Home can open the same staged request from its thread and rail. */
+  homeToolApprovals?: boolean;
   items: ThreadItem[];
   /** The Home conversation this list shows; its live preview text (CAD-2228)
    *  is painted on the turn that is generating. */
@@ -266,9 +271,14 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
  * head, one folded trace, one answer surface and its artifact cards; every
  * other item keeps the row renderer unchanged.
  */
+const emptyToolDecisions: readonly StagedWrite[] = [];
+const noToolDecisions = () => emptyToolDecisions;
+const noToolDecisionSubscription = () => () => {};
+
 function HomeList({
   items,
   highlightSkillCommand,
+  homeToolApprovals = false,
   conversation = null,
   readOnly,
   liveAfter,
@@ -283,7 +293,47 @@ function HomeList({
   activity,
 }: HomeListProps) {
   const { t } = useLocale();
+  const decisionSource = useContext(StagedSourceContext);
+  const toolSource = homeToolApprovals ? decisionSource : null;
+  const toolRows = useSyncExternalStore(
+    toolSource?.subscribe ?? noToolDecisionSubscription,
+    toolSource === null ? noToolDecisions : () => toolSource.currentDecisions().rows,
+    noToolDecisions,
+  );
   const runs = useMemo(() => threadRuns(items), [items]);
+  const { toolNotes, toolsByRun } = useMemo(() => {
+    const toolNotes = new Map<string, StagedWrite>();
+    const toolsByRun = new Map<string, { all: readonly StagedWrite[]; visible: readonly StagedWrite[]; continuing: boolean }>();
+    const external = toolRows.filter(isExternalToolDecision);
+    if (external.length === 0) return { toolNotes, toolsByRun };
+    const byId = new Map(external.map((write) => [write.id, write]));
+    const seen = new Set<string>();
+    for (const item of items) {
+      if (item.type !== "operator") continue;
+      const id = toolApprovalDecisionId(item.entry);
+      if (id === null || seen.has(id)) continue;
+      const write = byId.get(id);
+      if (!write || write.status === "pending") continue;
+      seen.add(id);
+      toolNotes.set(item.key, write);
+    }
+    // A repeated request can point at the same server action. Keep its one
+    // visible review (or fallback receipt) by the most recent matching turn.
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const run = runs[i];
+      if (!run.turn) continue;
+      const entries = run.items.flatMap((item) => item.type === "tools" ? item.entries : item.type === "pending" ? [] : [item.entry]);
+      const tools = stagedInTurn(entries, external);
+      if (tools.length === 0) continue;
+      const visible = tools.filter((write) => {
+        if (seen.has(write.id)) return false;
+        seen.add(write.id);
+        return true;
+      });
+      toolsByRun.set(run.key, { all: tools, visible, continuing: activityAfterStagedTool(entries, tools).continuing });
+    }
+    return { toolNotes, toolsByRun };
+  }, [items, runs, toolRows]);
   const clocks = useMemo(() => clockRuns(runs), [runs]);
   // Only a transcript with no answer kind anywhere predates the mapper. A
   // current transcript may legitimately have answer-less runs (tool turns,
@@ -396,10 +446,14 @@ function HomeList({
         typingTail.current = { key: send ? `turn:${send}` : "typing-tail", node: act.node };
       }
     }
+    const toolNote = toolNotes.get(item.key);
+    const marker = item.type === "operator" && toolApprovalDecisionId(item.entry) !== null;
+    if (marker && !toolNote && (act?.kind !== "row" || hoist)) return null;
     return (
       <li key={rowPaintKey(item)} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
         {act?.kind === "row" && act.position === "before" && !hoist ? act.node : null}
-        <ThreadItemView item={item} readOnly={readOnly} highlightSkillCommand={highlightSkillCommand} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
+        {toolNote ? <HomeToolReceipt write={toolNote} /> :
+          !marker && <ThreadItemView item={item} readOnly={readOnly} highlightSkillCommand={highlightSkillCommand} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />}
         {item.type === "answer" && <CorrectionReport question={visibleQuestion(items, items.indexOf(item))} answer={item.entry.text} />}
         {act?.kind === "row" && act.position === "after" && !hoist ? act.node : null}
         {after?.(item)}
@@ -429,7 +483,8 @@ function HomeList({
           rows.push(isValidElement(node) ? cloneElement(node, { key }) : <Fragment key={key}>{node}</Fragment>);
         };
         if (!run.turn) {
-          pushRow(row(run.item), rowPaintKey(run.item));
+          const node = row(run.item);
+          if (node !== null) pushRow(node, rowPaintKey(run.item));
           continue;
         }
         const acts = run.items.map((item) => activity?.(item) ?? null);
@@ -457,6 +512,7 @@ function HomeList({
           (running !== null && run.items.some((item) => itemMessage(item) === running));
         const live = Number(run.key.slice(1)) > liveAfter;
         const answer = run.items.find((item) => item.type === "answer");
+        const tools = toolsByRun.get(run.key);
         if (hasFallback) {
           const fallback = acts.find((act) => act?.kind === "row" && act.fallback === true);
           if (fallback?.kind === "row") typingTail.current = { key: "typing-tail", node: fallback.node };
@@ -472,6 +528,7 @@ function HomeList({
               allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
               previewConversation={conversation}
+              homeTools={toolSource === null ? undefined : { source: toolSource, all: tools?.all ?? emptyToolDecisions, visible: tools?.visible ?? emptyToolDecisions, continuing: tools?.continuing ?? false }}
               after={
                 <>
                   {answer && (

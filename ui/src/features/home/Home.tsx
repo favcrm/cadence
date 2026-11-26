@@ -1,8 +1,8 @@
 import { useWriteBlock, WriteGate } from "../auth/WriteGate";
 import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { AttachmentNamesContext, SkillDraftReviewContext } from "./TurnRichCards";
+import { AttachmentNamesContext, SkillDraftReviewContext, homeToolWrites } from "./TurnRichCards";
 import { useHomeSkillReview } from "./HomeSkillReview";
-import { attachmentNames } from "./turnCards";
+import { activityAfterStagedTool, attachmentNames, stagedActionId } from "./turnCards";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
@@ -51,7 +51,7 @@ import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock"
 import MasterChips from "./MasterChips";
 import ConversationIdCopy from "./ConversationIdCopy";
 import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
-import { homeDecisions } from "../decisions/useDecisions";
+import { homeDecisions, useDecisions } from "../decisions/useDecisions";
 import { StagedSourceContext } from "../../ui/StagedChip";
 import { askDraft, type HomeNeed } from "./needs";
 import type { HomeDecisionOpen } from "../../lib/workItems";
@@ -68,6 +68,7 @@ import { usePendingPermissionRequest } from "../app-shell/chat/usePendingApprova
 import PrivateAppReviewCards from "./PrivateAppReviewCards";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
 import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
+import { useConversationPreview } from "../app-shell/chat/conversationPreview";
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
@@ -105,6 +106,7 @@ import {
   planAnchors,
   stepSummary,
   threadItems,
+  toolApprovalDecisionId,
   visibleWindow,
   WINDOW,
   type PendingAttachment,
@@ -676,6 +678,7 @@ const ThreadList = memo(function ThreadList({
       <Conversation
         mode={{ kind: "home" }}
         highlightSkillCommand={hosted}
+        homeToolApprovals={hosted}
         items={shown}
         conversation={conversation}
         readOnly={readOnly}
@@ -1025,7 +1028,8 @@ function MasterHome({
   });
   const master = modelState.state;
   const offered = modelState.offered;
-  const items = useMemo(() => threadItems(thread.data), [thread.data]);
+  const showToolApprovals = hosted === true && decisions;
+  const items = useMemo(() => threadItems(thread.data, showToolApprovals), [thread.data, showToolApprovals]);
   const loaded = thread.data !== null;
   // The seq watermark for the enter animation: items at or below the mount
   // tail are history and render still; only what lands after rises in. Set
@@ -1073,6 +1077,35 @@ function MasterHome({
   // message, Cancel only for this surface's own queued message. Home uses
   // the server-issued thread ID, just as app conversations do.
   const threadEntries = thread.data?.entries ?? [];
+  const { rows: decisionRows } = useDecisions(showToolApprovals);
+  const latestStaging = useMemo(() => {
+    if (decisionRows.length === 0) return null;
+    const start = threadEntries.findLastIndex((entry) => entry.role === "operator" && entry.kind === "message");
+    if (start === -1) return null;
+    const tail = threadEntries.slice(start + 1);
+    const actions = homeToolWrites(tail, decisionRows);
+    if (actions.length === 0) return null;
+    return {
+      pending: actions.some((action) => action.status === "pending"),
+      ...activityAfterStagedTool(tail, actions),
+    };
+  }, [threadEntries, decisionRows]);
+  const lastDecisionSeq = useRef<number | null>(null);
+  useEffect(() => {
+    if (!showToolApprovals || thread.data === null) return;
+    const last = lastDecisionSeq.current;
+    lastDecisionSeq.current = threadEntries.at(-1)?.seq ?? 0;
+    // The hosted list polls as a fallback. Read promptly when the transcript
+    // carries a new staging result or the server's redacted continuation.
+    if (last === null) return;
+    for (let i = threadEntries.length - 1; i >= 0 && threadEntries[i].seq > last; i--) {
+      const entry = threadEntries[i];
+      if ((entry.kind === "tool_result" && stagedActionId(entry) !== null) || toolApprovalDecisionId(entry) !== null) {
+        homeDecisions.backgroundReload();
+        break;
+      }
+    }
+  }, [showToolApprovals, thread.data, threadEntries]);
   // CAD-2463: a Sources chip names an attachment by the file the user sent.
   const homeAttachmentNames = useMemo(() => attachmentNames(threadEntries), [threadEntries]);
   const pendingPermission = usePendingPermissionRequest(threadEntries, hosted === false);
@@ -1098,6 +1131,14 @@ function MasterHome({
     },
     homeConversation ?? null,
   );
+  const workingHere = turnBar.kind === "working" || turnBar.kind === "writing";
+  const previewAfterStaging = useConversationPreview(homeConversation ?? null, latestStaging !== null && workingHere);
+  // A recorded decision does not restart the old turn. The runtime may still
+  // report that turn as working until it settles or starts the continuation.
+  const stagingPaused = latestStaging !== null && !(workingHere && (
+    latestStaging.continuing || previewAfterStaging !== null ||
+    (latestStaging.continuation !== null && latestStaging.continuation === master.data?.turn?.message)
+  ));
   // The Pi watch closes normally between turns; the SPA reconnects with a
   // fresh cursor. That is not a stale conversation while no turn is active.
   // `writing` and `approval` are presentations of a running turn; `sending`
@@ -1119,7 +1160,8 @@ function MasterHome({
     if (streamReconnecting && activeTurn) {
       return { label: link === "stopped" ? t("stream stopped") : t("reconnecting…"), tone: warn };
     }
-    if (turnBar.kind === "approval") return { label: t("Needs you"), tone: warn };
+    if ((stagingPaused && latestStaging?.pending) || turnBar.kind === "approval") return { label: t("Needs you"), tone: warn };
+    if (stagingPaused && workingHere) return { label: t("Available"), tone: ok };
     if (turnBar.kind === "queued") return { label: t("Queued"), tone: ok };
     // A turn in another conversation still occupies this assistant.
     if (activeTurn || master.data?.turn?.state === "working") return { label: t("Working"), tone: ok };
@@ -1128,8 +1170,7 @@ function MasterHome({
   })();
   // CAD-1880: Stop sits in the composer's send slot while this pane's own
   // turn runs. Never while the stream is down: that state is last known.
-  const runningMessage =
-    turnBar.kind === "working" || turnBar.kind === "writing" ? turnBar.stopMessage : null;
+  const runningMessage = !stagingPaused && workingHere ? turnBar.stopMessage : null;
   const canStop = writeBlock === null && loaded && link === "live" && runningMessage !== null;
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
@@ -1186,8 +1227,16 @@ function MasterHome({
   // is the composer's own POST in flight (no stored entry to anchor on yet),
   // `working` the daemon's verified turn. A queued wait keeps the dock's
   // honest "behind a turn" line instead of claiming to type.
-  const workingActivity =
+  // Hosted master state can describe another conversation's turn. Only
+  // paint activity when the conversation-scoped projection owns it, and
+  // never present a disconnected stream's last-known state as live.
+  const hostedActivityCurrent = hosted !== true || (!streamReconnecting && (
     turn.kind === "working"
+      ? (!stagingPaused && workingHere) || turnBar.kind === "approval"
+      : turnBar.kind === "sending"
+  ));
+  const workingActivity =
+    !hostedActivityCurrent ? null : turn.kind === "working"
       ? {
           message: turn.message,
           since: typeof turn.since === "number" ? turn.since : null,
@@ -1222,6 +1271,7 @@ function MasterHome({
     // CAD-2228: this stream's preview frames are the home conversation's
     // in-flight text, shown only while that conversation generates.
     homeConversation ?? null,
+    showToolApprovals,
   );
 
   // Keep master_state honest: it follows the agents resource's

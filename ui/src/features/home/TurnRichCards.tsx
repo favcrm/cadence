@@ -9,7 +9,7 @@ import { openArtifact } from "../canvas/canvasStore";
 import { artifactRef } from "../canvas/feed";
 import { useImageConversation } from "../canvas/imageConversation";
 import { stagedChipView } from "../decisions/stagedRef";
-import type { StagedOutcome, StagedWrite } from "../decisions/stagedWrite";
+import { failureReason, reasonText, type StagedOutcome, type StagedWrite } from "../decisions/stagedWrite";
 import { openAttachmentInTab } from "./AttachmentMedia";
 import type { ThreadEntry } from "./thread";
 import {
@@ -141,6 +141,105 @@ export function TurnSources({
         </button>
       )}
     </div>
+  );
+}
+
+export function isExternalToolDecision(write: StagedWrite): boolean {
+  return write.kind === "custom_mcp_effect" || write.kind === "connected_effect";
+}
+
+function toolReviewLabel(write: StagedWrite) {
+  const preview = write.customMcp?.preview ?? write.connected?.preview;
+  return {
+    title: preview?.title ?? write.title,
+    connection: preview?.toolkitLabel ?? write.customMcp?.connectionName ?? write.connected?.toolkit ?? write.app,
+    tool: write.customMcp?.tool ?? write.connected?.slug ?? write.title,
+  };
+}
+
+export function HomeToolReceipt({ write }: { write: StagedWrite }) {
+  const t = useTranslate();
+  const { title, connection, tool } = toolReviewLabel(write);
+  const approved = write.status === "approved";
+  const uncertain = write.result?.ok === false && (write.result.retry === true || write.result.code === "uncertain");
+  const at = write.decidedAt === null ? null : new Date(write.decidedAt);
+  return (
+    <div className="min-w-0 text-right" data-chat-message="user" data-tool-decision-receipt>
+      <details className="form-receipt tool-decision-receipt">
+        <summary>
+          <span className={approved ? "text-ok" : "text-ink-400"} aria-hidden>{approved ? "✓" : "↳"}</span>
+          <strong>{t(approved ? "Approval recorded" : "Denial recorded")}</strong>
+          {at !== null && Number.isFinite(at.getTime()) && (
+            <time className="num text-ink-500">{at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })}</time>
+          )}
+          <span className="tool-decision-subject"><bdi>{title}</bdi>{connection && <> · <bdi>{connection}</bdi></>}</span>
+          {uncertain && <span className="tool-decision-subject text-warn">{t("Tool execution unconfirmed")}</span>}
+        </summary>
+        <dl className="turncard-fields">
+          <div className="turncard-field"><dt>{t("Tool")}</dt><dd><bdi>{tool}</bdi></dd></div>
+          {approved && <div className="turncard-field"><dt>{t("Approval scope")}</dt><dd>{t("This request")}</dd></div>}
+          {uncertain ? (
+            <div className="turncard-field"><dt>{t("Tool result")}</dt><dd>{t("The provider may have acted.")}</dd></div>
+          ) : approved && write.result?.ok === false && (
+            <div className="turncard-field"><dt>{t("Tool result")}</dt><dd>{reasonText(failureReason(write), t)}</dd></div>
+          )}
+        </dl>
+      </details>
+    </div>
+  );
+}
+
+export function homeToolWrites(entries: readonly ThreadEntry[], rows: readonly StagedWrite[]) {
+  return stagedInTurn(entries, rows).filter(isExternalToolDecision);
+}
+
+function HomeToolRequest({ write, source }: { write: StagedWrite; source: StagedSource }) {
+  const t = useTranslate();
+  const { title, connection } = toolReviewLabel(write);
+  return (
+    <TurnCard
+      kind="staged"
+      density="full"
+      className="card turncard-staged"
+      data-kind="staged-action"
+      data-staged-id={write.id}
+      data-outcome="pending"
+      label={`${t("Tool approval")}: ${title}`}
+      kindLabel={t("External tool")}
+      status={{ text: t("Needs approval"), tone: "warn" }}
+      footer={<button type="button" className="btn btn-sm" data-staged-review aria-haspopup="dialog" onClick={(e) => source.requestReview(write.id, e.currentTarget)}>{t("Review request")}</button>}
+    >
+      <p className="turncard-title"><bdi>{title}</bdi></p>
+      {connection && <p className="turncard-from"><bdi>{connection}</bdi></p>}
+      <p className="text-label text-ink-400">{t("This tool is paused until you decide.")}</p>
+    </TurnCard>
+  );
+}
+
+function HomeToolCards({ writes, source }: {
+  writes: readonly StagedWrite[]; source: StagedSource;
+}) {
+  if (writes.length === 0) return null;
+  return (
+    <div className="turn-artifacts turn-staged" data-kind="staged-actions">
+      {writes.map((write) => write.status === "pending"
+        ? <HomeToolRequest key={write.id} write={write} source={source} />
+        : <HomeToolReceipt key={write.id} write={write} />)}
+    </div>
+  );
+}
+
+/** Keep the regular cards for non-tools; the Home-only tool presentation
+ *  may appear before an answer and never claims that approval ran the tool. */
+export function HomeTurnStagedCards({ toolEntries, density, source, tools, streaming }: {
+  toolEntries: readonly ThreadEntry[]; density: CardDensity; source: StagedSource;
+  tools: readonly StagedWrite[]; streaming: boolean;
+}) {
+  return (
+    <>
+      {!streaming && <StagedCardsFor source={source} toolEntries={toolEntries} density={density} withoutExternalTools />}
+      <HomeToolCards writes={tools} source={source} />
+    </>
   );
 }
 
@@ -285,9 +384,11 @@ export function TurnStagedCards({ toolEntries, density }: { toolEntries: readonl
   return <StagedCardsFor source={source} toolEntries={toolEntries} density={density} />;
 }
 
-function StagedCardsFor({ source, toolEntries, density }: { source: StagedSource; toolEntries: readonly ThreadEntry[]; density: CardDensity }) {
+function StagedCardsFor({ source, toolEntries, density, withoutExternalTools = false }: {
+  source: StagedSource; toolEntries: readonly ThreadEntry[]; density: CardDensity; withoutExternalTools?: boolean;
+}) {
   const { rows } = useSyncExternalStore(source.subscribe, source.currentDecisions, source.currentDecisions);
-  const writes = stagedInTurn(toolEntries, rows);
+  const writes = stagedInTurn(toolEntries, rows).filter((write) => !withoutExternalTools || !isExternalToolDecision(write));
   if (writes.length === 0) return null;
   return (
     <div className="turn-artifacts turn-staged" data-kind="staged-actions">

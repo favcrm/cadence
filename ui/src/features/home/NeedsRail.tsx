@@ -1023,6 +1023,7 @@ export default function NeedsRail({
           queue={review.queue}
           at={review.at}
           readOnly={readOnly}
+          home
           onAt={(at) => setReview((r) => (r === null ? r : { ...r, at }))}
           onClose={closeStaged}
         />

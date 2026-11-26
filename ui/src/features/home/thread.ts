@@ -132,6 +132,13 @@ export function asEntry(value: unknown): ThreadEntry | null {
   };
 }
 
+/** The hosted API marks its own redacted continuation; client-chosen
+ *  message ids and text alone never make a decision note. */
+export function toolApprovalDecisionId(entry: ThreadEntry): string | null {
+  if (entry.role !== "system" || entry.kind !== "tool_approval_decision") return null;
+  return /^decision:([a-f0-9]{32})$/.exec(entry.message ?? "")?.[1] ?? null;
+}
+
 /** Only server provenance marks a cloud row, including routed local copies. */
 export function isCloudEntry(entry: ThreadEntry): boolean {
   return entry.payload != null &&
@@ -428,7 +435,7 @@ const cardType = (kind: string): "artifact" | "image" | "video" | "connect" | "r
  * `turn_result` as the answer; other messages (the daemon's, a peer's)
  * as a system line. Pending messages come last.
  */
-export function threadItems(state: ThreadState | null): ThreadItem[] {
+export function threadItems(state: ThreadState | null, homeToolApprovals = false): ThreadItem[] {
   const items: ThreadItem[] = [];
   // The daemon stores an artifact's card inside the put RPC, before the put's
   // own `tool_result`. A card met inside a tools run waits until the run ends
@@ -500,6 +507,10 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
     } else if (entry.kind === "video_job") {
       // A generated video's block: a job id and a shape, never the video.
       items.push({ type: "video", key, entry });
+    } else if (homeToolApprovals && toolApprovalDecisionId(entry) !== null) {
+      // Home treats the marker as a continuation boundary. Other chats show
+      // the host's safe system line instead of the original model-only note.
+      items.push({ type: "operator", key, entry });
     } else if (entry.role === "operator") {
       items.push(formAnswerShown(entry, surfaces) ? { type: "operator", key, entry, formShown: true } : { type: "operator", key, entry });
     } else {
@@ -805,7 +816,7 @@ export function stepSummary(text: string | null | undefined): string {
  * no call in the window — the call was paged out — stands alone at the
  * end rather than closing an unrelated open call.
  */
-export function toolSteps(entries: ThreadEntry[]): ToolStep[] {
+export function toolSteps(entries: readonly ThreadEntry[]): ToolStep[] {
   const steps: ToolStep[] = [];
   const byId = new Map<string, ToolStep>();
   const open: ToolStep[] = [];
