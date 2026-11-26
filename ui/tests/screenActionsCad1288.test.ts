@@ -123,8 +123,45 @@ async function main() {
   equal(sourceCalls.length, 3, "refused lookups never reach the host");
   equal(plainRefusal(new ApiError("x", 400, { code: "stale_cursor" })).code, "stale_cursor", "a stale cursor keeps its code so the app can restart");
   equal(plainRefusal(new ApiError("x", 400, { code: "invalid_cursor" })).code, "invalid_cursor", "an invalid cursor keeps its code");
+  await verifySocialExtensionVerbs();
   console.log("screenActionsCad1288 ok");
 }
+
+async function verifySocialExtensionVerbs() {
+  const ctx = {} as ActionContext;
+  const withToken = { ...ui([]), actionToken: "a".repeat(64) };
+  const relayed: { url: string; body: Record<string, unknown> }[] = [];
+  globalThis.fetch = async (input, init) => {
+    relayed.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  assert((await runCall(ctx, "social.brands.list", { alias: "social.draft" }, withToken)).ok, "brands.list relays");
+  assert(relayed[0]!.url.endsWith("/api/app-social-drafts/brands/list"), "brands/list route");
+
+  assert((await runCall(ctx, "social.brands.show", { alias: "social.draft", slug: "default" }, withToken)).ok, "brands.show relays");
+  assert(relayed[1]!.url.endsWith("/api/app-social-drafts/brands/show"), "brands/show route");
+
+  assert((await runCall(ctx, "social.models.list", { alias: "social.draft" }, withToken)).ok, "models.list relays");
+  assert(relayed[2]!.url.endsWith("/api/app-social-drafts/models/list"), "models/list route");
+
+  assert((await runCall(ctx, "social.radar.show", { alias: "social.draft" }, withToken)).ok, "radar.show relays");
+  assert(relayed[3]!.url.endsWith("/api/app-social-drafts/radar/show"), "radar/show route");
+
+  assert((await runCall(ctx, "social.radar.save", { alias: "social.draft", keywords: ["coffee"], region: "HK" }, withToken)).ok, "radar.save relays");
+  assert(relayed[4]!.url.endsWith("/api/app-social-drafts/radar/save"), "radar/save route");
+
+  assert((await runCall(ctx, "social.radar.scan", { alias: "social.draft", request_id: "scan-1", keywords: ["coffee"] }, withToken)).ok, "radar.scan relays");
+  assert(relayed[5]!.url.endsWith("/api/app-social-drafts/radar/scan"), "radar/scan route");
+
+  const badSave = await runCall(ctx, "social.radar.save", { alias: "social.draft", keywords: [""] }, withToken);
+  assert(!badSave.ok && badSave.refusal.code === "bad_args", "radar.save rejects empty keyword");
+  const badScan = await runCall(ctx, "social.radar.scan", { alias: "social.draft" }, withToken);
+  assert(!badScan.ok && badScan.refusal.code === "bad_args", "radar.scan rejects missing request_id");
+  equal(relayed.length, 6, "rejected radar calls never reach host");
+  console.log("socialExtensionVerbs ok");
+}
+
 main().catch(error => { console.error(error); { throw error; }; });
 
 // SOC-54: the host that keeps every retained read refuses a profile removed

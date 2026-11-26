@@ -70,3 +70,17 @@ An app bundle may include scoped agent skills under bundle-relative `skills/<tag
 - Each skill contains `skill.json` (`{ schema: 1, name, files }`), `SKILL.md`, flat root files matching `<stem>.(md|txt|json|yaml|yml|csv|css|svg)`, plus optional `scripts/<stem>.py|sh|js|mjs` and `references/<stem>.md|txt`.
 - Caps: max `16` members per skill, `16 KiB` per member, `4 KiB` for `skill.json`, `32 KiB` per skill package.
 - **Script execution is agent-side and unattested:** static inventory & undeclared-reference token scans run on native install/check, native runs freeze declared bytes and digests into `snapshot.workflow.steps[].skill` without host-side execution or sandboxing beyond the worker's own confinement, and hosted boards (`app_skill`) list `scripts/` by name only without returning or running them. Approving a bundle or run approves the frozen package material—never present a package digest or runtime approval as proof that a script ran or ran as written.
+
+## 7. Shared Workspace Brand Kit (`global/brands/<slug>/`)
+
+All brand-aware Cadence apps read and maintain brand context from Workspace Wiki under `global/brands/<slug>/` (`default` for the primary workspace brand; slug format `^[a-z0-9][a-z0-9-]{0,47}$`):
+
+- **Directory layout (`global/brands/<slug>/`):**
+  - `brand.md` — identity, positioning, target audience, locale, tone pills, CTA style.
+  - `guardrails.md` — protected terms, forbidden claims, required price/legal disclaimers.
+  - `examples.md` — few-shot exemplar captions/copy with notes on why they work.
+  - `visual.md` — palette hex swatches (`Background`, `Accent`, `Surface / Type`, `Shadow`), typography feel, art direction.
+  - `assets/` — visual reference images/logos referenced by media generators.
+  - `global/brands/_map.json` (optional) — maps connected destinations/channels to specific brand slugs.
+- **Bounds & host contract:** Keep enumeration bounded (`MAX_BRANDS = 32`, `MAX_ASSETS = 24`, `MAX_FILE_CHARS = 8_192`). Persist selected `brand_slug` in context defaults (`""` for default workspace brand) with optional per-draft overrides.
+- **ACL & injection rule:** Reads use shared workspace wiki scope; writes go through operator/member Workspace Wiki ACLs under `global/`. Sanitize extracted markdown/asset metadata before prompt injection and quote it strictly as reference data.

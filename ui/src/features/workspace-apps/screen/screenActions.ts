@@ -258,7 +258,7 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
   const alias=verb==="social.drafts.discard"?"social.draft":args.alias;
   if(typeof actionToken!=="string" || !/^[a-f0-9]{64}$/.test(actionToken) || typeof alias!=="string") return refuse("denied","That draft action is unavailable.");
   const common={action_token:actionToken,alias};
-  let operation:"create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/page"|"sources/get"|"sources/save"|"effect-stage";
+  let operation:"create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/page"|"sources/get"|"sources/save"|"brands/list"|"brands/show"|"models/list"|"radar/show"|"radar/save"|"radar/scan"|"effect-stage";
   let fields:Record<string,unknown>;
   switch(verb){
     case "social.drafts.list": operation="list"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
@@ -276,6 +276,32 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
     // SOC-55: exact receipt/post resolution for an older draft — never a scan.
     case "social.sources.get": operation="sources/get"; if(!exact(args,["alias","receipt_id","post_id"])||typeof args.receipt_id!=="string"||typeof args.post_id!=="string"||args.receipt_id.length===0||args.receipt_id.length>128||args.post_id.length===0||args.post_id.length>100) return refuse("bad_args","That request is not valid."); fields={receipt_id:args.receipt_id,post_id:args.post_id}; break;
     case "social.sources.save": operation="sources/save"; if(!exact(args,["alias","request_id","expected_revision","handles"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,expected_revision:args.expected_revision,handles:args.handles}; break;
+    case "social.brands.list": operation="brands/list"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
+    case "social.brands.show": operation="brands/show"; if((!exact(args,["alias"])&&!exact(args,["alias","slug"]))||("slug" in args&&(typeof args.slug!=="string"||args.slug.length===0||args.slug.length>48))) return refuse("bad_args","That request is not valid."); fields={...("slug" in args?{slug:args.slug}:{})}; break;
+    case "social.models.list": operation="models/list"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
+    case "social.radar.show": operation="radar/show"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
+    case "social.radar.save": {
+      operation="radar/save";
+      const allowed=new Set(["alias","keywords","region","locale","brand_slug"]);
+      if(Object.keys(args).some((k)=>!allowed.has(k))||!Array.isArray(args.keywords)||args.keywords.length>12||args.keywords.some((k)=>typeof k!=="string"||!k.trim()||k.length>60)) return refuse("bad_args","That request is not valid.");
+      if("region" in args&&(typeof args.region!=="string"||!args.region.trim()||args.region.length>16)) return refuse("bad_args","That request is not valid.");
+      if("locale" in args&&(typeof args.locale!=="string"||!args.locale.trim()||args.locale.length>16)) return refuse("bad_args","That request is not valid.");
+      if("brand_slug" in args&&(typeof args.brand_slug!=="string"||!args.brand_slug.trim()||args.brand_slug.length>48)) return refuse("bad_args","That request is not valid.");
+      fields={keywords:args.keywords,...("region" in args?{region:args.region}:{}),...("locale" in args?{locale:args.locale}:{}),...("brand_slug" in args?{brand_slug:args.brand_slug}:{})};
+      break;
+    }
+    case "social.radar.scan": {
+      operation="radar/scan";
+      const allowed=new Set(["alias","request_id","keywords","region","locale","brand_slug","model"]);
+      if(Object.keys(args).some((k)=>!allowed.has(k))||typeof args.request_id!=="string"||!args.request_id.length||args.request_id.length>128) return refuse("bad_args","That request is not valid.");
+      if("keywords" in args&&(!Array.isArray(args.keywords)||args.keywords.length>12||args.keywords.some((k)=>typeof k!=="string"||!k.trim()||k.length>60))) return refuse("bad_args","That request is not valid.");
+      if("region" in args&&(typeof args.region!=="string"||!args.region.trim()||args.region.length>16)) return refuse("bad_args","That request is not valid.");
+      if("locale" in args&&(typeof args.locale!=="string"||!args.locale.trim()||args.locale.length>16)) return refuse("bad_args","That request is not valid.");
+      if("brand_slug" in args&&(typeof args.brand_slug!=="string"||!args.brand_slug.trim()||args.brand_slug.length>48)) return refuse("bad_args","That request is not valid.");
+      if("model" in args&&(typeof args.model!=="string"||!args.model.trim()||args.model.length>128)) return refuse("bad_args","That request is not valid.");
+      fields={request_id:args.request_id,...("keywords" in args?{keywords:args.keywords}:{}),...("region" in args?{region:args.region}:{}),...("locale" in args?{locale:args.locale}:{}),...("brand_slug" in args?{brand_slug:args.brand_slug}:{}),...("model" in args?{model:args.model}:{})};
+      break;
+    }
     default: return refuse("bad_args","That request is not valid.");
   }
   try { const data=await workspaceApps.socialDraftAction(operation,{...common,...fields}); return {ok:true,data}; }
@@ -571,6 +597,12 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.sources.page": () => socialDraftCall(verb,args,ui),
     "social.sources.get": () => socialDraftCall(verb,args,ui),
     "social.sources.save": () => socialDraftCall(verb,args,ui),
+    "social.brands.list": () => socialDraftCall(verb,args,ui),
+    "social.brands.show": () => socialDraftCall(verb,args,ui),
+    "social.models.list": () => socialDraftCall(verb,args,ui),
+    "social.radar.show": () => socialDraftCall(verb,args,ui),
+    "social.radar.save": () => socialDraftCall(verb,args,ui),
+    "social.radar.scan": () => socialDraftCall(verb,args,ui),
     "publish.destination.use": async () => runPlan(await planUseDestination(ctx, args)),
     "publish.destination.remove": async () => runPlan(await planRemoveDestination(ctx, args)),
     "publish.settings.save": async () => runPlan(await planSavePublishSettings(ctx, args)),

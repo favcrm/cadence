@@ -157,10 +157,11 @@ void (async () => {
   const closedVerbs = ["context.defaults.save", "open-link", "publish.consent.allow", "publish.consent.status",
     "publish.destination.remove", "publish.destination.use", "publish.draft.cancel", "publish.draft.confirm",
     "publish.draft.reschedule", "publish.draft.schedule", "publish.settings.save", "read.run", "run.start",
-    "screen.drawer.close", "screen.drawer.open", "social.destinations.list", "social.drafts.create",
-    "social.drafts.discard", "social.drafts.list", "social.drafts.publish.stage", "social.drafts.show",
-    "social.drafts.update", "social.image.pick", "social.sources.get", "social.sources.page",
-    "social.sources.save", "social.sources.show"];
+    "screen.drawer.close", "screen.drawer.open", "social.brands.list", "social.brands.show",
+    "social.destinations.list", "social.drafts.create", "social.drafts.discard", "social.drafts.list",
+    "social.drafts.publish.stage", "social.drafts.show", "social.drafts.update", "social.image.pick",
+    "social.models.list", "social.radar.save", "social.radar.scan", "social.radar.show",
+    "social.sources.get", "social.sources.page", "social.sources.save", "social.sources.show"];
   check(p.v === 2 && Array.isArray(p.actions) && !p.actions!.some(v => v.startsWith("media.")) &&
     !p.actions!.includes("screen.drawer.context") && !!p.publish_intents,
     "v2 envelope: v 2, intents kept, media verbs and the child-only drawer read are never advertised");

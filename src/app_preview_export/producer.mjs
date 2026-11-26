@@ -131,6 +131,12 @@ var CALL_VERBS = [
 	"social.sources.get",
 	"social.sources.save",
 	"social.destinations.list",
+	"social.brands.list",
+	"social.brands.show",
+	"social.models.list",
+	"social.radar.show",
+	"social.radar.save",
+	"social.radar.scan",
 	"publish.consent.status",
 	"publish.destination.use",
 	"publish.destination.remove",
@@ -894,7 +900,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/10";
+var CONTRACT = "app-screen-projection-fixtures/11";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",
