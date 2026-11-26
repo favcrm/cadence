@@ -34,16 +34,28 @@ export interface HumanMember {
   look?: string | null;
 }
 
+export type HumanAttachmentKind = "image" | "video" | "pdf" | "text" | "office";
+
+export interface HumanPostAttachment {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  kind: HumanAttachmentKind;
+  url: string;
+}
+
 export interface HumanPost {
   id: string;
   /** Opaque, per-human marker for this visible post. */
   read_cursor: string;
   sender: { id: string | null; label: string; kind?: "human" | "agent" };
-  /** Already sanitized by the daemon (`conversations::body`). Plain text. */
+  /** Plain or safe inline Markdown body; empty when the post only carries attachments. */
   body: string;
   created: number;
   silent: boolean;
   outcomes: MentionOutcome[];
+  attachments?: HumanPostAttachment[];
 }
 
 export interface HumanRoomEvent {
@@ -158,6 +170,19 @@ function mentionOutcome(value: unknown): value is MentionOutcome {
     && (o.reason === undefined || typeof o.reason === "string");
 }
 
+const ATTACHMENT_KINDS = new Set<HumanAttachmentKind>(["image", "video", "pdf", "text", "office"]);
+
+function humanPostAttachment(value: unknown): value is HumanPostAttachment {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const att = value as Record<string, unknown>;
+  return typeof att.id === "string" && att.id.length > 0
+    && typeof att.name === "string"
+    && typeof att.mime === "string" && att.mime.length > 0
+    && typeof att.size === "number" && Number.isFinite(att.size) && att.size >= 0
+    && typeof att.kind === "string" && ATTACHMENT_KINDS.has(att.kind as HumanAttachmentKind)
+    && typeof att.url === "string" && att.url.startsWith("/api/human-threads/rooms/");
+}
+
 function humanPost(value: unknown): value is HumanPost {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const post = value as Record<string, unknown>;
@@ -171,6 +196,7 @@ function humanPost(value: unknown): value is HumanPost {
     && typeof post.created === "number"
     && typeof post.silent === "boolean"
     && Array.isArray(post.outcomes) && post.outcomes.every(mentionOutcome)
+    && (post.attachments === undefined || (Array.isArray(post.attachments) && post.attachments.every(humanPostAttachment)))
     && (who.id === null || typeof who.id === "string")
     && typeof who.label === "string"
     && (who.kind === undefined || who.kind === "human" || who.kind === "agent");
@@ -216,17 +242,59 @@ export function readHumanRoom(id: string, at: { before?: string; limit?: number 
   });
 }
 
+/** `POST /api/human-threads/rooms/<id>/attachments` — upload one room-scoped file or image. */
+export function uploadHumanRoomAttachment(
+  roomId: string,
+  file: File,
+  signal?: AbortSignal,
+): Promise<HumanPostAttachment> {
+  return usingPrivateOperation(undefined, async (op) => {
+    const form = new FormData();
+    form.set("file", file);
+    const resp = await privateFetch(`${roomPath(roomId)}/attachments`, {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: form,
+    }, op);
+    const parsed = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(
+        errorMessage(parsed, `${resp.status} ${resp.statusText}`.trim()),
+        resp.status,
+        parsed ?? undefined,
+      );
+    }
+    if (!parsed || typeof parsed !== "object" || !humanPostAttachment(parsed.attachment)) {
+      throw new ApiError("The server returned an invalid human room attachment response", 502);
+    }
+    return parsed.attachment;
+  }, signal);
+}
+
 /** `POST /api/human-threads/rooms/<id>/posts` — post and dispatch active `@mentions` (unless `silent`). */
 export function postHumanRoom(
   id: string,
   clientId: string,
   body: string,
   silent = false,
+  attachmentIds?: readonly string[],
 ): Promise<{ post: HumanPost; created: boolean }> {
+  const payload = {
+    client_id: clientId,
+    body,
+    ...(silent ? { silent: true } : {}),
+    ...(attachmentIds && attachmentIds.length > 0 ? { attachment_ids: [...attachmentIds] } : {}),
+  };
   return call<{ post: HumanPost; created: boolean }>(
     "POST",
     `${roomPath(id)}/posts`,
-    silent ? { client_id: clientId, body, silent: true } : { client_id: clientId, body },
+    payload,
   ).then((receipt) => {
     if (!humanPost(receipt.post) || typeof receipt.created !== "boolean") throw invalidRoomResponse();
     return receipt;

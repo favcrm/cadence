@@ -14,6 +14,8 @@ export interface AttachDestination {
   /** Absent for Home; app uploads must carry their install and conversation. */
   app?: { install_id: string; context_id?: string };
   conversation?: string;
+  /** Hosted Channel/DM room id for room-scoped attachment uploads. */
+  humanRoom?: string;
   /** Unsaved-subject preparation captured at selection time. */
   subject?: string;
   prepareConversation?: (stillOwned: () => boolean) => Promise<string>;
@@ -116,6 +118,9 @@ export function sameAttachDestination(
   expected: AttachDestination | undefined,
 ): boolean {
   if (!row || !expected) return row === expected;
+  if (expected.humanRoom !== undefined || row.humanRoom !== undefined) {
+    return row.humanRoom === expected.humanRoom;
+  }
   if (
     row.app?.install_id !== expected.app?.install_id ||
     row.app?.context_id !== expected.app?.context_id

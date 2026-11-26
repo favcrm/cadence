@@ -625,6 +625,13 @@ export default function ThreadsPage({
                 onChanged={humanRooms.reload}
                 isDm={humanRoom?.kind === "dm"}
                 roomTitle={humanRoom?.title}
+                initialUnread={
+                  humanRoom
+                    ? humanRoom.unread
+                    : humanRooms.rooms !== null || humanRooms.error !== null
+                      ? 0
+                      : null
+                }
                 people={people.people}
                 boardAgents={agentsState.data?.agents ?? null}
               />
