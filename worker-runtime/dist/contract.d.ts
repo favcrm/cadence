@@ -153,6 +153,12 @@ export interface RuntimeTools {
  * - `agent_profile` is an external session's profile context, not an
  *   authenticated agent, tool grant or the member's private profile.
  */
+export interface WorkspaceCompanyContext {
+    /** Bounded overview from `wiki/global/COMPANY.md` (<= 1200 chars); scrubbed and framed as untrusted data at render time. */
+    readonly company_summary?: string | null;
+    /** Bounded workspace norms from `wiki/global/SOUL.md` (<= 800 chars); scrubbed and framed as untrusted data at render time. */
+    readonly company_soul?: string | null;
+}
 export type AssistantIdentityContext = {
     readonly scope: "personal";
     readonly profile: {
@@ -163,11 +169,15 @@ export type AssistantIdentityContext = {
             readonly revision: number;
         };
         readonly bootstrap_state: "pending" | "complete" | "skipped" | "deferred";
+        readonly bootstrap_kind?: "owner" | "member" | null;
         readonly user_name: string | null;
         readonly preferences: string | null;
+        readonly memory_index?: string | null;
     };
     /** The host's avatar catalogue, in its own established order. */
     readonly avatarLooks: readonly string[];
+    /** Shared, read-only workspace company context (`wiki/global/`). */
+    readonly workspaceContext?: WorkspaceCompanyContext;
     /**
      * The member's own managed instructions for their assistant: guidance
      * rendered after the identity, not tools, permissions or authority.
@@ -182,6 +192,8 @@ export type AssistantIdentityContext = {
         readonly look: string;
         readonly revision: string;
     };
+    /** Shared, read-only workspace company context (`wiki/global/`). */
+    readonly workspaceContext?: WorkspaceCompanyContext;
     /**
      * The owner-managed instructions for the company Master only: guidance
      * rendered after the identity, not tools, permissions or authority.
@@ -197,6 +209,8 @@ export type AssistantIdentityContext = {
         readonly responsibilities: string;
         readonly revision: string;
     };
+    /** Shared, read-only workspace company context (`wiki/global/`). */
+    readonly workspaceContext?: WorkspaceCompanyContext;
 } | {
     readonly scope: "agent_profile";
     readonly profile: {

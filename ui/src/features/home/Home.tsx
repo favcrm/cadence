@@ -121,9 +121,9 @@ const EXAMPLES = [
 ];
 
 const DAY0_EXAMPLES = [
+  "Learn our company background and propose a draft for global/COMPANY.md.",
   "Help me set up my first project and break down the initial milestones.",
   "Draft a weekly operating plan for my team and turn the key tasks into tickets.",
-  "What can you help me organize, automate, and track in this workspace?",
 ];
 
 
@@ -1677,9 +1677,15 @@ function MasterHome({
 
   const showNotStarted = status.kind === "absent" || status.kind === "stopped";
   const empty = loaded && !missing && items.length === 0;
-  const bootstrapCardIdentity =
+  const rawBootstrapIdentity =
     !readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "pending"
       ? personalBootstrap.identity ?? (actor.read.state === "ready" ? actor.read.identity : null)
+      : null;
+  // Stage 1 (Avatar + Name card) hides once a name is saved while keeping
+  // `bootstrap === "pending"` for Stage 2's interactive company/personal setup.
+  const bootstrapCardIdentity =
+    rawBootstrapIdentity !== null && rawBootstrapIdentity.name === null
+      ? rawBootstrapIdentity
       : null;
 
   /** Ask master: a prefilled draft with the row's subject as refs —

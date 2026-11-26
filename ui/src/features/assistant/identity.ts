@@ -125,6 +125,7 @@ export interface PersonalProfileMutation {
   expected_revision: number;
   action: PersonalProfileAction;
   name?: string;
+  tone?: string;
   look?: AvatarLook;
 }
 

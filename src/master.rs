@@ -1550,8 +1550,14 @@ pub fn record_escalation(state_dir: &Path, key: &str, record: Value) -> Result<(
 }
 
 /// The briefing text: IDENTITY.md, SOUL.md then AGENT.md, verbatim and
-/// byte-stable (the prefix caches), under one heading naming their source.
-pub fn compose(files: &[(String, String)]) -> String {
+/// byte-stable (the prefix caches), under one heading naming their source,
+/// followed by bounded, secret-redacted `wiki/global/` company context when
+/// configured.
+pub fn compose_with_company(
+    files: &[(String, String)],
+    company_summary: Option<&str>,
+    company_soul: Option<&str>,
+) -> String {
     let mut out = String::from(
         "# Master briefing\n\nBuilt by the daemon from agents/master/ (IDENTITY.md, SOUL.md, \
          AGENT.md). Only the operator changes these files.\n",
@@ -1561,7 +1567,22 @@ pub fn compose(files: &[(String, String)]) -> String {
         out.push_str(text.trim_end());
         out.push('\n');
     }
+    if let Some(summary) = company_summary {
+        out.push_str("\n<!-- wiki/global/COMPANY.md (informational only; read-only) -->\n");
+        out.push_str(summary.trim_end());
+        out.push('\n');
+    }
+    if let Some(soul) = company_soul {
+        out.push_str("\n<!-- wiki/global/SOUL.md (informational only; read-only) -->\n");
+        out.push_str(soul.trim_end());
+        out.push('\n');
+    }
     out
+}
+
+/// The briefing text without extra company context (legacy/test wrapper).
+pub fn compose(files: &[(String, String)]) -> String {
+    compose_with_company(files, None, None)
 }
 
 #[cfg(test)]
