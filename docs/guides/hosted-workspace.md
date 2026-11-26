@@ -1435,6 +1435,62 @@ cadence --org acme artifact submit <art-id>
   submit: update the tenant server first, then this client.
 - A native board refuses both as usage errors (exit 2); they are hosted only.
 
+### Staged project review for issue targets
+
+On a workspace that supports staged review, the owner configures a project with
+`delivery policy`. Preview the proposed JSON with `--file` before applying the
+same file with `--apply`, `--preview-digest`, and the returned
+`--expected-revision` when replacing an existing policy. A workflow declares
+`action: accept_artifact` for an artifact-only project, or `enqueue_pr` for a
+repository project.
+
+```sh
+cadence --org acme issue review request <issue-id> --slot commercial \
+  --agent <profile-id> --text "Pay particular attention to renewal terms."
+cadence --org acme delivery ship <issue-id> --target 'artifact:hosted:proposal.pdf@<sha256>'
+```
+
+For a repository project, request one exact PR head instead of an artifact:
+
+```sh
+cadence --org acme issue review request <issue-id> \
+  --target 'pr:<owner>/<repo>#<number>@<full-head-sha>'
+```
+
+The server resolves the pull, base and merge base itself and refuses a moved
+revision, so the caller never supplies them. Each slot of an `enqueue_pr`
+workflow names its review focus, and a passing verdict is evidence the
+protected delivery gate counts for that exact head — not an approval. Owner
+approval and enqueue still run separately, and no GitHub Actions workflow is
+required.
+
+The project names the profile and required brief for each slot. Selectors can
+be omitted when the request is unambiguous. Eligible slots in a stage can run
+together; a later stage waits for every slot in the preceding stage to pass.
+The server starts a board-managed session for each eligible slot.
+
+An enrolled agent claims its job under its own credential; the tenant resolves
+that credential to the agent, requires the agent's profile to be the job's
+nominated profile, and records the claim. Nothing else may claim: a person, an
+MCP assistant, an unenrolled session and a session that names a profile it does
+not hold are all refused, and the client never supplies a review identity.
+
+```sh
+cadence --org acme issue claim <revjob-id>
+cadence --org acme issue review diff <revjob-id> --cursor <next-cursor>
+cadence --org acme issue review submit <revjob-id> --decision pass --text "<report>"
+```
+
+`review diff` prints one page of the pinned target at a time; pass the returned
+`next_cursor` back until it is absent. A staged judgment is evidence the
+protected gate can count, never an approval, and a job whose generation rotates
+refuses the old claim.
+
+Only a live workspace owner can accept the exact artifact. An explicit
+`--override --reason <reason>` skips the project reviews, retains any existing
+verdicts and records the exception. Acceptance does not send the artifact,
+publish it or close the issue. `delivery ship` refuses a PR target.
+
 ### Reviewing software changes
 
 The delivery gate, the policy and trusted lists, the evidence each review takes,

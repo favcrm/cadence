@@ -5,6 +5,11 @@ use super::*;
 pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
         Commands::Org { action } => org::run(action),
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Claim { ref id, .. },
+        } if id.starts_with("revjob_") => Err(Error::rejected(
+            "review claims require a hosted org; nothing was sent",
+        )),
         Commands::Issue { action } => issue::run(state_dir, action),
         Commands::Connection { action } => connection::run(state_dir, action),
         Commands::Platform { action } => platform::run(state_dir, action),

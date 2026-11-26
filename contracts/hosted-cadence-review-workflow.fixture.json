@@ -1,0 +1,35 @@
+{
+  "version": "hosted-cadence-review-workflow.v1",
+  "workflow": {
+    "stages": [
+      { "slots": [{ "key": "commercial", "profile": "ap_commercial", "brief": "Check commercial terms." }] },
+      { "slots": [{ "key": "client-readiness", "profile": "ap_client", "brief": "Check client readiness." }] }
+    ],
+    "action": "accept_artifact"
+  },
+  "calls": {
+    "review_request": {
+      "version": "hosted-cadence-review-workflow.v1",
+      "issue": "SALE-42",
+      "target": "artifact:hosted:proposal.pdf@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "slot": "commercial",
+      "agent": "ap_commercial",
+      "text": "Check scope and terms."
+    },
+    "review_claim": { "version": "hosted-cadence-review-workflow.v1", "review_id": "revjob_example" },
+    "review_submit": {
+      "version": "hosted-cadence-review-workflow.v1",
+      "review_id": "revjob_example",
+      "decision": "pass",
+      "report": "Scope and terms checked."
+    },
+    "delivery_ship": {
+      "version": "hosted-cadence-review-workflow.v1",
+      "issue": "SALE-42",
+      "target": "artifact:hosted:proposal.pdf@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "override": true,
+      "reason": "Owner accepts the remaining review risk."
+    }
+  },
+  "pr_target": "pr:owner/repo#42@0123456789abcdef0123456789abcdef01234567"
+}

@@ -398,6 +398,21 @@ fn bearer_for_with(
         return Ok((login, ActorSource::HumanLogin));
     }
 
+    // AOS-777: the review job verbs are decided by the tenant against the
+    // caller's enrolled CLI login. An implicit harness must send that login's
+    // own credential rather than be refused as an assistant identity it never
+    // claimed, and the source is the enrolled login — never the human
+    // fallback the reviewer-credential rule forbids. An assistant-only login
+    // or an explicit non-human actor stays refused.
+    if matches!(surface, Surface::Cli)
+        && matches!(verb, "review_claim" | "review_diff" | "review_submit")
+    {
+        if assistant_login || cli_actor_is_explicit_non_human() {
+            return Err(non_human_authority_refusal(verb, assistant_login));
+        }
+        return Ok((login, ActorSource::EnrolledLogin));
+    }
+
     let implicit_assistant_enrolled_allowed = !assistant_login
         && actor
             .as_ref()
@@ -1163,6 +1178,48 @@ mod tests {
         .unwrap();
         assert!(matches!(enroll_start_src, ActorSource::HumanLogin));
         assert_eq!(enroll_start_cred.access_token, login.access_token);
+
+        // AOS-777: the review verbs send the enrolled CLI login itself — the
+        // credential the tenant checks against its enrollment — and never
+        // request an assistant or agent actor credential.
+        for verb in ["review_claim", "review_diff", "review_submit"] {
+            let (cred, src) = bearer_for_with(
+                &target,
+                &dir,
+                Instant::now() + AUTH_TIMEOUT,
+                Surface::Cli,
+                verb,
+                None,
+                |_, _, _, _, _, _| {
+                    panic!("{verb} must use the enrolled login, never actor-credential")
+                },
+            )
+            .unwrap();
+            assert!(matches!(src, ActorSource::EnrolledLogin), "{verb}");
+            assert_eq!(cred.access_token, login.access_token);
+        }
+        // An explicit assistant actor is not an enrolled reviewer.
+        bind_cli_actor(Some(CliActor {
+            mode: CliActorMode::Assistant,
+            implicit_harness: false,
+        }));
+        let review_refused = bearer_for_with(
+            &target,
+            &dir,
+            Instant::now() + AUTH_TIMEOUT,
+            Surface::Cli,
+            "review_claim",
+            None,
+            |_, _, _, _, _, _| panic!("an explicit assistant must refuse before posting"),
+        )
+        .err()
+        .expect("an explicit assistant must be refused for a review verb");
+        assert!(!review_refused.to_string().is_empty());
+        // Restore the implicit harness for the assertions that follow.
+        bind_cli_actor(Some(CliActor {
+            mode: CliActorMode::Assistant,
+            implicit_harness: true,
+        }));
 
         let list_err = bearer_for_with(
             &target,
