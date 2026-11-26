@@ -2435,7 +2435,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         storeKey={composerKey}
         onReveal={revealComposer}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
-        prepareEdit={hosted && canSend && binding.error === null && mode.contextId === "default" && convId !== null && operationsCurrent && prepareState?.scope === operationScope && prepareState.revision === streamRevision && prepareState.capability !== null ? { ...prepareState.capability, scope: operationScope, submit: prepareEdit } : undefined}
+        prepareEdit={hosted && canSend && binding.error === null && mode.contextId === "default" && operationsCurrent && prepareState?.scope === operationScope && prepareState.revision === streamRevision && prepareState.capability !== null ? { ...prepareState.capability, scope: operationScope, submit: prepareEdit } : undefined}
         onSubmitted={engage}
         onCommand={(name, arg) => {
           if (name === "new" || name === "clear") {

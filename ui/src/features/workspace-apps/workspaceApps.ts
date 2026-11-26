@@ -222,6 +222,7 @@ export interface SourceReceipt {
 }
 export interface CapabilityQuote {
   slot: string;
+  model?: string;
   binding_digest: string;
   quote_digest: string;
   quote: { schema: 1; currency: "USD"; unit_price_micros: number; units: number; total_price_micros: number; price_revision: string };
