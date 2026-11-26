@@ -1,6 +1,7 @@
 import { useWriteBlock } from "../auth/WriteGate";
 import { issuePath } from "../issues/model";
 import { PRIORITY_CHIP } from "../issues/chips";
+import { prefetchIssue } from "../../lib/resources";
 import type { IssueCard } from "../../lib/types";
 import Link from "../../ui/Link";
 import { useLocale } from "../../lib/locale";
@@ -82,6 +83,8 @@ export default function Card({
         <Link
           href={issuePath(t.project, t.id)}
           className="num text-label text-ink-100 font-medium"
+          onMouseEnter={() => prefetchIssue(t.id)}
+          onFocus={() => prefetchIssue(t.id)}
         >
           {t.id}
         </Link>
@@ -109,7 +112,14 @@ export default function Card({
         )}
       </div>
       <h3 className="mt-2 text-secondary leading-[1.45]">
-        <Link href={issuePath(t.project, t.id)} className="board-issue-title text-ink-200 hover:text-accent">{t.title}</Link>
+        <Link
+          href={issuePath(t.project, t.id)}
+          className="board-issue-title text-ink-200 hover:text-accent"
+          onMouseEnter={() => prefetchIssue(t.id)}
+          onFocus={() => prefetchIssue(t.id)}
+        >
+          {t.title}
+        </Link>
       </h3>
       {(t.agents?.length ?? 0) > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-1.5">

@@ -1,6 +1,6 @@
 import SafeLink from "../../ui/SafeLink";
-import { useEffect, useId, useRef, useState } from "react";
-import { Resource, type ResourceState } from "../../lib/cache";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { type ResourceState } from "../../lib/cache";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useMaybeResource, useQuery } from "../../lib/useResource";
@@ -11,6 +11,7 @@ import type {
 } from "../../lib/types";
 import { navigate } from "../../lib/useLocation";
 import Button from "../../ui/Button";
+import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import SectionTabs from "../../ui/SectionTabs";
 import { buildMentionCandidates } from "../mentions/candidates";
@@ -27,12 +28,13 @@ import { Activity } from "./Activity";
 import { PrPanel } from "./PrPanel";
 import { Evidence } from "./Evidence";
 import { Fields } from "./Fields";
-import { STATUS_CHIP } from "./chips";
+import { PRIORITY_CHIP, STATUS_CHIP } from "./chips";
 import { WorkResult } from "./WorkResult";
 import { Links } from "./Links";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { useLocale } from "../../lib/locale";
 import { ReadNotice } from "./issuePageShared";
+import { IssuePageSkeleton, LaneCardSkeleton } from "./IssueSkeleton";
 import {
   acceptanceItems,
   hasCodeDelivery,
@@ -54,6 +56,14 @@ const TABS: { id: IssueTab; label: string }[] = [
   { id: "evidence", label: "Evidence" },
 ];
 
+const EMPTY_HISTORY_STATE: ResourceState<IssueHistoryEntry[]> = {
+  data: null,
+  status: "loading",
+  error: null,
+  asOf: null,
+  inFlight: false,
+};
+
 export default function IssuePage(props: Props) {
   // All drafts and dialogs belong to one issue, including cached-to-cached navigation.
   return <IssueWorkspace key={props.id} {...props} />;
@@ -68,21 +78,28 @@ function IssueWorkspace(props: Props) {
   const laneState = useMaybeResource(laneResource);
   const detail = state.data?.id === props.id ? state.data : null;
   const lane = laneState?.data?.issue === props.id ? laneState.data : null;
-  const [historyResource] = useState(
-    () =>
-      new Resource(() => api.history(props.id, 40).then((r) => r.history), {
-        isEmpty: (rows) => rows.length === 0,
-      }),
-  );
-  const history = useQuery(historyResource);
+  const wantHistory = props.tab === "activity";
+  const historyResource = resources.issueHistory(props.id);
+  useEffect(() => {
+    if (wantHistory) void historyResource.revalidate();
+  }, [wantHistory, historyResource]);
+  const history = useMaybeResource(wantHistory ? historyResource : null) ?? EMPTY_HISTORY_STATE;
   const revision = useRef(detail?.rev);
   const [kickoff, setKickoff] = useState(false);
   useEffect(() => {
     // History and detail settle independently, including the first cold revision.
-    if (detail?.rev && detail.rev !== revision.current)
-      void historyResource.invalidate();
+    if (detail?.rev && detail.rev !== revision.current) {
+      if (wantHistory) {
+        const snap = historyResource.get();
+        if (revision.current !== undefined || snap.asOf !== null) {
+          void historyResource.invalidate();
+        }
+      } else if (revision.current !== undefined) {
+        historyResource.markInvalid();
+      }
+    }
     revision.current = detail?.rev;
-  }, [detail?.rev, historyResource]);
+  }, [detail?.rev, wantHistory, historyResource]);
   const dispatchBlock =
     props.kickoffBlock ??
     (props.readOnly ? (props.writeBlock ?? "Writes are off.") : null);
@@ -92,15 +109,41 @@ function IssueWorkspace(props: Props) {
   );
 
   if (!detail) {
+    if (state.error) {
+      return (
+        <main className="px-4 lg:px-8 py-6 grid gap-4" data-issue-page={props.id}>
+          <div>
+            <div className="kicker">
+              <span className="num normal-case">{props.id}</span>
+              {" · "}
+              <Link
+                className="hover:text-ink-200 transition-colors"
+                href={`/projects/${encodeURIComponent(props.project)}/issues`}
+              >
+                {props.project}
+              </Link>
+            </div>
+            <h1 className="text-drawer font-semibold text-ink-100 tracking-tight mt-0.5">
+              {props.id}
+            </h1>
+          </div>
+          <ReadNotice
+            name="issue"
+            state={state}
+            retry={() => void resources.issue(props.id).refresh()}
+          />
+        </main>
+      );
+    }
+    const seedCard = props.issues.find((item) => item.id === props.id) ?? null;
     return (
-      <main className="px-4 lg:px-8 py-10" data-issue-page={props.id}>
-        <h1 className="text-drawer font-semibold text-ink-100">{props.id}</h1>
-        <ReadNotice
-          name="issue"
-          state={state}
-          retry={() => void resources.issue(props.id).refresh()}
-        />
-      </main>
+      <IssuePageSkeleton
+        id={props.id}
+        project={props.project}
+        card={seedCard}
+        hosted={props.hosted === true}
+        tab={props.tab}
+      />
     );
   }
 
@@ -208,8 +251,7 @@ function PageBody({
   const { t } = useLocale();
   const fieldsId = useId();
   const teammates = useWorkspaceTeammates(hosted === true);
-  const items = acceptanceItems(detail.body);
-  const rows = timelineRows(detail, history.data ?? []);
+  const items = useMemo(() => acceptanceItems(detail.body), [detail.body]);
   const pr = prRef(detail.refs);
   const codeDelivery = hasCodeDelivery(detail, projectRepos, hosted);
   const visibleTabs = TABS.filter((tabItem) => {
@@ -220,11 +262,34 @@ function PageBody({
   const activeTab: IssueTab = visibleTabs.some((tabItem) => tabItem.id === tab)
     ? tab
     : "overview";
+  const rows = useMemo(
+    () => (activeTab === "activity" ? timelineRows(detail, history.data ?? []) : []),
+    [activeTab, detail, history.data],
+  );
   const done = items.filter((i) => i.checked).length;
   const fenced = laneFenceBanner(lane?.lane?.state);
-  const images = detail.artifacts.filter((f) => IMG.test(f.name));
-  const files = detail.artifacts.filter((f) => !IMG.test(f.name));
+  const images = useMemo(() => detail.artifacts.filter((f) => IMG.test(f.name)), [detail.artifacts]);
+  const files = useMemo(() => detail.artifacts.filter((f) => !IMG.test(f.name)), [detail.artifacts]);
   const [compose, setCompose] = useState<"ask" | "instruct">("ask");
+  const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+  }, []);
+  const copyId = () => {
+    if (!navigator.clipboard?.writeText) return;
+    void navigator.clipboard.writeText(id).then(() => {
+      setCopied(true);
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(false), 1500);
+    }, () => undefined);
+  };
+  const laneLoading =
+    !hosted &&
+    lane === null &&
+    laneState !== null &&
+    !laneState.error &&
+    (laneState.inFlight || laneState.status === "loading");
   const [descriptionDraft, setDescriptionDraft] = useState<{ body: string; rev: string } | null>(null);
   const editingDescription = hosted === true && !readOnly && descriptionDraft !== null;
   const [savingDescription, setSavingDescription] = useState(false);
@@ -234,11 +299,15 @@ function PageBody({
     void resources.issue(id).invalidate();
     if (!hosted) void resources.lane(id).invalidate();
   };
-  const epics = issues.filter(
-    (i) =>
-      i.project === project &&
-      i.id !== id &&
-      (i.container || i.work?.type === "epic"),
+  const epics = useMemo(
+    () =>
+      issues.filter(
+        (i) =>
+          i.project === project &&
+          i.id !== id &&
+          (i.container || i.work?.type === "epic"),
+      ),
+    [issues, project, id],
   );
   const hrefFor = (issueId: string) => {
     const card = issues.find((i) => i.id === issueId);
@@ -250,12 +319,11 @@ function PageBody({
     navigate(tabHref("conversation"));
   };
 
-  const patch = (body: Parameters<typeof api.patch>[1], verb: string) => {
+  const patch = (body: Parameters<typeof api.patch>[1], verb: string) =>
     api
       .patch(id, body, detail.rev)
       .then((r) => onWrite(r, verb))
       .catch((e) => onError(e, verb));
-  };
   const saveDescription = async () => {
     if (!descriptionDraft || descriptionStale || savingDescription || readOnly) return;
     setSavingDescription(true);
@@ -279,10 +347,24 @@ function PageBody({
     <div className="issue-workspace flex flex-col min-w-0" data-issue-page={id}>
       <header className="flex flex-wrap items-end justify-between gap-4 px-4 lg:px-8 pt-5 pb-3">
         <div className="min-w-0">
-          <div className="kicker">
-            <span className="num normal-case">{id}</span>
-            {" · "}
-            {project}
+          <div className="kicker flex items-center gap-1 flex-wrap">
+            <button
+              type="button"
+              className="issue-kicker-copy num normal-case"
+              onClick={copyId}
+              aria-label={t("Copy issue ID")}
+              title={t("Copy issue ID")}
+            >
+              <span>{id}</span>
+              {copied && <span className="text-micro text-ok">{t("Copied")}</span>}
+            </button>
+            <span aria-hidden="true">·</span>
+            <Link
+              className="hover:text-ink-200 transition-colors"
+              href={`/projects/${encodeURIComponent(project)}/issues`}
+            >
+              {project}
+            </Link>
           </div>
           <h1 className="issue-title font-semibold text-ink-100 tracking-tight mt-0.5">
             {detail.title}
@@ -293,7 +375,11 @@ function PageBody({
             >
               {t(detail.status)}
             </span>
-            <span className="num text-label text-ink-400">{t(detail.priority)}</span>
+            <span
+              className={`chip ${PRIORITY_CHIP[detail.priority] ?? "bg-ink-800 text-ink-400"}`}
+            >
+              {t(detail.priority)}
+            </span>
             {detail.work?.stage && (
               <span className="text-label text-ink-400">{stageLabel(detail.work.stage, t)}</span>
             )}
@@ -383,6 +469,7 @@ function PageBody({
             <WorkResult
               detail={detail}
               lane={lane}
+              laneLoading={laneLoading}
               checksDone={done}
               checksTotal={items.length}
               checklistVisible={!editingDescription}
@@ -494,11 +581,15 @@ function PageBody({
         </main>
         <aside id={fieldsId} tabIndex={-1} className="issue-context grid grid-cols-[minmax(0,1fr)] gap-5 px-4 lg:px-8 xl:px-6 xl:pr-8 py-5 min-w-0">
           {!hosted && laneState && (
-            <ReadNotice
-              name="lane"
-              state={laneState}
-              retry={() => void resources.lane(id).refresh()}
-            />
+            laneLoading ? (
+              <LaneCardSkeleton />
+            ) : (
+              <ReadNotice
+                name="lane"
+                state={laneState}
+                retry={() => void resources.lane(id).refresh()}
+              />
+            )
           )}
           {!hosted && lane !== null && (!laneState?.error || lane.lane !== null) && (
             <LaneCard

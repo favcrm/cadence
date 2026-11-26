@@ -6,11 +6,13 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front};
@@ -670,18 +672,168 @@ fn normalized_subject(subject: &str) -> &str {
     bare.unwrap_or(s).trim()
 }
 
+const MAX_CACHED_REPOS: usize = 16;
+const MAX_CACHED_ISSUES_PER_REPO: usize = 256;
+const MAX_LOOSE_REFS: usize = 512;
+
+struct CachedRepoLog {
+    digest: [u8; 32],
+    log: Arc<String>,
+    default_ref: Option<String>,
+    by_issue: HashMap<String, Vec<Value>>,
+    last_used: Instant,
+}
+
+static REPO_COMMIT_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedRepoLog>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve `(git_dir, common_dir)` for a repository checkout or worktree.
+pub(crate) fn resolve_git_paths(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dot_git = dir.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else if dot_git.is_file() {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let raw = text
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))?
+            .trim();
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            dir.join(path)
+        }
+    } else {
+        hooks::git_dir(dir)?
+    };
+    if !git_dir.is_dir() {
+        return None;
+    }
+    let commondir_file = git_dir.join("commondir");
+    let common_dir = if commondir_file.is_file() {
+        let raw = std::fs::read_to_string(&commondir_file).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            git_dir.clone()
+        } else {
+            let path = Path::new(trimmed);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                git_dir.join(path)
+            }
+        }
+    } else {
+        git_dir.clone()
+    };
+    Some((git_dir, common_dir))
+}
+
+fn collect_loose_refs(root: &Path, cur: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> Option<()> {
+    let entries = std::fs::read_dir(cur).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+        if meta.is_dir() {
+            collect_loose_refs(root, &path, out)?;
+        } else if meta.is_file() {
+            if out.len() >= MAX_LOOSE_REFS {
+                return None;
+            }
+            let rel = path.strip_prefix(root).ok()?.to_path_buf();
+            out.push((rel, path));
+        }
+    }
+    Some(())
+}
+
+fn hash_show_ref(dir: &Path) -> Option<[u8; 32]> {
+    let out = git_bounded(dir, &["show-ref", "--head"], Duration::from_secs(2)).ok()?;
+    Some(Sha256::digest(out.as_bytes()).into())
+}
+
+fn repo_ref_digest(dir: &Path, git_dir: &Path, common_dir: &Path) -> Option<[u8; 32]> {
+    if common_dir.join("reftable").exists() {
+        return hash_show_ref(dir);
+    }
+    let head_bytes = std::fs::read(git_dir.join("HEAD")).ok()?;
+    let refs_root = common_dir.join("refs");
+    let mut loose = Vec::new();
+    if refs_root.is_dir() && collect_loose_refs(&refs_root, &refs_root, &mut loose).is_none() {
+        return hash_show_ref(dir);
+    }
+    loose.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"HEAD\0");
+    hasher.update(&head_bytes);
+
+    let packed_path = common_dir.join("packed-refs");
+    if packed_path.is_file() {
+        let packed = std::fs::read(&packed_path).ok()?;
+        hasher.update(b"PACKED\0");
+        hasher.update(&packed);
+    }
+
+    for (rel, full) in loose {
+        let bytes = std::fs::read(&full).ok()?;
+        hasher.update(b"REF\0");
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&bytes);
+    }
+    Some(hasher.finalize().into())
+}
+
+fn extract_code_hits<'a>(log: &'a str, id: &str) -> Vec<(&'a str, Value)> {
+    log.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(6, '\x1f');
+            let (full, sha, at, author, subject, issues) = (
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+            );
+            let tagged = issues.split(',').any(|t| t.trim() == id);
+            (tagged || subject_mentions(subject, id)).then(|| {
+                (
+                    full,
+                    json!({
+                        "repo": "",
+                        "sha": sha,
+                        "at": at
+                            .parse::<i64>()
+                            .map(time::iso)
+                            .unwrap_or_else(|_| at.to_string()),
+                        "author": author,
+                        "subject": subject,
+                    }),
+                )
+            })
+        })
+        .take(40)
+        .collect()
+}
+
 /// Tag `(full sha, commit)` candidates from one repo with `on_default`
 /// and drop each not-on-default commit that has a same-subject twin on
 /// the default branch. One `rev-list --no-walk <candidates> --not
 /// <default>` names the commits the default branch does not reach.
-fn dedupe_stale(dir: &Path, hits: Vec<(&str, Value)>) -> Vec<Value> {
+fn dedupe_stale_with_default(dir: &Path, default: &str, hits: Vec<(&str, Value)>) -> Vec<Value> {
     if hits.is_empty() {
         return Vec::new();
     }
-    let default = default_ref(dir);
     let mut args = vec!["rev-list", "--no-walk"];
     args.extend(hits.iter().map(|(full, _)| *full));
-    args.extend(["--not", default.as_str()]);
+    args.extend(["--not", default]);
     let off_default = git_bounded(dir, &args, Duration::from_secs(5)).ok();
     let mut commits: Vec<Value> = hits
         .into_iter()
@@ -705,6 +857,21 @@ fn dedupe_stale(dir: &Path, hits: Vec<(&str, Value)>) -> Vec<Value> {
                 .any(|s| s == normalized_subject(c["subject"].as_str().unwrap_or_default()))
     });
     commits
+}
+
+const CODE_LOG_ARGS: &[&str] = &[
+    "log",
+    "--all",
+    "-n",
+    "2000",
+    "--format=%H%x1f%h%x1f%at%x1f%an%x1f%s%x1f%(trailers:key=Issue,valueonly,separator=%x2C)",
+];
+
+fn stamp_repo_label(mut rows: Vec<Value>, label: &str) -> Vec<Value> {
+    for row in &mut rows {
+        row["repo"] = Value::String(label.to_string());
+    }
+    rows
 }
 
 /// `commits` for an issue's detail: for each repo the project lists,
@@ -743,58 +910,103 @@ pub fn code_commits(pm_dir: &Path, issue: &board::Issue) -> (Vec<Value>, Vec<Val
             continue;
         };
         let dir = project::expand_home(path);
-        if !dir.is_dir() || hooks::git_dir(&dir).is_none() {
+        let Some((git_dir, common_dir)) = dir.is_dir().then(|| resolve_git_paths(&dir)).flatten()
+        else {
             skipped.push(json!({"repo": label, "reason": "not a git repo"}));
             continue;
-        }
-        let out = git_bounded(
-            &dir,
-            &[
-                "log",
-                "--all",
-                "-n",
-                "2000",
-                "--format=%H%x1f%h%x1f%at%x1f%an%x1f%s%x1f%(trailers:key=Issue,valueonly,separator=%x2C)",
-            ],
-            Duration::from_secs(5),
-        );
-        match out {
-            Err(reason) => skipped.push(json!({"repo": label, "reason": reason})),
-            Ok(log) => {
-                let hits: Vec<(&str, Value)> = log
-                    .lines()
-                    .filter_map(|line| {
-                        let mut parts = line.splitn(6, '\x1f');
-                        let (full, sha, at, author, subject, issues) = (
-                            parts.next()?,
-                            parts.next()?,
-                            parts.next()?,
-                            parts.next()?,
-                            parts.next()?,
-                            parts.next()?,
-                        );
-                        let tagged = issues.split(',').any(|t| t.trim() == id);
-                        (tagged || subject_mentions(subject, id)).then(|| {
-                            (
-                                full,
-                                json!({
-                                    "repo": label,
-                                    "sha": sha,
-                                    "at": at
-                                        .parse::<i64>()
-                                        .map(time::iso)
-                                        .unwrap_or_else(|_| at.to_string()),
-                                    "author": author,
-                                    "subject": subject,
-                                }),
-                            )
-                        })
-                    })
-                    .take(40)
-                    .collect();
-                commits.append(&mut dedupe_stale(&dir, hits));
+        };
+        let Some(digest) = repo_ref_digest(&dir, &git_dir, &common_dir) else {
+            match git_bounded(&dir, CODE_LOG_ARGS, Duration::from_secs(5)) {
+                Err(reason) => skipped.push(json!({"repo": label, "reason": reason})),
+                Ok(log) => {
+                    let hits = extract_code_hits(&log, id);
+                    if !hits.is_empty() {
+                        let dref = default_ref(&dir);
+                        let rows = dedupe_stale_with_default(&dir, &dref, hits);
+                        commits.extend(stamp_repo_label(rows, &label));
+                    }
+                }
+            }
+            continue;
+        };
+
+        let mut cached_log: Option<Arc<String>> = None;
+        let mut cached_default: Option<String> = None;
+        let mut cached_rows: Option<Vec<Value>> = None;
+        if let Ok(mut cache) = REPO_COMMIT_CACHE.lock() {
+            if let Some(entry) = cache.get_mut(&dir) {
+                if entry.digest == digest {
+                    entry.last_used = Instant::now();
+                    if let Some(rows) = entry.by_issue.get(id) {
+                        cached_rows = Some(rows.clone());
+                    } else {
+                        cached_log = Some(Arc::clone(&entry.log));
+                        cached_default = entry.default_ref.clone();
+                    }
+                }
             }
         }
+        if let Some(rows) = cached_rows {
+            commits.extend(stamp_repo_label(rows, &label));
+            continue;
+        }
+
+        let log = match cached_log {
+            Some(log) => log,
+            None => match git_bounded(&dir, CODE_LOG_ARGS, Duration::from_secs(5)) {
+                Err(reason) => {
+                    skipped.push(json!({"repo": label, "reason": reason}));
+                    continue;
+                }
+                Ok(raw) => Arc::new(raw),
+            },
+        };
+
+        let hits = extract_code_hits(&log, id);
+        let (rows, resolved_default) = if hits.is_empty() {
+            (Vec::new(), cached_default)
+        } else {
+            let dref = cached_default.unwrap_or_else(|| default_ref(&dir));
+            let rows = dedupe_stale_with_default(&dir, &dref, hits);
+            (rows, Some(dref))
+        };
+
+        if let Ok(mut cache) = REPO_COMMIT_CACHE.lock() {
+            let now = Instant::now();
+            let same_digest = cache.get(&dir).is_some_and(|e| e.digest == digest);
+            if !same_digest {
+                if !cache.contains_key(&dir) && cache.len() >= MAX_CACHED_REPOS {
+                    if let Some(oldest) = cache
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(k, _)| k.clone())
+                    {
+                        cache.remove(&oldest);
+                    }
+                }
+                cache.insert(
+                    dir.clone(),
+                    CachedRepoLog {
+                        digest,
+                        log: Arc::clone(&log),
+                        default_ref: resolved_default.clone(),
+                        by_issue: HashMap::new(),
+                        last_used: now,
+                    },
+                );
+            }
+            if let Some(entry) = cache.get_mut(&dir) {
+                entry.last_used = now;
+                if entry.default_ref.is_none() {
+                    entry.default_ref = resolved_default;
+                }
+                if entry.by_issue.len() >= MAX_CACHED_ISSUES_PER_REPO {
+                    entry.by_issue.clear();
+                }
+                entry.by_issue.insert(id.to_string(), rows.clone());
+            }
+        }
+        commits.extend(stamp_repo_label(rows, &label));
     }
     commits.sort_by(|a, b| {
         let off = |c: &Value| c["on_default"] == json!(false);
@@ -1005,6 +1217,62 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn code_commits_cache_invalidates_when_a_new_commit_lands() {
+        let root = tempfile::tempdir().unwrap();
+        let pm = root.path().join("pm");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(pm.join("demo/CAD-99")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            pm.join("demo/project.yaml"),
+            format!(
+                "key: demo\nprefix: CAD\nrepos:\n- path: {}\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            pm.join("demo/CAD-99/issue.md"),
+            "---\nid: CAD-99\ntitle: t\nstatus: doing\npriority: P2\n\
+             created: '2026-01-01T00:00:00Z'\n---\nbody\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=test", "-c", "user.email=test@test"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "feat: first (CAD-99)"]);
+
+        let issues = board::load_all(&pm, Some("demo")).unwrap();
+        let issue = issues.iter().find(|i| i.front.id == "CAD-99").unwrap();
+
+        let (first, skipped) = code_commits(&pm, issue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(first.len(), 1, "{first:?}");
+        // Warm cache hit returns identical result.
+        let (cached, _) = code_commits(&pm, issue);
+        assert_eq!(cached.len(), 1, "{cached:?}");
+
+        // Second commit immediately after must invalidate via ref digest.
+        std::fs::write(repo.join("b.txt"), "two\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "feat: second (CAD-99)"]);
+
+        let (after, skipped) = code_commits(&pm, issue);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(after.len(), 2, "{after:?}");
     }
 
     /// A real tracker repo for `owner_assignments`: issues under

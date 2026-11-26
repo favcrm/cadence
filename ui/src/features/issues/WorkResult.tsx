@@ -34,6 +34,7 @@ const TONE_DOT: Record<string, string> = {
 function nextAction({
   detail,
   lane,
+  laneLoading,
   questions,
   verdict,
   checksTotal,
@@ -45,6 +46,7 @@ function nextAction({
   detail: IssueDetail;
   /** Null while the lane resource is loading or failed — not "no lane". */
   lane: LanePayload | null;
+  laneLoading: boolean;
   questions: TaskReport[];
   verdict: TaskReport | null;
   checksTotal: number;
@@ -102,7 +104,9 @@ function nextAction({
   // `blocked` carries the real reason (write gate or dispatch block); show it.
   if (blocked) return t(blocked);
   if (lane === null)
-    return t("The lane record is unavailable — check the lane card for its state.");
+    return laneLoading
+      ? t("Checking lane state…")
+      : t("The lane record is unavailable — check the lane card for its state.");
   const view = lane.lane;
   if (!view) return t("Kick off a lane to start the work.");
   if (view.state === "fenced")
@@ -127,6 +131,7 @@ function nextAction({
 export function WorkResult({
   detail,
   lane,
+  laneLoading = false,
   checksDone,
   checksTotal,
   checklistVisible = true,
@@ -145,6 +150,7 @@ export function WorkResult({
 }: {
   detail: IssueDetail;
   lane: LanePayload | null;
+  laneLoading?: boolean;
   checksDone: number;
   checksTotal: number;
   checklistVisible?: boolean;
@@ -383,6 +389,7 @@ export function WorkResult({
           {nextAction({
             detail,
             lane,
+            laneLoading,
             questions: view.questions,
             verdict,
             checksTotal,
@@ -409,7 +416,9 @@ export function WorkResult({
               : hosted
                 ? hostedAssignmentText(detail, t)
                 : lane === null
-                  ? t("Lane state unavailable")
+                  ? laneLoading
+                    ? t("Checking lane…")
+                    : t("Lane state unavailable")
                   : t("No lane yet")}
           </dd>
         </dl>

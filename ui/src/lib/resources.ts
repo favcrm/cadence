@@ -3,7 +3,7 @@ import { normalizeAgentsPayload } from "./agentOn";
 import { myWorkApiQuery, myWorkViewKey, type MyWorkView } from "./myWorkQuery";
 import { QueryCache, type Resource } from "./cache";
 import { loadThread, type PageReader, type ThreadState } from "../features/home/thread";
-import { onPrivateReadsPaused, onPrivateSessionReset } from "./privateSession";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed } from "./privateSession";
 
 /** Page reads of one agent's thread. */
 export function threadReader(alias: string): PageReader {
@@ -23,6 +23,7 @@ import type {
   ConnectionProvider,
   IssueCard,
   IssueDetail,
+  IssueHistoryEntry,
   MasterState,
   MilestoneRow,
   OutboxItem,
@@ -213,6 +214,16 @@ export const resources = {
     discardOnError: unavailablePrivateRecord,
     onDiscard: () => retirePersonalIssue(id),
   })),
+  /** `GET /api/issues/<id>/history` — git-log timeline for the Activity tab. */
+  issueHistory: cache.family<string, IssueHistoryEntry[]>(
+    "issueHistory",
+    (id) => api.history(id, 40).then((r) => r.history),
+    {
+      isEmpty: (rows) => rows.length === 0,
+      freshMs: 10_000,
+      discardOnError: unavailablePrivateRecord,
+    },
+  ),
   /**
    * `GET /api/issues/<id>/lane` — live lane state. Not in `issue.md`, so
    * the focus poll and an agents stream frame invalidate it with the issue.
@@ -322,3 +333,13 @@ export const resources = {
     partial: connectionsListPartial,
   })),
 };
+
+/** Warm an issue detail store on hover/focus without disrupting loaded state. */
+export function prefetchIssue(id: string): void {
+  if (!id || !privateReadsAllowed()) return;
+  const resource = resources.issue(id);
+  const snap = resource.get();
+  if (!snap.inFlight && (snap.asOf === null || snap.status === "stale" || Date.now() - snap.asOf >= 5_000)) {
+    void resource.revalidate();
+  }
+}

@@ -4766,3 +4766,12 @@ const CAD2838_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2838_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+Object.assign(zhTW, {
+  "Loading lane…": "正在載入執行車道…",
+  "Loading history…": "正在載入歷程記錄…",
+  "Checking lane state…": "正在檢查執行車道狀態…",
+  "Checking lane…": "正在檢查執行車道…",
+  "Copy issue ID": "複製議題編號",
+  "Conversation could not be loaded.": "無法載入對話。",
+});

@@ -325,18 +325,22 @@ function ImageArtifact({ id, name, size, open, onOpen, onClose }: {
       </>
     );
   }
-  return (
-    <div className="grid min-w-0 min-h-28 gap-2 p-2.5 text-label">
-      {failed ? (
+  if (failed) {
+    return (
+      <div className="grid min-w-0 min-h-28 gap-2 p-2.5 text-label">
         <div role="alert">
           <span>{t("Could not load")} {displayName}. </span>
           <button type="button" className="lnk" aria-label={`${t("Retry")} ${displayName}`} onClick={retry}>
             {t("Retry")}
           </button>
         </div>
-      ) : (
-        <span role="status">{t("Loading")} {displayName}…</span>
-      )}
+      </div>
+    );
+  }
+  return (
+    <div className="relative min-w-0 min-h-28 bg-ink-900">
+      <div className="issue-skel-bar issue-skel-pulse w-full h-28 !rounded-none" aria-hidden="true" />
+      <span className="sr-only" role="status">{t("Loading")} {displayName}…</span>
     </div>
   );
 }
@@ -439,8 +443,15 @@ function FileArtifactRow({ id, name, size, open, onOpen, onClose }: {
                 </button>
               </div>
             ) : (
-              <span role="status">
-                {t("Loading")} {displayName}…
+              <span className="inline-flex items-center gap-2 align-middle">
+                <span
+                  className="issue-skel-bar issue-skel-pulse"
+                  style={{ width: "3.5rem", height: "0.75rem" }}
+                  aria-hidden="true"
+                />
+                <span className="sr-only" role="status">
+                  {t("Loading")} {displayName}…
+                </span>
               </span>
             )}
           </div>

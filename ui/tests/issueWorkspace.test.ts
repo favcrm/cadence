@@ -50,8 +50,10 @@ const IssuePageComponent = require("../src/features/issues/IssuePage")
   .default as typeof import("../src/features/issues/IssuePage").default;
 const IssuePage = (props: React.ComponentProps<typeof IssuePageComponent>) =>
   React.createElement(LocaleProvider, null, React.createElement(IssuePageComponent, props));
-const { resources } =
+const { prefetchIssue, resources } =
   require("../src/lib/resources") as typeof import("../src/lib/resources");
+const { allowPrivateReads: allowReads, pausePrivateReads: pauseReads } =
+  require("../src/lib/privateSession") as typeof PrivateSessionModule;
 type Detail = import("../src/lib/types").IssueDetail;
 const detail = (id: string): Detail => ({
   id,
@@ -204,6 +206,20 @@ const scenario = require("process").argv[2] ?? "all";
 async function run() {
   await render();
   if (scenario === "all" || scenario === "cold_history") {
+    details["CAD-7"] = detail("CAD-7");
+    id = "CAD-7";
+    tab = "overview";
+    await render();
+    assert(
+      (historyReads["CAD-7"] ?? 0) === 0,
+      "Overview tab defers history fetch until Activity is opened",
+    );
+    tab = "activity";
+    await render();
+    assert(
+      historyReads["CAD-7"] === 1,
+      "Opening Activity fetches history once",
+    );
     details["CAD-4"] = detail("CAD-4");
     id = "CAD-4";
     tab = "activity";
@@ -299,8 +315,10 @@ async function run() {
     held.add("/api/issues/CAD-3");
     await render();
     assert(
-      text().includes("Loading issue"),
-      "Initial issue read shows loading",
+      text().includes("Loading issue") &&
+        host.querySelector('[data-read-state="issue"][role="status"]') !== null &&
+        host.querySelector(".issue-skeleton-surface") !== null,
+      "Initial issue read shows accessible skeleton loading state",
     );
     held.clear();
     await React.act(async () =>
@@ -313,13 +331,41 @@ async function run() {
     await flush();
     assert(
       text().includes("Issue could not be loaded.") &&
-        !text().includes("Work CAD-3"),
+        !text().includes("Work CAD-3") &&
+        host.querySelector(".issue-skeleton-surface") === null,
       "Initial failure does not paint an issue",
     );
     await click(button(/Retry issue/));
     assert(text().includes("Work CAD-3"), "Initial failure retry recovers");
     id = "CAD-1";
     await render();
+  }
+  if (scenario === "all" || scenario === "prefetch") {
+    details["CAD-8"] = detail("CAD-8");
+    const readsBefore = resources.issue("CAD-8").get().data !== null;
+    assert(!readsBefore, "CAD-8 starts unloaded before prefetch");
+    pauseReads();
+    try {
+      await React.act(async () => {
+        prefetchIssue("CAD-8");
+      });
+      await flush();
+      assert(
+        resources.issue("CAD-8").get().data === null &&
+          !resources.issue("CAD-8").get().inFlight,
+        "prefetchIssue is a no-op when private reads are paused",
+      );
+    } finally {
+      allowReads();
+    }
+    await React.act(async () => {
+      prefetchIssue("CAD-8");
+    });
+    await flush();
+    assert(
+      resources.issue("CAD-8").get().data?.id === "CAD-8",
+      "prefetchIssue warms the issue store once private reads are allowed",
+    );
   }
   if (scenario === "all" || scenario === "issue") {
     errors.add("/api/issues/CAD-1");

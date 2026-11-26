@@ -4,7 +4,9 @@ import { WriteGate } from "../auth/WriteGate";
 import { asEntry, type ThreadEntry } from "../home/thread";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
+import { useLocale } from "../../lib/locale";
 import { composerBlocked, isStatusAsk, statusText } from "./lane";
+import { ConversationSkeleton } from "./IssueSkeleton";
 
 /** The lane agent's thread, with Ask for status and Instruction composers. */
 export function LaneConversation({
@@ -20,10 +22,14 @@ export function LaneConversation({
   mode?: "ask" | "instruct";
   onMode?: (mode: "ask" | "instruct") => void;
 }) {
+  const { t } = useLocale();
   const writeBlock = useContext(WriteGate);
   const [entries, setEntries] = useState<ThreadEntry[]>([]);
   const [draft, setDraft] = useState("");
   const [localMode, setLocalMode] = useState<"ask" | "instruct">(mode ?? "ask");
+  const [loading, setLoading] = useState(Boolean(agent));
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const active = mode ?? localMode;
@@ -36,22 +42,30 @@ export function LaneConversation({
   useEffect(() => {
     if (!agent) {
       setEntries([]);
+      setLoading(false);
+      setLoadError(null);
       return;
     }
     let cancel = false;
+    setLoading(true);
+    setLoadError(null);
     api.thread(agent, { tail: true, limit: 200 }).then(
       (page) => {
         if (cancel) return;
         setEntries(page.entries.map(asEntry).filter((e): e is ThreadEntry => e != null));
+        setLoading(false);
       },
-      () => {
-        if (!cancel) setEntries([]);
+      (e) => {
+        if (cancel) return;
+        setEntries([]);
+        setLoadError(e instanceof ApiError ? e.message : t("Conversation could not be loaded."));
+        setLoading(false);
       },
     );
     return () => {
       cancel = true;
     };
-  }, [agent]);
+  }, [agent, attempt, t]);
 
   const setMode = (next: "ask" | "instruct") => {
     setLocalMode(next);
@@ -88,18 +102,32 @@ export function LaneConversation({
     <section className="card" data-testid="lane-conversation">
       <h2 className="text-ink">Conversation</h2>
       {!agent && <p data-testid="lane-thread-empty">No lane yet</p>}
-      <ol data-testid="lane-thread">
-        {entries.map((entry) => {
-          const ask = entry.role === "operator" && isStatusAsk(entry.payload?.source, entry.text);
-          return (
-            <li key={entry.seq} data-testid="lane-entry">
-              <span className="chip">{entry.role === "operator" ? "you" : entry.role}</span>
-              {ask && <span className="chip" data-testid="lane-status-badge">status</span>}
-              <Md text={entry.text} />
-            </li>
-          );
-        })}
-      </ol>
+      {agent && loading && entries.length === 0 ? (
+        <ConversationSkeleton />
+      ) : loadError && entries.length === 0 ? (
+        <div className="issue-read-notice" data-read-state="conversation" role="alert">
+          <div>
+            <strong>{t("Conversation could not be loaded.")}</strong>
+            <p>{loadError}</p>
+          </div>
+          <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>
+            {t("Retry")}
+          </Button>
+        </div>
+      ) : (
+        <ol data-testid="lane-thread">
+          {entries.map((entry) => {
+            const ask = entry.role === "operator" && isStatusAsk(entry.payload?.source, entry.text);
+            return (
+              <li key={entry.seq} data-testid="lane-entry">
+                <span className="chip">{entry.role === "operator" ? "you" : entry.role}</span>
+                {ask && <span className="chip" data-testid="lane-status-badge">status</span>}
+                <Md text={entry.text} />
+              </li>
+            );
+          })}
+        </ol>
+      )}
       <div className="flex gap-2">
         <span data-testid="lane-mode-ask" className="inline-flex">
           {/* CAD-617 Button does not forward aria-pressed. */}

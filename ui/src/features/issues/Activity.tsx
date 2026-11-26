@@ -17,6 +17,7 @@ import {
 import { timelineRows } from "./model";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { ReadNotice } from "./issuePageShared";
+import { ActivitySkeleton } from "./IssueSkeleton";
 import { useLocale } from "../../lib/locale";
 
 const TONE: Record<string, string> = {
@@ -123,9 +124,11 @@ export function Activity({
       setBusy(false);
     }
   };
+  const historyLoading =
+    history.data === null && !history.error && (history.inFlight || history.status === "loading");
   return (
     <section className="grid gap-4">
-      <ReadNotice name="history" state={history} retry={retryHistory} />
+      {historyLoading ? <ActivitySkeleton /> : <ReadNotice name="history" state={history} retry={retryHistory} />}
       {rows.length === 0 && history.data !== null && !history.error ? (
         <div className="card px-4 py-8 text-center">
           <div className="text-cardtitle font-semibold text-ink-100">
