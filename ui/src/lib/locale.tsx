@@ -3483,6 +3483,10 @@ Object.assign(zhTW, {
   "Master · company, owners only": "主助理 · 公司，僅限擁有者",
   "Chat with the company Master is for owners. Your assistant is on Home.": "與公司主助理對話僅限擁有者。你的助理在首頁。",
   "Your assistant’s instructions are not edited here yet.": "此處暫時無法編輯你的助理的指示。",
+  "Your assistant’s tools are not configured here yet.": "此處暫時無法設定你的助理的工具。",
+  "Your assistant’s skills are not edited here yet.": "此處暫時無法編輯你的助理的技能。",
+  "Your assistant ID could not be loaded.": "無法載入你的助理 ID。",
+  "Opt-in tool groups are managed by the workspace owner.": "選用工具群組由工作區擁有者管理。",
 });
 
 // CAD-2363: assistant turns — tool labels, the elapsed clock, raw calls and ID tokens.

@@ -41,6 +41,12 @@ export const liveOwnDeps: OwnDeps = {
       text: r.instructions ?? "",
       revision: r.revision,
       ...(Number.isSafeInteger(tokens) && tokens! >= 0 ? { builtInInstructionTokens: tokens } : {}),
+      ...(kind === "personal"
+        ? {
+            skills: Array.isArray(r.skills) ? r.skills : [],
+            enabledTools: Array.isArray(r.enabled_tools) ? r.enabled_tools : [],
+          }
+        : {}),
     };
   },
   write: async (kind, base, text) => {
@@ -49,10 +55,32 @@ export const liveOwnDeps: OwnDeps = {
       // No revision in the answer means the save is not confirmed; a check reads it.
       const revision = r.assistant?.identity?.revision;
       if (typeof revision !== "number") throw new Error("The saved revision was not returned.");
-      return { text: stored(kind, text), revision };
+      return {
+        text: stored(kind, text),
+        revision,
+        ...(base.builtInInstructionTokens !== undefined ? { builtInInstructionTokens: base.builtInInstructionTokens } : {}),
+        skills: Array.isArray(r.skills) ? r.skills : (base.skills ?? []),
+        enabledTools: Array.isArray(r.enabled_tools) ? r.enabled_tools : (base.enabledTools ?? []),
+      };
     }
     const r = await api.masterIdentityUpdate({ expected_revision: String(base.revision), instructions: text });
     return { text: stored(kind, text), revision: r.identity.revision };
+  },
+  writePersonalFields: async (base, patch) => {
+    const r = await api.memberAssistProfileUpdate({
+      expected_revision: Number(base.revision),
+      action: "update",
+      ...(patch.skills !== undefined ? { skills: patch.skills } : {}),
+      ...(patch.enabled_tools !== undefined ? { enabled_tools: patch.enabled_tools } : {}),
+    });
+    const revision = r.assistant?.identity?.revision;
+    if (typeof revision !== "number") throw new Error("The saved revision was not returned.");
+    return {
+      ...base,
+      revision,
+      skills: Array.isArray(r.skills) ? r.skills : (patch.skills ?? base.skills ?? []),
+      enabledTools: Array.isArray(r.enabled_tools) ? r.enabled_tools : (patch.enabled_tools ?? base.enabledTools ?? []),
+    };
   },
 };
 
@@ -86,6 +114,10 @@ export interface InstructionsDoc {
   phase: DocPhase;
   /** Hosted only: when and at which revision the stored text last changed. */
   profile: StoredAgentProfile | null;
+  /** Personal only: workspace skill names saved on the caller's actor profile. */
+  personalSkills?: string[] | null;
+  /** Personal only: opt-in tool groups saved on the caller's actor profile. */
+  personalEnabledTools?: string[] | null;
   /** Native: what the last save said about when the agent reads it. */
   applies: string | null;
   /** What the busy phase is doing, so a read is not labelled "Saving". */
@@ -299,8 +331,39 @@ export function useInstructionsDoc(opts: {
     }
   };
 
+  /** Write one personal profile field (`skills` or `enabled_tools`) at the
+   *  revision this page holds, preserving instructions and unrelated fields. */
+  const saveOwnField = async (
+    patch: { skills?: string[]; enabled_tools?: string[] },
+    landed: (latest: OwnDoc) => boolean,
+  ): Promise<SkillsOutcome> => {
+    if (!ready || kind !== "personal" || !own || !ownDeps.writePersonalFields || busy.current) return { kind: "busy" };
+    busy.current = true;
+    const base = own;
+    try {
+      setOwn(await ownDeps.writePersonalFields(base, patch));
+      return { kind: "saved" };
+    } catch (error) {
+      const out = classifyFailure(error, "personal");
+      if (out === "refused") return { kind: out, message: error instanceof Error ? error.message : String(error) };
+      if (out === "unconfirmed") {
+        const latest = await ownDeps.read("personal").catch(() => null);
+        if (latest && Number(latest.revision) === Number(base.revision) + 1 && latest.text === base.text && landed(latest)) {
+          setOwn(latest);
+          return { kind: "saved" };
+        }
+      }
+      return { kind: out };
+    } finally {
+      busy.current = false;
+    }
+  };
+
   const text = draft ?? served ?? "";
   const ready = writable && kind !== null && state === "ready";
+  const currentOwn = isOwnKind(kind) ? (phase === "conflict" && theirsOwn ? theirsOwn : own) : null;
+  const personalSkills = kind === "personal" && state === "ready" ? (own?.skills ?? []) : null;
+  const personalEnabledTools = kind === "personal" && state === "ready" ? (own?.enabledTools ?? []) : null;
 
   async function readOwnConflict(scope: OwnKind, adoptRead: (doc: OwnDoc) => void, error: string) {
     if (busy.current) return;
@@ -328,13 +391,13 @@ export function useInstructionsDoc(opts: {
     kind,
     read: state,
     served,
-    builtInInstructionTokens: isOwnKind(kind)
-      ? (phase === "conflict" && theirsOwn ? theirsOwn : own)?.builtInInstructionTokens
-      : undefined,
+    builtInInstructionTokens: currentOwn?.builtInInstructionTokens,
     draft,
     setDraft,
     phase,
     profile,
+    personalSkills,
+    personalEnabledTools,
     applies,
     working,
     selection,
@@ -403,15 +466,25 @@ export function useInstructionsDoc(opts: {
       if (job && sent.current) void run(job, sent.current.text, sent.current.base, sent.current.own, true);
     },
     saveSkills: (skills) =>
-      saveProfileField(
-        (base) => profileBody(base, base.responsibilities, base.revision, skills),
-        (latest) => latest.skills.join("\n") === skills.join("\n"),
-      ),
+      kind === "personal"
+        ? saveOwnField(
+            { skills },
+            (latest) => (latest.skills ?? []).join("\n") === skills.join("\n"),
+          )
+        : saveProfileField(
+            (base) => profileBody(base, base.responsibilities, base.revision, skills),
+            (latest) => latest.skills.join("\n") === skills.join("\n"),
+          ),
     saveEnabledTools: (enabledTools) =>
-      saveProfileField(
-        (base) => profileBody(base, base.responsibilities, base.revision, base.skills, enabledTools),
-        (latest) => [...(latest.enabled_tools ?? [])].sort().join("\n") === [...enabledTools].sort().join("\n"),
-      ),
+      kind === "personal"
+        ? saveOwnField(
+            { enabled_tools: enabledTools },
+            (latest) => [...(latest.enabledTools ?? [])].sort().join("\n") === [...enabledTools].sort().join("\n"),
+          )
+        : saveProfileField(
+            (base) => profileBody(base, base.responsibilities, base.revision, base.skills, enabledTools),
+            (latest) => [...(latest.enabled_tools ?? [])].sort().join("\n") === [...enabledTools].sort().join("\n"),
+          ),
     discard: () => {
       if (phase !== "unconfirmed") {
         setDraftState(null);
