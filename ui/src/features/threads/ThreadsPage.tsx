@@ -67,6 +67,7 @@ import {
 } from "./threadsView";
 import {
   ChannelTimelineSkeleton,
+  ChannelsBackButton,
   ConversationListSkeleton,
   DetailsPanelSkeleton,
   HumanContextPanel,
@@ -1134,17 +1135,7 @@ function Timeline({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
-        {onBack && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={onBack}
-            aria-label={t("Back to channels")}
-            className="threads-back-btn"
-          >
-            <span aria-hidden="true">←</span> {t("Channels")}
-          </Button>
-        )}
+        <ChannelsBackButton onBack={onBack} />
         <div className="threads-kicker">{t(KIND_LABEL[row.kind])}</div>
         <h2>{conversationTitle(row, t)}</h2>
         <div className="threads-head-actions">
@@ -1802,17 +1793,7 @@ function DraftDm({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
-        {onBack && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={onBack}
-            aria-label={t("Back to channels")}
-            className="threads-back-btn"
-          >
-            <span aria-hidden="true">←</span> {t("Channels")}
-          </Button>
-        )}
+        <ChannelsBackButton onBack={onBack} />
         <div className="threads-kicker">{t(KIND_LABEL.operator)}</div>
         <h2>{t("You ↔ {alias}").replace("{alias}", () => alias)}</h2>
       </header>

@@ -185,15 +185,9 @@ export function Select({
       if (!trigger || !pop) return;
       const rect = trigger.getBoundingClientRect();
       const gap = 4;
-      const footer = trigger.closest("dialog")?.querySelector<HTMLElement>(".threads-create-footer, footer");
-      const bottomEdge = footer ? Math.min(window.innerHeight, footer.getBoundingClientRect().top) : window.innerHeight;
       // The popup is never narrower than its trigger, nor wider than the viewport minus an 8px gutter.
       const width = Math.min(Math.max(rect.width, 160), window.innerWidth - 16);
-      pop.style.maxHeight = "";
-      const placement = flipPlacement(rect, pop.offsetHeight, bottomEdge, gap);
-      if (placement === "above") {
-        pop.style.maxHeight = `${Math.max(120, Math.floor(rect.top - gap - 8))}px`;
-      }
+      const placement = flipPlacement(rect, pop.offsetHeight, window.innerHeight, gap);
       let left = rect.left;
       const maxLeft = window.innerWidth - width - 8;
       if (left > maxLeft) left = Math.max(8, maxLeft);
