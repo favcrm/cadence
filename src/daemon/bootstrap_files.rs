@@ -38,12 +38,47 @@ pub const PROFILE_MAX: usize = 16384;
 pub const FILE_MAX: u64 = 64 * 1024;
 
 const BOOTSTRAP_TEMPLATE: &str = include_str!("../../agents/member-assistant/BOOTSTRAP.md");
+pub const BOOTSTRAP_OWNER_TEMPLATE: &str =
+    include_str!("../../agents/member-assistant/BOOTSTRAP-OWNER.md");
+pub const BOOTSTRAP_MEMBER_TEMPLATE: &str =
+    include_str!("../../agents/member-assistant/BOOTSTRAP-MEMBER.md");
 const IDENTITY_TEMPLATE: &str = include_str!("../../agents/member-assistant/IDENTITY.md");
 const SOUL_TEMPLATE: &str = include_str!("../../agents/member-assistant/SOUL.md");
 const USER_TEMPLATE: &str = include_str!("../../agents/member-assistant/USER.md");
 const AGENTS_TEMPLATE: &str = include_str!("../../agents/member-assistant/AGENTS.md");
 pub const MEMORY_SEED: &str =
     "# Memory\n\nOne line per fact, newest first. Longer notes go in memory/<topic>.md.\n";
+
+/// Character caps applied after secret redaction for Tier-1 shared company context.
+pub const COMPANY_SUMMARY_MAX_CHARS: usize = 1200;
+pub const COMPANY_SOUL_MAX_CHARS: usize = 800;
+
+/// Which onboarding template applies while `bootstrap_state == "pending"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapKind {
+    Owner,
+    Member,
+}
+
+/// Bounded, secret-redacted workspace company context read from `wiki/global/`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CompanyContext {
+    pub company_summary: Option<String>,
+    pub company_soul: Option<String>,
+}
+
+/// Select the dual bootstrap template for owner vs. subsequent member.
+pub fn bootstrap_template(kind: BootstrapKind) -> &'static str {
+    match kind {
+        BootstrapKind::Owner => BOOTSTRAP_OWNER_TEMPLATE,
+        BootstrapKind::Member => BOOTSTRAP_MEMBER_TEMPLATE,
+    }
+}
+
+/// True when `BOOTSTRAP.md` matches the unedited legacy platform placeholder.
+pub fn is_default_bootstrap_text(text: &str) -> bool {
+    text.trim() == BOOTSTRAP_TEMPLATE.trim()
+}
 
 /// The closed profile object a member may agree to.
 ///
@@ -234,7 +269,14 @@ fn read_bounded(file: &mut File, name: &str) -> Result<String> {
 /// is created only when `include_bootstrap` is true, which the caller sets
 /// only while the stored state is `pending`. Exclusive create never overwrites
 /// an existing file, including a symlink. Every other error propagates.
+#[cfg(test)]
 pub fn seed(root: &Path, include_bootstrap: bool) -> Result<()> {
+    seed_for(root, include_bootstrap, None)
+}
+
+/// Seed profile files like [`seed`], choosing `BOOTSTRAP-OWNER.md` vs.
+/// `BOOTSTRAP-MEMBER.md` when `kind` is provided.
+pub fn seed_for(root: &Path, include_bootstrap: bool, kind: Option<BootstrapKind>) -> Result<()> {
     let dir = open_root(root)?;
     match dir.mkdir(c"memory", 0o700) {
         Ok(()) => {}
@@ -258,7 +300,10 @@ pub fn seed(root: &Path, include_bootstrap: bool) -> Result<()> {
         (MEMORY, MEMORY_SEED),
     ];
     if include_bootstrap {
-        files.push((BOOTSTRAP, BOOTSTRAP_TEMPLATE));
+        files.push((
+            BOOTSTRAP,
+            kind.map_or(BOOTSTRAP_TEMPLATE, bootstrap_template),
+        ));
     }
     let mut created = false;
     for (name, text) in files {
@@ -403,5 +448,131 @@ pub fn read_profile_file(root: &Path, name: &str) -> Result<String> {
     match open_read(&dir, name)? {
         None => Ok(String::new()),
         Some(mut file) => read_bounded(&mut file, name),
+    }
+}
+
+fn open_optional_dir_nofollow(path: &Path, label: &str) -> Result<Option<DirFd>> {
+    match DirFd::open_nofollow(path) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == ErrorKind::InvalidInput => {
+            Err(Error::rejected(format!("{label} contains an interior nul")))
+        }
+        Err(_) => Err(Error::rejected(format!(
+            "{label} is not a real directory or is a symlink"
+        ))),
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let take = max_chars.saturating_sub(1);
+    match text.char_indices().nth(take) {
+        Some((idx, _)) => format!("{}…", text[..idx].trim_end()),
+        None => text.to_string(),
+    }
+}
+
+fn read_company_doc(global_dir: &DirFd, name: &str, max_chars: usize) -> Result<Option<String>> {
+    let label = format!("global/{name}");
+    let cname = CString::new(name).map_err(|_| Error::rejected("bad company context file name"))?;
+    let Some(mut file) = open_read_child(global_dir, &label, &cname)? else {
+        return Ok(None);
+    };
+    let raw = read_bounded_capped(&mut file, &label, FILE_MAX)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // Redact secrets BEFORE truncating so partial secret fragments never survive a cut.
+    let redacted = crate::secret::redact_text(trimmed)?;
+    Ok(Some(truncate_chars(redacted.trim(), max_chars)))
+}
+
+/// Read bounded, secret-redacted `global/COMPANY.md` and `global/SOUL.md` from
+/// `vault_root`. Absent `vault_root`, `global/`, or target files yield `None`;
+/// symlinks, non-regular files, and oversized files refuse.
+pub fn read_company_context(vault_root: &Path) -> Result<CompanyContext> {
+    let Some(vault_dir) = open_optional_dir_nofollow(vault_root, "wiki vault")? else {
+        return Ok(CompanyContext::default());
+    };
+    let global_dir = match vault_dir.open_child_dir(c"global") {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(CompanyContext::default()),
+        Err(_) => {
+            return Err(Error::rejected(
+                "wiki global/ directory is invalid or a symlink",
+            ));
+        }
+    };
+    Ok(CompanyContext {
+        company_summary: read_company_doc(&global_dir, "COMPANY.md", COMPANY_SUMMARY_MAX_CHARS)?,
+        company_soul: read_company_doc(&global_dir, "SOUL.md", COMPANY_SOUL_MAX_CHARS)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn company_context_absent_dir_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = read_company_context(&dir.path().join("missing-vault")).unwrap();
+        assert_eq!(ctx, CompanyContext::default());
+
+        std::fs::create_dir_all(dir.path().join("vault")).unwrap();
+        let ctx = read_company_context(&dir.path().join("vault")).unwrap();
+        assert_eq!(ctx, CompanyContext::default());
+    }
+
+    #[test]
+    fn company_context_redacts_secrets_before_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(&global).unwrap();
+        let secret = format!("ghp_{}", "a1b2c3d4e5f6".repeat(3));
+        let body = format!(
+            "Acme Robotics builds warehouse drones. Key: {secret} {}",
+            "x".repeat(2000)
+        );
+        std::fs::write(global.join("COMPANY.md"), body).unwrap();
+        std::fs::write(
+            global.join("SOUL.md"),
+            format!("Be direct. {}", "y".repeat(1200)),
+        )
+        .unwrap();
+
+        let ctx = read_company_context(dir.path()).unwrap();
+        let summary = ctx.company_summary.expect("company_summary");
+        let soul = ctx.company_soul.expect("company_soul");
+        assert!(!summary.contains(&secret), "secret leaked: {summary}");
+        assert!(summary.contains("[redacted:"), "{summary}");
+        assert!(summary.chars().count() <= COMPANY_SUMMARY_MAX_CHARS);
+        assert!(soul.chars().count() <= COMPANY_SOUL_MAX_CHARS);
+    }
+
+    #[test]
+    fn company_context_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(&global).unwrap();
+        let target = dir.path().join("outside.md");
+        std::fs::write(&target, "secret").unwrap();
+        std::os::unix::fs::symlink(&target, global.join("COMPANY.md")).unwrap();
+
+        let err = read_company_context(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn dual_bootstrap_templates_differ_and_prioritize_request() {
+        let owner = bootstrap_template(BootstrapKind::Owner);
+        let member = bootstrap_template(BootstrapKind::Member);
+        assert_ne!(owner, member);
+        assert!(owner.contains("global/COMPANY.md"));
+        assert!(member.contains("global/COMPANY.md"));
     }
 }

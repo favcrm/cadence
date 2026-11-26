@@ -61,6 +61,7 @@ import "./assistant-identity.css";
 export type PersonalProfileSaveChange = {
   expected_revision: number;
   name?: string | null;
+  tone?: string | null;
   look?: AvatarLook;
 };
 
@@ -77,8 +78,29 @@ export function toPersonalUpdateMutation(change: PersonalProfileSaveChange): Per
     expected_revision: change.expected_revision,
     action: "update",
     ...(change.name !== undefined ? { name: change.name ?? "" } : {}),
+    ...(change.tone !== undefined ? { tone: change.tone ?? "" } : {}),
     ...(change.look !== undefined ? { look: change.look } : {}),
   };
+}
+
+/** Stage 1 onboarding saves Avatar + Name while keeping `bootstrap_state`
+ *  `"pending"` when a name is supplied so Stage 2 conversation (`BOOTSTRAP-OWNER`
+ *  / `BOOTSTRAP-MEMBER`) starts right away with the Stage 1 card hidden. */
+export function toPersonalStage1Mutation(input: {
+  expected_revision: number;
+  name?: string;
+  look: AvatarLook;
+}): PersonalProfileMutation {
+  const trimmedName = input.name?.trim();
+  if (trimmedName) {
+    return {
+      expected_revision: input.expected_revision,
+      action: "update",
+      name: trimmedName,
+      look: input.look,
+    };
+  }
+  return toPersonalCompleteMutation(input);
 }
 
 export function toPersonalCompleteMutation(input: {
@@ -550,7 +572,7 @@ export function useHostedPersonalBootstrap(
 
   const complete = useCallback(
     (input: { expected_revision: number; name?: string; look: AvatarLook }) =>
-      runMutation(toPersonalCompleteMutation(input)),
+      runMutation(toPersonalStage1Mutation(input)),
     [runMutation],
   );
 
@@ -868,6 +890,7 @@ function PersonalIdentityEditor({
   const t = useTranslate();
   const [base, setBase] = useState(identity);
   const [name, setName] = useState(identity.name ?? "");
+  const [tone, setTone] = useState(identity.tone ?? "");
   const [look, setLook] = useState<AvatarLook>(identity.look);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -875,7 +898,8 @@ function PersonalIdentityEditor({
   const stale = Number(identity.revision) > Number(base.revision);
 
   const nextName = name.trim() === "" ? null : name.trim();
-  const dirty = nextName !== base.name || look !== base.look;
+  const nextTone = tone.trim() === "" ? null : tone.trim();
+  const dirty = nextName !== base.name || nextTone !== base.tone || look !== base.look;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -886,6 +910,7 @@ function PersonalIdentityEditor({
     const result = await request.saveProfile({
       expected_revision: Number(base.revision),
       ...(nextName !== base.name ? { name: nextName ?? "" } : {}),
+      ...(nextTone !== base.tone ? { tone: nextTone ?? "" } : {}),
       ...(look !== base.look ? { look } : {}),
     });
     setPending(false);
@@ -899,6 +924,7 @@ function PersonalIdentityEditor({
     }
     setBase(result.identity);
     setName(result.identity.name ?? "");
+    setTone(result.identity.tone ?? "");
     setLook(result.identity.look);
     setNotice(t("Saved. The new identity applies to the next turn."));
   };
@@ -941,6 +967,7 @@ function PersonalIdentityEditor({
             onClick={() => {
               setBase(identity);
               setName(identity.name ?? "");
+              setTone(identity.tone ?? "");
               setLook(identity.look);
               setError(null);
               setNotice(null);
@@ -971,6 +998,18 @@ function PersonalIdentityEditor({
             autoComplete="off"
             onChange={(event) => setName(event.target.value)}
             placeholder={t("Not named yet")}
+          />
+        </label>
+        <label className="assistant-field">
+          <span>{t("Tone")}</span>
+          <input
+            className="field"
+            value={tone}
+            maxLength={80}
+            disabled={pending}
+            autoComplete="off"
+            onChange={(event) => setTone(event.target.value)}
+            placeholder={t("e.g. Concise & direct")}
           />
         </label>
         <Button type="submit" variant="primary" loading={pending} disabled={pending || !dirty || stale}>

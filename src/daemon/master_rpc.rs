@@ -876,7 +876,7 @@ impl Shared {
             // per-turn identity context is the live provider's refresh path.
             let files = master::read_files(&pm.dir, ALIAS, false)?;
             master::verify(&self.state_dir, ALIAS, &files)?;
-            let briefing = master::compose(&files);
+            let briefing = compose_master_briefing(&pm.dir, &files);
             let file = client::briefing_path(&self.state_dir, &Value::Null, ALIAS);
             if let Some(dir) = file.parent() {
                 std::fs::create_dir_all(dir)?;
@@ -1062,7 +1062,7 @@ impl Shared {
         }
         let launch = Value::Object(launch);
         crate::adapter::registry::validate_launch_params(&provider, "managed", &launch)?;
-        let briefing = master::compose(&files);
+        let briefing = compose_master_briefing(&pm.dir, &files);
         let file = client::briefing_path(&self.state_dir, &Value::Null, ALIAS);
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1889,6 +1889,17 @@ pub(super) fn route_id(project: &str, id: &str, row: &Value) -> String {
     };
     let path = format!("{project}/{id}/{}/{name}", task_report::DIR);
     format!("{what}-{}", short_hash(&path))
+}
+
+fn compose_master_briefing(pm_dir: &std::path::Path, files: &[(String, String)]) -> String {
+    let company = crate::home::vault_for(pm_dir)
+        .ok()
+        .and_then(|vault| super::bootstrap_files::read_company_context(&vault).ok());
+    master::compose_with_company(
+        files,
+        company.as_ref().and_then(|c| c.company_summary.as_deref()),
+        company.as_ref().and_then(|c| c.company_soul.as_deref()),
+    )
 }
 
 #[cfg(test)]

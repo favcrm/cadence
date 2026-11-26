@@ -61,6 +61,8 @@ async function main() {
     AssistantAboutButton,
     AssistantActorProvider,
     AssistantBootstrapCard,
+    toPersonalStage1Mutation,
+    toPersonalUpdateMutation,
   } = require("../src/features/assistant/AssistantIdentity") as typeof import("../src/features/assistant/AssistantIdentity");
   const SetupNudge = (require("../src/features/setup/SetupNudge") as typeof import("../src/features/setup/SetupNudge")).default;
 
@@ -143,8 +145,15 @@ async function main() {
       completions[0]?.expected_revision === 0 &&
       completions[0]?.name === "Nova" &&
       completions[0]?.look === "guard",
-    "submit sends fenced complete payload with chosen name and look",
+    "submit sends fenced payload with chosen name and look",
   );
+  const stage1Req = toPersonalStage1Mutation(completions[0]!);
+  assert(
+    stage1Req.action === "update" && stage1Req.name === "Nova" && stage1Req.look === "guard",
+    "Stage 1 with a chosen name keeps bootstrap_state pending via action: update for Stage 2 chat onboarding",
+  );
+  const toneReq = toPersonalUpdateMutation({ expected_revision: 1, tone: "Concise" });
+  assert(toneReq.tone === "Concise", "personal update mutation includes tone when provided");
 
   const skipBtn = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(
     (btn) => btn.textContent === "Skip for now",

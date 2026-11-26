@@ -10,6 +10,7 @@ import {
   customMcpSkills,
   operationalSkills,
   runtimeHealthSkills,
+  workspaceOnboardingSkills,
 } from "./profile.ts";
 
 /**
@@ -128,6 +129,7 @@ export async function runtimeSkillSources(
     runtimeHealthSkills,
     customMcpSkills,
     companyOutputSkills,
+    workspaceOnboardingSkills,
     ...(workspace === null ? [] : [workspace]),
   ];
 }

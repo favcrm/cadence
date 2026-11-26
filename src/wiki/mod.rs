@@ -266,14 +266,27 @@ pub(crate) fn allowed_by_table(caller: &Caller, op: Op, segs: &[&str]) -> Result
         },
         "global" => match op {
             Op::Read => Ok(()),
-            Op::Write | Op::Remove => match caller {
-                Caller::Operator => Ok(()),
-                Caller::User(_) if segs.len() > 1 => Ok(()),
-                Caller::User(_) => no("members mutate pages below global/, not the namespace root"),
-                _ => no(
-                    "global/ writes are the operator's and a board member's; agents keep their own areas",
-                ),
-            },
+            Op::Write | Op::Remove => {
+                if segs.len() == 2
+                    && (segs[1].eq_ignore_ascii_case("COMPANY.md")
+                        || segs[1].eq_ignore_ascii_case("SOUL.md"))
+                {
+                    return match caller {
+                        Caller::Operator => Ok(()),
+                        _ => no(
+                            "global/COMPANY.md and global/SOUL.md are owner-managed — only the operator writes them",
+                        ),
+                    };
+                }
+                match caller {
+                    Caller::Operator => Ok(()),
+                    Caller::User(_) if segs.len() > 1 => Ok(()),
+                    Caller::User(_) => no("members mutate pages below global/, not the namespace root"),
+                    _ => no(
+                        "global/ writes are the operator's and a board member's; agents keep their own areas",
+                    ),
+                }
+            }
         },
         "projects" => {
             if segs.len() == 1 {
@@ -311,7 +324,9 @@ pub(crate) fn allowed_by_table(caller: &Caller, op: Op, segs: &[&str]) -> Result
                 // `agents/` and `agents/<a>/` — listing folders.
                 return match op {
                     Op::Read => Ok(()),
-                    Op::Write | Op::Remove => no("agent folders are layout — write under knowledge/ instead"),
+                    Op::Write | Op::Remove => {
+                        no("agent folders are layout — write under knowledge/ instead")
+                    }
                 };
             }
             let area = segs[2];
@@ -325,8 +340,10 @@ pub(crate) fn allowed_by_table(caller: &Caller, op: Op, segs: &[&str]) -> Result
                 },
                 "memory" => match op {
                     Op::Read => Ok(()),
-                    Op::Write | Op::Remove => no("memory/ is a read-only view of the memory store — propose \
-                         through `cadence memory`"),
+                    Op::Write | Op::Remove => {
+                        no("memory/ is a read-only view of the memory store — propose \
+                         through `cadence memory`")
+                    }
                 },
                 "knowledge" => match op {
                     Op::Read => Ok(()),
@@ -1973,6 +1990,32 @@ mod tests {
             (&user, Op::Remove, "global", false),
             (&public, Op::Write, "global/notes.md", false),
             (&public, Op::Remove, "global/notes.md", false),
+            // global/COMPANY.md and global/SOUL.md: read by all; written/removed ONLY by operator.
+            (&op, Op::Read, "global/COMPANY.md", true),
+            (&agent(), Op::Read, "global/COMPANY.md", true),
+            (&public, Op::Read, "global/COMPANY.md", true),
+            (&user, Op::Read, "global/COMPANY.md", true),
+            (&op, Op::Write, "global/COMPANY.md", true),
+            (&op, Op::Remove, "global/COMPANY.md", true),
+            (&user, Op::Write, "global/COMPANY.md", false),
+            (&user, Op::Remove, "global/COMPANY.md", false),
+            (&agent(), Op::Write, "global/COMPANY.md", false),
+            (&agent(), Op::Remove, "global/COMPANY.md", false),
+            (&public, Op::Write, "global/COMPANY.md", false),
+            (&public, Op::Remove, "global/COMPANY.md", false),
+            (&op, Op::Write, "global/SOUL.md", true),
+            (&op, Op::Remove, "global/SOUL.md", true),
+            (&user, Op::Write, "global/SOUL.md", false),
+            (&user, Op::Remove, "global/SOUL.md", false),
+            (&agent(), Op::Write, "global/SOUL.md", false),
+            (&agent(), Op::Remove, "global/SOUL.md", false),
+            (&public, Op::Write, "global/SOUL.md", false),
+            (&public, Op::Remove, "global/SOUL.md", false),
+            (&op, Op::Write, "global/company.md", true),
+            (&user, Op::Write, "global/company.md", false),
+            (&user, Op::Remove, "global/company.md", false),
+            (&user, Op::Write, "global/soul.md", false),
+            (&user, Op::Remove, "global/soul.md", false),
             // projects/<key>/: all read; write = operator, owning agent, or a board member.
             (&op, Op::Read, "projects/cadence/a.md", true),
             (&public, Op::Read, "projects/cadence/a.md", true),

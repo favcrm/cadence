@@ -58,7 +58,7 @@ import {
   AssistantBootstrapCard,
   AssistantFace,
   postPersonalProfile,
-  toPersonalCompleteMutation,
+  toPersonalStage1Mutation,
   toPersonalUpdateMutation,
   type AssistantActorValue,
   type PersonalProfileSaveChange,
@@ -537,7 +537,7 @@ export default function MemberChat({
 
   const completeBootstrap = useCallback(
     (input: { expected_revision: number; name?: string; look: AvatarLook }) =>
-      runProfileMutation(toPersonalCompleteMutation(input)),
+      runProfileMutation(toPersonalStage1Mutation(input)),
     [runProfileMutation],
   );
 
@@ -631,7 +631,10 @@ export default function MemberChat({
   // produce it.
   const empty = loaded && history.error === undefined && items.length === 0;
   const showBootstrapCard =
-    !readOnly && surface?.bootstrap === "pending" && identity.state === "ready";
+    !readOnly &&
+    surface?.bootstrap === "pending" &&
+    identity.state === "ready" &&
+    identity.identity.name === null;
   const agents = roster.data?.agents ?? [];
   const hasLiveAgents = agents.some((a) => a.running > 0);
   const hasRail =

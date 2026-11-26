@@ -129,3 +129,22 @@ For first-time setup in the owner's Cadence Home chat, confirm the public MCP en
     },
   ],
 });
+
+/** Bundled onboarding workflow skill (first-owner vs member briefing & separation of scopes). */
+export const workspaceOnboardingSkills = createSkillSource({
+  id: "tenant-workspace-onboarding",
+  skills: [
+    {
+      name: "workspace-onboarding",
+      description:
+        "Use during initial workspace or member onboarding to capture company context into global/COMPANY.md (owner-approved) vs personal USER.md/MEMORY.md.",
+      body: `# Workspace onboarding (Owner & Member)
+
+1. Always answer the user's immediate request or task FIRST. Never block help behind onboarding questions.
+2. Check whether shared workspace company context (\`global/COMPANY.md\` / \`global/SOUL.md\`) is already present in your context:
+   - **First owner (\`bootstrap_kind: "owner"\` or company context absent):** Ask at most ONE light question per turn to learn what the company does, who it serves, and preferred communication style. Stage a concise draft for \`global/COMPANY.md\` (and \`global/SOUL.md\` if norms were discussed) for owner approval rather than mixing company facts into personal \`USER.md\` or \`MEMORY.md\`.
+   - **Joining member (\`bootstrap_kind: "member"\`):** Orient the member concisely using the shared \`global/COMPANY.md\` summary, ask at most ONE light question about their role or working style, and store personal preferences in \`USER.md\` / \`MEMORY.md\`. Never modify \`global/COMPANY.md\` or \`global/SOUL.md\`.
+3. Once company context (for owners) or personal alignment (for members) is confirmed, call \`assistant_profile\` with \`action: "complete"\` to retire bootstrap so onboarding instructions carry zero overhead on future turns.`,
+    },
+  ],
+});

@@ -349,6 +349,7 @@ export interface MemberAssistProfileRequest {
   expected_revision: number;
   action: MemberAssistProfileAction;
   name?: string;
+  tone?: string;
   look?: AvatarLook;
   /** CAD-2354: the member's own instructions; blank clears, omitted keeps. */
   instructions?: string;
