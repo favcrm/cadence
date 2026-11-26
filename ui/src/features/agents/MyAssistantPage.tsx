@@ -32,6 +32,7 @@ function normalizePersonalTab(tab: AgentTab | undefined): PersonalTab {
 
 function personalTabContext({
   alias,
+  displayName,
   operator,
   writable,
   hostedBoard,
@@ -40,6 +41,7 @@ function personalTabContext({
   toast,
 }: {
   alias: string;
+  displayName: string;
   operator: boolean;
   writable: boolean;
   hostedBoard: boolean;
@@ -49,6 +51,8 @@ function personalTabContext({
 }): TabContext {
   return {
     alias,
+    personalAssistant: true,
+    displayName,
     profile: undefined,
     observed: undefined,
     detail: null,
@@ -155,8 +159,9 @@ export default function MyAssistantPage({
   const look = own?.look ?? row.look;
   const routinesCtx = personalTabContext({
     alias: assistantId ?? "",
+    displayName: name,
     operator,
-    writable: operator && writable,
+    writable,
     hostedBoard,
     scopedRoster,
     doc,
@@ -164,6 +169,7 @@ export default function MyAssistantPage({
   });
   const toolsCtx = personalTabContext({
     alias: PERSONAL_ALIAS,
+    displayName: name,
     operator,
     writable,
     hostedBoard,
@@ -185,6 +191,7 @@ export default function MyAssistantPage({
             <span>
               {name} · {t("Your assistant")}
             </span>
+            <span className="rc-private-chip">{t("Private to you")}</span>
           </div>
         </div>
         <div className="ap-acts">
@@ -209,9 +216,7 @@ export default function MyAssistantPage({
       </nav>
       <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
         {section === "routines" ? (
-          !operator ? (
-            <RoutinesTab c={routinesCtx} />
-          ) : assistantRead === "reading" ? (
+          assistantRead === "reading" ? (
             <p className="rc-note">{t("Loading routines…")}</p>
           ) : assistantRead === "failed" || !assistantId ? (
             <p className="rc-note" role="alert">
@@ -242,7 +247,9 @@ export default function MyAssistantPage({
         ) : section === "tools" ? (
           <div className="ap-body">
             {!operator && doc.read === "ready" && (
-              <p className="rc-note">{t("Opt-in tool groups are managed by the workspace owner.")}</p>
+              <p className="rc-note">
+                {t("You can enable personal-safe tools here. Workspace-level tools are managed by the workspace owner.")}
+              </p>
             )}
             <OptInTools c={toolsCtx} />
           </div>

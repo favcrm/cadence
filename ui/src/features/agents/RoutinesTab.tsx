@@ -84,6 +84,9 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
   const zones = useTimeZones();
   const viewerZone = zones.effective;
   const companyZone = zones.company ?? "UTC";
+  const canAccess = c.operator || Boolean(c.personalAssistant);
+  const canMutate = c.writable && canAccess;
+  const agentLabel = c.displayName?.trim() || c.alias;
   const [routines, setRoutines] = useState<Routine[] | null>(null);
   const [proposals, setProposals] = useState<StagedRoutineProposal[]>([]);
   const [waitingRuns, setWaitingRuns] = useState<RoutineRun[]>([]);
@@ -119,7 +122,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
   const [createErr, setCreateErr] = useState<string | null>(null);
 
   const load = useCallback(() => {
-    if (!c.operator) return;
+    if (!canAccess) return;
     setLoadErr(null);
     routinesApi
       .list(c.alias)
@@ -137,20 +140,22 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
         }
         setLoadErr(e instanceof ApiError ? e.message : t("Could not load routines."));
       });
-    api
-      .connections()
-      .then((res) => {
-        setConnections((res.connections ?? []).filter((conn) => conn.kind === "enrolled"));
-      })
-      .catch(() => {});
-  }, [c.alias, c.operator, t]);
+    if (c.operator) {
+      api
+        .connections()
+        .then((res) => {
+          setConnections((res.connections ?? []).filter((conn) => conn.kind === "enrolled"));
+        })
+        .catch(() => {});
+    }
+  }, [c.alias, c.operator, canAccess, t]);
 
   useEffect(() => {
     load();
   }, [load]);
 
   useEffect(() => {
-    if (!openId || !c.operator) {
+    if (!openId || !canAccess) {
       setDetail(null);
       return;
     }
@@ -172,7 +177,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     return () => {
       live = false;
     };
-  }, [openId, c.operator, routines]);
+  }, [openId, canAccess, routines]);
 
   const scheduled = useMemo(
     () => (routines ?? []).filter((r) => r.trigger_kind === "schedule"),
@@ -192,7 +197,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     [proposals, c.alias, c.scopedRoster],
   );
 
-  if (!c.operator) {
+  if (!canAccess) {
     return (
       <div className="rtn-wrap" data-routines-tab>
         <p className="text-label text-ink-500">
@@ -236,8 +241,9 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
       setCreateErr(t("Enter a routine name."));
       return;
     }
-    const targetKind =
-      whatMode === "playbook"
+    const targetKind = !c.operator
+      ? "markdown"
+      : whatMode === "playbook"
         ? "markdown"
         : wakeWithPlaybook
           ? "script_then_markdown"
@@ -295,7 +301,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     if (destThread.trim()) {
       body.destination_thread = destThread.trim();
     }
-    if (newConnAccount.trim()) {
+    if (c.operator && newConnAccount.trim()) {
       body.connection_account = newConnAccount.trim();
     }
 
@@ -389,7 +395,9 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
     try {
       const res = await routinesApi.update(r.id, {
         destination_thread: repointThread.trim() ? repointThread.trim() : null,
-        connection_account: editConnAccount.trim() ? editConnAccount.trim() : null,
+        ...(c.operator
+          ? { connection_account: editConnAccount.trim() ? editConnAccount.trim() : null }
+          : {}),
       });
       setDetail(res.routine);
       load();
@@ -480,7 +488,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
   };
 
   const drawerMenu: DrawerMenuItem[] =
-    activeRoutine && c.writable
+    activeRoutine && canMutate
       ? [
           {
             key: "delete",
@@ -499,12 +507,16 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
       <div className="rtn-head">
         <div className="rtn-head-copy">
           <p className="text-label text-ink-400">
-            {t(
-              "Run an owner-approved Playbook (.md) or SHA-256 pinned script on a recurring schedule or verified event.",
-            )}
+            {c.operator
+              ? t(
+                  "Run an owner-approved Playbook (.md) or SHA-256 pinned script on a recurring schedule or verified event.",
+                )
+              : t(
+                  "Run a Playbook (.md) routine on a recurring schedule or verified incoming event.",
+                )}
           </p>
         </div>
-        {c.writable && (
+        {canMutate && (
           <Button
             size="sm"
             variant="primary"
@@ -517,6 +529,14 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
           </Button>
         )}
       </div>
+
+      {c.personalAssistant && (
+        <div className="rtn-callout" role="note">
+          {t(
+            "Personal routines run inside your private hosted assistant session under your own workspace role. Only you can view or manage them; incoming emails and webhooks are treated as untrusted data.",
+          )}
+        </div>
+      )}
 
       <IncomingEndpointsSection
         c={c}
@@ -554,7 +574,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                         <b className="text-ink-100">{run.routine_name ?? run.routine_id}</b>{" "}
                         <span className="text-warn text-micro">({waitingStep})</span>
                       </span>
-                      {c.writable ? (
+                      {canMutate ? (
                         <span className="flex flex-wrap items-center gap-1.5">
                           <Button
                             size="sm"
@@ -597,7 +617,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                         ({p.kind === "wiki_propose" ? t("Playbook draft") : t("Routine draft")})
                       </span>
                     </span>
-                    {c.writable ? (
+                    {canMutate ? (
                       <span className="flex flex-wrap items-center gap-1.5">
                         <Button
                           size="sm"
@@ -665,7 +685,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
           preventClose={busy}
           label={t("New routine")}
           title={t("New routine")}
-          subtitle={`${t("Agent")}: ${c.alias}`}
+          subtitle={`${t("Agent")}: ${agentLabel}`}
           onClose={() => setCreating(false)}
           secondary={
             <Button size="sm" variant="ghost" onClick={() => setCreating(false)} disabled={busy}>
@@ -842,33 +862,35 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                     </>
                   )}
 
-                  <div className="rtn-field">
-                    <span className="rtn-field-label">{t("What runs")}</span>
-                    <div className="rtn-seg" role="radiogroup" aria-label={t("What runs")}>
-                      <button
-                        type="button"
-                        role="radio"
-                        aria-checked={whatMode === "playbook"}
-                        className="rtn-seg-btn"
-                        onClick={() => setWhatMode("playbook")}
-                      >
-                        <b>{t("Playbook (.md)")}</b>
-                        <small>{t("Context Markdown instructions")}</small>
-                      </button>
-                      <button
-                        type="button"
-                        role="radio"
-                        aria-checked={whatMode === "script"}
-                        className="rtn-seg-btn"
-                        onClick={() => setWhatMode("script")}
-                      >
-                        <b>{t("Custom script")}</b>
-                        <small>{t("SHA-256 pinned pre-check (0 LLM tokens when empty)")}</small>
-                      </button>
+                  {c.operator && (
+                    <div className="rtn-field">
+                      <span className="rtn-field-label">{t("What runs")}</span>
+                      <div className="rtn-seg" role="radiogroup" aria-label={t("What runs")}>
+                        <button
+                          type="button"
+                          role="radio"
+                          aria-checked={whatMode === "playbook"}
+                          className="rtn-seg-btn"
+                          onClick={() => setWhatMode("playbook")}
+                        >
+                          <b>{t("Playbook (.md)")}</b>
+                          <small>{t("Context Markdown instructions")}</small>
+                        </button>
+                        <button
+                          type="button"
+                          role="radio"
+                          aria-checked={whatMode === "script"}
+                          className="rtn-seg-btn"
+                          onClick={() => setWhatMode("script")}
+                        >
+                          <b>{t("Custom script")}</b>
+                          <small>{t("SHA-256 pinned pre-check (0 LLM tokens when empty)")}</small>
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  )}
 
-                  {whatMode === "script" && (
+                  {c.operator && whatMode === "script" && (
                     <>
                       <div className="rtn-field">
                         <label htmlFor="rtn-script">{t("Script path")}</label>
@@ -891,7 +913,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                     </>
                   )}
 
-                  {(whatMode === "playbook" || wakeWithPlaybook) && (
+                  {(!c.operator || whatMode === "playbook" || wakeWithPlaybook) && (
                     <div className="rtn-field">
                       <label htmlFor="rtn-md">{t("Playbook (.md) path")}</label>
                       <input
@@ -907,34 +929,36 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                     </div>
                   )}
 
-                  <div className="rtn-field">
-                    <label htmlFor="rtn-conn-account">{t("Connection account")}</label>
-                    <select
-                      id="rtn-conn-account"
-                      className="rtn-input"
-                      value={newConnAccount}
-                      onChange={(e) => setNewConnAccount(e.target.value)}
-                    >
-                      <option value="">{t("Default account")}</option>
-                      {connections.map((conn) => (
-                        <option key={conn.id} value={conn.id}>
-                          {conn.provider} · {conn.account}
-                          {conn.policy?.visibility === "personal" ? ` (${t("Just me (Personal)")})` : ""}
-                          {conn.policy?.is_default ? ` · ${t("Default")}` : ""}
-                        </option>
-                      ))}
-                    </select>
-                    {newTrigger === "event" &&
-                      newConnAccount &&
-                      connections.find((conn) => conn.id === newConnAccount)?.policy
-                        ?.allow_external_triggers === false && (
-                        <p className="rtn-ep-warn" role="status">
-                          {t(
-                            "Selected connection blocks external triggers (allow_external_triggers: false). Enable external triggers in Connections before external events can invoke it.",
-                          )}
-                        </p>
-                      )}
-                  </div>
+                  {c.operator && (
+                    <div className="rtn-field">
+                      <label htmlFor="rtn-conn-account">{t("Connection account")}</label>
+                      <select
+                        id="rtn-conn-account"
+                        className="rtn-input"
+                        value={newConnAccount}
+                        onChange={(e) => setNewConnAccount(e.target.value)}
+                      >
+                        <option value="">{t("Default account")}</option>
+                        {connections.map((conn) => (
+                          <option key={conn.id} value={conn.id}>
+                            {conn.provider} · {conn.account}
+                            {conn.policy?.visibility === "personal" ? ` (${t("Just me (Personal)")})` : ""}
+                            {conn.policy?.is_default ? ` · ${t("Default")}` : ""}
+                          </option>
+                        ))}
+                      </select>
+                      {newTrigger === "event" &&
+                        newConnAccount &&
+                        connections.find((conn) => conn.id === newConnAccount)?.policy
+                          ?.allow_external_triggers === false && (
+                          <p className="rtn-ep-warn" role="status">
+                            {t(
+                              "Selected connection blocks external triggers (allow_external_triggers: false). Enable external triggers in Connections before external events can invoke it.",
+                            )}
+                          </p>
+                        )}
+                    </div>
+                  )}
 
                   <div className="rtn-field">
                     <label htmlFor="rtn-thread">{t("Destination thread (optional)")}</label>
@@ -992,7 +1016,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
           }}
           menu={drawerMenu}
           secondary={
-            c.writable && activeRoutine.status === "on" ? (
+            canMutate && activeRoutine.status === "on" ? (
               <Button
                 size="sm"
                 variant="secondary"
@@ -1004,7 +1028,7 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
             ) : undefined
           }
           primary={
-            c.writable ? (
+            canMutate ? (
               activeRoutine.status === "waiting_approval" ? (
                 <Button
                   size="sm"
@@ -1111,38 +1135,42 @@ export default function RoutinesTab({ c }: { c: TabContext }) {
                         </div>
                       )}
                     </dl>
-                    {c.writable && (
+                    {canMutate && (
                       <div className="rtn-field mt-2">
-                        <label htmlFor="rtn-edit-conn">{t("Connection account")}</label>
-                        <select
-                          id="rtn-edit-conn"
-                          className="rtn-input"
-                          value={editConnAccount}
-                          onChange={(e) => setEditConnAccount(e.target.value)}
-                        >
-                          <option value="">{t("Default account")}</option>
-                          {editConnAccount &&
-                            !connections.some((conn) => conn.id === editConnAccount) && (
-                              <option value={editConnAccount}>{editConnAccount}</option>
-                            )}
-                          {connections.map((conn) => (
-                            <option key={conn.id} value={conn.id}>
-                              {conn.provider} · {conn.account}
-                              {conn.policy?.visibility === "personal" ? ` (${t("Just me (Personal)")})` : ""}
-                              {conn.policy?.is_default ? ` · ${t("Default")}` : ""}
-                            </option>
-                          ))}
-                        </select>
-                        {activeRoutine.trigger_kind === "event" &&
-                          editConnAccount &&
-                          connections.find((conn) => conn.id === editConnAccount)?.policy
-                            ?.allow_external_triggers === false && (
-                            <p className="rtn-ep-warn" role="status">
-                              {t(
-                                "Selected connection blocks external triggers (allow_external_triggers: false). Enable external triggers in Connections before external events can invoke it.",
+                        {c.operator && (
+                          <>
+                            <label htmlFor="rtn-edit-conn">{t("Connection account")}</label>
+                            <select
+                              id="rtn-edit-conn"
+                              className="rtn-input"
+                              value={editConnAccount}
+                              onChange={(e) => setEditConnAccount(e.target.value)}
+                            >
+                              <option value="">{t("Default account")}</option>
+                              {editConnAccount &&
+                                !connections.some((conn) => conn.id === editConnAccount) && (
+                                  <option value={editConnAccount}>{editConnAccount}</option>
+                                )}
+                              {connections.map((conn) => (
+                                <option key={conn.id} value={conn.id}>
+                                  {conn.provider} · {conn.account}
+                                  {conn.policy?.visibility === "personal" ? ` (${t("Just me (Personal)")})` : ""}
+                                  {conn.policy?.is_default ? ` · ${t("Default")}` : ""}
+                                </option>
+                              ))}
+                            </select>
+                            {activeRoutine.trigger_kind === "event" &&
+                              editConnAccount &&
+                              connections.find((conn) => conn.id === editConnAccount)?.policy
+                                ?.allow_external_triggers === false && (
+                                <p className="rtn-ep-warn" role="status">
+                                  {t(
+                                    "Selected connection blocks external triggers (allow_external_triggers: false). Enable external triggers in Connections before external events can invoke it.",
+                                  )}
+                                </p>
                               )}
-                            </p>
-                          )}
+                          </>
+                        )}
                         <label htmlFor="rtn-repoint">{t("Destination thread")}</label>
                         <div className="flex flex-wrap gap-2">
                           <input

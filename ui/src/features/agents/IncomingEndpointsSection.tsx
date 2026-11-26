@@ -126,6 +126,8 @@ export function IncomingEndpointsSection({
   const zones = useTimeZones();
   const viewerZone = zones.effective;
   const isMaster = c.alias === MASTER;
+  const canAccess = c.operator || Boolean(c.personalAssistant);
+  const agentLabel = c.displayName?.trim() || c.alias;
 
   const [endpoints, setEndpoints] = useState<AgentEndpoint[] | null>(null);
   const [notServed, setNotServed] = useState(false);
@@ -172,7 +174,7 @@ export function IncomingEndpointsSection({
   );
 
   const load = useCallback(() => {
-    if (!c.operator || isMaster) return;
+    if (!canAccess || isMaster) return;
     setLoadErr(null);
     endpointsApi
       .list(c.alias)
@@ -191,7 +193,7 @@ export function IncomingEndpointsSection({
         }
         setLoadErr(e instanceof ApiError ? e.message : t("Could not load incoming endpoints."));
       });
-  }, [c.alias, c.operator, isMaster, onEndpointsChange, t]);
+  }, [c.alias, canAccess, isMaster, onEndpointsChange, t]);
 
   useEffect(() => {
     load();
@@ -225,16 +227,16 @@ export function IncomingEndpointsSection({
   );
 
   useEffect(() => {
-    if (!openId || !c.operator || isMaster) {
+    if (!openId || !canAccess || isMaster) {
       setDetail(null);
       setDeliveries([]);
       return;
     }
     setActionErr(null);
     void refreshDetail(openId);
-  }, [openId, c.operator, isMaster, refreshDetail]);
+  }, [openId, canAccess, isMaster, refreshDetail]);
 
-  if (!c.operator) return null;
+  if (!canAccess) return null;
 
   if (isMaster) {
     const { company, domain } = companyEmailHost();
@@ -622,7 +624,7 @@ export function IncomingEndpointsSection({
           preventClose={busy}
           label={createKind === "email" ? t("New email endpoint") : t("New webhook endpoint")}
           title={createKind === "email" ? t("New email endpoint") : t("New webhook endpoint")}
-          subtitle={`${t("Agent")}: ${c.alias} · ${t("Starts disabled")}`}
+          subtitle={`${t("Agent")}: ${agentLabel} · ${t("Starts disabled")}`}
           onClose={() => setCreateKind(null)}
           secondary={
             <Button size="sm" variant="ghost" onClick={() => setCreateKind(null)} disabled={busy}>
