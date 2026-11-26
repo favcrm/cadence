@@ -204,6 +204,20 @@ const scenario = require("process").argv[2] ?? "all";
 async function run() {
   await render();
   if (scenario === "all" || scenario === "cold_history") {
+    details["CAD-7"] = detail("CAD-7");
+    id = "CAD-7";
+    tab = "overview";
+    await render();
+    assert(
+      (historyReads["CAD-7"] ?? 0) === 0,
+      "Overview tab defers history fetch until Activity is opened",
+    );
+    tab = "activity";
+    await render();
+    assert(
+      historyReads["CAD-7"] === 1,
+      "Opening Activity fetches history once",
+    );
     details["CAD-4"] = detail("CAD-4");
     id = "CAD-4";
     tab = "activity";
@@ -299,8 +313,10 @@ async function run() {
     held.add("/api/issues/CAD-3");
     await render();
     assert(
-      text().includes("Loading issue"),
-      "Initial issue read shows loading",
+      text().includes("Loading issue") &&
+        host.querySelector('[data-read-state="issue"][role="status"]') !== null &&
+        host.querySelector(".issue-skeleton-surface") !== null,
+      "Initial issue read shows accessible skeleton loading state",
     );
     held.clear();
     await React.act(async () =>
@@ -313,7 +329,8 @@ async function run() {
     await flush();
     assert(
       text().includes("Issue could not be loaded.") &&
-        !text().includes("Work CAD-3"),
+        !text().includes("Work CAD-3") &&
+        host.querySelector(".issue-skeleton-surface") === null,
       "Initial failure does not paint an issue",
     );
     await click(button(/Retry issue/));

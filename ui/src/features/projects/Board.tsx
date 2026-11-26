@@ -7,6 +7,7 @@ import { agentOn } from "../../lib/agentOn";
 import type { ResourceState } from "../../lib/cache";
 import { issuePath } from "../issues/model";
 import { STATUS_CHIP } from "../issues/chips";
+import { prefetchIssue } from "../../lib/resources";
 import Link from "../../ui/Link";
 import { agentIsUnassigned, agentMatchesProject, issueIndex } from "../../lib/scope";
 import type { AgentsPayload, Health, IssueCard, Project } from "../../lib/types";
@@ -82,7 +83,14 @@ export function IssueList({ issues, project, onOpen, trackerEmpty }: { issues: I
               <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{t(issue.status)}</span>
               <span className="num text-micro text-ink-500 ml-auto">{t(issue.priority)}</span>
             </div>
-            <Link href={issuePath(issue.project, issue.id)} className="board-issue-title block text-left text-ink-100 mt-1.5 leading-[1.4] font-medium hover:text-accent">{issue.title}</Link>
+            <Link
+              href={issuePath(issue.project, issue.id)}
+              className="board-issue-title block text-left text-ink-100 mt-1.5 leading-[1.4] font-medium hover:text-accent"
+              onMouseEnter={() => prefetchIssue(issue.id)}
+              onFocus={() => prefetchIssue(issue.id)}
+            >
+              {issue.title}
+            </Link>
             <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-micro text-ink-500">
               <span>{issue.owner ?? t("unassigned")}</span>
               <span>{issue.component ?? t("no component")}</span>
@@ -113,7 +121,15 @@ export function IssueList({ issues, project, onOpen, trackerEmpty }: { issues: I
                 <td className="px-4 py-3 min-w-0 max-w-[28rem]">
                   <div className="min-w-0">
                     <span className="num text-ink-500">{issue.id}</span>
-                    <Link href={issuePath(issue.project, issue.id)} className="block text-left text-ink-200 hover:text-accent truncate mt-0.5 max-w-full" title={issue.title}>{issue.title}</Link>
+                    <Link
+                      href={issuePath(issue.project, issue.id)}
+                      className="block text-left text-ink-200 hover:text-accent truncate mt-0.5 max-w-full"
+                      title={issue.title}
+                      onMouseEnter={() => prefetchIssue(issue.id)}
+                      onFocus={() => prefetchIssue(issue.id)}
+                    >
+                      {issue.title}
+                    </Link>
                     <button type="button" className="board-preview-link mt-1" aria-label={`${t("Preview")} ${issue.id}`} onClick={() => onOpen(issue.id)}>{t("Preview")}</button>
                   </div>
                 </td>

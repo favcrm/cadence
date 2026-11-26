@@ -629,14 +629,22 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   pageIssueRef.current = route.screen === "issue" ? route.id : null;
   const hostedRef = useRef(meta?.hosted === true);
   hostedRef.current = meta?.hosted === true;
-  const loadDetail = useCallback(() => {
+  const loadDetail = useCallback((force = true) => {
     for (const id of refreshIssueIds(openIdRef.current, pageIssueRef.current)) {
-      void resources.issue(id).invalidate();
-      if (!hostedRef.current) void resources.lane(id).invalidate();
+      if (force) {
+        void resources.issue(id).invalidate();
+        if (!hostedRef.current) void resources.lane(id).invalidate();
+      } else {
+        void resources.issue(id).revalidate();
+        if (!hostedRef.current) void resources.lane(id).revalidate();
+      }
     }
     // The peek's quick actions need a current membership too, so a refresh
     // recovers a failed membership read without reopening the peek.
-    if (personalWanted.current && openIdRef.current) void resources.myWorkIssue(openIdRef.current).invalidate();
+    if (personalWanted.current && openIdRef.current) {
+      if (force) void resources.myWorkIssue(openIdRef.current).invalidate();
+      else void resources.myWorkIssue(openIdRef.current).revalidate();
+    }
   }, []);
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();
@@ -696,7 +704,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // Bootstrap is owned by AuthBoundary. A private refresh first verifies
   // the current session; failed verification pauses this entire Activity.
   const healthRequest = useRef(0);
-  const runRefreshReads = useCallback((generation: number) => {
+  const runRefreshReads = useCallback((generation: number, forceDetail = true) => {
     if (!privateReadsAllowed() || generation !== privateSessionGeneration()) return;
     const healthProbe = ++healthRequest.current;
     api.health()
@@ -714,17 +722,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     // CAD-2286: a probe that failed recovers on the routine recheck; a
     // latched `unavailable` answers from the store without a request.
     if (documentsHosted) void documentsProbe.revalidate();
-    loadDetail();
+    loadDetail(forceDetail);
   }, [loadDetail, documentsHosted]);
-  const runRefresh = useCallback((verifySession: boolean) => {
+  const runRefresh = useCallback((verifySession: boolean, forceDetail = true) => {
     const generation = privateSessionGeneration();
     if (!verifySession) {
-      runRefreshReads(generation);
+      runRefreshReads(generation, forceDetail);
       return;
     }
     void recheck().then((verified) => {
       if (!verified) return;
-      runRefreshReads(generation);
+      runRefreshReads(generation, forceDetail);
     });
   }, [recheck, runRefreshReads]);
   const refresh = useCallback(() => {
@@ -750,10 +758,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     const generation = privateSessionGeneration();
     if (initialMountGenRef.current !== null && initialMountGenRef.current === generation && privateReadsAllowed()) {
       initialMountGenRef.current = null;
-      runRefresh(false);
+      runRefresh(false, false);
       return;
     }
-    runRefresh(true);
+    runRefresh(true, false);
   }, [runRefresh]);
 
   const reconcile = useCallback(() => {

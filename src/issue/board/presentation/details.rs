@@ -11,7 +11,9 @@ use cadence_core::board_api::{
 use cadence_core::issue::CardChecks;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 fn link_ref(views_by_id: &HashMap<String, &View>, id: &str) -> LinkRef {
     match views_by_id.get(id) {
@@ -184,6 +186,53 @@ fn activity(view: &View, history: Vec<HistoryEntry>) -> Vec<ActivityEntry> {
     activity
 }
 
+const MAX_CACHED_ISSUE_LOGS: usize = 512;
+
+struct CachedIssueLog {
+    head: String,
+    entries: Vec<HistoryEntry>,
+    last_used: Instant,
+}
+
+static ISSUE_GIT_LOG_CACHE: LazyLock<Mutex<HashMap<(PathBuf, PathBuf), CachedIssueLog>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn resolve_head_sha(pm_dir: &Path) -> Option<String> {
+    if !pm_dir.join(".git").exists() {
+        return None;
+    }
+    let (git_dir, common_dir) = history::resolve_git_paths(pm_dir)?;
+    if common_dir.join("reftable").exists() {
+        return None;
+    }
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let sha = if let Some(ref_name) = head.strip_prefix("ref:") {
+        let ref_name = ref_name.trim();
+        if ref_name.is_empty() || ref_name.contains("..") {
+            return None;
+        }
+        let loose = common_dir.join(ref_name);
+        if let Ok(text) = std::fs::read_to_string(&loose) {
+            text.trim().to_string()
+        } else {
+            let packed = std::fs::read_to_string(common_dir.join("packed-refs")).ok()?;
+            packed
+                .lines()
+                .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
+                .find_map(|line| {
+                    let mut parts = line.split_whitespace();
+                    let sha = parts.next()?;
+                    let name = parts.next()?;
+                    (name == ref_name).then(|| sha.to_string())
+                })?
+        }
+    } else {
+        head.to_string()
+    };
+    (sha.len() >= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sha)
+}
+
 /// `git log --format` for this issue's `issue.md` — the file history
 /// half of the activity feed. Empty when the PM dir is not a repo.
 fn git_log(pm_dir: &Path, issue: &Issue) -> Vec<HistoryEntry> {
@@ -193,6 +242,18 @@ fn git_log(pm_dir: &Path, issue: &Issue) -> Vec<HistoryEntry> {
         .strip_prefix(pm_dir)
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|_| issue.dir.join("issue.md"));
+    let head = resolve_head_sha(pm_dir);
+    let key = (pm_dir.to_path_buf(), rel.clone());
+    if let Some(ref h) = head {
+        if let Ok(mut cache) = ISSUE_GIT_LOG_CACHE.lock() {
+            if let Some(entry) = cache.get_mut(&key) {
+                if entry.head == *h {
+                    entry.last_used = Instant::now();
+                    return entry.entries.clone();
+                }
+            }
+        }
+    }
     let out = crate::reaper::output(
         std::process::Command::new("git")
             .arg("-C")
@@ -206,7 +267,7 @@ fn git_log(pm_dir: &Path, issue: &Issue) -> Vec<HistoryEntry> {
     if !out.status.success() {
         return vec![];
     }
-    String::from_utf8_lossy(&out.stdout)
+    let entries: Vec<HistoryEntry> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
             let mut parts = line.splitn(3, '|');
@@ -216,5 +277,28 @@ fn git_log(pm_dir: &Path, issue: &Issue) -> Vec<HistoryEntry> {
                 subject: parts.next().unwrap_or_default().to_string(),
             })
         })
-        .collect()
+        .collect();
+    if let Some(h) = head {
+        if let Ok(mut cache) = ISSUE_GIT_LOG_CACHE.lock() {
+            let now = Instant::now();
+            if !cache.contains_key(&key) && cache.len() >= MAX_CACHED_ISSUE_LOGS {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
+            cache.insert(
+                key,
+                CachedIssueLog {
+                    head: h,
+                    entries: entries.clone(),
+                    last_used: now,
+                },
+            );
+        }
+    }
+    entries
 }

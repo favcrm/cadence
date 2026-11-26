@@ -9,7 +9,7 @@ import type { IssueDetail } from "../../lib/types";
 import { useLocale } from "../../lib/locale";
 import { fmtTime } from "../../lib/fmt";
 import { privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
-import { resources } from "../../lib/resources";
+import { prefetchIssue, resources } from "../../lib/resources";
 import {
   acceptanceItems,
   hostedAssignmentText,
@@ -163,7 +163,11 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
       tabs={tabs}
       foot={
         <>
-          <div className="crm-drawer-actions">
+          <div
+            className="crm-drawer-actions"
+            onMouseEnter={href ? () => prefetchIssue(id) : undefined}
+            onFocus={href ? () => prefetchIssue(id) : undefined}
+          >
             {href ? (
               <Button variant="primary" href={href}>{t("Open full issue")}</Button>
             ) : (
