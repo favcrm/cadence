@@ -758,6 +758,65 @@ equal(prefetchedContexts.length, 1, "coalesced scope read resolves contexts");
 equal(reads.filter((p) => p === "/api/app-installations/install-second").length, 1, "prefetchAppScope + readAppScopeFresh issue 1 detail request");
 equal(reads.filter((p) => p === "/api/app-installations/install-second/contexts").length, 1, "prefetchAppScope + readAppScopeFresh issue 1 contexts request");
 
+// Unified shell loading surface shows initialTitle, suppresses duplicate child overlays,
+// forwards initialScope, and clears once onScreenState("ready") fires.
+{
+  const prevFiles = social.files;
+  const prevExec = (social as any).executable;
+  (social as any).files = ["screens/main/screens.json"];
+  (social as any).executable = true;
+  const unifiedSurface = document.createElement("div");
+  document.body.append(unifiedSurface);
+  const unifiedRoot = createRoot(unifiedSurface);
+  history.pushState(null, "", "/app-installations/install-social");
+  let screenArg: {
+    suppressLoadingOverlay?: boolean;
+    onScreenState?: (state: "loading" | "ready" | "fallback") => void;
+    initialScope?: { installation: { install_id: string }; contexts: unknown[] };
+  } | undefined;
+  try {
+    await React.act(async () => {
+      unifiedRoot.render(
+        React.createElement(LocaleProvider, null,
+          React.createElement(AppShell, {
+            installId: "install-social",
+            initialTitle: "Social Content",
+            viewer: { operator: true, readOnly: false },
+            children: (_onMediaAttach: unknown, _contextId: string, screen) => {
+              screenArg = screen;
+              return React.createElement("div", { className: "unified-child" }, "child");
+            },
+          }),
+        ),
+      );
+    });
+    await settle(() => {
+      assert(screenArg?.initialScope?.installation.install_id === "install-social", "AppShell forwards resolved initialScope to child");
+    });
+    equal(screenArg?.suppressLoadingOverlay, true, "AppShell asks child to suppress duplicate loading overlays");
+    const overlay = unifiedSurface.querySelector(".wa-shell-loading-overlay[role='status']");
+    assert(overlay, "unified AppShell loading overlay renders while screen is loading");
+    equal(overlay.querySelector(".wa-loading-title")?.textContent, "Social Content", "unified loading overlay carries initialTitle");
+    await React.act(async () => {
+      screenArg?.onScreenState?.("ready");
+    });
+    assert(!unifiedSurface.querySelector(".wa-shell-loading-overlay"), "unified loading overlay clears after onScreenState('ready')");
+    await React.act(async () => {
+      screenArg?.onScreenState?.("loading");
+    });
+    assert(unifiedSurface.querySelector(".wa-shell-loading-overlay"), "unified loading overlay can re-enter loading state cleanly");
+    await React.act(async () => {
+      screenArg?.onScreenState?.("fallback");
+    });
+    assert(!unifiedSurface.querySelector(".wa-shell-loading-overlay"), "unified loading overlay clears when child reports fallback before mounting");
+  } finally {
+    social.files = prevFiles;
+    (social as any).executable = prevExec;
+    await React.act(async () => { unifiedRoot.unmount(); });
+    unifiedSurface.remove();
+  }
+}
+
 console.log("app shell checks passed");
 }
 void main();

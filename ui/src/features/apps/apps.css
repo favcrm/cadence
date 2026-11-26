@@ -607,3 +607,28 @@
     transform: none;
   }
 }
+
+.apps-home .apps-skeleton-grid {
+  animation: wa-loading-reveal 160ms ease-out 120ms both;
+}
+.apps-home .apps-skeleton-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.625rem;
+  min-height: 11.75rem;
+  padding: 1.25rem 0.875rem 1rem;
+  pointer-events: none;
+}
+.apps-home .apps-skeleton-icon {
+  width: 3rem;
+  height: 3rem;
+  border-radius: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .apps-home .apps-skeleton-grid {
+    animation: none;
+    opacity: 1;
+  }
+}

@@ -7,9 +7,8 @@ import Link from "../../ui/Link";
 import { IconClose, IconMore, IconThreads } from "../../ui/icons";
 import { ErrorNotice, Loading, Notice } from "./shared/States";
 import type { Viewer } from "../projects/work";
-import { dropWorkspaceAppSnapshot, readAppScopeFresh, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
+import { dropWorkspaceAppSnapshot, readAppScopeFresh, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import AppLoadingSurface from "../workspace-apps/AppLoadingSurface";
-import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
 import { chatScreenFor } from "./chatScreen";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
 import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
@@ -153,12 +152,15 @@ export interface AppShellHeaderTargets {
 
 export default function AppShell({
   installId,
+  initialTitle,
   viewer,
   children,
   onInstallation,
   header,
 }: {
   installId: string;
+  /** Optional known app title from the board's installation list so breadcrumbs and loading states stay named immediately. */
+  initialTitle?: string;
   viewer: Viewer;
   header?: AppShellHeaderTargets;
   /** Installed screen receives only the trusted native chat handoff and
@@ -181,6 +183,12 @@ export default function AppShell({
     onRestoreDrawerConsumed: () => void;
     /** The screen went away: the drawer closes with it. */
     onScreenClosed: () => void;
+    /** Verified `(installation, contexts)` already fetched by AppShell so WorkspaceApp does not re-fetch or block on it. */
+    initialScope?: { installation: Installation; contexts: AppContext[] };
+    /** Notify AppShell of the mounted screen lifecycle so one unified loading surface spans the entire transition. */
+    onScreenState?: (state: "loading" | "ready" | "fallback") => void;
+    /** Suppress the child screen's duplicate overlay while AppShell renders the single unified loading surface. */
+    suppressLoadingOverlay?: boolean;
   }) => React.ReactNode;
   /** Board menu wiring: receives the verified installation (or null
    *  while loading, failed, or switched away). The parent matches
@@ -233,6 +241,7 @@ export default function AppShell({
   const [generalSetup, setGeneralSetup] = useState<{ key: string; error: string | null } | null>(null);
   const [generalSetupAttempt, setGeneralSetupAttempt] = useState(0);
   const [contextId, setContextId] = useState("");
+  const [screenState, setScreenState] = useState<"loading" | "ready" | "fallback">("loading");
   // CAD-1615 — the legacy embedded drawer: an older presentation peer asks
   // for it, and the shell promotes the app outlet (kept unchanged).
   const [screenDrawer, setScreenDrawer] = useState<string | null>(null);
@@ -606,13 +615,14 @@ export default function AppShell({
   // keyed `loadFailure` needs no clearing here — the new route's
   // `loadError` computes to null and the stale entry is overwritten
   // by the switch effect's `setLoadFailure(null)`.
-  if (firstInstall.current !== installId && (installation !== null || contexts.length > 0 || contextId !== "" || linkNotice !== null || loadError !== null || launcherRun !== null)) {
+  if (firstInstall.current !== installId && (installation !== null || contexts.length > 0 || contextId !== "" || linkNotice !== null || loadError !== null || launcherRun !== null || screenState !== "loading")) {
     setInstallation(null);
     setScreenNavigation(null);
     setContexts([]);
     setContextId("");
     setLinkNotice(null);
     setLauncherRun(null);
+    setScreenState("loading");
   }
   // Receipts count only when they are the current route's verified
   // ones: a departed install's `installation`/`contexts`, or a load
@@ -928,6 +938,7 @@ export default function AppShell({
     setLoadFailure(null);
     setLinkNotice(null);
     setContextId("");
+    setScreenState("loading");
     writeQuery({ appview: null, record: null, conversation: null, clearContractPreview: true }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
@@ -1184,21 +1195,12 @@ export default function AppShell({
         locale,
         t,
       ) || t("App")
-    : t("App");
+    : (initialTitle || t("App"));
   const isSocial = isSocialContent(installation);
-  const cachedPreviewSnapshot = !receiptReady && viewer.operator === true && loadError === null
-    ? readWorkspaceAppSnapshot(installId)
-    : null;
-  const cachedPreviewContextId = (() => {
-    if (!cachedPreviewSnapshot) return null;
-    const active = cachedPreviewSnapshot.contexts.filter((context) =>
-      context.install_id === installId && context.state === "active",
-    );
-    const values = query.getAll("ctx");
-    if (values.length === 0) return active.length === 1 ? active[0].id : null;
-    if (values.length !== 1) return null;
-    return active.some((context) => context.id === values[0]) ? values[0] : null;
-  })();
+  const initialScope = useMemo(
+    () => (installation && installation.install_id === installId ? { installation, contexts } : undefined),
+    [installation, contexts, installId],
+  );
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
   // CAD-1174: with a single active scope the context concept is not a
@@ -1226,6 +1228,29 @@ export default function AppShell({
   const [wabaScreenRevision, setWabaScreenRevision] = useState(0);
   const wabaHostFallback =
     wabaFallbackInstallId === installId || isMarkedWhatsAppSettingsUnsupported(installId);
+  const isWabaSettingsActive =
+    isWabaConnection &&
+    !wabaHostFallback &&
+    ((viewer.operator === true && !viewer.readOnly) || viewer.screenReader === true);
+  const isNativeBackdoor = query.get("screen") === "native";
+  const canMountScreen = isSocial
+    ? Boolean(children) && viewer.operator !== null
+    : (viewer.operator === true && !viewer.readOnly) || viewer.screenReader === true;
+  const expectsScreen =
+    receiptReady &&
+    contextAdoptionReady &&
+    installation !== null &&
+    !needsSetup &&
+    previewKey === null &&
+    loadError === null &&
+    !isWabaSettingsActive &&
+    !isNativeBackdoor &&
+    canMountScreen &&
+    screenTag(installation) !== null;
+  const showUnifiedLoading =
+    loading ||
+    (receiptReady && !needsSetup && !contextAdoptionReady && loadError === null) ||
+    (expectsScreen && screenState === "loading");
   const chatScreen = chatScreenFor(installation, verified, section, view);
   const currentHeaderSection = verified && effectiveNavigation && section !== effectiveNavigation.default_section
     ? effectiveNavigation.sections.find((item) => item.id === section) ?? null
@@ -1297,8 +1322,8 @@ export default function AppShell({
           {headerSection !== null ? (
             <Link href={appParentHref} className="app-header-name" title={title}>{title}</Link>
           ) : (
-            <span className="app-header-name" aria-current="page" title={verified ? title : undefined}>
-              {loading ? t("Loading…") : verified ? title : t("App")}
+            <span className="app-header-name" aria-current="page" title={verified ? title : initialTitle || undefined}>
+              {loading ? (initialTitle || t("Loading…")) : verified ? title : t("App")}
             </span>
           )}
           {verified && installation.version && (
@@ -1378,15 +1403,15 @@ export default function AppShell({
 
       <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined}>
         <section id="app-shell-workspace" ref={outletRef} className="app-shell-outlet" data-screen-drawer={drawerOpen ? "true" : undefined} inert={independentOpen} aria-label={`${title} ${t("workspace")}`} role={drawerOpen ? "dialog" : undefined} aria-modal={drawerOpen ? true : undefined} tabIndex={drawerOpen ? -1 : undefined}>
-          {cachedPreviewSnapshot?.installation.install_id === installId &&
-            isSocialContent(cachedPreviewSnapshot.installation) && loading ? (
-              <WorkspaceAppCachedPreview
-                snapshot={cachedPreviewSnapshot}
-                contextId={cachedPreviewContextId}
-              />
-            ) : loading ? (
-              <AppLoadingSurface label={t("Loading this app…")} variant="page" />
-            ) : null}
+          {showUnifiedLoading && (
+            <AppLoadingSurface
+              key="shell-loading"
+              className="wa-shell-loading-overlay"
+              label={t("Loading this app…")}
+              title={verified ? title : initialTitle}
+              variant="page"
+            />
+          )}
           {loadError && (
             <p className="card px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
               {t(loadError)}{" "}
@@ -1480,7 +1505,7 @@ export default function AppShell({
                 // Social keeps its legacy native workspace (and its
                 // `?screen=native` back door). Other apps mount the
                 // screen their package declares.
-                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, restoreDrawer: canDriveScreen && screenViewer ? returnDrawer : null, onRestoreDrawerConsumed: consumeReturnDrawer, onScreenClosed: closeScreenDrawer })
+                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, restoreDrawer: canDriveScreen && screenViewer ? returnDrawer : null, onRestoreDrawerConsumed: consumeReturnDrawer, onScreenClosed: closeScreenDrawer, initialScope, onScreenState: setScreenState, suppressLoadingOverlay: true })
               ) : (
                 <InstalledScreenOutlet
                   key={installation.name === "waba" ? `waba-screen:${wabaScreenRevision}` : undefined}
@@ -1489,6 +1514,8 @@ export default function AppShell({
                   drawerTarget={independentOpen ? drawerTarget : null}
                   admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
                   onRefreshScope={autoRefreshScope}
+                  suppressLoadingOverlay={true}
+                  onStateChange={setScreenState}
                   renderFailure={(failure, retry) => (
                     <ScreenFailurePane
                       failure={failure}
@@ -1500,7 +1527,7 @@ export default function AppShell({
                   fallback={contextAdoptionReady
                     ? <ScreenUnavailable installation={installation} contexts={contexts} contextId={scope.contextId}
                         admitted={viewer.operator === true && !viewer.readOnly} operator={viewer.operator === true} />
-                    : <AppLoadingSurface label={t("Loading this app…")} variant="page" />} />
+                    : null} />
               )}
             </>
           )}

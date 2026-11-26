@@ -71,7 +71,7 @@ function triggerWhatsAppMediaSave(bytes: ArrayBuffer, mimeType: string, fileName
   }
 }
 
-export default function ScreenOutlet({ projection, fallback, renderFailure, onRefreshScope, loadAsset, actions, onMounted, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
+export default function ScreenOutlet({ projection, fallback, renderFailure, onRefreshScope, loadAsset, actions, onMounted, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit, suppressLoadingOverlay = false, onStateChange }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
   renderFailure?: ScreenFailurePane;
@@ -133,6 +133,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
   socialSources?: { installId: string; contextId: string; epoch: number; visit: number } | null;
   /** The current scope's visit, from the workspace's synchronous transition counter. */
   socialVisit?: number;
+  /** Suppress the outlet's own loading overlay when an outer shell owns a single unified surface. */
+  suppressLoadingOverlay?: boolean;
+  /** Observe mount lifecycle transitions ("loading" | "ready" | "fallback") without remounting. */
+  onStateChange?: (state: "loading" | "ready" | "fallback") => void;
 }) {
   const { t, locale } = useLocale();
   const presentationLocale = useRef(locale);
@@ -172,6 +176,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
   } | null>(null);
   const audioKeyRef = useRef(0);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
+  const stateChangeRef = useRef(onStateChange);
+  stateChangeRef.current = onStateChange;
+  useEffect(() => { stateChangeRef.current?.(state); }, [state]);
   // The board's applied pick, carried on the frame URL: a sandboxed frame is
   // its own document and never sees the board's `data-theme`. A later change is
   // pushed to the live frame (see the effect below) — never a re-mount, which
@@ -560,6 +567,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
         // the mount request was pending must not mint the old theme.
         const mountedTheme = appliedFrameTheme();
         const mountQuery = new URLSearchParams();
+        mountQuery.set("inline", "1");
         if (mountedTheme) mountQuery.set("theme", mountedTheme);
         if (composeServices) {
           mountQuery.set("wa_compose_availability", "1");
@@ -857,7 +865,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
           }}
         />
         {/* CAD-1137 / CAD-2534: quiet layout-neutral overlay with 120ms reveal grace delay. */}
-        {state === "loading" && (
+        {state === "loading" && !suppressLoadingOverlay && (
           <AppLoadingSurface
             className="wa-screen-loading-overlay"
             label={t("Loading installed app…")}

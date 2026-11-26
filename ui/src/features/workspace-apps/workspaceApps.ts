@@ -890,7 +890,10 @@ type InFlightRead<T> = {
 };
 
 const snapshotReads = new Map<string, InFlightRead<WorkspaceAppSnapshot>>();
+const screenSnapshotReads = new Map<string, InFlightRead<WorkspaceAppSnapshot>>();
 const scopeReads = new Map<string, InFlightRead<[Installation, AppContext[]]>>();
+const appHomeReads = new Map<string, InFlightRead<HomeInstallation[]>>();
+const appFavoritesReads = new Map<string, InFlightRead<FavoritesPayload>>();
 let snapshotEpoch = 0;
 
 function abortFlights<T>(reads: Map<string, InFlightRead<T>>): void {
@@ -969,6 +972,7 @@ function coalesceInFlightRead<T>(
 export function dropWorkspaceAppSnapshot(installId: string): void {
   snapshots.delete(installId);
   abortInstallFlights(snapshotReads, installId);
+  abortInstallFlights(screenSnapshotReads, installId);
   abortInstallFlights(scopeReads, installId);
 }
 
@@ -981,6 +985,42 @@ export function readAppScopeFresh(installId: string, signal?: AbortSignal): Prom
       workspaceApps.detail(installId, sharedSignal),
       workspaceApps.contexts(installId, sharedSignal),
     ]),
+    signal,
+  );
+}
+
+/**
+ * Framed screen snapshot read: reuses the shell's verified `(installation, contexts)`
+ * scope and fetches only `(bindings, runs, effects)` without blocking on `/api/agents`
+ * or `/api/connections`.
+ */
+export function readWorkspaceScreenSnapshotFresh(
+  installId: string,
+  scope: { installation: Installation; contexts: AppContext[] },
+  signal?: AbortSignal,
+): Promise<WorkspaceAppSnapshot> {
+  return coalesceInFlightRead(
+    screenSnapshotReads,
+    installId,
+    async (sharedSignal, requestSession, generation) => {
+      const [bindings, runs, effects] = await Promise.all([
+        workspaceApps.bindings(installId, undefined, sharedSignal),
+        workspaceApps.runs(installId, undefined, sharedSignal),
+        workspaceApps.effects(installId, undefined, sharedSignal),
+      ]);
+      const existing = readWorkspaceAppSnapshot(installId);
+      const data: WorkspaceAppSnapshot = {
+        installation: scope.installation,
+        contexts: scope.contexts,
+        bindings,
+        connections: existing?.connections ?? [],
+        agents: existing?.agents ?? [],
+        runs,
+        effects,
+      };
+      writeWorkspaceAppSnapshot(installId, data, requestSession, generation);
+      return data;
+    },
     signal,
   );
 }
@@ -1038,6 +1078,8 @@ export function prefetchWorkspaceApp(installId: string): void {
 /** The `/api/app-installations` list, held the same way: the Apps
  *  screen paints the last read at once and refetches behind it. */
 let installationsSnapshot: { at: number; session: string | null; rows: Installation[] } | null = null;
+let appHomeSnapshot: { at: number; session: string | null; rows: HomeInstallation[] } | null = null;
+let appFavoritesSnapshot: { at: number; session: string | null; data: FavoritesPayload } | null = null;
 
 export function readInstallationsSnapshot(): Installation[] | null {
   if (!installationsSnapshot || !privateReadsAllowed() || installationsSnapshot.session !== sessionKey() ||
@@ -1045,15 +1087,24 @@ export function readInstallationsSnapshot(): Installation[] | null {
   return installationsSnapshot.rows;
 }
 
-/** Fresh read of the installations list; stores the snapshot. */
-export async function readInstallationsFresh(signal?: AbortSignal): Promise<Installation[]> {
+/**
+ * Guarded `/api/app-installations` read: passes `signal` directly to the caller's
+ * fetch so disable/unmount abort propagates immediately, while enforcing the same
+ * session/epoch fence before storing or returning results.
+ */
+export async function readInstallationsGuarded(signal?: AbortSignal): Promise<Installation[]> {
   const requestSession = sessionKey();
   const generation = privateSessionGeneration();
   const epoch = snapshotEpoch;
   const rows = await workspaceApps.installations(signal);
   if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
-  if (epoch !== snapshotEpoch || requestSession !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
-    throw new ApiError("The session changed while loading apps", 401);
+  if (
+    epoch !== snapshotEpoch ||
+    requestSession !== sessionKey() ||
+    generation !== privateSessionGeneration() ||
+    !privateReadsAllowed()
+  ) {
+    throw new ApiError("The session changed while loading this app", 401);
   }
   if (Array.isArray(rows)) installationsSnapshot = { at: Date.now(), session: requestSession, rows };
   return rows;
@@ -1063,19 +1114,71 @@ export function dropInstallationsSnapshot(): void {
   installationsSnapshot = null;
 }
 
+export function readAppHomeSnapshot(): HomeInstallation[] | null {
+  if (!appHomeSnapshot || !privateReadsAllowed() || appHomeSnapshot.session !== sessionKey() ||
+      Date.now() - appHomeSnapshot.at > SNAPSHOT_TTL_MS) return null;
+  return appHomeSnapshot.rows;
+}
+
+export function readAppHomeFresh(signal?: AbortSignal): Promise<HomeInstallation[]> {
+  return coalesceInFlightRead(
+    appHomeReads,
+    "__app_home__",
+    async (sharedSignal, requestSession) => {
+      const res = await appExplorer.home(sharedSignal);
+      const rows = res.installations;
+      if (Array.isArray(rows)) appHomeSnapshot = { at: Date.now(), session: requestSession, rows };
+      return rows;
+    },
+    signal,
+  );
+}
+
+export function readAppFavoritesSnapshot(): FavoritesPayload | null {
+  if (!appFavoritesSnapshot || !privateReadsAllowed() || appFavoritesSnapshot.session !== sessionKey() ||
+      Date.now() - appFavoritesSnapshot.at > SNAPSHOT_TTL_MS) return null;
+  return appFavoritesSnapshot.data;
+}
+
+export function readAppFavoritesFresh(signal?: AbortSignal): Promise<FavoritesPayload> {
+  return coalesceInFlightRead(
+    appFavoritesReads,
+    "__app_favorites__",
+    async (sharedSignal, requestSession) => {
+      const data = await appExplorer.favorites(sharedSignal);
+      if (data) appFavoritesSnapshot = { at: Date.now(), session: requestSession, data };
+      return data;
+    },
+    signal,
+  );
+}
+
+export function writeAppFavoritesSnapshot(data: FavoritesPayload): void {
+  if (!privateReadsAllowed()) return;
+  appFavoritesSnapshot = { at: Date.now(), session: sessionKey(), data };
+}
+
 onPrivateReadsPaused(() => {
   snapshotEpoch += 1;
   abortFlights(snapshotReads);
+  abortFlights(screenSnapshotReads);
   abortFlights(scopeReads);
+  abortFlights(appHomeReads);
+  abortFlights(appFavoritesReads);
   prefetching.clear();
   prefetchingScopes.clear();
 });
 
 onPrivateSessionReset(() => {
   abortFlights(snapshotReads);
+  abortFlights(screenSnapshotReads);
   abortFlights(scopeReads);
+  abortFlights(appHomeReads);
+  abortFlights(appFavoritesReads);
   snapshots.clear();
   prefetching.clear();
   prefetchingScopes.clear();
   dropInstallationsSnapshot();
+  appHomeSnapshot = null;
+  appFavoritesSnapshot = null;
 });

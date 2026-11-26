@@ -57,6 +57,28 @@ async function main() {
   equal(calls, 2, "re-enabling requests again");
   equal(seen?.list, operatorList, "re-enabled hook loads the list again");
 
+  // Mid-flight pause/session reset must refuse without writing or returning stale installations.
+  const { readInstallationsGuarded, readInstallationsSnapshot, dropInstallationsSnapshot } =
+    require("../src/features/workspace-apps/workspaceApps") as typeof import("../src/features/workspace-apps/workspaceApps");
+  const { pausePrivateReads, allowPrivateReads } =
+    require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+  dropInstallationsSnapshot();
+  let resolveInFlight!: (rows: any) => void;
+  (workspaceApps as any).installations = () => new Promise((resolve) => { resolveInFlight = resolve; });
+  const pending = readInstallationsGuarded();
+  pausePrivateReads();
+  resolveInFlight(operatorList);
+  let refused = false;
+  try {
+    await pending;
+  } catch (error: any) {
+    refused = error?.status === 401;
+  } finally {
+    allowPrivateReads();
+  }
+  equal(refused, true, "mid-flight pause refuses installations result with 401");
+  equal(readInstallationsSnapshot(), null, "refused mid-flight read never caches under current session");
+
   await act(async () => { root.unmount(); });
   win.close?.();
 }

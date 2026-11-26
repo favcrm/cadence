@@ -22,7 +22,7 @@ import type { ScreenPush } from "./screenProtocol";
  * host but keep the mounted frame and its handshake; only a context
  * switch, a new bundle or another screen rebuilds it.
  */
-export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onRefreshScope" | "onMounted" | "onToolInvoked" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "restoreDrawer" | "onRestoreDrawerConsumed" | "socialSources" | "socialVisit" | "readOnly" | "route">) {
+export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onRefreshScope" | "onMounted" | "onToolInvoked" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "restoreDrawer" | "onRestoreDrawerConsumed" | "socialSources" | "socialVisit" | "readOnly" | "route" | "suppressLoadingOverlay" | "onStateChange">) {
   const href = useHref();
   // A canvas frame (it owns its route) never follows the board URL's back door.
   const native = !callbacks.route && new URLSearchParams(href.split("?")[1] ?? "").get("screen") === "native";
@@ -34,7 +34,7 @@ export default function ScreenHost({ projection, fallback, loadAsset, actions, .
  * a files entry or URL by itself never authorizes execution. */
 export function InstalledScreenOutlet({ installation, contexts, contextId, admitted, fallback, ...callbacks }: {
   installation: Installation; contexts: AppContext[]; contextId: string; admitted: boolean; fallback: ReactNode;
-} & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onRefreshScope" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "readOnly" | "route">) {
+} & Pick<ComponentProps<typeof ScreenOutlet>, "renderFailure" | "onRefreshScope" | "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation" | "drawerTarget" | "readOnly" | "route" | "suppressLoadingOverlay" | "onStateChange">) {
   const declarations = installation.files.filter(f => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f));
   const tag = declarations.length === 1 ? declarations[0].split("/")[1] : null;
   const liveContext = contexts.some(c => c.id === contextId && c.install_id === installation.install_id && c.state === "active");

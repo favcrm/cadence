@@ -745,6 +745,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   }, [metaUnavailable]);
   const initialMountGenRef = useRef<number | null>(privateReadsAllowed() ? privateSessionGeneration() : null);
   const initialReconcileGenRef = useRef<number | null>(privateReadsAllowed() ? privateSessionGeneration() : null);
+  const bootedAtRef = useRef(Date.now());
   useEffect(() => {
     const generation = privateSessionGeneration();
     if (initialMountGenRef.current !== null && initialMountGenRef.current === generation && privateReadsAllowed()) {
@@ -766,9 +767,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     cache.invalidate("lane");
     invalidatePersonal();
     noteThreadsChanged();
-    noteMasterChanged();
     const generation = privateSessionGeneration();
-    if (initialReconcileGenRef.current !== null && initialReconcileGenRef.current === generation && privateReadsAllowed()) {
+    const isInitialBootReconcile =
+      initialReconcileGenRef.current !== null &&
+      initialReconcileGenRef.current === generation &&
+      privateReadsAllowed();
+    if (!isInitialBootReconcile || Date.now() - bootedAtRef.current >= 5000) {
+      noteMasterChanged();
+    }
+    if (isInitialBootReconcile) {
       initialReconcileGenRef.current = null;
       runRefresh(false);
       return;
@@ -1124,7 +1131,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // CAD-1537: a member resolves app keys from `/api/app-home`, never the
   // operator-only installed-app list.
   const memberHome = screenReader && !boardReadOnly;
-  const installationsRefreshKey = `${route.screen === "apps" || route.screen === "appsExplore" ? route.screen : "steady"}:${appsTick}`;
+  const onAppsBrowserRoute = route.screen === "apps" || route.screen === "appsExplore";
+  const wasOnAppsBrowserRef = useRef(onAppsBrowserRoute);
+  const [appsVisitTick, setAppsVisitTick] = useState(0);
+  useEffect(() => {
+    const entering = onAppsBrowserRoute && !wasOnAppsBrowserRef.current;
+    wasOnAppsBrowserRef.current = onAppsBrowserRoute;
+    if (entering) setAppsVisitTick((n) => n + 1);
+  }, [onAppsBrowserRoute]);
+  const installationsRefreshKey = `${appsVisitTick}:${appsTick}`;
   const installations = useInstallations(listReader, installationsRefreshKey, memberHome ? "home" : "list");
   // A removed or disabled app is not an app to open: drop it from the menu.
   // It stays visible on the Apps surface, which is where it is managed.
@@ -1184,6 +1199,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     return () => window.clearTimeout(timer);
   }, [onAppScreen, routeInstallId]);
   const deferUnreadProbes = onAppScreen && activeApp === null && !unreadProbesFallback;
+  const [unreadProbesMounted, setUnreadProbesMounted] = useState(() => !onAppScreen);
+  useEffect(() => {
+    if (!listReader) {
+      setUnreadProbesMounted(false);
+      return;
+    }
+    if (!deferUnreadProbes) setUnreadProbesMounted(true);
+  }, [listReader, deferUnreadProbes]);
   // CAD-1193: one viewer for every consumer — `access` splits the
   // `operator: null` unknown into "checking" (a probe is still in
   // flight or has never run) and "unavailable" (a completed probe
@@ -1502,7 +1525,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           {onAppScreen && <div ref={setAppActionsTarget} className="app-header-actions-target" />}
         </header>
 
-        {!deferUnreadProbes && (
+        {unreadProbesMounted && (
           <>
             <AssistantUnreadProbes apps={installed} />
             <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />
@@ -1886,7 +1909,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "apps" && !route.project && (
-          <Apps viewer={viewer} />
+          <Apps viewer={viewer} installationsList={installations.list} />
         )}
         {route.screen === "appsExplore" && (
           <Explorer viewer={viewer} />
@@ -2309,11 +2332,31 @@ function WorkspaceAppEntry({
     <AppShell
       key={installation.install_id}
       installId={installation.install_id}
+      initialTitle={installation.title || installation.name}
       viewer={viewer}
       onInstallation={onInstallation}
       header={header}
     >
-      {(onMediaAttach, contextId, screen) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} contextId={contextId} onMediaAttach={onMediaAttach} onScreenDrawer={screen.onScreenDrawer} presentation={screen.presentation} onScreenClosed={screen.onScreenClosed} drawerTarget={screen.drawerTarget} restoreDrawer={screen.restoreDrawer} onRestoreDrawerConsumed={screen.onRestoreDrawerConsumed} automaticUpdatesEnabled={automaticUpdatesEnabled} />}
+      {(onMediaAttach, contextId, screen) => (
+        <WorkspaceApp
+          installId={installation.install_id}
+          appKey={appKey}
+          viewer={viewer}
+          onBack={onBack}
+          contextId={contextId}
+          onMediaAttach={onMediaAttach}
+          onScreenDrawer={screen.onScreenDrawer}
+          presentation={screen.presentation}
+          onScreenClosed={screen.onScreenClosed}
+          drawerTarget={screen.drawerTarget}
+          restoreDrawer={screen.restoreDrawer}
+          onRestoreDrawerConsumed={screen.onRestoreDrawerConsumed}
+          automaticUpdatesEnabled={automaticUpdatesEnabled}
+          initialScope={screen.initialScope}
+          onScreenState={screen.onScreenState}
+          suppressLoadingOverlay={screen.suppressLoadingOverlay}
+        />
+      )}
     </AppShell>
   );
 }
