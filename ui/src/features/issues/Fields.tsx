@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import type { IssueCard, IssueDetail } from "../../lib/types";
 import Select from "../../ui/Select";
@@ -30,16 +30,20 @@ export function Fields({
   const locked = noDragReason(detail);
   const [owner, setOwner] = useState(detail.owner ?? "");
   const [savingField, setSavingField] = useState<SavingField>(null);
+  const ownerSavingRef = useRef(false);
   useEffect(() => setOwner(detail.owner ?? ""), [detail.owner, detail.rev]);
 
   const runPatch = (field: Exclude<SavingField, null>, body: Parameters<typeof api.patch>[1], verb: string) => {
+    if (field === "owner") ownerSavingRef.current = true;
     setSavingField(field);
     void Promise.resolve(onPatch(body, verb)).finally(() => {
+      if (field === "owner") ownerSavingRef.current = false;
       setSavingField((current) => (current === field ? null : current));
     });
   };
 
   const commitOwner = () => {
+    if (ownerSavingRef.current) return;
     if ((detail.owner ?? "") !== owner) {
       runPatch("owner", { owner }, `${detail.id} owner`);
     }
