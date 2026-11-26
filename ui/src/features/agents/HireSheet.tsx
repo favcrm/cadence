@@ -1,7 +1,9 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { useTranslate } from "../../lib/locale";
+import { resources } from "../../lib/resources";
+import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
 import DrawerShell from "../app-shell/shared/DrawerShell";
 import { HireBlock } from "../auth/WriteGate";
@@ -45,6 +47,12 @@ export default function HireSheet({
 }) {
   const t = useTranslate();
   const hireBlock = useContext(HireBlock);
+  const appsState = useQuery(resources.apps);
+  const installedApps = useMemo(
+    () => (appsState.data ? new Set(appsState.data.map((app) => app.name)) : null),
+    [appsState.data],
+  );
+  const recommendedApps = role.recommended_apps ?? [];
   const [alias, setAlias] = useState(suggested);
   const [job, setJob] = useState(startJob ?? role.instructions);
   const [saving, setSaving] = useState(false);
@@ -162,9 +170,36 @@ export default function HireSheet({
             <Chip text="Its job (below)" />
             <Chip text="Workspace wiki" />
             <Chip text="Project notes of the ticket it works on" />
-            <Chip text="Its own memory" planned />
+            {role.context_seed ? <Chip text="Starter playbook seeded at hire" /> : null}
           </div>
         </div>
+        {recommendedApps.length > 0 && (
+          <div className="rc-blk">
+            <h4>{t("Recommended apps")}</h4>
+            <div className="rc-kst-row">
+              {recommendedApps.map((app) => {
+                const accessLabel = app.access === "draft" ? t("Read & draft") : t("Read-only");
+                const installLabel =
+                  installedApps === null
+                    ? null
+                    : installedApps.has(app.app_key)
+                      ? t("Installed")
+                      : t("Install later");
+                const parts = [app.app_key, accessLabel, installLabel].filter(Boolean);
+                return (
+                  <span key={app.app_key} className="rc-kst">
+                    {parts.join(" · ")}
+                  </span>
+                );
+              })}
+            </div>
+            <p className="rc-note">
+              {t(
+                "Bound apps restrict which workspace apps this specialist can call. Install missing apps anytime in Apps.",
+              )}
+            </p>
+          </div>
+        )}
         <div className="rc-blk">
           <h4>{t("Skills")}</h4>
           <div className="rc-kst-row">
@@ -175,19 +210,26 @@ export default function HireSheet({
             ))}
           </div>
           <p className="rc-note">
-            {t(
-              "Today every agent on the machine shares all bundled skills; per-role skill sets are planned.",
-            )}
+            {role.skills.length > 0
+              ? t("Role skills and connected app skills load on demand in each session.")
+              : t("Uses its role instructions and connected app skills on demand.")}
           </p>
         </div>
         <div className="rc-blk">
           <h4>{t("Tools")}</h4>
           <div className="rc-kst-row">
-            {role.tools.map((tool, index) => (
-              <Chip key={tool} text={tool} planned={role.kind === "apps" && index === 0} />
+            {role.tools.map((tool) => (
+              <Chip key={tool} text={tool} />
             ))}
-            <Chip text="Asks you before sending or publishing" planned />
+            <Chip text="Owner approval required before external sends" />
           </div>
+          {role.disabled_tools && role.disabled_tools.length > 0 ? (
+            <p className="rc-note">
+              {t("Disabled tool groups: {groups}").replace("{groups}", () =>
+                role.disabled_tools!.join(", "),
+              )}
+            </p>
+          ) : null}
           <p className="rc-note">{t("Not copied: logins, API keys, MCP servers. Connect them after hiring.")}</p>
         </div>
 

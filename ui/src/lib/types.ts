@@ -700,6 +700,13 @@ export interface AgentRegisterBody {
 /** CAD-1989: `POST /api/agent-profiles` body, generated from the Rust type. */
 export type AgentProfileBody = Api.AgentProfileReq;
 
+/** Recommended Cadence App pairing declared by an admin-managed specialist role. */
+export interface RoleRecommendedApp {
+  app_key: string;
+  access: "read" | "draft";
+  default_bind: boolean;
+}
+
 /** One role of `GET /api/agent-roles`. Roles carry no model. */
 export interface AgentRole {
   id: string;
@@ -715,6 +722,10 @@ export interface AgentRole {
   first_tasks: string[];
   /** The text a hire stores as the agent's instructions. */
   instructions: string;
+  /** Optional DB-backed specialist metadata (AOS-800 / CAD-2857). */
+  recommended_apps?: RoleRecommendedApp[];
+  disabled_tools?: string[];
+  context_seed?: string | null;
 }
 
 export interface AgentRolesPayload {
@@ -754,6 +765,8 @@ export interface StoredAgentProfile {
   disabled_tools?: string[];
   /** AOS-679: opt-in tool groups switched on. Absent means none are. */
   enabled_tools?: string[];
+  /** AOS-800: optional app allowlist (`null` = unrestricted). */
+  allowed_apps?: string[] | null;
 }
 
 /** `GET /api/workspace-skills` on a hosted board (agenticos-v2 AOS-626): one
