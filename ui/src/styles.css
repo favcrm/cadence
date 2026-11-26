@@ -4294,16 +4294,77 @@ button.turnsource:hover {
 /* The staged action card: kind and live status in the header, the write's
    title, its key fields (a missing value flagged), Review / Not now. */
 .turncard-staged,
-.turncard-skill {
+.turncard-skill,
+.turncard-ticket {
   /* CAD-2450: one width for every staged card, not content-sized. */
   width: min(100%, 32rem);
   overflow: hidden;
 }
 .turncard-staged .turncard-body,
-.turncard-skill .turncard-body {
+.turncard-skill .turncard-body,
+.turncard-ticket .turncard-body {
   display: grid;
   gap: .6rem;
   padding: .75rem;
+}
+.turncard-id-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: .05rem .3rem;
+  border: 1px solid transparent;
+  border-radius: .25rem;
+  background: transparent;
+  color: var(--color-ink-500);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+}
+.turncard-id-btn:hover {
+  border-color: var(--color-ink-700);
+  background: var(--color-ink-800);
+  color: var(--color-ink-200);
+}
+.turncard-assignee-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .35rem;
+}
+.turncard-perm-note {
+  display: inline-flex;
+  align-items: center;
+  padding: .04rem .35rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .25rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+.turncard-cap-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .25rem;
+  margin-bottom: .25rem;
+}
+.turncard-cap-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: .06rem .38rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .25rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-300);
+  font-size: var(--text-micro);
+  font-weight: 500;
+}
+.turncard-cap-chip[data-optin] {
+  border-color: color-mix(in srgb, var(--color-accent) 35%, transparent);
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  color: color-mix(in srgb, var(--color-accent) 78%, var(--color-ink-100));
+}
+.turncard-ticket-note {
+  margin-right: auto;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
 }
 .turncard-title {
   margin: 0;

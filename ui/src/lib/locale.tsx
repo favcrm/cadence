@@ -4708,3 +4708,44 @@ const CAD2792_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2792_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2838_ZHTW: Record<string, string> = {
+  "Ticket proposal": "工作單提案",
+  "Proposal ID": "提案編號",
+  "Copy ID": "複製編號",
+  "Copied": "已複製",
+  "Assignee": "指派對象",
+  "Capabilities": "能力權限",
+  "uses your permissions": "使用你的權限執行",
+  "Show {n} tools": "顯示 {n} 項工具",
+  "Hide {n} tools": "隱藏 {n} 項工具",
+  "Starts one run when approved": "核准後會啟動一次執行",
+  "Read-only board: cannot start runs": "唯讀看板：無法啟動執行",
+  "Draft": "草稿",
+  "Assigned": "已指派",
+  "Already created": "已建立",
+  "Unconfirmed": "未確認",
+  "Failed": "失敗",
+  "Read-only": "唯讀",
+  "Board": "看板",
+  "Wiki": "知識庫",
+  "Apps": "應用程式",
+  "Web": "網頁",
+  "Skills": "技能",
+  "Channels": "頻道",
+  "Documents": "文件範本",
+  "Media": "媒體生成",
+  "GitHub read-only": "GitHub 唯讀",
+  "Board writes": "看板寫入",
+  "Channel posting": "頻道發佈",
+  "Other": "其他",
+  "finished": "已完成",
+  "finished without a report": "已完成（無回報）",
+  "failed": "失敗",
+  "refused": "已拒絕",
+  "stopped": "已停止",
+  "paused": "已暫停",
+};
+for (const [key, value] of Object.entries(CAD2838_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

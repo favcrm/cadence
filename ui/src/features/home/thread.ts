@@ -514,11 +514,11 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 }
 
 /** Item types that belong to an assistant turn. */
-const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "video", "hire", "form", "connect", "record", "view", "share"]);
+const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "video", "hire", "ticket", "form", "connect", "record", "view", "share"]);
 
 /** A card that follows its turn's answer without ending or starting a turn. */
 export const isCardItem = (item: { type: string }): boolean =>
-  item.type === "artifact" || item.type === "image" || item.type === "video" || item.type === "form" || item.type === "connect" || item.type === "record" || item.type === "view" || item.type === "share";
+  item.type === "artifact" || item.type === "image" || item.type === "video" || item.type === "ticket" || item.type === "form" || item.type === "connect" || item.type === "record" || item.type === "view" || item.type === "share";
 
 /** One render run: an assistant turn (its flat items), or one item that is
  *  not part of a turn. The items themselves stay flat — `threadItems` is

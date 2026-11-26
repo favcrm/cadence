@@ -1,5 +1,5 @@
-import { threadItems, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
-import { createAndAssign, parseTicketProposal } from "../src/features/agents/ticketProposal";
+import { isCardItem, threadItems, threadRuns, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
+import { createAndAssign, parseTicketProposal, proposalCapabilities } from "../src/features/agents/ticketProposal";
 
 function check(condition: boolean, message: string): void {
   if (!condition) throw new Error(`ticketProposal: ${message}`);
@@ -35,8 +35,30 @@ const state = {
 const items = threadItems(state);
 const card = items.find((i) => i.type === "ticket");
 check(card !== undefined, "a ticket_proposal entry becomes a ticket card item");
+check(isCardItem(card!), "ticket proposal counts as an answer-turn card item");
 check(items.indexOf(card!) === 1, "the card keeps its place between the commentary and the answer");
 check(items.some((i) => i.type === "commentary"), "the commentary stays its own line");
+const grouped = threadRuns(items);
+check(grouped.length === 1 && grouped[0]?.turn === true, "ticket_proposal stays inside its assistant turn");
+check(
+  grouped[0]?.turn === true &&
+    grouped[0].items.map((i) => i.type).join(",") === "commentary,ticket,answer",
+  "the proposal card stays attached to the turn alongside commentary and answer",
+);
+
+const caps = proposalCapabilities([
+  "board_list_issues",
+  "wiki_search",
+  "template",
+  "repo_tree",
+  "custom_extra",
+]);
+check(
+  caps.map((c) => `${c.id}:${c.optIn}`).join(",") ===
+    "dispatch_documents:true,repo_read:true,board:false,wiki:false,other:false",
+  "proposalCapabilities surfaces opt-in groups distinctly, summarizes core groups, and retains unknown names",
+);
+check(proposalCapabilities([]).length === 0, "empty tool list yields no capability chips");
 
 // The payload is validated, never trusted: a missing agent or text yields no
 // card action, and the component falls back to the entry's plain text.
