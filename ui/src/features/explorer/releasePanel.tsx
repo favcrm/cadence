@@ -13,6 +13,7 @@ import {
 } from "../../lib/privateSession";
 import {
   appExplorer,
+  compareSemverVersions,
   notifyAppsChanged,
   workspaceApps,
   type AccessDiff,
@@ -137,24 +138,7 @@ function settleOutcome(
   publishOutcome(id, uncertain ? { ...pending, phase: "uncertain" } : null);
 }
 
-/** Numeric semver compare; `null` when either side is not `X.Y.Z` —
- * an unordered pair is refused rather than guessed. */
-function compareVersions(a: string, b: string): number | null {
-  const canonical = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
-  if (!canonical.test(a) || !canonical.test(b)) return null;
-  const left = a.split(".").map(BigInt);
-  const right = b.split(".").map(BigInt);
-  for (let i = 0; i < 3; i += 1) {
-    if (left[i] > 18446744073709551615n || right[i] > 18446744073709551615n)
-      return null;
-  }
-  for (let i = 0; i < 3; i += 1) {
-    const l = left[i];
-    const r = right[i];
-    if (l !== r) return l < r ? -1 : 1;
-  }
-  return 0;
-}
+const compareVersions = compareSemverVersions;
 
 function locatorEq(
   a: CatalogueLocator | null | undefined,

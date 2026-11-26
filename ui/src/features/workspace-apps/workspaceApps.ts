@@ -648,7 +648,97 @@ export const workspaceApps = {
  * re-reads at once instead of waiting for the next navigation. */
 export const APPS_CHANGED_EVENT = "cadence:apps-changed";
 export function notifyAppsChanged(): void {
+  dropAppCatalogSnapshot();
   try { window.dispatchEvent(new Event(APPS_CHANGED_EVENT)); } catch { /* no window in a test */ }
+}
+
+const CANONICAL_SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+const SAFE_CATALOG_ID = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** Numeric semver compare; `null` when either side is not plain `X.Y.Z`. */
+export function compareSemverVersions(a: string, b: string): number | null {
+  if (!CANONICAL_SEMVER.test(a) || !CANONICAL_SEMVER.test(b)) return null;
+  const left = a.split(".").map(BigInt);
+  const right = b.split(".").map(BigInt);
+  for (let i = 0; i < 3; i += 1) {
+    if (left[i] > 18446744073709551615n || right[i] > 18446744073709551615n) return null;
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+export type CatalogUpdateHint = {
+  catalogId: string;
+  latestVersion: string;
+  digest: string | null;
+};
+
+export function isSafeCatalogId(id: string | null | undefined): id is string {
+  return typeof id === "string" && SAFE_CATALOG_ID.test(id) && !id.startsWith(".") && !id.includes("..");
+}
+
+export function catalogUpdateHref(catalogId: string, installId: string): string {
+  return `/apps/catalog/${encodeURIComponent(catalogId)}?${new URLSearchParams({ installation: installId })}`;
+}
+
+/**
+ * Derive actionable marketplace update hints keyed by `install_id`. Requires a
+ * strictly newer SemVer (`compareSemverVersions === 1`) when the installed version
+ * is known so every hint opens a real update action in the catalog panel.
+ */
+export function pendingCatalogUpdates(
+  cards: readonly CatalogCard[] | null | undefined,
+  installed?: readonly {
+    install_id: string;
+    version?: string | null;
+    state?: string | null;
+    attention?: { state: string };
+  }[] | null,
+): Map<string, CatalogUpdateHint> {
+  const updates = new Map<string, CatalogUpdateHint>();
+  if (!cards?.length) return updates;
+  const byInstall = installed?.length
+    ? new Map(installed.map((row) => [row.install_id, row]))
+    : null;
+  for (const card of cards) {
+    if (
+      card.update_available !== true ||
+      card.retired === true ||
+      card.state === "removed" ||
+      card.state === "off" ||
+      !isSafeCatalogId(card.id) ||
+      typeof card.install_id !== "string" ||
+      !card.install_id ||
+      typeof card.version !== "string" ||
+      compareSemverVersions(card.version, card.version) !== 0
+    ) {
+      continue;
+    }
+    const row = byInstall?.get(card.install_id);
+    if (row) {
+      const attState = row.attention?.state;
+      if (
+        row.state === "removed" ||
+        row.state === "disabled" ||
+        row.state === "off" ||
+        attState === "removed" ||
+        attState === "off"
+      ) {
+        continue;
+      }
+      if (typeof row.version === "string" && row.version.length > 0) {
+        if (compareSemverVersions(card.version, row.version) !== 1) continue;
+      }
+    }
+    updates.set(card.install_id, {
+      catalogId: card.id,
+      latestVersion: card.version,
+      digest: typeof card.digest === "string" ? card.digest : null,
+    });
+  }
+  return updates;
 }
 
 
@@ -894,6 +984,7 @@ const screenSnapshotReads = new Map<string, InFlightRead<WorkspaceAppSnapshot>>(
 const scopeReads = new Map<string, InFlightRead<[Installation, AppContext[]]>>();
 const appHomeReads = new Map<string, InFlightRead<HomeInstallation[]>>();
 const appFavoritesReads = new Map<string, InFlightRead<FavoritesPayload>>();
+const appCatalogReads = new Map<string, InFlightRead<CatalogCard[]>>();
 let snapshotEpoch = 0;
 
 function abortFlights<T>(reads: Map<string, InFlightRead<T>>): void {
@@ -1077,9 +1168,46 @@ export function prefetchWorkspaceApp(installId: string): void {
 
 /** The `/api/app-installations` list, held the same way: the Apps
  *  screen paints the last read at once and refetches behind it. */
+const APP_CATALOG_TTL_MS = 5 * 60 * 1000;
 let installationsSnapshot: { at: number; session: string | null; rows: Installation[] } | null = null;
 let appHomeSnapshot: { at: number; session: string | null; rows: HomeInstallation[] } | null = null;
 let appFavoritesSnapshot: { at: number; session: string | null; data: FavoritesPayload } | null = null;
+let appCatalogSnapshot: { at: number; session: string | null; cards: CatalogCard[] } | null = null;
+
+export function readAppCatalogSnapshot(): CatalogCard[] | null {
+  if (!appCatalogSnapshot || !privateReadsAllowed() || appCatalogSnapshot.session !== sessionKey() ||
+      Date.now() - appCatalogSnapshot.at > APP_CATALOG_TTL_MS) {
+    appCatalogSnapshot = null;
+    return null;
+  }
+  return appCatalogSnapshot.cards;
+}
+
+/**
+ * Operator-only TTL-cached catalog read: returns the cached snapshot without
+ * hitting `/api/app-catalog` while fresh (5 min TTL), coalesces concurrent reads,
+ * and drops cleanly on `notifyAppsChanged()`, session pause, or session reset.
+ */
+export function readAppCatalogCached(signal?: AbortSignal): Promise<CatalogCard[]> {
+  const cached = readAppCatalogSnapshot();
+  if (cached !== null) return Promise.resolve(cached);
+  return coalesceInFlightRead(
+    appCatalogReads,
+    "__app_catalog__",
+    async (sharedSignal, requestSession) => {
+      const res = await appExplorer.catalog(sharedSignal);
+      const cards = Array.isArray(res.catalog) ? res.catalog : [];
+      appCatalogSnapshot = { at: Date.now(), session: requestSession, cards };
+      return cards;
+    },
+    signal,
+  );
+}
+
+export function dropAppCatalogSnapshot(): void {
+  appCatalogSnapshot = null;
+  abortFlights(appCatalogReads);
+}
 
 export function readInstallationsSnapshot(): Installation[] | null {
   if (!installationsSnapshot || !privateReadsAllowed() || installationsSnapshot.session !== sessionKey() ||
@@ -1165,6 +1293,7 @@ onPrivateReadsPaused(() => {
   abortFlights(scopeReads);
   abortFlights(appHomeReads);
   abortFlights(appFavoritesReads);
+  dropAppCatalogSnapshot();
   prefetching.clear();
   prefetchingScopes.clear();
 });
@@ -1175,6 +1304,7 @@ onPrivateSessionReset(() => {
   abortFlights(scopeReads);
   abortFlights(appHomeReads);
   abortFlights(appFavoritesReads);
+  dropAppCatalogSnapshot();
   snapshots.clear();
   prefetching.clear();
   prefetchingScopes.clear();

@@ -4,14 +4,21 @@ import Button from "../../ui/Button";
 import Switch from "../../ui/Switch";
 import {
   appExplorer,
+  catalogUpdateHref,
+  isSafeCatalogId,
+  pendingCatalogUpdates,
+  readAppCatalogCached,
+  readAppCatalogSnapshot,
   workspaceApps,
   type AppBinding,
+  type CatalogCard,
   type HomeInstallation,
   type Installation,
   type RemovePreview,
   type UpgradeProposal,
   notifyAppsChanged,
 } from "../workspace-apps/workspaceApps";
+import { onPrivateReadsPaused, onPrivateSessionReset } from "../../lib/privateSession";
 import type { Viewer } from "../projects/work";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { PrivateAppDialog } from "../workspace-apps/PrivateAppDialog";
@@ -99,6 +106,7 @@ export default function ManageApp({
   } | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
+  const [catalogCards, setCatalogCards] = useState<CatalogCard[] | null>(() => (isOp ? readAppCatalogSnapshot() : null));
   const hasCatalogSlots = inst?.source_kind === "private" && declaredSlots(inst).some(isCatalogSlot);
   const [reread, setReread] = useState(0);
   const refreshCatalog = useCallback(() => setReread(n => n + 1), []);
@@ -107,7 +115,19 @@ export default function ManageApp({
   // keys get no link instead of the retired ID route.
   const installs = useInstallations(viewer.operator === true, reread).list;
   useEffect(() => {
-    if (!isOp) return;
+    const clearCatalog = () => setCatalogCards(null);
+    const stopPause = onPrivateReadsPaused(clearCatalog);
+    const stopReset = onPrivateSessionReset(clearCatalog);
+    return () => {
+      stopPause();
+      stopReset();
+    };
+  }, []);
+  useEffect(() => {
+    if (!isOp) {
+      setCatalogCards(null);
+      return;
+    }
     const controller = new AbortController();
     setError(null);
     setHome(null);
@@ -128,6 +148,18 @@ export default function ManageApp({
         setHome(row);
       })
       .catch(() => { if (!controller.signal.aborted) setHomeUnavailable(true); });
+    const cachedCatalog = readAppCatalogSnapshot();
+    if (cachedCatalog !== null) {
+      setCatalogCards(cachedCatalog);
+    } else {
+      void readAppCatalogCached(controller.signal)
+        .then((cards) => {
+          if (!controller.signal.aborted) setCatalogCards(cards);
+        })
+        .catch(() => {
+          // Catalog check stays best-effort; never block Manage on catalog failure.
+        });
+    }
     return () => controller.abort();
   }, [installId, reread, isOp]);
 
@@ -254,18 +286,18 @@ export default function ManageApp({
   const removed = inst.removed != null || home?.attention.state === "removed";
   const restorable = inst.restore_after == null || Date.now() / 1000 <= inst.restore_after;
   const off = !removed && (home?.attention.state === "off" || inst.approved === false);
-  const updateReady = home?.attention.state === "update";
+  const catalogUpdate = !removed ? pendingCatalogUpdates(catalogCards, [inst]).get(installId) ?? null : null;
+  const updateReady = home?.attention.state === "update" || catalogUpdate !== null;
   const catalogue = inst.catalogue;
-  const catalogueId = catalogue && typeof catalogue.id === "string"
-    && /^[A-Za-z0-9._-]{1,64}$/.test(catalogue.id)
-    && !catalogue.id.startsWith(".") && !catalogue.id.includes("..")
+  const catalogueId = catalogue && isSafeCatalogId(catalogue.id)
     && typeof inst.version === "string" && inst.version.length > 0
     && typeof inst.digest === "string" && /^sha256:[0-9a-f]{64}$/.test(inst.digest)
     && catalogue.version === inst.version && catalogue.digest === inst.digest
     ? catalogue.id : null;
-  const catalogueHref = catalogueId === null
+  const reviewCatalogId = catalogUpdate?.catalogId ?? catalogueId;
+  const catalogueHref = reviewCatalogId === null
     ? "/apps/explore"
-    : `/apps/catalog/${encodeURIComponent(catalogueId)}?${new URLSearchParams({ installation: inst.install_id })}`;
+    : catalogUpdateHref(reviewCatalogId, inst.install_id);
 
   const mutateCatalog = async (work: () => Promise<void>) => {
     if (!isOp || catalogLock.current) return;
@@ -492,16 +524,20 @@ export default function ManageApp({
               onToggle={toggleAutomatic}
             />
           </div>
-          <p className="mt-3">{home === null
-            ? t(homeUnavailable ? "Update status unavailable." : "Checking update status…")
+          <p className="mt-3">{removed
+            ? t(restorable ? "Removed — restore it to review published updates." : "Removed — updates are unavailable.")
             : updateReady ? t("An update is ready to review.")
-            : removed ? t(restorable ? "Removed — restore it to review published updates." : "Removed — updates are unavailable.")
-            : t(catalogueId === null ? "No update is currently flagged." : "Check the catalogue for published updates.")}</p>
-          <p className="mt-1">{t("Installed version {version}.").replace("{version}", () => inst.version)}</p>
+            : home === null
+              ? t(homeUnavailable ? "Update status unavailable." : "Checking update status…")
+              : t(reviewCatalogId === null ? "No update is currently flagged." : "Check the catalogue for published updates.")}</p>
+          <p className="mt-1">
+            {t("Installed version {version}.").replace("{version}", () => inst.version)}
+            {catalogUpdate ? ` (v${inst.version} → v${catalogUpdate.latestVersion})` : ""}
+          </p>
           {!removed && (
             <div className="mt-3">
-              <Link className="btn btn-sm" href={catalogueHref}>
-                {t(catalogueId === null ? "Browse published apps" : "Review published versions")}
+              <Link className={catalogUpdate ? "btn btn-primary btn-sm" : "btn btn-sm"} href={catalogueHref}>
+                {t(catalogUpdate ? "Review update" : reviewCatalogId === null ? "Browse published apps" : "Review published versions")}
               </Link>
             </div>
           )}
