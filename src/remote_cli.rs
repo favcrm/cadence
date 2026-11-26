@@ -1293,6 +1293,53 @@ fn issue_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, V
     }
 }
 
+/// AOS-777: `review_claim` answers `{review:{reviewId,…}}` for the job it
+/// claimed. Any other 2xx body cannot prove the claim landed under this call.
+fn review_claim_receipt_correlates(reply: &Value, arguments: &Map<String, Value>) -> bool {
+    let Some(want) = arguments.get("review_id").and_then(Value::as_str) else {
+        return false;
+    };
+    reply
+        .pointer("/review/reviewId")
+        .and_then(Value::as_str)
+        .is_some_and(|got| !got.is_empty() && got == want)
+}
+
+/// AOS-777: `review_submit` answers the recorded decision for the job it
+/// filed. The job, the decision and the report must be the ones sent.
+fn review_submit_receipt_correlates(reply: &Value, arguments: &Map<String, Value>) -> bool {
+    let (Some(id), Some(decision), Some(report)) = (
+        arguments.get("review_id").and_then(Value::as_str),
+        arguments.get("decision").and_then(Value::as_str),
+        arguments.get("report").and_then(Value::as_str),
+    ) else {
+        return false;
+    };
+    let Some(review) = reply.get("review").and_then(Value::as_object) else {
+        return false;
+    };
+    review.get("reviewId").and_then(Value::as_str) == Some(id)
+        && review.get("decision").and_then(Value::as_str) == Some(decision)
+        && review.get("report").and_then(Value::as_str) == Some(report)
+}
+
+/// AOS-777: one diff page carries the pinned revisions it was read at. A
+/// `{}`, `null` or foreign page is a refusal, never a silent end of paging.
+fn review_diff_page_usable(reply: &Value) -> bool {
+    reply
+        .get("review")
+        .and_then(Value::as_object)
+        .is_some_and(|page| {
+            page.get("head_sha")
+                .and_then(Value::as_str)
+                .is_some_and(|sha| !sha.is_empty())
+                && page
+                    .get("base_sha")
+                    .and_then(Value::as_str)
+                    .is_some_and(|sha| !sha.is_empty())
+        })
+}
+
 /// `project_policy` answers one of two proven success shapes: the tenant's
 /// `{state:"recorded", project, visibility, grants, revision}` and the native
 /// receipt must match the project, visibility and grants that were sent.
@@ -6765,6 +6812,44 @@ fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
     ))
 }
 
+/// AOS-777: a board that predates the staged-review verbs answers `501
+/// not_implemented` before it reads anything. Name the verb and the
+/// server-first rollout order; never an outage, never a retry.
+fn review_job_board_too_old(verb: &str, status: u16) -> Option<Error> {
+    if !matches!(verb, "review_claim" | "review_diff" | "review_submit") || status != 501 {
+        return None;
+    }
+    let nothing = if mutating_cli_verb(verb) {
+        "Nothing was written"
+    } else {
+        "Nothing was read"
+    };
+    Some(Error::invalid(
+        "not_implemented",
+        format!(
+            "this workspace's board predates `{verb}` (HTTP {status}, not_implemented) — update \
+             the board first, then use this client. {nothing}"
+        ),
+    ))
+}
+
+/// AOS-777: the tenant admits these verbs only for an owner-approved enrolled
+/// login. A human login or an unenrolled agent gets `403 not_permitted`; say
+/// so instead of the generic refusal, and never fall back to the human bearer.
+fn review_job_not_enrolled(verb: &str, status: u16, code: Option<&str>) -> Option<Error> {
+    if !matches!(verb, "review_claim" | "review_diff" | "review_submit")
+        || status != 403
+        || code != Some("not_permitted")
+    {
+        return None;
+    }
+    Some(Error::rejected(
+        "this login is not an owner-approved reviewer enrollment for this job; the tenant \
+         refused it, and the client never falls back to a human login. Ask the owner to approve \
+         `cadence agent enroll` for the job's profile. Nothing was changed",
+    ))
+}
+
 /// CAD-2240: a board that predates `project_timeline` answers `501
 /// not_implemented`; an older control relay rejects the unknown verb name as
 /// `400 invalid_request`/`unknown_verb`. Both are a release-order problem, not
@@ -7676,6 +7761,16 @@ fn call_verb_until_retry(
                 effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN),
             ));
         }
+        // AOS-777: a diff page is evidence only when it names the pinned
+        // revisions. An empty or foreign page must not read as "no more".
+        if verb == "review_diff" && (200..300).contains(&status) {
+            let usable = body.as_ref().is_some_and(review_diff_page_usable);
+            if !usable {
+                return Err(Error::rejected(
+                    "remote `review_diff` returned no usable page; nothing was read",
+                ));
+            }
+        }
         // A 2xx object is a receipt only when it names what this call wrote —
         // the tenant's own reply contract, mirrored by the native route. A
         // malformed or foreign receipt cannot prove the write landed, so it is
@@ -7696,6 +7791,8 @@ fn call_verb_until_retry(
                 | "workspace_skill_revoke"
                 | "workspace_skill_delete" => !skill_receipt_correlates(verb, reply, &arguments),
                 "document_submit" => !document_submit_receipt(reply),
+                "review_claim" => !review_claim_receipt_correlates(reply, &arguments),
+                "review_submit" => !review_submit_receipt_correlates(reply, &arguments),
                 "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
                     !team_receipt_correlates(verb, status, reply, &arguments)
                 }
@@ -7767,6 +7864,12 @@ fn call_verb_until_retry(
         // CAD-2101: a board without the profile verbs answers 501; say to
         // update it, not that coordination is unavailable.
         if let Some(error) = profile_board_too_old(verb, status) {
+            return Err(error);
+        }
+        if let Some(error) = review_job_board_too_old(verb, status) {
+            return Err(error);
+        }
+        if let Some(error) = review_job_not_enrolled(verb, status, refusal_code.as_deref()) {
             return Err(error);
         }
         if let Some(why) = timeline_board_too_old(verb, status, refusal_code.as_deref(), &arguments)

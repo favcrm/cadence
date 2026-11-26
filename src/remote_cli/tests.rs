@@ -11060,3 +11060,47 @@ fn endpoint_request_in_sends_bearer_without_cookies_and_decodes_refusals() {
     assert!(captured[1].0.starts_with("POST /api/endpoints HTTP/1.1"));
     assert!(captured[1].1.contains("\"slug\":\"orders\""));
 }
+
+#[test]
+fn review_receipts_name_the_job_decision_and_page() {
+    let args = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), json!(value)))
+            .collect::<serde_json::Map<String, Value>>()
+    };
+    let claim = args(&[("review_id", "revjob_a")]);
+    assert!(review_claim_receipt_correlates(
+        &json!({"review": {"reviewId": "revjob_a"}}),
+        &claim
+    ));
+    assert!(!review_claim_receipt_correlates(
+        &json!({"review": {"reviewId": "revjob_b"}}),
+        &claim
+    ));
+    assert!(!review_claim_receipt_correlates(&json!({}), &claim));
+
+    let submit = args(&[
+        ("review_id", "revjob_a"),
+        ("decision", "pass"),
+        ("report", "Scope checked."),
+    ]);
+    assert!(review_submit_receipt_correlates(
+        &json!({"review": {"reviewId": "revjob_a", "decision": "pass", "report": "Scope checked."}}),
+        &submit
+    ));
+    assert!(!review_submit_receipt_correlates(
+        &json!({"review": {"reviewId": "revjob_a", "decision": "revise", "report": "Scope checked."}}),
+        &submit
+    ));
+    assert!(!review_submit_receipt_correlates(
+        &json!({"review": {"reviewId": "revjob_b", "decision": "pass", "report": "Scope checked."}}),
+        &submit
+    ));
+
+    assert!(review_diff_page_usable(
+        &json!({"review": {"head_sha": "a", "base_sha": "b"}})
+    ));
+    assert!(!review_diff_page_usable(&json!({})));
+    assert!(!review_diff_page_usable(&Value::Null));
+}
