@@ -33,6 +33,10 @@ export interface ViewHeaderProps {
   expand: { expanded: boolean; enabled: boolean; onToggle: () => void } | null;
   /** In a pane (CAD-2635): "Move to tab" sits in the "⋯", and the close returns the view to its tab. */
   pane?: { onMoveToTab: () => void } | null;
+  /** Whether this view is mounted editable instead of read-only. */
+  editing?: boolean;
+  /** Operator-gated edit toggle ("Edit here" / "Done editing"); null when unavailable. */
+  edit?: { active: boolean; label: string; onToggle: () => void } | null;
   onClose: () => void;
   /** The tab bar's action slot: undefined when no tab bar leads (the actions stay here); null until it mounts. */
   tabRow?: HTMLElement | null;
@@ -48,19 +52,32 @@ function focusExpand(root: HTMLElement | null): void {
   });
 }
 
-export default function ViewHeader({ mark, back, title, appName, options, note, open, expand, pane = null, onClose, tabRow }: ViewHeaderProps) {
+export default function ViewHeader({ mark, back, title, appName, options, note, open, expand, pane = null, editing = false, edit = null, onClose, tabRow }: ViewHeaderProps) {
   const t = useTranslate();
   const head = useRef<HTMLElement | null>(null);
   const tip = useId();
   const docked = tabRow !== undefined && back === null && pane === null;
-  const line = [appName, ...(options === "" ? [] : [options]), ...(note === null ? [] : [t("Read-only")])].join(" · ");
+  const statusLabel = editing ? t("Editing") : note === null ? null : t("Read-only");
+  const line = [appName, ...(options === "" ? [] : [options]), ...(statusLabel === null ? [] : [statusLabel])].join(" · ");
   const expandLabel = t(expand?.expanded ? "Collapse canvas" : "Expand canvas");
   const folded: RowMenuItem[] = [];
   if (pane) folded.push({ key: "tab", label: t("Move to tab"), onSelect: pane.onMoveToTab });
-  if (open) folded.push({ key: "open", label: open.label, hint: note ?? undefined, onSelect: () => { open.onOpen(); navigate(open.href); } });
+  if (edit) folded.push({ key: "edit", label: edit.label, onSelect: edit.onToggle });
+  if (open) folded.push({ key: "open", label: open.label, hint: editing ? undefined : (note ?? undefined), onSelect: () => { open.onOpen(); navigate(open.href); } });
   if (expand?.enabled) folded.push({ key: "expand", label: expandLabel, onSelect: expand.onToggle });
   const actions = (
     <>
+      {edit ? (
+        <button
+          type="button"
+          className={`btn btn-ghost cv-edit cv-wide${edit.active ? " is-editing" : ""}`}
+          onClick={edit.onToggle}
+          data-canvas-edit
+          aria-pressed={edit.active}
+        >
+          {edit.label}
+        </button>
+      ) : null}
       {open ? (
         // Navigating away leaves the tab behind: the caller closes it (the sheet closes the drawer).
         <Link className="btn btn-ghost cv-open cv-wide" href={open.href} title={open.label} aria-label={open.label} onClick={open.onOpen}>
@@ -108,7 +125,12 @@ export default function ViewHeader({ mark, back, title, appName, options, note, 
       )}
       <p className="cv-meta" data-view-options>
         <span className="cv-meta-text" title={line}>{appName}{options === "" ? null : ` · ${options}`}</span>
-        {note === null ? null : (
+        {editing ? (
+          <>
+            <span className="cv-meta-dot" aria-hidden>·</span>
+            <span className="cv-editing" data-canvas-editing>{t("Editing")}</span>
+          </>
+        ) : note === null ? null : (
           <>
             <span className="cv-meta-dot" aria-hidden>·</span>
             <span className="cv-ro" tabIndex={0} aria-describedby={tip} data-read-only>

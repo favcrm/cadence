@@ -435,4 +435,10 @@ button.cv-saved:hover { color: var(--color-ink-100); border-color: var(--color-i
 /* "Move to tab" lives in the "⋯" of a pane at every width. */
 .cv-fold[data-pane] { display: inline-flex; }
 .viewcard-placed { margin: 0; }
+.cv-edit { flex: none; height: 26px; padding: 0 9px; border: 1px solid var(--color-ink-700); border-radius: 6px; font-size: var(--text-micro); font-weight: 500; white-space: nowrap; }
+.cv-edit.is-editing { border-color: color-mix(in srgb, var(--color-accent) 60%, transparent); background: color-mix(in srgb, var(--color-accent) 14%, transparent); color: var(--color-ink-100); }
+.cv-editing { flex: none; color: var(--color-accent); font-weight: 500; }
+.cv-works-new { flex: none; display: inline-flex; align-items: center; }
+.cv-works-new-btn { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 9px; border: 1px solid var(--color-ink-700); border-radius: 6px; font-size: var(--text-micro); font-weight: 500; color: var(--color-ink-200); white-space: nowrap; }
+.cv-works-new-compact { margin-left: 4px; }
 @media (prefers-reduced-motion: reduce) { .cv-divider::after { transition: none; } }
