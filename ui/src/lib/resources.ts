@@ -325,6 +325,11 @@ export const resources = {
       return r.connections;
     }),
   ),
+  /** SMTP-only metadata, with legacy peers filtered by the email view. */
+  smtpConnections: cache.resource("smtp-connections", () => api.smtpConnections(), {
+    freshMs: 5_000,
+    discardOnError: unavailablePrivateRecord,
+  }),
   /**
    * Whether that list is partial, because the board couldn't reach the platform's
    * accounts. The list read sets it, so the two can't disagree and nothing reads twice.

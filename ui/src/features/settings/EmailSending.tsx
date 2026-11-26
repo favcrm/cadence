@@ -1,17 +1,22 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { api } from "../../lib/api";
-import { resources } from "../../lib/resources";
-import { EMAIL_CONNECTIONS_HREF, routePath } from "../../lib/router";
+import { api, ApiError } from "../../lib/api";
+import { cache, resources } from "../../lib/resources";
+import { useMaybeResource } from "../../lib/useResource";
+import { EMAIL_CONNECTIONS_HREF, EMAIL_SENDING_HREF, routePath } from "../../lib/router";
+import { navigate } from "../../lib/useLocation";
 import type { Connection } from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import PageState from "../../ui/PageState";
-import { IconOutbox } from "../../ui/icons";
+import { IconApps, IconArrowDown, IconOutbox, IconSettings } from "../../ui/icons";
 import type { Viewer } from "../projects/work";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import SettingsDrawer from "./SettingsDrawer";
 import EmailSetup from "./EmailSetup";
+import { RotateForm, RevokeConfirm } from "./Connections";
+import { useProtectedEntry } from "../connections/useProtectedEntry";
+import { errorCopy, openTrustedEntry } from "../connections/credentialRequestView";
 import { newAudienceId } from "../app-shell/segmentGrammar";
 import {
   friendlySendError,
@@ -22,7 +27,7 @@ import {
   type SmtpBinding,
 } from "../app-shell/sendClient";
 import type { HostScope } from "../app-shell/hostActions";
-import { isSmtpSender } from "./connectionsView";
+import { connectionNeedsAttention, isSmtpSender } from "./connectionsView";
 import { HOSTED_ACCOUNT } from "./hostedSmtpView";
 import { workspaceApps, type Installation } from "../workspace-apps/workspaceApps";
 import {
@@ -55,13 +60,13 @@ function activeInstall(install: Installation): boolean {
 }
 
 /** Every active context of an install that declares SMTP sending, flattened. */
-async function loadTargets(signal: AbortSignal): Promise<Target[]> {
-  const installs = (await workspaceApps.installations(signal)).filter(
+async function loadTargets(): Promise<Target[]> {
+  const installs = (await workspaceApps.installations()).filter(
     (i) => i.smtp_custody === true && activeInstall(i),
   );
   const out: Target[] = [];
   for (const install of installs) {
-    const contexts = await workspaceApps.contexts(install.install_id, signal);
+    const contexts = await workspaceApps.contexts(install.install_id);
     for (const ctx of contexts.filter((c) => c.state === "active")) {
       out.push({
         scope: { installId: install.install_id, contextId: ctx.id },
@@ -70,6 +75,22 @@ async function loadTargets(signal: AbortSignal): Promise<Target[]> {
     }
   }
   return out;
+}
+
+const targetsResource = cache.resource<Target[]>("email-targets", loadTargets, { freshMs: 5_000 });
+const bindingByKey = cache.family("email-binding", (key: string) => {
+  const [installId, contextId] = JSON.parse(key) as [string, string];
+  return readSmtpBinding({ installId, contextId });
+}, { freshMs: 5_000 });
+
+function bindingResource(scope: HostScope) {
+  return bindingByKey(JSON.stringify([scope.installId, scope.contextId]));
+}
+
+function invalidateAccounts() {
+  resources.connections.markInvalid();
+  cache.invalidate("email-binding");
+  void resources.smtpConnections.invalidate();
 }
 
 // Stored status note: a UI-owned key (plus data), translated at render.
@@ -101,69 +122,49 @@ export default function EmailSending({
   focusSenders?: boolean;
 }) {
   const t = useTranslate();
-  const [targets, setTargets] = useState<Target[] | null>(null);
-  const [rows, setRows] = useState<Connection[] | null>(null);
-  const [hostedSmtp, setHostedSmtp] = useState(false);
-  const [accountsError, setAccountsError] = useState<string | null>(null);
-  const [targetsError, setTargetsError] = useState<string | null>(null);
-  const [partial, setPartial] = useState(false);
-  const [accountsAttempt, setAccountsAttempt] = useState(0);
-  const [targetsAttempt, setTargetsAttempt] = useState(0);
+  const targetState = useMaybeResource(viewer.operator === true ? targetsResource : null);
+  const targets = targetState?.data ?? null;
+  const accountResource = viewer.operator === true ? resources.smtpConnections : null;
+  const accountState = useMaybeResource(accountResource);
+  const rows = accountState?.data?.connections?.filter(isSmtpSender) ?? null;
+  const hostedSmtp = accountState?.data?.hosted_smtp === true;
+  const partial = accountState?.data?.connections_unavailable !== undefined;
+  const accountsError = accountState?.status === "failed" || accountState?.status === "stale" ? accountState.error : null;
+  const [accountsAnswered, setAccountsAnswered] = useState(false);
+  const accountCurrent = accountsAnswered && accountState !== null && !accountState.inFlight && accountState.status === "ok" && !partial;
+  const targetsError = targetState?.status === "failed" || targetState?.status === "stale" ? targetState.error : null;
   // One drawer at a time: rows stay reachable by keyboard behind an open one.
   const [openRow, setOpenRow] = useState<string | null>(null);
   const sendersHeading = useRef<HTMLHeadingElement>(null);
   const accountsHeading = useRef<HTMLHeadingElement>(null);
   const accountAdded = useRef(false);
   const sendersFocused = useRef(false);
-  const accountsLoaded = rows !== null;
   useEffect(() => {
     if (!focusSenders || viewer.operator !== true) sendersFocused.current = false;
     if (viewer.operator !== true) return;
-    if (accountAdded.current && accountsLoaded) {
+    if (accountAdded.current && accountCurrent) {
       accountAdded.current = false;
       accountsHeading.current?.focus();
     } else if (!accountAdded.current && focusSenders && !sendersFocused.current) {
       sendersHeading.current?.focus();
       sendersFocused.current = true;
     }
-  }, [focusSenders, accountsLoaded, viewer.operator]);
+  }, [focusSenders, accountCurrent, viewer.operator]);
 
-  const canAdd = viewer.operator === true && !viewer.readOnly && rows !== null && !partial
+  const canAdd = viewer.operator === true && !viewer.readOnly && accountCurrent && rows !== null
     && !(hostedSmtp && rows.some((row) => row.provider === "smtp" && row.account === HOSTED_ACCOUNT));
 
   useEffect(() => {
-    if (viewer.operator !== true) return;
-    const controller = new AbortController();
-    api.connections().then(
-      (list) => {
-        if (controller.signal.aborted) return;
-        setRows(list.connections ?? []);
-        setHostedSmtp(list.hosted_smtp === true);
-        setPartial(list.connections_unavailable !== undefined);
-        setAccountsError(null);
-      },
-      (e: unknown) => {
-        if (!controller.signal.aborted) setAccountsError(friendlySendError(e));
-      },
-    );
-    return () => controller.abort();
-  }, [viewer.operator, accountsAttempt]);
+    setAccountsAnswered(false);
+    if (!accountResource) return;
+    let live = true;
+    void accountResource.revalidate().then(() => { if (live) setAccountsAnswered(true); });
+    return () => { live = false; };
+  }, [accountResource]);
 
   useEffect(() => {
-    if (viewer.operator !== true) return;
-    const controller = new AbortController();
-    loadTargets(controller.signal).then(
-      (nextTargets) => {
-        if (controller.signal.aborted) return;
-        setTargets(nextTargets);
-        setTargetsError(null);
-      },
-      (e: unknown) => {
-        if (!controller.signal.aborted) setTargetsError(friendlySendError(e));
-      },
-    );
-    return () => controller.abort();
-  }, [viewer.operator, targetsAttempt]);
+    if (viewer.operator === true) void targetsResource.revalidate();
+  }, [viewer.operator]);
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="email-sending-title">
@@ -192,18 +193,18 @@ export default function EmailSending({
         <PageState title={t("Operator access required")}>{t("Email sending is available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : (
         <div className="grid gap-6 min-w-0">
-          <EmailAccounts headingRef={accountsHeading} rows={rows ?? []} complete={rows !== null && !partial && accountsError === null} canAdd={canAdd} hostedSmtp={hostedSmtp} onAdd={() => setOpenRow("add")} />
+          <EmailAccounts headingRef={accountsHeading} rows={rows ?? []} complete={accountCurrent} canAdd={canAdd} hostedSmtp={hostedSmtp} onAdd={() => setOpenRow("add")} />
           {accountsError !== null ? (
             <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
               {accountsError}
-              <Button size="sm" onClick={() => { setAccountsError(null); setRows(null); setAccountsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+              <Button size="sm" onClick={() => { if (accountResource) void accountResource.refresh(); }}>{t("Retry")}</Button>
             </p>
           ) : rows === null ? (
             <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
           ) : partial ? (
             <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert" data-state="connections-partial">
               {t("Some connected accounts couldn't be loaded, so this list may be incomplete.")}
-              <Button size="sm" onClick={() => { setRows(null); setAccountsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+              <Button size="sm" onClick={() => { if (accountResource) void accountResource.refresh(); }}>{t("Retry")}</Button>
             </p>
           ) : null}
           <section aria-labelledby="app-senders">
@@ -212,7 +213,7 @@ export default function EmailSending({
             {targetsError !== null ? (
               <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
                 {targetsError}
-                <Button size="sm" onClick={() => { setTargetsError(null); setTargets(null); setTargetsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+                <Button size="sm" onClick={() => { void targetsResource.refresh(); }}>{t("Retry")}</Button>
               </p>
             ) : targets === null ? (
               <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
@@ -228,9 +229,9 @@ export default function EmailSending({
                     onOpen={() => setOpenRow(`${target.scope.installId}:${target.scope.contextId}`)}
                     onClose={() => setOpenRow(null)}
                     target={target}
-                    rows={rows !== null && !partial && accountsError === null ? rows : null}
+                    rows={accountCurrent ? rows : null}
                     hostedSmtp={hostedSmtp}
-                    viewer={viewer}
+                    viewer={{ ...viewer, readOnly: viewer.readOnly || targetState?.status !== "ok" || targetState.inFlight }}
                   />
                 ))}
                 {!fixedUnsubscribeAddress && (
@@ -252,15 +253,202 @@ export default function EmailSending({
               onSaved={() => {
                 accountAdded.current = true;
                 setOpenRow(null);
-                setRows(null);
-                setAccountsAttempt((n) => n + 1);
-                void resources.connections.invalidate();
+                invalidateAccounts();
               }}
             />
           )}
         </div>
       )}
     </section>
+  );
+}
+
+/** SMTP account management never needs the provider directory or broad connection list. */
+export function EmailAccount({ id, viewer, hostedBoard }: { id: string; viewer: Viewer; hostedBoard: boolean }) {
+  const t = useTranslate();
+  const resource = viewer.operator === true ? resources.smtpConnections : null;
+  const state = useMaybeResource(resource);
+  const [answered, setAnswered] = useState(false);
+  useEffect(() => {
+    setAnswered(false);
+    if (!resource) return;
+    let live = true;
+    // A cached hit can render at once. A miss from a prior list is not a 404.
+    const cached = resource.get().data?.connections?.some((row) => row.id === id && isSmtpSender(row));
+    void (cached ? resource.revalidate() : resource.refresh()).then(() => { if (live) setAnswered(true); });
+    return () => { live = false; };
+  }, [resource, id]);
+  const row = state?.data?.connections?.find((item) => item.id === id && isSmtpSender(item)) ?? null;
+  const unavailable = state?.status === "failed" || state?.status === "stale" || state?.data?.connections_unavailable !== undefined;
+  const current = answered && state?.status === "ok" && !state.inFlight && !unavailable;
+  return (
+    <section className="px-4 lg:px-8 py-5 min-w-0">
+      <Link href={EMAIL_CONNECTIONS_HREF} className="lnk text-label">{t("← Email accounts")}</Link>
+      {viewer.operator !== true ? (
+        <PageState title={viewer.access === "unavailable" ? t("Access could not be confirmed") : viewer.operator === null ? t("Checking access…") : t("Operator access required")}>
+          {viewer.access === "unavailable" && viewer.onRetryAccess && <Button size="sm" onClick={viewer.onRetryAccess}>{t("Retry access check")}</Button>}
+        </PageState>
+      ) : (
+        <>
+          {unavailable && (
+            <p role="alert" className="text-label text-fail mt-3">{t("Account information could not be fully confirmed.")}{" "}
+              <Button size="sm" onClick={() => { if (resource) void resource.refresh(); }}>{t("Retry")}</Button>
+            </p>
+          )}
+          {row ? <EmailAccountOverview row={row} current={current} canWrite={current && !viewer.readOnly} hostedBoard={hostedBoard} /> :
+            current ? <PageState title={t("Email account not found")}>{t("This account may have been disconnected.")}</PageState> :
+              !unavailable && <p role="status" className="text-label text-ink-400 mt-4">{t("Loading account…")}</p>}
+        </>
+      )}
+    </section>
+  );
+}
+
+function EmailAccountOverview({ row, current, canWrite, hostedBoard }: {
+  row: Connection;
+  current: boolean;
+  canWrite: boolean;
+  hostedBoard: boolean;
+}) {
+  const t = useTranslate();
+  const entry = useProtectedEntry(!hostedBoard);
+  const [rotating, setRotating] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [usedBy, setUsedBy] = useState<string[] | null>(null);
+  const [usageUnknown, setUsageUnknown] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    let live = true;
+    setUsedBy(null);
+    setUsageUnknown(false);
+    void (async () => {
+      await (attempt ? targetsResource.refresh() : targetsResource.revalidate());
+      const targets = targetsResource.get();
+      if (targets.status !== "ok" || !targets.data) {
+        if (live) { setUsedBy([]); setUsageUnknown(true); }
+        return;
+      }
+      const reads = targets.data.map(async (target) => {
+        const resource = bindingResource(target.scope);
+        await (attempt ? resource.refresh() : resource.revalidate());
+        const state = resource.get();
+        return { target, state };
+      });
+      const results = await Promise.all(reads);
+      if (!live) return;
+      setUsedBy(results.filter(({ state }) => state.status === "ok" && state.data?.connectionId === row.id).map(({ target }) => target.label));
+      setUsageUnknown(results.some(({ state }) => state.status !== "ok"));
+    })();
+    return () => { live = false; };
+  }, [row.id, attempt]);
+  const ready = row.smtp != null && row.status.custody_available && !connectionNeedsAttention(row);
+  const label = row.smtp?.sender_name || row.account;
+  const update = () => {
+    if (!canWrite || busy) return;
+    if (hostedBoard || (entry.status === "ready" && !entry.entry.configured)) {
+      setRotating(true);
+      return;
+    }
+    if (entry.status !== "ready") return;
+    setBusy(true);
+    setError(null);
+    void api.credentialRequestCreate({
+      provider: row.provider, verb: "rotate", connection_id: row.id,
+      ...(row.revision !== null ? { expected_credential_revision: row.revision } : {}),
+    }).then(({ request }) => {
+      if (!openTrustedEntry(request)) setError(errorCopy("unsupported_deployment"));
+    }).catch((e: unknown) => setError(errorCopy(e instanceof ApiError ? e.code : null)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="grid gap-6 mt-4">
+      <header className="flex flex-wrap items-center justify-between gap-4 border-b border-ink-700 pb-5">
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="inline-flex items-center justify-center rounded-lg bg-accent/10 text-accent size-10 shrink-0" aria-hidden="true"><IconOutbox size={21} /></span>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-section font-medium text-ink-100 break-words">{label}</h1>
+              <span className={`chip ${current && ready ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"}`}>
+                {!current ? t("Not confirmed") : ready ? t("Ready") : t("Needs attention")}
+              </span>
+            </div>
+            {row.smtp?.sender && <p className="text-label text-ink-400 break-words">{row.smtp.sender}</p>}
+          </div>
+        </div>
+        {row.kind === "enrolled" && (
+          <Button variant="primary" className="max-sm:w-full" disabled={!canWrite || (!hostedBoard && entry.status !== "ready")} loading={busy} onClick={update}>
+            {t("Update credentials")}
+          </Button>
+        )}
+      </header>
+      {error && <p role="alert" className="text-label text-fail">{error}</p>}
+      {!hostedBoard && entry.status === "failed" && <p role="alert" className="text-label text-fail">{t("Secure credential settings could not be loaded.")}</p>}
+      {canWrite && rotating && (
+        <SettingsDrawer title={t("Update credentials")} onClose={() => setRotating(false)}>
+          <RotateForm row={row} hostedBoard={hostedBoard} onClose={() => setRotating(false)} onDone={() => { setRotating(false); invalidateAccounts(); }} />
+        </SettingsDrawer>
+      )}
+      <section aria-labelledby="email-used-by">
+        <h2 id="email-used-by" className="text-cardtitle font-medium text-ink-100 mb-2">{t("Used by")}</h2>
+        {usedBy === null && <p role="status" className="text-label text-ink-400">{t("Loading app senders…")}</p>}
+        {!!usedBy?.length && (
+          <div className="settings-rows">
+            <div className="settings-row flex-wrap">
+              <span className="inline-flex items-center justify-center rounded bg-accent/10 text-accent size-8 shrink-0" aria-hidden="true">
+                <IconApps />
+              </span>
+              <span className="settings-row-text"><b>{usedBy.join(", ")}</b></span>
+              <Link href={EMAIL_SENDING_HREF} className="lnk">{t("View app senders")}</Link>
+            </div>
+          </div>
+        )}
+        {usedBy?.length === 0 && !usageUnknown && <p className="text-label text-ink-400">{t("No app currently uses this account.")}</p>}
+        {usageUnknown && (
+          <p role="alert" className="text-label text-fail">{t("Some app sender bindings could not be loaded; usage may be incomplete.")}{" "}
+            <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
+          </p>
+        )}
+      </section>
+      <details className="group rounded-lg border border-ink-700 text-label">
+        <summary className="flex cursor-pointer list-none items-center gap-3 px-3 py-2.5">
+          <IconSettings className="shrink-0 text-ink-400" aria-hidden="true" />
+          <span className="grow min-w-0">
+            <strong className="font-medium text-ink-100">{t("Advanced settings")}</strong>
+            <span className="block text-ink-400">{t("SMTP configuration and connection ID")}</span>
+          </span>
+          <IconArrowDown className="shrink-0 text-ink-400 group-open:rotate-180" aria-hidden="true" />
+        </summary>
+        <div className="border-t border-ink-700 px-3 py-2.5">
+          <dl className="grid gap-2 break-words">
+            <div><dt className="text-ink-400">{t("SMTP server")}</dt><dd>{row.smtp?.host ?? t("Unavailable")}</dd></div>
+            <div><dt className="text-ink-400">{t("Port and encryption")}</dt><dd>{row.smtp ? `${row.smtp.port} · ${row.smtp.tls_mode === "implicit" ? t("Implicit TLS") : row.smtp.tls_mode === "starttls" ? "STARTTLS" : row.smtp.tls_mode}` : t("Unavailable")}</dd></div>
+            <div><dt className="text-ink-400">{t("SMTP username")}</dt><dd>{row.smtp?.username ?? t("Unavailable")}</dd></div>
+            <div><dt className="text-ink-400">{t("Connection ID")}</dt><dd><code>{row.id}</code></dd></div>
+          </dl>
+          {!hostedBoard && (
+            <Link className="lnk mt-3 inline-block" href={routePath({ screen: "settings", section: "connections", page: { kind: "detail", id: row.id } })}>
+              {t("Connection diagnostics")}
+            </Link>
+          )}
+        </div>
+      </details>
+      {row.kind === "enrolled" && (
+        <footer className="border-t border-ink-700 pt-2">
+          <Button variant="ghost" className="text-fail!" disabled={!canWrite} onClick={() => setDisconnecting(true)}>
+            {t("Disconnect account")}
+          </Button>
+          {canWrite && disconnecting && (
+            <SettingsDrawer title={t("Disconnect account")} onClose={() => setDisconnecting(false)}>
+              {!!usedBy?.length && <p className="text-label text-ink-300 break-words">{t("{apps} will stop sending from this address.").replace("{apps}", () => usedBy.join(", "))}</p>}
+              {(usedBy === null || usageUnknown) && <p className="text-label text-ink-300">{t("App usage could not be fully confirmed. Any app using this account will stop sending from it.")}</p>}
+              <RevokeConfirm row={row} onClose={() => setDisconnecting(false)} onDone={() => { invalidateAccounts(); navigate(EMAIL_CONNECTIONS_HREF); }} />
+            </SettingsDrawer>
+          )}
+        </footer>
+      )}
+    </div>
   );
 }
 
@@ -275,38 +463,33 @@ function SenderRow({ target, rows, hostedSmtp, viewer, open, onOpen, onClose }: 
   viewer: Viewer;
 }) {
   const t = useTranslate();
-  const [binding, setBinding] = useState<SmtpBinding | null | undefined>(undefined);
-  const [failed, setFailed] = useState(false);
+  const resource = bindingResource(target.scope);
+  const state = useMaybeResource(resource);
+  const binding = state?.data;
+  const failed = state?.status === "failed" || state?.status === "stale";
   useEffect(() => {
-    const controller = new AbortController();
-    setFailed(false);
-    readSmtpBinding(target.scope).then(
-      (bound) => {
-        if (!controller.signal.aborted) setBinding(bound);
-      },
-      () => {
-        if (!controller.signal.aborted) setFailed(true);
-      },
-    );
-    return () => controller.abort();
-  }, [target.scope.installId, target.scope.contextId, open]);
+    void resource.revalidate();
+  }, [resource]);
   const live = sendingFrom(binding);
   const line = failed
-    ? t("Couldn't read the sender")
-    : binding === undefined
+    ? t("Couldn’t load the sender")
+    : state === null || state.status === "loading"
       ? t("Reading…")
       : binding === null
         ? t("No sender chosen")
         : live ?? t("The chosen sender needs re-checking");
   return (
     <>
-      <button type="button" className="settings-row" onClick={onOpen}>
-        <span className="settings-row-text">
-          <b>{target.label}</b>
-          <small>{line}</small>
-        </span>
-        {binding && live === null && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
-      </button>
+      <div className="flex items-center gap-2">
+        <button type="button" className="settings-row flex-1" onClick={onOpen}>
+          <span className="settings-row-text">
+            <b>{target.label}</b>
+            <small>{line}</small>
+          </span>
+          {binding && live === null && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+        </button>
+        {failed && !open && <Button size="sm" className="me-2" onClick={() => { void resource.refresh(); }}>{t("Retry")}</Button>}
+      </div>
       {open && (
         <SettingsDrawer title={target.label} onClose={onClose}>
           <SenderCard target={target} rows={rows} hostedSmtp={hostedSmtp} viewer={viewer} onClose={onClose} />
@@ -351,7 +534,7 @@ function OriginRow({ viewer, open, onOpen, onClose }: {
   );
 }
 
-function EmailAccounts({ headingRef, rows, complete, canAdd, hostedSmtp, onAdd }: {
+function EmailAccounts({ headingRef, rows: accounts, complete, canAdd, hostedSmtp, onAdd }: {
   headingRef: React.Ref<HTMLHeadingElement>;
   rows: Connection[];
   complete: boolean;
@@ -360,7 +543,6 @@ function EmailAccounts({ headingRef, rows, complete, canAdd, hostedSmtp, onAdd }
   onAdd: () => void;
 }) {
   const t = useTranslate();
-  const accounts = rows.filter(isSmtpSender);
   return (
     <section aria-labelledby="email-accounts-title">
       <header className="flex flex-wrap items-end justify-between gap-2 mb-2">
@@ -375,8 +557,8 @@ function EmailAccounts({ headingRef, rows, complete, canAdd, hostedSmtp, onAdd }
       ) : (
         <ul className="settings-rows" aria-label={t("Sending accounts")}>
           {accounts.map((row) => {
-            const usable = row.smtp != null && row.status.custody_available;
-            let label = row.account;
+            const usable = row.smtp != null && row.status.custody_available && !connectionNeedsAttention(row);
+            let label = row.smtp?.sender_name || row.account;
             if (isHostedSender(row)) label = t("AgenticOS sender");
             else if (hostedSmtp && row.account === HOSTED_ACCOUNT) label = t("Workspace email account");
             return (
@@ -387,11 +569,13 @@ function EmailAccounts({ headingRef, rows, complete, canAdd, hostedSmtp, onAdd }
                     <b>{label}</b>
                     {row.smtp?.sender && <small>{row.smtp.sender}</small>}
                   </span>
-                  <span className={`chip ${usable ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"}`}>{usable ? t("Ready") : t("Needs attention")}</span>
+                  <span className={`chip ${complete && usable ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"}`}>
+                    {!complete ? t("Not confirmed") : usable ? t("Ready") : t("Needs attention")}
+                  </span>
                   {row.kind === "enrolled" && (
                     <Link
                       className="settings-quiet"
-                      href={routePath({ screen: "settings", section: "connections", page: { kind: "detail", id: row.id } })}
+                      href={routePath({ screen: "settings", section: "connections", page: { kind: "emailAccount", id: row.id } })}
                       aria-label={t("Manage {name}").replace("{name}", () => label)}
                     >{t("Manage")}</Link>
                   )}
@@ -430,18 +614,17 @@ function SenderCard({
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
-    const controller = new AbortController();
+    let live = true;
     setBinding(undefined);
     setError(null);
-    readSmtpBinding(target.scope).then(
-      (bound) => {
-        if (!controller.signal.aborted) setBinding(bound);
-      },
-      (e: unknown) => {
-        if (!controller.signal.aborted) setError(friendlySendError(e));
-      },
-    );
-    return () => controller.abort();
+    const resource = bindingResource(target.scope);
+    void resource.refresh().then(() => {
+      if (!live) return;
+      const state = resource.get();
+      if (state.status === "ok") setBinding(state.data);
+      else setError(state.error ?? "The sender could not be loaded.");
+    });
+    return () => { live = false; };
   }, [target.scope.installId, target.scope.contextId, attempt]);
 
   const { usable, unusable } = senderChoices(rows ?? []);
@@ -454,6 +637,7 @@ function SenderCard({
     setNote(null);
     void action()
       .then((value) => {
+        void bindingResource(target.scope).invalidate();
         setBinding(value);
         setNote(ok);
       })
@@ -511,7 +695,7 @@ function SenderCard({
           <Link href={EMAIL_CONNECTIONS_HREF} onClick={onClose}>{t("Manage email accounts")}</Link>.
         </p>
       )}
-      {canWrite && usable.length > 0 && (
+      {canWrite && error === null && usable.length > 0 && (
         <div className="crm-field-row">
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor={selectId}>{t("Send email from")}</label>
@@ -573,7 +757,7 @@ function SenderCard({
           </p>
         </details>
       )}
-      {confirmRevoke && binding && (
+      {confirmRevoke && binding && rows !== null && canWrite && error === null && (
         <ConfirmDialog
           title={t("Stop using this sender?")}
           body={

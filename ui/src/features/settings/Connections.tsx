@@ -757,10 +757,12 @@ function ConnectionsIndex({
                 }
                 onChanged={() => {
                   if (listRes) void listRes.invalidate();
+                  resources.smtpConnections.markInvalid();
                 }}
                 onRevoked={() => {
                   setOpenId(null);
                   if (listRes) void listRes.invalidate();
+                  resources.smtpConnections.markInvalid();
                 }}
               />
             </SettingsDrawer>
@@ -986,6 +988,7 @@ function ConnectionsAdd({
     // The list is re-read after an enrollment: bypass the freshness
     // window so a just-created row is not reported missing.
     if (listRes) void listRes.invalidate();
+    resources.smtpConnections.markInvalid();
   };
   // The chooser/setup candidates: the reviewed enrollment shapes only.
   // Provider "local" (the built-in outbox) is never offered for setup.
@@ -1215,6 +1218,7 @@ function ConnectionsDetail({
   const providers = providersState?.data ?? [];
   const refresh = () => {
     if (listRes) void listRes.invalidate();
+    resources.smtpConnections.markInvalid();
     if (providersRes) void providersRes.revalidate();
   };
   const row = rows.find((r) => r.id === id) ?? null;
@@ -2785,7 +2789,7 @@ export function RotateForm({
 }
 
 /** Revoke with an explicit confirmation — nothing happens on the first click. */
-function RevokeConfirm({
+export function RevokeConfirm({
   row,
   onDone,
   onClose,

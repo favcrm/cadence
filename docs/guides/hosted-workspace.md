@@ -826,8 +826,11 @@ that supports video artifact pages.
 
 Open **Settings → Connections → Email** as the workspace operator.
 Under **Accounts**, use **Add email** to verify and connect an SMTP sender,
-or **Manage** to replace credentials on an existing account. A hosted
-workspace can enroll one SMTP account. Gmail SMTP uses an app password
+or **Manage** to check the sending address and which apps use it. Replace
+credentials with **Update credentials**; look under **Advanced settings** for
+the server, port, encryption, and SMTP username. Disconnecting the account
+stops its assigned app contexts from sending until you choose another sender.
+A hosted workspace can enroll one SMTP account. Gmail SMTP uses an app password
 where Google allows it. Microsoft 365 legacy SMTP works only if both the
 organization and the mailbox allow password-based SMTP authentication.
 OAuth is not available for app senders.

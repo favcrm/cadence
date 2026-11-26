@@ -16,12 +16,13 @@ export type ProtectedEntryState =
   | { status: "failed"; entry: null }
   | { status: "ready"; entry: ProtectedEntry };
 
-export function useProtectedEntry(): ProtectedEntryState {
+export function useProtectedEntry(enabled = true): ProtectedEntryState {
   const [state, setState] = useState<ProtectedEntryState>({
     status: "loading",
     entry: null,
   });
   useEffect(() => {
+    if (!enabled) return;
     let live = true;
     const controller = new AbortController();
     api
@@ -36,7 +37,7 @@ export function useProtectedEntry(): ProtectedEntryState {
       live = false;
       controller.abort();
     };
-  }, []);
+  }, [enabled]);
   return state;
 }
 
