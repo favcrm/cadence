@@ -113,6 +113,7 @@ export default function HostedSmtpConnect({
     <form
       className="grid gap-3 min-w-0"
       aria-label={t("Connect your email")}
+      autoComplete="off"
       onSubmit={(e) => {
         e.preventDefault();
         submit();
@@ -187,12 +188,13 @@ export default function HostedSmtpConnect({
         </div>
       <div className="crm-field">
         <label className="text-label text-ink-300" htmlFor="hs-username">{t("SMTP username (optional)")}</label>
-        <input id="hs-username" className="field" autoComplete="username" spellCheck={false} value={username} onChange={(e) => setUsername(e.target.value)} disabled={pending} />
+        <input id="hs-username" className="field" autoComplete="off" spellCheck={false} value={username} onChange={(e) => setUsername(e.target.value)} disabled={pending} />
         <p className="text-micro text-ink-500">{t("Leave blank to use your email address.")}</p>
       </div>
       <div className="crm-field">
         <label className="text-label text-ink-300" htmlFor="hs-password">{preset.id === "gmail" ? t("App password") : t("SMTP password")}</label>
-        <input id="hs-password" className="field" type="password" autoComplete="current-password" spellCheck={false}
+        {/* This secret is for another service, not the signed-in board account. */}
+        <input id="hs-password" className="field" type="password" autoComplete="new-password" spellCheck={false}
           value={password} onChange={(e) => setPassword(e.target.value)} disabled={pending} />
       </div>
       {riskNeeded && (
