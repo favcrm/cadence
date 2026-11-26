@@ -1,5 +1,6 @@
 import { useContext, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useTranslate } from "../../lib/locale";
+import { installedAppHref } from "../apps/appViewModel";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import {
   readInstallationsGuarded,
@@ -115,6 +116,8 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
 
   const launch = (section: WorksSection, label: string) => {
     setOpen(false);
+    const baseHref = installedAppHref(works.name);
+    if (!baseHref) return;
     const sectionQuery = works.navigation?.section_query || "works";
     openAppViewEditable({
       installId: works.install_id,
@@ -123,7 +126,7 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
       route: { section, view: "new", record_id: null, segment_id: null },
       title: label,
       appLabel: works.title || "Works",
-      href: `/apps/${encodeURIComponent(works.name)}?install=${encodeURIComponent(works.install_id)}&ctx=default&${encodeURIComponent(sectionQuery)}=${section}`,
+      href: `${baseHref}?install=${encodeURIComponent(works.install_id)}&ctx=default&${encodeURIComponent(sectionQuery)}=${section}`,
     });
   };
 
