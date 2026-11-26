@@ -95,6 +95,8 @@ mod cad2215_job_events_opaque_http_acceptance;
 mod cad2215_member_history_opaque_http_acceptance;
 #[path = "cad2215_privacy_http_acceptance.rs"]
 mod cad2215_privacy_http_acceptance;
+#[path = "cad2834_member_memory_http_acceptance.rs"]
+mod cad2834_member_memory_http_acceptance;
 
 fn loopback_server() -> Server {
     (3110..=3199)
@@ -137,6 +139,9 @@ struct Authority {
     status: u16,
     /// Opt-in response recorder for CAD-1485 only. None preserves the old rig.
     board_authorize: Option<cad1485_member_chat_refusal::BoardAuthorize>,
+    /// Opt-in callback for child acceptance modules that cannot construct
+    /// `cad1485_member_chat_refusal::BoardAuthorize` directly.
+    board_authorize_fn: Option<Box<dyn FnMut(tiny_http::Request) + Send>>,
     queue_service_token: Option<String>,
 }
 
@@ -206,6 +211,10 @@ fn answer_platform(
         let mut guard = authority.lock().unwrap();
         if let Some(reply) = guard.board_authorize.as_mut() {
             reply.answer(request);
+            return;
+        }
+        if let Some(cb) = guard.board_authorize_fn.as_mut() {
+            cb(request);
             return;
         }
     }

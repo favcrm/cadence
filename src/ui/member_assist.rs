@@ -58,6 +58,9 @@ enum MemberVerb {
     State,
     History,
     Send,
+    MemoryGet,
+    MemoryEdit,
+    MemoryUndo,
 }
 
 impl MemberVerb {
@@ -66,6 +69,9 @@ impl MemberVerb {
             "state" => Some(MemberVerb::State),
             "history" => Some(MemberVerb::History),
             "send" => Some(MemberVerb::Send),
+            "memory-get" => Some(MemberVerb::MemoryGet),
+            "memory-edit" => Some(MemberVerb::MemoryEdit),
+            "memory-undo" => Some(MemberVerb::MemoryUndo),
             _ => None,
         }
     }
@@ -77,16 +83,20 @@ impl MemberVerb {
             MemberVerb::State => AssistVerb::AssistState,
             MemberVerb::History => AssistVerb::AssistHistory,
             MemberVerb::Send => AssistVerb::AssistSend,
+            MemberVerb::MemoryGet => AssistVerb::MemoryGet,
+            MemberVerb::MemoryEdit => AssistVerb::MemoryEdit,
+            MemberVerb::MemoryUndo => AssistVerb::MemoryUndo,
         }
     }
 
-    /// The verb the issuer's `board-authorize` call names — the contract's
-    /// wire field, identical to this route's own path segment.
+    /// The verb the issuer's `board-authorize` call names — `memory-*`
+    /// reuses `state` (`assist.read`) and `send` (`assist.write`) so no
+    /// platform schema change is needed to mint a scoped envelope.
     fn verb_segment(self) -> &'static str {
         match self {
-            MemberVerb::State => "state",
+            MemberVerb::State | MemberVerb::MemoryGet => "state",
             MemberVerb::History => "history",
-            MemberVerb::Send => "send",
+            MemberVerb::Send | MemberVerb::MemoryEdit | MemberVerb::MemoryUndo => "send",
         }
     }
 }
@@ -132,9 +142,11 @@ fn read_member_args(request: &mut Request, verb: MemberVerb) -> Result<Value, Ht
         "issuer",
     ];
     let allowed: &[&str] = match verb {
-        MemberVerb::State => &[],
+        MemberVerb::State | MemberVerb::MemoryGet => &[],
         MemberVerb::History => &["after", "before", "tail", "limit"],
         MemberVerb::Send => &["text", "message"],
+        MemberVerb::MemoryEdit => &["target", "content", "expected_sha"],
+        MemberVerb::MemoryUndo => &["history_id"],
     };
     for key in obj.keys() {
         if IDENTITY.contains(&key.as_str()) {

@@ -683,6 +683,11 @@ fn member_rpc(
             }
         }
         Err(crate::error::Error::Rejected(m)) => assist_fail(403, "forbidden", &m),
+        Err(e @ crate::error::Error::Structured(_))
+            if e.kind() == "conflict" || e.code() == Some("revision_conflict") =>
+        {
+            assist_fail(409, e.code().unwrap_or("revision_conflict"), &e.to_string())
+        }
         // CAD-2215: the daemon's opaque-cursor refusals carry a stable code
         // the scoped client must see. Missing key material is unavailable;
         // every malformed, stale or foreign token is the same generic
@@ -786,6 +791,90 @@ fn dispatch(
                 return resp;
             }
             member_rpc(state_dir, "member_assist_state", actor, envelope, args)
+        }
+        AssistVerb::MemoryGet => {
+            if let Some(field) = args.as_object().and_then(|o| o.keys().next()) {
+                return assist_fail(
+                    400,
+                    "invalid_request",
+                    &format!("memory_get takes no arguments; field '{field}' is not accepted"),
+                );
+            }
+            if let Err(resp) = provision(state_dir, "assist_state", envelope) {
+                return resp;
+            }
+            member_rpc(state_dir, "member_assist_memory_get", actor, envelope, args)
+        }
+        AssistVerb::MemoryEdit => {
+            if let Some(field) = args.as_object().and_then(|o| {
+                o.keys()
+                    .find(|k| !["target", "content", "expected_sha"].contains(&k.as_str()))
+            }) {
+                return assist_fail(
+                    400,
+                    "invalid_request",
+                    &format!(
+                        "memory_edit takes target, content and optional expected_sha; \
+                         field '{field}' is not accepted"
+                    ),
+                );
+            }
+            match (
+                arg_str(args, "target"),
+                arg_str(args, "content"),
+                arg_str(args, "expected_sha"),
+            ) {
+                (Ok(Some(target)), Ok(Some(_)), Ok(_)) if !target.trim().is_empty() => {
+                    if let Err(resp) = provision(state_dir, "assist_send", envelope) {
+                        return resp;
+                    }
+                    member_rpc(
+                        state_dir,
+                        "member_assist_memory_edit",
+                        actor,
+                        envelope,
+                        args,
+                    )
+                }
+                (Err(resp), _, _) | (_, Err(resp), _) | (_, _, Err(resp)) => resp,
+                _ => assist_fail(
+                    400,
+                    "invalid_request",
+                    "memory_edit needs arguments.target and arguments.content",
+                ),
+            }
+        }
+        AssistVerb::MemoryUndo => {
+            if let Some(field) = args
+                .as_object()
+                .and_then(|o| o.keys().find(|k| k.as_str() != "history_id"))
+            {
+                return assist_fail(
+                    400,
+                    "invalid_request",
+                    &format!("memory_undo takes history_id only; field '{field}' is not accepted"),
+                );
+            }
+            match arg_str(args, "history_id") {
+                Ok(Some(id)) if !id.trim().is_empty() => {
+                    if let Err(resp) = provision(state_dir, "assist_send", envelope) {
+                        return resp;
+                    }
+                    member_rpc(
+                        state_dir,
+                        "member_assist_memory_undo",
+                        actor,
+                        envelope,
+                        args,
+                    )
+                }
+                Err(resp) => resp,
+                _ => assist_fail(
+                    400,
+                    "invalid_request",
+                    "memory_undo needs arguments.history_id",
+                ),
+            }
         }
         AssistVerb::AssistHistory => {
             // The caller supplies only paging arguments. The relay selects

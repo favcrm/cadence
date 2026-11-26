@@ -60,8 +60,11 @@ pub enum AssistVerb {
     // assist.read
     AssistState,
     AssistHistory,
+    MemoryGet,
     // assist.write
     AssistSend,
+    MemoryEdit,
+    MemoryUndo,
     // assist.jobs
     JobRequest,
     JobList,
@@ -87,7 +90,10 @@ impl AssistVerb {
         Some(match segment {
             "assist_state" => AssistVerb::AssistState,
             "assist_history" => AssistVerb::AssistHistory,
+            "memory_get" => AssistVerb::MemoryGet,
             "assist_send" => AssistVerb::AssistSend,
+            "memory_edit" => AssistVerb::MemoryEdit,
+            "memory_undo" => AssistVerb::MemoryUndo,
             "job_request" => AssistVerb::JobRequest,
             "job_list" => AssistVerb::JobList,
             "job_evidence" => AssistVerb::JobEvidence,
@@ -101,8 +107,12 @@ impl AssistVerb {
 
     pub fn scope(self) -> AssistScope {
         match self {
-            AssistVerb::AssistState | AssistVerb::AssistHistory => AssistScope::Read,
-            AssistVerb::AssistSend => AssistScope::Write,
+            AssistVerb::AssistState | AssistVerb::AssistHistory | AssistVerb::MemoryGet => {
+                AssistScope::Read
+            }
+            AssistVerb::AssistSend | AssistVerb::MemoryEdit | AssistVerb::MemoryUndo => {
+                AssistScope::Write
+            }
             AssistVerb::JobRequest
             | AssistVerb::JobList
             | AssistVerb::JobEvidence

@@ -429,7 +429,7 @@ export default function MemberChat({
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
   // Browser activity still follows the last stored item when the feed is down.
-  const tail = [...items].reverse().find((i) => !["system", "artifact", "image", "video", "hire", "share"].includes(i.type));
+  const tail = [...items].reverse().find((i) => !["system", "artifact", "image", "video", "hire", "share", "context_receipt"].includes(i.type));
   const turnOpen = tail !== undefined && tail.type !== "answer" && !(tail.type === "pending" && tail.pending.state === "failed");
   useBrowserFeed(conversationId, turnOpen, `${lastSeq(thread.data) ?? 0}:${thread.data?.pending?.length ?? 0}`);
 

@@ -7,6 +7,7 @@
 //   node ui/scripts/qa-board.mjs status [--name <n>]
 //   node ui/scripts/qa-board.mjs down [--name <n>]
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -381,6 +382,67 @@ function serve(opts) {
     };
   }
 
+  const shaOf = (text) => crypto.createHash("sha256").update(text, "utf8").digest("hex");
+  const memInitial = "# Memory\n\nOne line per fact, newest first. Longer notes go in memory/<topic>.md.\n- 2026-11-26: Supplier quotes for 500 tote bags use shop.example-supplier.test\n";
+  const memBeforeInitial = "# Memory\n\nOne line per fact, newest first. Longer notes go in memory/<topic>.md.\n";
+  const memoryStore = {
+    files: {
+      "SOUL.md": {
+        text: "# Soul\n\n<!-- cadence:managed-begin tone -->\nTone: Concise, direct\n<!-- cadence:managed-end tone -->\n\n<!-- cadence:managed-begin soul_body -->\nLead with clear next actions.\n<!-- cadence:managed-end soul_body -->\n",
+      },
+      "USER.md": {
+        text: "# User preferences\n\n<!-- cadence:managed-begin user_name -->\nUsername: QA Member\n<!-- cadence:managed-end user_name -->\n\n<!-- cadence:managed-begin preferences -->\nPreferences: Keep supplier updates brief.\n<!-- cadence:managed-end preferences -->\n",
+      },
+      "MEMORY.md": { text: memInitial },
+      "memory/preferences.md": { text: "# preferences\n\n- Default order batch size: 500 units.\n" },
+    },
+    history: [
+      {
+        id: "mem_qa_1",
+        at: "2026-11-26T09:00:00Z",
+        op: "remember",
+        target: "MEMORY.md",
+        actor: "assistant-qa",
+        turn_id: "m_qa_1",
+        before_exists: true,
+        before_sha: shaOf(memBeforeInitial),
+        after_sha: shaOf(memInitial),
+        before_text: memBeforeInitial,
+        added: ["- 2026-11-26: Supplier quotes for 500 tote bags use shop.example-supplier.test"],
+        removed: [],
+        undone_by: null,
+      },
+    ],
+    seq: 1,
+  };
+  const memoryGet = () => ({
+    files: ["SOUL.md", "USER.md", "MEMORY.md"].map((target) => {
+      const text = memoryStore.files[target]?.text ?? "";
+      return {
+        target,
+        text,
+        sha: shaOf(text),
+        line_count: text.trimEnd() === "" ? 0 : text.trimEnd().split("\n").length,
+        ...(target === "MEMORY.md" ? { cap: 200 } : {}),
+      };
+    }),
+    topics: Object.keys(memoryStore.files)
+      .filter((k) => k.startsWith("memory/") && k.endsWith(".md"))
+      .sort()
+      .map((target) => {
+        const text = memoryStore.files[target].text;
+        return {
+          slug: target.slice("memory/".length, -".md".length),
+          target,
+          text,
+          sha: shaOf(text),
+          line_count: text.trimEnd() === "" ? 0 : text.trimEnd().split("\n").length,
+        };
+      }),
+    history: memoryStore.history.map(({ before_text: _bt, ...rest }) => rest),
+    applies: "next_turn",
+  });
+
   const fixtures = {
     "GET /api/meta": () => boardMeta(fx, presets),
     "GET /api/locale": () => locale,
@@ -391,7 +453,90 @@ function serve(opts) {
     },
     "POST /api/member-assistant/state": () => fx["member-assistant-state"],
     "POST /api/member-assistant/profile": () => fx["member-assistant-profile"],
+    "POST /api/member-assistant/instructions": () => ({
+      instructions: "Lead with concise, practical recommendations tailored to this member.",
+      revision: fx["member-assistant-state"]?.assistant?.identity?.revision ?? 1,
+      built_in_instruction_tokens: 120,
+      skills: [],
+      enabled_tools: [],
+    }),
     "POST /api/member-assistant/history": (b) => page(b ?? {}),
+    "POST /api/member-assistant/memory-get": () => memoryGet(),
+    "POST /api/member-assistant/memory-edit": (b, res) => {
+      const target = String(b?.target ?? "").trim();
+      const content = typeof b?.content === "string" ? b.content : "";
+      if (!["SOUL.md", "USER.md", "MEMORY.md"].includes(target) && !/^memory\/[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?\.md$/.test(target)) {
+        return send(res, 400, { ok: false, error: { code: "invalid_target", message: `target '${target}' is not allowed` } });
+      }
+      const prev = memoryStore.files[target];
+      const prevText = prev?.text ?? "";
+      const prevSha = shaOf(prevText);
+      if (b?.expected_sha !== undefined && b.expected_sha !== (prev ? prevSha : "")) {
+        return send(res, 409, { ok: false, error: { code: "revision_conflict", message: `${target} changed since it was loaded` } });
+      }
+      const normalized = content.endsWith("\n") || content === "" ? content : `${content}\n`;
+      const nextSha = shaOf(normalized);
+      memoryStore.seq += 1;
+      const histId = `mem_qa_${memoryStore.seq}`;
+      const beforeSet = new Set(prevText.split("\n").map((l) => l.trim()).filter(Boolean));
+      const afterSet = new Set(normalized.split("\n").map((l) => l.trim()).filter(Boolean));
+      memoryStore.history.unshift({
+        id: histId,
+        at: new Date().toISOString(),
+        op: "member_edit",
+        target,
+        actor: "users/usr_qa_member",
+        turn_id: "member-ui",
+        before_exists: prev !== undefined,
+        before_sha: prevSha,
+        after_sha: nextSha,
+        before_text: prevText,
+        added: [...afterSet].filter((l) => !beforeSet.has(l)).slice(0, 10),
+        removed: [...beforeSet].filter((l) => !afterSet.has(l)).slice(0, 10),
+        undone_by: null,
+      });
+      memoryStore.files[target] = { text: normalized };
+      return { target, sha: nextSha, history_id: histId, applies: "next_turn" };
+    },
+    "POST /api/member-assistant/memory-undo": (b, res) => {
+      const historyId = String(b?.history_id ?? "").trim();
+      const entry = memoryStore.history.find((h) => h.id === historyId);
+      if (!entry) return send(res, 403, { ok: false, error: { code: "forbidden", message: `unknown history entry '${historyId}'` } });
+      if (entry.undone_by) return send(res, 409, { ok: false, error: { code: "already_undone", message: `history entry '${historyId}' was already undone` } });
+      const curText = memoryStore.files[entry.target]?.text ?? "";
+      if (shaOf(curText) !== entry.after_sha) {
+        return send(res, 409, { ok: false, error: { code: "revision_conflict", message: `${entry.target} changed since that edit` } });
+      }
+      memoryStore.seq += 1;
+      const undoId = `mem_qa_${memoryStore.seq}`;
+      entry.undone_by = undoId;
+      if (entry.before_exists) memoryStore.files[entry.target] = { text: entry.before_text };
+      else delete memoryStore.files[entry.target];
+      memoryStore.history.unshift({
+        id: undoId,
+        at: new Date().toISOString(),
+        op: "undo",
+        target: entry.target,
+        actor: "users/usr_qa_member",
+        turn_id: "member-ui",
+        before_exists: true,
+        before_sha: shaOf(curText),
+        after_sha: entry.before_sha,
+        before_text: curText,
+        added: entry.removed,
+        removed: entry.added,
+        undone_by: null,
+      });
+      return {
+        undone: historyId,
+        undo_history_id: undoId,
+        op: entry.op,
+        target: entry.target,
+        sha: entry.before_sha,
+        revision_sha: entry.before_sha,
+        applies: "next_turn",
+      };
+    },
     "POST /api/member-assistant/send": (b) => {
       entries.push({ id: `csrid_qa_${entries.length + 1}`, role: "member", kind: "message", text: String(b?.text ?? ""), message: b?.message ?? null, created: Date.now() / 1000 });
       return { ...fx["member-assistant-send"], message: b?.message };
@@ -513,7 +658,19 @@ function serve(opts) {
         });
         upstream.on("error", () => resolve(null));
       });
-      return send(res, 200, skills.roster(listed));
+      const rosterPayload = skills.roster(listed);
+      const st = fx["member-assistant-state"]?.assistant;
+      if (rosterPayload && typeof rosterPayload === "object" && st) {
+        rosterPayload.personal_assistant = {
+          scope: "personal",
+          opens: "home",
+          name: st.identity?.name ?? "Poppy",
+          look: st.identity?.look ?? "designer",
+          bootstrap_state: st.bootstrap_state ?? "complete",
+          conversation_id: st.conversation_id ?? fx["member-assistant-state"]?.conversation_id ?? null,
+        };
+      }
+      return send(res, 200, rosterPayload);
     }
     if (pathname === "/api/team/members" && req.method === "GET" && servesRoster(presets)) {
       count("GET /api/team/members");

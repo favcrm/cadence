@@ -416,6 +416,71 @@ export interface MemberAssistSend {
   attention?: string;
 }
 
+/** CAD-2834: one editable personal-assistant context file (`SOUL.md`, `USER.md`, `MEMORY.md`). */
+export interface MemberAssistantMemoryFile {
+  target: string;
+  text: string;
+  sha: string;
+  line_count: number;
+  cap?: number;
+}
+
+/** CAD-2834: one `memory/<slug>.md` topic file. */
+export interface MemberAssistantMemoryTopic {
+  slug: string;
+  target: string;
+  text: string;
+  sha: string;
+  line_count: number;
+}
+
+/** CAD-2834: one `.memory-history.jsonl` row exposed to the member UI. */
+export interface MemberAssistantMemoryHistoryEntry {
+  id: string;
+  at: string;
+  op: string;
+  target: string;
+  actor: string;
+  turn_id: string;
+  before_exists: boolean;
+  before_sha: string;
+  after_sha: string;
+  added: string[];
+  removed: string[];
+  undone_by?: string | null;
+}
+
+/** CAD-2834: `POST /api/member-assistant/memory-get` response. */
+export interface MemberAssistantMemorySnapshot {
+  files: MemberAssistantMemoryFile[];
+  topics: MemberAssistantMemoryTopic[];
+  history: MemberAssistantMemoryHistoryEntry[];
+  applies: "next_turn";
+}
+
+export interface MemberAssistantMemoryEditRequest {
+  target: string;
+  content: string;
+  expected_sha?: string;
+}
+
+export interface MemberAssistantMemoryEditResult {
+  target: string;
+  sha: string;
+  history_id: string;
+  applies: "next_turn";
+}
+
+export interface MemberAssistantMemoryUndoResult {
+  undone: string;
+  undo_history_id: string;
+  op: string;
+  target: string;
+  sha: string;
+  revision_sha: string;
+  applies: "next_turn";
+}
+
 export { ApiError } from "./apiError";
 
 const conditional = new ConditionalGet(
@@ -1144,6 +1209,19 @@ export const api = {
       `/api/member-assistant/send`,
       attachments && attachments.length > 0 ? { text, message, attachments } : { text, message },
     ),
+  /** CAD-2834: `POST /api/member-assistant/memory-get` — inspect editable
+   *  `SOUL.md`, `USER.md`, `MEMORY.md`, topics, and `.memory-history.jsonl`. */
+  memberAssistMemoryGet: () =>
+    post<MemberAssistantMemorySnapshot>(`/api/member-assistant/memory-get`, {}),
+  /** CAD-2834: `POST /api/member-assistant/memory-edit` — CAS-guarded edit
+   *  to one editable personal-assistant file (`SOUL.md`, `USER.md`, `MEMORY.md`,
+   *  or `memory/<slug>.md`). */
+  memberAssistMemoryEdit: (body: MemberAssistantMemoryEditRequest) =>
+    post<MemberAssistantMemoryEditResult>(`/api/member-assistant/memory-edit`, body),
+  /** CAD-2834: `POST /api/member-assistant/memory-undo` — 1-click undo of
+   *  one `.memory-history.jsonl` change. */
+  memberAssistMemoryUndo: (history_id: string) =>
+    post<MemberAssistantMemoryUndoResult>(`/api/member-assistant/memory-undo`, { history_id }),
   /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
    *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */
