@@ -172,6 +172,158 @@ fn marker_state(value: Option<&Value>) -> Option<&str> {
     value?.get("state")?.as_str()
 }
 
+/// A policy slot name or slot key: the tenant's `^[A-Za-z0-9._:-]{1,200}$`.
+fn policy_slot_key(value: &str) -> bool {
+    (1..=200).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+fn policy_nonblank(value: &str, max: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max
+}
+
+/// `assigned_reviews` in a hosted policy answer: `{overridable_slots: [slot…],
+/// default_profile?}` or null. The client does not consume the setting — the
+/// tenant's dispatch does — but a shape the tenant could not have stored is
+/// refused rather than ignored.
+fn assigned_reviews_answer(value: &Value) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let fields = value
+        .as_object()
+        .ok_or_else(|| refuse("`delivery_policy` assigned_reviews is not an object or null"))?;
+    if fields
+        .keys()
+        .any(|k| k != "overridable_slots" && k != "default_profile")
+    {
+        return Err(refuse(
+            "`delivery_policy` assigned_reviews has an unknown key",
+        ));
+    }
+    let slots = fields
+        .get("overridable_slots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            refuse("`delivery_policy` assigned_reviews has no overridable_slots list")
+        })?;
+    if slots
+        .iter()
+        .any(|slot| !slot.as_str().is_some_and(policy_slot_key))
+    {
+        return Err(refuse(
+            "`delivery_policy` assigned_reviews lists a value that is not a slot key",
+        ));
+    }
+    if let Some(default) = fields.get("default_profile") {
+        if !default
+            .as_str()
+            .is_some_and(|profile| policy_nonblank(profile, 200))
+        {
+            return Err(refuse(
+                "`delivery_policy` assigned_reviews default_profile is malformed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `review_workflow` in a hosted policy answer, in the tenant's strict shape:
+/// action `enqueue_pr|accept_artifact`, stages of `{slots}` holding unique slot
+/// keys, and evidence only where that action allows it. Null means none.
+fn review_workflow_answer(value: &Value) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let fields = value
+        .as_object()
+        .ok_or_else(|| refuse("`delivery_policy` review_workflow is not an object or null"))?;
+    if fields.keys().any(|k| k != "stages" && k != "action") {
+        return Err(refuse(
+            "`delivery_policy` review_workflow has an unknown key",
+        ));
+    }
+    let action = fields
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|action| matches!(*action, "enqueue_pr" | "accept_artifact"))
+        .ok_or_else(|| refuse("`delivery_policy` review_workflow has no known action"))?;
+    let stages = fields
+        .get("stages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| refuse("`delivery_policy` review_workflow has no stages list"))?;
+    if stages.len() > 256 {
+        return Err(refuse(
+            "`delivery_policy` review_workflow has too many stages",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for stage in stages {
+        let stage = stage
+            .as_object()
+            .filter(|stage| stage.len() == 1 && stage.contains_key("slots"))
+            .ok_or_else(|| refuse("`delivery_policy` review_workflow stage is not {slots}"))?;
+        let slots = stage["slots"]
+            .as_array()
+            .ok_or_else(|| refuse("`delivery_policy` review_workflow stage has no slots list"))?;
+        if slots.is_empty() || slots.len() > 256 {
+            return Err(refuse(
+                "`delivery_policy` review_workflow stage has an invalid slot count",
+            ));
+        }
+        for slot in slots {
+            let slot = slot
+                .as_object()
+                .ok_or_else(|| refuse("`delivery_policy` review_workflow slot is not an object"))?;
+            if slot
+                .keys()
+                .any(|k| !matches!(k.as_str(), "key" | "profile" | "brief" | "evidence_kind"))
+            {
+                return Err(refuse(
+                    "`delivery_policy` review_workflow slot has an unknown key",
+                ));
+            }
+            let key = slot
+                .get("key")
+                .and_then(Value::as_str)
+                .filter(|key| policy_slot_key(key))
+                .ok_or_else(|| refuse("`delivery_policy` review_workflow slot has no valid key"))?;
+            if !seen.insert(key) {
+                return Err(refuse(
+                    "`delivery_policy` review_workflow repeats a slot key",
+                ));
+            }
+            for (name, max) in [("profile", 200), ("brief", 16 * 1024)] {
+                if !slot
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| policy_nonblank(text, max))
+                {
+                    return Err(refuse(format!(
+                        "`delivery_policy` review_workflow slot has a malformed {name}"
+                    )));
+                }
+            }
+            if action == "enqueue_pr" {
+                let kind = slot.get("evidence_kind").and_then(Value::as_str);
+                if !matches!(kind, Some("standards" | "spec-security" | "general")) {
+                    return Err(refuse(
+                        "`delivery_policy` review_workflow PR slot must name standards, \
+                         spec-security or general evidence",
+                    ));
+                }
+            } else if slot.contains_key("evidence_kind") {
+                return Err(refuse(
+                    "`delivery_policy` review_workflow artifact slot cannot declare evidence_kind",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `{project, revision, repos, delivery, delivery_approval}`, echoing
 /// `project`:
 /// - `repos` `{state:"set", repos:[owner/name…]}` (non-empty); `not_stored`
@@ -186,22 +338,38 @@ fn marker_state(value: Option<&Value>) -> Option<&str> {
 ///   native policy digest; any other state is no approval (strict, as an
 ///   unapproved custom section is natively).
 ///
-/// Any other key or shape refuses, so no policy input is ever ignored.
+/// `assigned_reviews` and `review_workflow` are optional: a tenant that stores
+/// them answers them, and this client does not consume either (the tenant's
+/// own dispatch and gate do). They are still validated strictly, never
+/// ignored. Any other key or shape refuses, so no policy input is ever
+/// silently accepted.
 pub(crate) fn delivery_policy_answer(body: &Value, project: &str) -> Result<ProjectPolicy> {
     let fields = body
         .as_object()
         .ok_or_else(|| refuse("`delivery_policy` answer is not an object"))?;
-    const KEYS: [&str; 5] = [
+    const REQUIRED: [&str; 5] = [
         "project",
         "revision",
         "repos",
         "delivery",
         "delivery_approval",
     ];
-    if fields.len() != KEYS.len() || !KEYS.iter().all(|k| fields.contains_key(*k)) {
+    const OPTIONAL: [&str; 2] = ["assigned_reviews", "review_workflow"];
+    if !REQUIRED.iter().all(|k| fields.contains_key(*k))
+        || fields
+            .keys()
+            .any(|k| !REQUIRED.contains(&k.as_str()) && !OPTIONAL.contains(&k.as_str()))
+    {
         return Err(refuse(
-            "`delivery_policy` answer must be exactly {project, revision, repos, delivery, delivery_approval}",
+            "`delivery_policy` answer must be {project, revision, repos, delivery, delivery_approval} \
+             with optional {assigned_reviews, review_workflow}",
         ));
+    }
+    if let Some(settings) = fields.get("assigned_reviews") {
+        assigned_reviews_answer(settings)?;
+    }
+    if let Some(workflow) = fields.get("review_workflow") {
+        review_workflow_answer(workflow)?;
     }
     if fields["project"].as_str() != Some(project) {
         return Err(refuse(format!(
@@ -3395,6 +3563,89 @@ mod tests {
         ] {
             assert!(delivery_policy_answer(&body, "cadence").is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn delivery_policy_answer_accepts_the_optional_policy_keys_and_refuses_bad_shapes() {
+        let set = json!({"state": "set", "repos": ["favcrm/cadence"]});
+        let base = answer(set, json!({"state": "absent"}), not_stored());
+        let with_settings = |settings: Value| {
+            let mut body = base.clone();
+            body["assigned_reviews"] = settings;
+            body
+        };
+        let with_workflow = |workflow: Value| {
+            let mut body = base.clone();
+            body["review_workflow"] = workflow;
+            body
+        };
+
+        // The tenant's own answers pass: settings with and without a default
+        // profile, a workflow per action, and null for "stored as none".
+        let mut both = base.clone();
+        both["assigned_reviews"] = json!({"overridable_slots": ["standards"]});
+        both["review_workflow"] = json!({"action": "enqueue_pr", "stages":
+            [{"slots": [{"key": "standards", "profile": "ap_1", "brief": "review it",
+                         "evidence_kind": "standards"}]}]});
+        for ok in [
+            with_settings(json!({"overridable_slots": []})),
+            with_settings(
+                json!({"overridable_slots": ["standards", "spec"], "default_profile": "ap_1"}),
+            ),
+            with_settings(Value::Null),
+            with_workflow(Value::Null),
+            with_workflow(json!({"action": "accept_artifact", "stages":
+                [{"slots": [{"key": "artifact", "profile": "ap_1", "brief": "review it"}]}]})),
+            both.clone(),
+        ] {
+            assert!(delivery_policy_answer(&ok, "cadence").is_ok(), "{ok}");
+        }
+
+        for bad in [
+            with_settings(json!({"overridable_slots": [""]})),
+            with_settings(json!({"overridable_slots": "standards"})),
+            with_settings(json!({"overridable_slots": [], "default_profile": ""})),
+            with_settings(json!({"overridable_slots": [], "extra": 1})),
+            with_settings(json!("standards")),
+            with_workflow(json!({"action": "other", "stages": []})),
+            with_workflow(json!({"action": "enqueue_pr"})),
+            with_workflow(json!({"action": "enqueue_pr", "stages": [{"slots": []}]})),
+            with_workflow(json!({"action": "enqueue_pr", "stages":
+                [{"slots": [{"key": "standards", "profile": "ap_1", "brief": "b"}]}]})),
+            with_workflow(json!({"action": "enqueue_pr", "stages":
+                [{"slots": [{"key": "standards", "profile": "ap_1", "brief": "b",
+                             "evidence_kind": "browser-qa"}]}]})),
+            with_workflow(json!({"action": "enqueue_pr", "stages":
+                [{"slots": [{"key": "a", "profile": "ap_1", "brief": "b", "evidence_kind": "standards"},
+                             {"key": "a", "profile": "ap_2", "brief": "b", "evidence_kind": "spec-security"}]}]})),
+            with_workflow(json!({"action": "accept_artifact", "stages":
+                [{"slots": [{"key": "a", "profile": "ap_1", "brief": "b",
+                             "evidence_kind": "standards"}]}]})),
+            with_workflow(json!({"action": "enqueue_pr", "stages":
+                [{"slots": [{"key": "a/b", "profile": "ap_1", "brief": "b",
+                             "evidence_kind": "standards"}]}]})),
+            with_workflow(json!({"action": "enqueue_pr", "stages":
+                [{"slots": [{"key": "a", "profile": "", "brief": "b",
+                             "evidence_kind": "standards"}]}]})),
+            with_workflow(json!({"action": "enqueue_pr", "stages":
+                [{"slots": [{"key": "a", "profile": "ap_1", "brief": " ",
+                             "evidence_kind": "standards"}]}]})),
+            with_workflow(json!({"action": "enqueue_pr", "stages":
+                [{"slots": [{"key": "a", "profile": "ap_1", "brief": "b",
+                             "evidence_kind": "standards", "extra": 1}]}]})),
+            with_workflow(json!({"action": "enqueue_pr", "stages":
+                [{"slots": [{"key": "a", "profile": "ap_1", "brief": "b",
+                             "evidence_kind": "standards"}], "extra": 1}]})),
+            with_workflow(json!({"stages": []})),
+            with_workflow(json!("enqueue_pr")),
+        ] {
+            assert!(delivery_policy_answer(&bad, "cadence").is_err(), "{bad}");
+        }
+
+        // An unknown top-level key still refuses even beside valid optional ones.
+        let mut unknown = both;
+        unknown["visibility"] = json!("private");
+        assert!(delivery_policy_answer(&unknown, "cadence").is_err());
     }
 
     #[test]
