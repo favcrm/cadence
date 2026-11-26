@@ -822,6 +822,20 @@ may be uncertain; inspect the original directory before retrying. Images are
 limited to 10 MiB and videos to 100 MiB. Video retrieval also requires a server
 that supports video artifact pages.
 
+## Sending email from apps
+
+Open **Settings → Connections → Email** as the workspace operator.
+Under **Accounts**, use **Add email** to verify and connect an SMTP sender,
+or **Manage** to replace credentials on an existing account. A hosted
+workspace can enroll one SMTP account. Gmail SMTP uses an app password
+where Google allows it; Microsoft 365 legacy SMTP works only where the
+mailbox allows password-based SMTP authentication.
+
+Under **App senders**, choose the account each app context sends from.
+Connecting an account does not assign it to any app or approve a send.
+A Gmail account connected through hosted sign-in for agent tools is not an
+app sender. Old Email sending links open **App senders** in the new location.
+
 ## Workspace connections and Search Console properties
 
 The hosted workspace owns its provider credentials and its enrolled accounts.

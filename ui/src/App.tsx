@@ -128,6 +128,7 @@ import { useMaybeResource, useResource } from "./lib/useResource";
 import {
   appNavigationSearch,
   goTo,
+  legacyRedirect,
   locationHref,
   matchRoute,
   openProject,
@@ -541,7 +542,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // makes no request for the rest of the session.
 
   // A board that says what Settings it serves never shows a page it doesn't.
-  const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
+  const emailAvailable = !meta?.settings_sections || meta.settings_sections.includes("email");
+  const settingsTarget = route.screen === "settings"
+    ? settingsRedirect(route.section, meta) ?? (!emailAvailable && route.section === "connections" && route.page?.kind === "email" ? settingsRedirect("email", meta) : null)
+    : null;
+  useEffect(() => {
+    const path = href.split("?")[0];
+    if (path === "/settings/email" || path === "/settings/email/") {
+      const target = legacyRedirect(path, search);
+      if (target) navigate(target, { replace: true });
+    }
+  }, [href, search]);
   const settingsCrumb = route.screen === "settings" ? settingsLabel(settingsTarget ?? route.section) : null;
   useEffect(() => {
     if (settingsTarget) {
@@ -1996,10 +2007,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             {route.section === "documents" && meta?.settings_sections?.includes("documents") && (
               <DocumentTypes hosted={documentsHosted} viewer={viewer} viewerSub={viewerSub} />
             )}
-            {route.section === "connections" && (
-              <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
-            )}
-            {route.section === "email" && <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} />}
+            {route.section === "connections" && (route.page?.kind === "email" ? (
+              <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} focusSenders={route.page.focusSenders} />
+            ) : (
+              <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} emailAvailable={emailAvailable} />
+            ))}
             {route.section === "templates" && (
               <Templates viewer={{ operator: viewer.operator, hosted: false }} />
             )}

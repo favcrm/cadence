@@ -57,9 +57,6 @@ export function sendingFrom(
   return binding && binding.state === "live" ? binding.sender.address : null;
 }
 
-/** Where campaigns send the operator to choose a sender. */
-export const EMAIL_SENDING_HREF = "/settings/email";
-
 /** What a hosted send parked for the owner reads as — never an error. */
 export const WAITING_APPROVAL_TEXT = "Waiting for owner approval in AgenticOS";
 

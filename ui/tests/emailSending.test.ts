@@ -1,6 +1,6 @@
 export {};
 /**
- * CAD-1059 / CAD-1063 slice 2: Settings -> Email sending, mounted.
+ * Settings → Connections → Email, mounted.
  * One page chooses the CRM sender (SMTP or hosted AgenticOS), binds or
  * rebinds it with the existing crm_smtp verbs, and sets the unsubscribe
  * origin once. Link/auth revisions stay behind Details.
@@ -17,6 +17,7 @@ function equal(actual: unknown, expected: unknown, why: string): void {
 
 interface World {
   connections: any[];
+  hostedSmtp?: boolean;
   binding: any | null;
   /** Per-context bindings; a missing key falls back to `binding`. */
   bindings?: Record<string, any | null>;
@@ -49,7 +50,7 @@ const bindingFor = (row: any, over: any = {}) => ({
 
 async function mount(world: World, viewer = { operator: true, readOnly: false }, fixedUnsubscribeAddress = false) {
   const { Window } = require("happy-dom");
-  const win = new Window({ url: "http://localhost/settings/email" });
+  const win = new Window({ url: "http://localhost/settings/connections/email" });
   for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLSelectElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
     Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
   for (const name of ["addEventListener", "removeEventListener"])
@@ -85,7 +86,7 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
           world.failConnectionsOnce = false;
           return json({ error: "connections are unavailable" }, 503);
         }
-        return json({ connections: world.connections });
+        return json({ connections: world.connections, hosted_smtp: world.hostedSmtp });
       case "POST /api/crm-smtp/show": {
         if (world.failShowOnce) {
           world.failShowOnce = false;
@@ -201,8 +202,8 @@ async function main() {
     equal(Object.keys(bind.body).sort(), ["connection_id", "context_id", "install_id", "request_id"], "bind body carries ids only, no revisions");
     await m.unmount();
   }
-  // CAD-1797: every eligible app/context is listed; each keeps its own
-  // binding. The page does not re-implement the Connections account form.
+  // Every eligible context keeps its own binding. Account credentials
+  // are only entered after opening Add email.
   {
     const a = smtpRow("conn-a"), b = smtpRow("conn-b");
     const world = fresh({
@@ -218,8 +219,7 @@ async function main() {
       assert(m.rowFor("CRM · Acme")?.textContent?.includes("conn-a@example.com"), "the bound context names its sender");
       assert(m.rowFor("CRM · Billing")?.textContent?.includes("No sender chosen"), "the other context is unbound");
     });
-    assert(!m.host.querySelector("#email-sending-target"), "no single-target selector");
-    assert(!m.host.querySelector("[data-section=connect-email]"), "no duplicate SMTP account form");
+    assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "a listed SMTP account can be managed");
     assert(!m.host.querySelector("input[type=password]"), "no password field on the policy page");
     await m.open("CRM · Billing");
     await m.settle(() => assert(m.button("Use this sender"), "bind button"));
@@ -262,7 +262,7 @@ async function main() {
     assert(m.host.querySelector("input[type=password]") === null, "no password field");
     await m.unmount();
   }
-  // Unusable SMTP sender: never bindable, typed reason, link to Connections.
+  // Unusable SMTP sender: never bindable, typed reason, link to Email accounts.
   {
     const bad = smtpRow("conn-bad", { smtp: null, smtp_error: "withheld_leak" });
     const m = await mount(fresh({ connections: [bad] }));
@@ -270,7 +270,7 @@ async function main() {
     await m.settle(() => assert(m.host.querySelector("[data-state=sender-unusable]"), "unusable row"));
     const li = m.host.querySelector("[data-state=sender-unusable]")!;
     assert(li.textContent!.includes("password shares characters"), "typed smtp_error reason");
-    assert(li.querySelector('a[href="/settings/connections"]'), "link to Connections");
+    assert(li.querySelector('a[href="/settings/connections/email"]'), "link to Email accounts");
     assert(m.button("Use this sender") === undefined, "an unusable sender cannot be bound");
     await m.unmount();
   }
@@ -360,6 +360,15 @@ async function main() {
     await m.settle(() => assert(m.button("Retry"), "the drawer offers Retry"));
     await m.click(m.button("Retry"));
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "Retry recovers"));
+    await m.unmount();
+  }
+  // A hosted workspace can manage its enrolled sender, not add a duplicate.
+  {
+    const m = await mount(fresh({
+      hostedSmtp: true, connections: [smtpRow("conn-hosted", { account: "email" })],
+    }), { operator: true, readOnly: false }, true);
+    await m.settle(() => assert(m.host.querySelector('a[href="/settings/connections/account/conn-hosted"]'), "existing hosted account can be managed"));
+    assert(!m.button("Add email"), "the single hosted SMTP account cannot be replaced through Add email");
     await m.unmount();
   }
   // A hosted board's links always use its own address: there is no setting to show.

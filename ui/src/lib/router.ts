@@ -68,9 +68,13 @@ export type WikiMode = "browse" | "edit" | "history" | "search" | "upload" | "tr
 export type DocumentStageFilter = Exclude<DocumentStage, "archived">;
 const DOCUMENT_STAGE_FILTERS: readonly DocumentStageFilter[] = ["draft", "in_review", "approved", "delivered"];
 
+export const EMAIL_CONNECTIONS_HREF = "/settings/connections/email";
+export const EMAIL_SENDING_HREF = "/settings/connections/email/senders";
+
 export type ConnectionPage =
   | { kind: "add" }
   | { kind: "addProvider"; provider: string }
+  | { kind: "email"; focusSenders: boolean }
   | { kind: "detail"; id: string };
 
 export type Route =
@@ -317,7 +321,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "preferences") return { screen: "settings", section: "preferences" };
       if (a === "security") return { screen: "settings", section: "security" };
       if (a === "permissions") return { screen: "settings", section: "permissions" };
-      if (a === "email") return { screen: "settings", section: "email" };
+      if (a === "email") return { screen: "settings", section: "connections", page: { kind: "email", focusSenders: true } };
       if (a === "general") return { screen: "settings", section: "general" };
       if (a === "members") return { screen: "settings", section: "members" };
       if (a === "documents") return { screen: "settings", section: "documents" };
@@ -335,6 +339,9 @@ export function matchRoute(pathname: string): Route {
         const rawSegs = pathname.split("/").slice(1);
         const emptyInternal = rawSegs.some((s, i) => s === "" && i < rawSegs.length - 1);
         if (!emptyInternal) {
+          if (b === "email" && (rest.length === 0 || (rest.length === 1 && rest[0] === "senders"))) {
+            return { screen: "settings", section: "connections", page: { kind: "email", focusSenders: rest.length === 1 } };
+          }
           if (b === "new" && rest.length === 0) {
             return { screen: "settings", section: "connections", page: { kind: "add" } };
           }
@@ -423,6 +430,7 @@ export function routePath(route: Route): string {
       if (route.section === "update") return "/settings/update";
       if (route.section === "permissions") return "/settings/permissions";
       if (route.section === "connections") {
+        if (route.page?.kind === "email") return route.page.focusSenders ? EMAIL_SENDING_HREF : EMAIL_CONNECTIONS_HREF;
         if (route.page?.kind === "add") return "/settings/connections/new";
         if (route.page?.kind === "addProvider") {
           return `/settings/connections/new/${encodeURIComponent(route.page.provider)}`;
@@ -432,7 +440,7 @@ export function routePath(route: Route): string {
         }
         return "/settings/connections";
       }
-      if (route.section === "email") return "/settings/email";
+      if (route.section === "email") return EMAIL_CONNECTIONS_HREF;
       if (route.section === "general") return "/settings/general";
       if (route.section === "members") return "/settings/members";
       if (route.section === "documents") return "/settings/documents";
@@ -733,6 +741,10 @@ export function legacyRedirect(
   search: string,
   storedView?: ProjectView,
 ): string | null {
+  if (pathname === "/settings/email" || pathname === "/settings/email/") {
+    const loc = readLocation(pathname, search, storedView);
+    return locationHref(loc, search);
+  }
   const q = new URLSearchParams(search);
   if (matchRoute(pathname).screen !== "home" || (!q.has("tab") && !q.has("view"))) {
     // `/index.html` is Home under its file name.

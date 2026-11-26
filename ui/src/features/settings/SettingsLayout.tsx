@@ -16,7 +16,6 @@ const ICONS: Record<SettingsIcon, ReactNode> = {
   preferences: line(SlidersHorizontalIcon),
   security: line(SquareLock01Icon),
   connections: <IconConnection size={16} />,
-  email: line(Mail01Icon),
   templates: line(File01Icon),
   general: line(GlobalIcon),
   daemons: line(ServerStack01Icon),

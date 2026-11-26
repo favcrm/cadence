@@ -95,9 +95,12 @@ async function main() {
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
   const { default: ConnectionsView } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
   const { LocaleProvider: PageLocale } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+  const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+  const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
   // Connections renders localized chips and must sit inside the locale provider (CAD-1331).
   const Connections = (props: import("react").ComponentProps<typeof ConnectionsView>) =>
-    React.createElement(PageLocale, null, React.createElement(ConnectionsView, props));
+    React.createElement(PageLocale, null,
+      React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(ConnectionsView, props) }));
 
   // Record every request; a private read or any mutation while the
   // operator proof is unknown fails the check.
@@ -238,6 +241,7 @@ async function main() {
       assert(text().includes("Connections"), "operator:true renders the index");
       assert(text().includes("+ Add"), "operator:true writable shows the add action");
       assert(!text().includes("Checking access"), "operator:true is not gated as unknown");
+      assert(host.querySelector('a[href="/settings/connections/email"]'), "Email connector is available even with no connected accounts");
     });
     assert(calls.some((c) => c.url.endsWith("/api/connections")), "operator:true issues the connections read");
   }

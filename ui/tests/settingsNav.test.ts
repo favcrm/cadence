@@ -18,7 +18,7 @@ const MEMBER = { settings_sections: ["preferences", "members"] };
 
 equal(
   flat(OWNER),
-  ["Preferences", "Members", "Connections", "Email sending", "General", "Status"],
+  ["Preferences", "Members", "Connections", "General", "Status"],
   "a hosted owner sees only what the board serves",
 );
 equal(flat(MEMBER), ["Preferences", "Members"], "a member can reach the read-only directory");
@@ -26,7 +26,7 @@ for (const absent of ["Agents", "Memory", "Master permissions", "Advanced custod
   if (flat(OWNER).includes(absent)) throw new Error(`${absent} must be hidden on a hosted board`);
 equal(
   flat(null),
-  ["Preferences", "Agents", "Connections", "Email sending", "Templates", "General", "Memory", "Status", "Master permissions", "Advanced custody"],
+  ["Preferences", "Agents", "Connections", "Templates", "General", "Memory", "Status", "Master permissions", "Advanced custody"],
   "no list keeps every section a native board has, General (company time zone) included",
 );
 equal(
@@ -69,6 +69,8 @@ equal(settingsLabel("account"), "Billing", "the crumb names Billing");
 equal(settingsRedirect("models", OWNER), "members", "bare /settings opens on a working page");
 equal(settingsRedirect("permissions", OWNER), "members", "a direct link to a hidden section moves");
 equal(settingsRedirect("connections", OWNER), null, "a served section stays");
+equal(settingsRedirect("email", OWNER), null, "hosted email remains available when advertised");
+equal(settingsRedirect("email", MEMBER), "members", "hosted email stays unavailable when not advertised");
 equal(settingsRedirect("models", MEMBER), "members", "a member lands on a page they have");
 equal(settingsRedirect("models", null), null, "nothing moves before the board has answered");
 equal(settingsRedirect("permissions", {}), null, "a board that states nothing keeps every route");
@@ -84,7 +86,7 @@ equal(settingsLabel("templates"), "Templates", "the crumb names Templates");
 const DOCUMENTS = { settings_sections: ["preferences", "general", "members", "documents", "connections", "email", "status"] };
 equal(
   flat(DOCUMENTS),
-  ["Preferences", "Members", "Documents", "Connections", "Email sending", "General", "Status"],
+  ["Preferences", "Members", "Documents", "Connections", "General", "Status"],
   "a board that serves the lifecycle offers Documents after Members",
 );
 equal(flat(OWNER).includes("Documents"), false, "a board that does not name documents hides it");
