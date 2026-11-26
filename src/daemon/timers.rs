@@ -200,7 +200,9 @@ impl Shared {
 
     /// CAD-2835: Periodically run deterministic status sweeping and tool-less
     /// memory tidy-up for idle bound personal assistants (at most every 5 minutes).
-    pub(super) fn assistant_memory_tidy_tick(&self) {
+    /// Dispatches work on a background thread so a 60s tool-less LLM call never
+    /// blocks `run_stall_watch`.
+    pub(super) fn assistant_memory_tidy_tick(self: &Arc<Self>) {
         const TIDY_CHECK_EVERY: Duration = Duration::from_secs(300);
         let now_inst = Instant::now();
         {
@@ -210,6 +212,33 @@ impl Shared {
             }
             *last = Some(now_inst);
         }
+        if self
+            .memory_tidy_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let shared = Arc::clone(self);
+        if std::thread::Builder::new()
+            .name("memory-tidy".to_string())
+            .spawn(move || {
+                struct Reset<'a>(&'a std::sync::atomic::AtomicBool);
+                impl Drop for Reset<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::SeqCst);
+                    }
+                }
+                let _guard = Reset(&shared.memory_tidy_running);
+                shared.run_assistant_memory_tidy_pass();
+            })
+            .is_err()
+        {
+            self.memory_tidy_running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn run_assistant_memory_tidy_pass(&self) {
         let bindings = match self.store.list_active_assistant_bindings() {
             Ok(list) => list,
             Err(_) => return,
@@ -268,9 +297,15 @@ impl Shared {
                 total_turns,
                 &cfg,
                 &binding.alias,
-                |sys, usr| match self.tidy_completer.as_ref() {
-                    Some(completer) => completer(sys, usr),
-                    None => Ok(None),
+                |sys, usr| {
+                    crate::adapter::pi::run_toolless_completion(
+                        &self.provider_env,
+                        &self.state_dir,
+                        &agent,
+                        sys,
+                        usr,
+                        Duration::from_secs(60),
+                    )
                 },
             );
             let Ok(out) = res else {

@@ -924,8 +924,8 @@ pub struct Shared {
     agent_gc: AgentGcTimer,
     /// CAD-2835: last automatic memory sweep/tidy check instant.
     memory_tidy_at: Mutex<Option<Instant>>,
-    /// CAD-2835: optional tool-less completer seam injected by runtime/tests.
-    tidy_completer: Option<Arc<assistant_memory_tidy::TidyCompleter>>,
+    /// CAD-2835: ensures only one background memory-tidy pass runs at a time.
+    memory_tidy_running: AtomicBool,
     /// CAD-96: the idle auto-stop timer (default ON, resumable).
     auto_stop: AutoStopTimer,
     /// CAD-339: a report was filed — the report router scans at once.
@@ -1578,7 +1578,7 @@ impl Shared {
             slot_clock,
             agent_gc: AgentGcTimer::new(opts.agent_gc.clone()),
             memory_tidy_at: Mutex::new(None),
-            tidy_completer: None,
+            memory_tidy_running: AtomicBool::new(false),
             reports_dirty: AtomicBool::new(false),
             router_every: match opts.report_router {
                 None => Some(Duration::from_secs(30)),

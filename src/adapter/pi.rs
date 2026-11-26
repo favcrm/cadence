@@ -145,7 +145,9 @@ pub use pi_confine::{
     refuse_confined_devin_agent, worker_confined, CONFINE_WORKER_EXTRA_READ_ENV,
     CONFINE_WORKER_EXTRA_WRITE_ENV,
 };
-pub use pi_launch::{copy_pi_auth, pi_config_dir, resolve_pi_launch_command};
+pub use pi_launch::{
+    copy_pi_auth, pi_config_dir, resolve_pi_launch_command, run_toolless_completion,
+};
 pub(crate) use pi_launch::{pi_master_env_scrub, pi_worker_env_scrub};
 
 /// Pi's display form of a provider HTTP error (`formatProviderError`):

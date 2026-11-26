@@ -775,6 +775,34 @@ pub(super) fn build_command(
     Ok(cmd)
 }
 
+fn confine_worker_command(
+    env: &ProviderEnv,
+    state_dir: &Path,
+    agent: &Agent,
+    command: Vec<String>,
+) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
+    if !worker_confined(agent) {
+        return Ok((command, None));
+    }
+    // Opt-in confinement cannot quietly lapse: `--confine` on a host
+    // that cannot confine is an error, not a plain launch.
+    crate::master::confinement_available(env)?;
+    // CAD-1380: a member-bound personal assistant (`params.assist`) gets
+    // the member-boundary policy — its own principal-owned subdir and
+    // worker dir only, never the tracker (`pm_dir`), the worktree/git
+    // targets, the toolchain caches or `$HOME` the generic worker grant
+    // carries. A member assistant is read-mostly; a build/fleet write
+    // set would let one member's chat read another lane's store.
+    let params = agent.params.clone().unwrap_or(Value::Null);
+    let (confine, policy) = if params.get("assist").is_some() {
+        pi_assistant_confinement(env, state_dir, agent)
+    } else {
+        pi_worker_confinement(env, state_dir, agent)
+    };
+    let argv = crate::master::confine_argv(&confine, &policy, &command);
+    Ok((argv, Some(policy)))
+}
+
 /// The full launch argv: [`build_command`], and for a confined
 /// endpoint that line wrapped in `cadence confine` — the master
 /// always (CAD-439), a worker when its `confine` param asks
@@ -798,26 +826,165 @@ pub(super) fn launch_command(
             "cannot isolate operational upload workspace without effective Master confinement",
         ));
     }
-    if !worker_confined(agent) {
-        return Ok((command, None));
-    }
-    // Opt-in confinement cannot quietly lapse: `--confine` on a host
-    // that cannot confine is an error, not a plain launch.
-    crate::master::confinement_available(env)?;
-    // CAD-1380: a member-bound personal assistant (`params.assist`) gets
-    // the member-boundary policy — its own principal-owned subdir and
-    // worker dir only, never the tracker (`pm_dir`), the worktree/git
-    // targets, the toolchain caches or `$HOME` the generic worker grant
-    // carries. A member assistant is read-mostly; a build/fleet write
-    // set would let one member's chat read another lane's store.
-    let params = agent.params.clone().unwrap_or(Value::Null);
-    let (confine, policy) = if params.get("assist").is_some() {
-        pi_assistant_confinement(env, state_dir, agent)
+    confine_worker_command(env, state_dir, agent, command)
+}
+
+/// Build an ephemeral, single-turn **tool-less** Pi/OMP command wrapped in the
+/// worker/assistant's fail-closed confinement policy. Prompts follow `--` so
+/// untrusted text can never be parsed as CLI flags.
+pub(crate) fn build_toolless_command(
+    env: &ProviderEnv,
+    state_dir: &Path,
+    agent: &Agent,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
+    let mut cmd = pi_command(env);
+    cmd.extend([
+        "--print".to_string(),
+        "--mode".to_string(),
+        "text".to_string(),
+        "--no-session".to_string(),
+        "--no-tools".to_string(),
+        "--no-extensions".to_string(),
+        "--no-skills".to_string(),
+    ]);
+    if agent.provider == "omp" {
+        cmd.extend(["--no-ui".to_string(), "--no-title".to_string()]);
     } else {
-        pi_worker_confinement(env, state_dir, agent)
+        cmd.extend([
+            "--offline".to_string(),
+            "--no-themes".to_string(),
+            "--no-prompt-templates".to_string(),
+            "--no-mcp".to_string(),
+        ]);
+    }
+    cmd.extend(["--system-prompt".to_string(), system_prompt.to_string()]);
+    let params = agent.params.clone().unwrap_or(Value::Null);
+    if let Some(model) = params
+        .get("model")
+        .and_then(Value::as_str)
+        .or(agent.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        cmd.extend(["--model".to_string(), model.to_string()]);
+    }
+    cmd.extend(["--".to_string(), user_prompt.to_string()]);
+    confine_worker_command(env, state_dir, agent, cmd)
+}
+
+/// Execute one bounded, confined, tool-less Pi/OMP completion using the
+/// agent's own provisioned `PI_CODING_AGENT_DIR` (`<worker>/pi`). Returns
+/// `Ok(None)` cleanly if the provider is not Pi/OMP or the private agent
+/// config directory is not yet provisioned.
+pub fn run_toolless_completion(
+    env: &ProviderEnv,
+    state_dir: &Path,
+    agent: &Agent,
+    system_prompt: &str,
+    user_prompt: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+    if !matches!(agent.provider.as_str(), "pi" | "omp") {
+        return Ok(None);
+    }
+    if !Path::new(&agent.cwd).is_dir() {
+        return Ok(None);
+    }
+    let config_dir = pi_worker_config_dir(state_dir, &agent.alias)?;
+    if !config_dir.is_dir() {
+        return Ok(None);
+    }
+    let cache_dir = pi_cache_dir(state_dir, &agent.alias)?;
+    ensure_private_dir(&cache_dir)?;
+
+    let (argv, policy) = build_toolless_command(env, state_dir, agent, system_prompt, user_prompt)?;
+    let bin = argv
+        .first()
+        .ok_or_else(|| Error::internal("empty toolless completion command"))?;
+    let mut command = Command::new(bin);
+    command
+        .args(&argv[1..])
+        .current_dir(&agent.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    pi_master_env_scrub().apply(&mut command);
+    command.env("PI_CODING_AGENT_DIR", &config_dir);
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("XDG_CACHE_HOME", &cache_dir);
+    if policy.is_some() {
+        let tmp = pi_worker_dir(state_dir, &agent.alias)?.join("tmp");
+        ensure_private_dir(&tmp)?;
+        command.env("TMPDIR", &tmp);
+    }
+
+    let mut child = crate::reaper::spawn(&mut command)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::internal("toolless completion stdout unavailable"))?;
+    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        stdout
+            .take(MAX_OUTPUT_BYTES as u64 + 1)
+            .read_to_end(&mut buf)?;
+        Ok(buf)
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(Error::rejected("tool-less tidy completion timed out"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(Error::rejected(format!(
+                    "failed waiting for tool-less tidy completion: {err}"
+                )));
+            }
+        }
     };
-    let argv = crate::master::confine_argv(&confine, &policy, &command);
-    Ok((argv, Some(policy)))
+
+    let buf = reader
+        .join()
+        .map_err(|_| Error::internal("tool-less completion reader panicked"))?
+        .map_err(|e| Error::rejected(format!("failed reading tool-less completion output: {e}")))?;
+    if buf.len() > MAX_OUTPUT_BYTES {
+        return Err(Error::rejected(format!(
+            "tool-less tidy completion output exceeded {MAX_OUTPUT_BYTES} bytes"
+        )));
+    }
+    if !status.success() {
+        return Err(Error::rejected(format!(
+            "tool-less tidy completion exited with {status}"
+        )));
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|_| Error::rejected("tool-less tidy completion returned invalid UTF-8"))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -936,5 +1103,33 @@ mod cad1752_session_argv_tests {
                 forked.to_string_lossy().to_string()
             ]
         );
+    }
+
+    #[test]
+    fn toolless_command_sets_no_tools_confinement_and_arg_terminator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let mut agent = hire(state, None);
+        agent.params = Some(json!({"confine": false, "model": "example/flash"}));
+        let env = ProviderEnv::refusing_providers();
+        let (argv, policy) = build_toolless_command(
+            &env,
+            state,
+            &agent,
+            "system rules",
+            "--tools bash override attempt",
+        )
+        .unwrap();
+        assert!(policy.is_none());
+        assert!(argv.contains(&"--print".to_string()));
+        assert!(argv.contains(&"--no-session".to_string()));
+        assert!(argv.contains(&"--no-tools".to_string()));
+        assert!(argv.contains(&"--no-extensions".to_string()));
+        assert!(argv.contains(&"--no-skills".to_string()));
+        assert!(argv.contains(&"--no-mcp".to_string()));
+        assert!(argv.contains(&"--system-prompt".to_string()));
+        assert!(argv.contains(&"--model".to_string()));
+        let sep_idx = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(argv[sep_idx + 1], "--tools bash override attempt");
     }
 }

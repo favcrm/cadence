@@ -67,9 +67,6 @@ pub struct TidyScheduleState {
     pub last_tidy_turns: u64,
 }
 
-/// Optional tool-less completion callback (`(system_prompt, user_prompt) -> Option<json>`).
-pub type TidyCompleter = dyn Fn(&str, &str) -> Result<Option<String>> + Send + Sync;
-
 #[derive(Clone, Debug)]
 pub struct TidyScheduleConfig {
     pub sweep_interval_secs: i64,
@@ -176,10 +173,17 @@ fn load_guards_raw(root_fd: &DirFd) -> Result<Vec<ReaddGuardEntry>> {
         return Ok(Vec::new());
     };
     let mut rows = Vec::new();
-    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
-        if let Ok(entry) = serde_json::from_str::<ReaddGuardEntry>(line) {
-            rows.push(entry);
+    for (idx, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
         }
+        let entry: ReaddGuardEntry = serde_json::from_str(line).map_err(|e| {
+            Error::rejected(format!(
+                "corrupt {READD_GUARD_FILE} at line {}: {e}",
+                idx + 1
+            ))
+        })?;
+        rows.push(entry);
     }
     Ok(rows)
 }
@@ -756,11 +760,7 @@ fn strip_code_fence(raw: &str) -> &str {
     trimmed
 }
 
-/// Parse and enforce structural bounds on a model's tool-less JSON array response.
-pub fn parse_tidy_ops(raw: &str) -> Result<Vec<TidyOp>> {
-    let stripped = strip_code_fence(raw);
-    let ops: Vec<TidyOp> = serde_json::from_str(stripped)
-        .map_err(|e| Error::rejected(format!("invalid tidy-up JSON ops array: {e}")))?;
+fn check_op_bounds(ops: &[TidyOp]) -> Result<()> {
     if ops.len() > TIDY_MAX_TOTAL_OPS {
         return Err(Error::rejected(format!(
             "tidy-up produced {} ops (max {TIDY_MAX_TOTAL_OPS})",
@@ -776,6 +776,15 @@ pub fn parse_tidy_ops(raw: &str) -> Result<Vec<TidyOp>> {
             "tidy-up produced {add_count} add ops (max {TIDY_MAX_ADD_OPS})"
         )));
     }
+    Ok(())
+}
+
+/// Parse and enforce structural bounds on a model's tool-less JSON array response.
+pub fn parse_tidy_ops(raw: &str) -> Result<Vec<TidyOp>> {
+    let stripped = strip_code_fence(raw);
+    let ops: Vec<TidyOp> = serde_json::from_str(stripped)
+        .map_err(|e| Error::rejected(format!("invalid tidy-up JSON ops array: {e}")))?;
+    check_op_bounds(&ops)?;
     Ok(ops)
 }
 
@@ -827,21 +836,7 @@ pub fn validate_and_apply_tidy_ops(
     actor: &str,
     turn_id: &str,
 ) -> Result<Value> {
-    if ops.len() > TIDY_MAX_TOTAL_OPS {
-        return Err(Error::rejected(format!(
-            "tidy-up produced {} ops (max {TIDY_MAX_TOTAL_OPS})",
-            ops.len()
-        )));
-    }
-    let add_count = ops
-        .iter()
-        .filter(|op| matches!(op, TidyOp::Add { .. }))
-        .count();
-    if add_count > TIDY_MAX_ADD_OPS {
-        return Err(Error::rejected(format!(
-            "tidy-up produced {add_count} add ops (max {TIDY_MAX_ADD_OPS})"
-        )));
-    }
+    check_op_bounds(ops)?;
 
     let root_fd = open_root(root)?;
     let before_opt = read_child_text(&root_fd, MEMORY, MEMORY_FILE_MAX)?;
@@ -1717,5 +1712,30 @@ mod tests {
         assert_eq!(out["applied"], true);
         assert_eq!(out["line_count"], 120);
         assert!(dir.path().join("memory/archive.md").exists());
+    }
+
+    #[test]
+    fn corrupt_readd_guard_fails_closed_without_mutating_memory() {
+        let dir = setup_root();
+        let initial = "# Memory\n\n- 2026-11-01: Keep SQL concise.\n";
+        write_mem(dir.path(), initial);
+        std::fs::write(dir.path().join(READD_GUARD_FILE), "{not valid json\n").unwrap();
+
+        let err = assistant_memory::remember_with_context(
+            dir.path(),
+            "Some stale fact",
+            None,
+            None,
+            1_795_680_000,
+            "assist-u1",
+            "turn-corrupt",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(READD_GUARD_FILE));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("MEMORY.md")).unwrap(),
+            initial
+        );
+        assert!(!dir.path().join("memory/archive.md").exists());
     }
 }

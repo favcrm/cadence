@@ -92,6 +92,32 @@ impl EnvScrub {
                 .any(|prefix| name.starts_with(prefix.as_str()))
                 && !self.keep.iter().any(|keep| keep == name))
     }
+
+    /// Apply this scrub policy to a `Command` environment.
+    pub(crate) fn apply(&self, command: &mut Command) {
+        if self.clear {
+            command.env_clear();
+            for name in &self.keep {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
+        for name in &self.names {
+            command.env_remove(name);
+        }
+        if !self.prefixes.is_empty() {
+            for (key, _) in std::env::vars_os() {
+                let Some(key) = key.to_str() else { continue };
+                if self.keep.iter().any(|k| k == key) {
+                    continue;
+                }
+                if self.prefixes.iter().any(|p| key.starts_with(p.as_str())) {
+                    command.env_remove(key);
+                }
+            }
+        }
+    }
 }
 
 pub struct StdioAdapter {
@@ -184,33 +210,7 @@ impl StdioAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log));
-        if self.env_scrub.clear {
-            command.env_clear();
-            for name in &self.env_scrub.keep {
-                if let Some(value) = std::env::var_os(name) {
-                    command.env(name, value);
-                }
-            }
-        }
-        for name in &self.env_scrub.names {
-            command.env_remove(name);
-        }
-        if !self.env_scrub.prefixes.is_empty() {
-            for (key, _) in std::env::vars_os() {
-                let Some(key) = key.to_str() else { continue };
-                if self.env_scrub.keep.iter().any(|k| k == key) {
-                    continue;
-                }
-                if self
-                    .env_scrub
-                    .prefixes
-                    .iter()
-                    .any(|p| key.starts_with(p.as_str()))
-                {
-                    command.env_remove(key);
-                }
-            }
-        }
+        self.env_scrub.apply(&mut command);
         for (key, value) in env {
             command.env(key, value);
         }
