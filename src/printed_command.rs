@@ -125,7 +125,7 @@ pub(crate) fn with_path(before: &'static str, path: &Path, after: &'static str) 
     ])
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(any(test, all(debug_assertions, feature = "ops-test-support")))]
 #[doc(hidden)]
 pub mod tests {
     use super::*;

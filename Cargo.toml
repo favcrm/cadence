@@ -70,6 +70,9 @@ ui = []
 # and review tests can inject proc roots. The compile_error! in
 # src/test_seam.rs keeps these seams out of every release build.
 test-seam = []
+# Only cadence-ops' dev-dependency enables these unit-test helpers. Unlike
+# test-seam, this feature does not arm the caller-identity override.
+ops-test-support = []
 # CAD-1159 SEC-002: admit an owner-elected PUBLIC fixture image-verification
 # root into a separately labelled debug/test-seam constructor artifact. Opt-in
 # only, never a default: the compile_error! in src/test_seam.rs refuses every

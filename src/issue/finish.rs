@@ -69,9 +69,6 @@ pub(crate) use git::{default_ref, git_branch, merged_claim};
 #[doc(hidden)]
 pub use git::{git, merge_rule};
 pub(crate) use guard::cwd_holder_aliases;
-#[cfg(any(test, debug_assertions))]
-#[doc(hidden)]
-pub use hosted::BEFORE_FINAL_LOCK;
 #[doc(hidden)]
 pub use hosted::{gh_merged_prs, release_hosted_lane};
 pub(crate) use run::{run, FinishArgs};

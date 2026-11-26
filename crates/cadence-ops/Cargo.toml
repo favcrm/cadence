@@ -34,3 +34,6 @@ tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 unicode-normalization = "0.1"
 ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
 uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+cadence-agent = { path = "../..", features = ["ops-test-support"] }

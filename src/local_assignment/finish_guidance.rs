@@ -1,5 +1,11 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_FINAL_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Why a hosted lane was not released when no release was attempted: the
 /// observation is guidance only and never authorizes cleanup.
 pub fn refusal<H: CoordHttp>(
@@ -169,6 +175,12 @@ fn release_bound<H: CoordHttp>(
         .map(|id| coordinator.assignment_lock(id))
         .collect::<Result<Vec<_>>>()?;
     let lock_and_validate = || {
+        #[cfg(test)]
+        BEFORE_FINAL_LOCK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let lock = remote_cli::assignment_coordination_lock(
             &coordinator.ledger,
             remote_cli::AssignmentCoordinationLock::Ledger,
@@ -2363,7 +2375,7 @@ mod tests {
         let coord = fx.cancel();
         let protected = fx.lane.join(".env");
         let created = protected.clone();
-        crate::issue::finish::BEFORE_FINAL_LOCK.with(|hook| {
+        BEFORE_FINAL_LOCK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 fs::write(created, "operator secret\n").unwrap();
             }));
