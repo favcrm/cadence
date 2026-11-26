@@ -3,7 +3,7 @@
 //! fans out to, plus the shared response plumbing (`send`, `coded_response`,
 //! `write_reply`) the read side reuses.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::Path;
 
@@ -484,42 +484,6 @@ fn project_policy_write(request: &mut Request, pm_dir: &Path, key: &str, actor: 
     }
 }
 
-/// CAD-2830: active or queued daemon jobs bound to issues in `key`.
-pub(crate) fn project_blockers(pm: &Pm, state_dir: &Path, key: &str) -> Vec<String> {
-    let Ok(issues) = crate::issue::board::load_all(&pm.dir, Some(key)) else {
-        return Vec::new();
-    };
-    let project_ids: HashSet<&str> = issues.iter().map(|i| i.front.id.as_str()).collect();
-    if project_ids.is_empty() {
-        return Vec::new();
-    }
-    let Ok(reply) = crate::client::rpc_deadline(
-        state_dir,
-        "job_list",
-        json!({"all": true}),
-        std::time::Duration::from_secs(2),
-    ) else {
-        return Vec::new();
-    };
-    let Some(jobs) = reply["jobs"].as_array() else {
-        return Vec::new();
-    };
-    jobs.iter()
-        .filter_map(|job| {
-            let issue_id = job.get("issue").and_then(Value::as_str)?;
-            if !project_ids.contains(issue_id) {
-                return None;
-            }
-            let state = job.get("state").and_then(Value::as_str).unwrap_or_default();
-            if matches!(state, "done" | "failed" | "cancelled" | "completed") {
-                return None;
-            }
-            let job_id = job.get("id").and_then(Value::as_str).unwrap_or("job");
-            Some(format!("{issue_id}: {job_id} ({state})"))
-        })
-        .collect()
-}
-
 fn project_archive_write(
     request: &mut Request,
     state_dir: &Path,
@@ -547,15 +511,17 @@ fn project_archive_write(
         Err(e) => return err_response(503, &e.to_string()),
     };
     let result = if archive {
-        let blockers = project_blockers(&pm, state_dir, key);
-        issue_write::archive_project(
-            &pm,
-            key,
-            &req.confirmation,
-            Some(req.expected_revision),
-            &blockers,
-            actor,
-        )
+        match issue_write::project_blockers(&pm, state_dir, key) {
+            Ok(blockers) => issue_write::archive_project(
+                &pm,
+                key,
+                &req.confirmation,
+                Some(req.expected_revision),
+                &blockers,
+                actor,
+            ),
+            Err(e) => Err(e),
+        }
     } else {
         issue_write::restore_project(
             &pm,
@@ -1259,7 +1225,8 @@ pub(crate) fn write_route(
             | RouteId::AgentDetail
             | RouteId::AgentRoles
             | RouteId::AutomaticUpdatesGet
-            | RouteId::MemberAccessGet => {
+            | RouteId::MemberAccessGet
+            | RouteId::ProjectLifecycle => {
                 err_response(500, "a read row reached the write dispatcher")
             }
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),

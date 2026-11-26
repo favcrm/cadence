@@ -1897,6 +1897,21 @@ fn read_dispatch(
                 (key == "install").then(|| install.to_string())
             })
         }
+        endpoints::RouteId::ProjectLifecycle => {
+            let key = bound.get("key").unwrap_or_default();
+            match Pm::at(pm_dir) {
+                Ok(pm) => {
+                    match crate::issue::write::project_lifecycle_checked(&pm, state_dir, key) {
+                        Ok(out) => json_response(out),
+                        Err(Error::Rejected(m)) if m.starts_with("no project ") => {
+                            err_response(404, "unknown project")
+                        }
+                        Err(e) => err_response(503, &e.to_string()),
+                    }
+                }
+                Err(error) => err_response(503, &error.to_string()),
+            }
+        }
         _ => err_response(500, "a write row reached the read dispatcher"),
     }
 }
@@ -3224,44 +3239,6 @@ fn handle(
                             },
                             Err(error) => send(request, err_response(503, &error.to_string())),
                         },
-                        Err(error) => send(request, err_response(503, &error.to_string())),
-                    }
-                    return;
-                }
-                if sub == Some("lifecycle") && segs.next().is_none() {
-                    if !model::valid_key(key) {
-                        send(request, err_response(400, "bad project key"));
-                        return;
-                    }
-                    let actor = match read_admission
-                        .as_ref()
-                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
-                    {
-                        Some(Ok(actor)) => actor,
-                        Some(Err(resp)) => {
-                            send(request, resp);
-                            return;
-                        }
-                        None => {
-                            send(request, err_response(503, "read admission is missing"));
-                            return;
-                        }
-                    };
-                    match Pm::at(pm_dir) {
-                        Ok(pm) => {
-                            if super::project_policy::refused(&pm, key, &actor) {
-                                send(request, err_response(404, "unknown project"));
-                                return;
-                            }
-                            let blockers = super::write_path::project_blockers(&pm, state_dir, key);
-                            match crate::issue::write::project_lifecycle(&pm, key, blockers) {
-                                Ok(out) => send(request, json_response(out)),
-                                Err(Error::Rejected(m)) if m.starts_with("no project ") => {
-                                    send(request, err_response(404, "unknown project"))
-                                }
-                                Err(e) => send(request, err_response(503, &e.to_string())),
-                            }
-                        }
                         Err(error) => send(request, err_response(503, &error.to_string())),
                     }
                     return;

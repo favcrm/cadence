@@ -76,6 +76,7 @@ pub(super) enum RouteId {
     ArtifactRead,
     ArtifactVersions,
     ProjectPolicy,
+    ProjectLifecycle,
     ProjectArchive,
     ProjectRestore,
 }
@@ -449,6 +450,12 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     row!(
         ProjectPolicy,
         "/api/projects/{key}/policy",
+        OperatorOnly,
+        PROJECT_KEY
+    ),
+    get!(
+        ProjectLifecycle,
+        "/api/projects/{key}/lifecycle",
         OperatorOnly,
         PROJECT_KEY
     ),

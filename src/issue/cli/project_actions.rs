@@ -96,7 +96,8 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                     )));
                 };
                 let pm = open_pm()?;
-                let out = write::archive_project(&pm, key, conf, None, &[], "")?;
+                let blockers = write::project_blockers(&pm, state_dir, key)?;
+                let out = write::archive_project(&pm, key, conf, None, &blockers, "")?;
                 print_json(&out);
                 Ok(0)
             }

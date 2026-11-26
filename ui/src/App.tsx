@@ -1779,6 +1779,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <ProjectSettings
             project={route.slug}
             block={policyBlock(meta)}
+            archived={viewedProjectArchived}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             openIssuesCount={
               issues.filter(

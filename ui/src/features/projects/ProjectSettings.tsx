@@ -43,6 +43,7 @@ type LifecycleState =
 export default function ProjectSettings({
   project,
   block,
+  archived,
   hosted,
   onToast,
   openIssuesCount,
@@ -51,6 +52,8 @@ export default function ProjectSettings({
   project: string;
   /** Why this session may not change the policy, or null when it may. */
   block: string | null;
+  /** True when the viewed project is already known to be archived. */
+  archived?: boolean;
   /** The board's own claim from `/api/meta`; null when it has not answered. */
   hosted: boolean | null;
   onToast: (text: string) => void;
@@ -114,7 +117,10 @@ export default function ProjectSettings({
       })
       .catch((e: unknown) => {
         if (!active) return;
-        if (e instanceof ApiError && (e.status === 404 || e.status === 501)) {
+        if (
+          e instanceof ApiError &&
+          (e.status === 403 || e.status === 404 || e.status === 501)
+        ) {
           setLifecycle({ kind: "unsupported" });
           return;
         }
@@ -157,7 +163,15 @@ export default function ProjectSettings({
   const base = draftOf(view);
   const draft = edits ?? base;
   const dirty = draftDirty(view, draft);
-  const locked = block !== null;
+  const isArchived =
+    archived === true || (lifecycle.kind === "ready" && lifecycle.data.archived);
+  const lifecycleLocked = block !== null;
+  const policyReadOnlyReason =
+    block ??
+    (isArchived
+      ? t("This project is archived. Restore it before changing its access policy.")
+      : null);
+  const locked = policyReadOnlyReason !== null;
   const unreadable = view.kind === "unreadable";
   const privateOffered =
     view.kind === "recorded"
@@ -565,7 +579,9 @@ export default function ProjectSettings({
                       : t("These changes would record private, which this build refuses — the isolation gate has not passed. Save stays off rather than sending a write the tracker would reject.")}
                   </p>
                 )}
-                {block && <p className="mt-4 text-label text-ink-400">{block}</p>}
+                {policyReadOnlyReason && (
+                  <p className="mt-4 text-label text-ink-400">{policyReadOnlyReason}</p>
+                )}
                 {error && (
                   <p className="mt-3 text-secondary text-fail" role="alert">
                     {error}
@@ -651,7 +667,7 @@ export default function ProjectSettings({
                       {lifecycleError}
                     </p>
                   )}
-                  {!locked && (
+                  {!lifecycleLocked && (
                     <div className="mt-4">
                       <button
                         type="button"
@@ -711,7 +727,7 @@ export default function ProjectSettings({
                       {lifecycleError}
                     </p>
                   )}
-                  {!locked && !confirmOpen && (
+                  {!lifecycleLocked && !confirmOpen && (
                     <div className="mt-4">
                       <button
                         type="button"
@@ -727,7 +743,7 @@ export default function ProjectSettings({
                       </button>
                     </div>
                   )}
-                  {!locked && confirmOpen && (
+                  {!lifecycleLocked && confirmOpen && (
                     <div className="mt-4 rounded border border-ink-700 bg-ink-900 p-3">
                       <label htmlFor={confirmId} className="block text-label text-ink-200">
                         {t("Type the exact project key to confirm")}:{" "}

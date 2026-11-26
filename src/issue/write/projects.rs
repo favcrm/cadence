@@ -580,7 +580,52 @@ fn lifecycle_payload(project: &project::Project, blockers: &[String]) -> Value {
     })
 }
 
-/// CAD-2830: read one project's archive lifecycle state.
+/// CAD-2830: active or queued daemon jobs bound to issues in `key`, failing closed
+/// if project issues cannot be loaded or the daemon job ledger cannot be queried.
+pub fn project_blockers(pm: &Pm, state_dir: &Path, key: &str) -> Result<Vec<String>> {
+    let key = crate::issue::model::check_key(key)?;
+    let issues = crate::issue::board::load_all(&pm.dir, Some(&key))?;
+    let project_ids: std::collections::HashSet<&str> =
+        issues.iter().map(|i| i.front.id.as_str()).collect();
+    if project_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reply = crate::client::rpc_deadline(
+        state_dir,
+        "job_list",
+        json!({"all": true}),
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|e| {
+        Error::invalid(
+            "blocked",
+            format!("Cannot verify active daemon jobs before archiving '{key}': {e}"),
+        )
+    })?;
+    let Some(jobs) = reply["jobs"].as_array() else {
+        return Err(Error::invalid(
+            "blocked",
+            format!("Malformed daemon job_list reply while checking blockers for '{key}'."),
+        ));
+    };
+    Ok(jobs
+        .iter()
+        .filter_map(|job| {
+            let issue_id = job.get("issue").and_then(Value::as_str)?;
+            if !project_ids.contains(issue_id) {
+                return None;
+            }
+            let state = job.get("state").and_then(Value::as_str).unwrap_or_default();
+            if matches!(state, "done" | "failed" | "cancelled" | "completed") {
+                return None;
+            }
+            let job_id = job.get("id").and_then(Value::as_str).unwrap_or("job");
+            Some(format!("{issue_id}: {job_id} ({state})"))
+        })
+        .collect())
+}
+
+/// CAD-2830: read one project's archive lifecycle state (for pure unit callers).
 pub fn project_lifecycle(pm: &Pm, key: &str, blockers: Vec<String>) -> Result<Value> {
     let key = crate::issue::model::check_key(key)?;
     let dir = project_dir(pm, &key)?;
@@ -595,6 +640,26 @@ pub fn project_lifecycle(pm: &Pm, key: &str, blockers: Vec<String>) -> Result<Va
         Vec::new()
     } else {
         blockers
+    };
+    Ok(lifecycle_payload(&project, &blockers))
+}
+
+/// CAD-2830: read one project's archive lifecycle state with fail-closed blocker
+/// verification against the live daemon when the project is active.
+pub fn project_lifecycle_checked(pm: &Pm, state_dir: &Path, key: &str) -> Result<Value> {
+    let key = crate::issue::model::check_key(key)?;
+    let dir = project_dir(pm, &key)?;
+    let yaml_path = dir.join("project.yaml");
+    if !crate::issue::board::is_real_file(&yaml_path) {
+        return Err(Error::rejected(format!(
+            "no project '{key}' — register it with `cadence issue project add`"
+        )));
+    }
+    let project = project::load(&yaml_path)?;
+    let blockers = if project.archived {
+        Vec::new()
+    } else {
+        project_blockers(pm, state_dir, &key)?
     };
     Ok(lifecycle_payload(&project, &blockers))
 }

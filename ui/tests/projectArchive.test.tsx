@@ -246,6 +246,18 @@ async function main() {
     assert(lastArchiveBody?.confirmation === "alpha", "expected exact key confirmation sent");
     assert(lastArchiveBody?.expected_revision === 0, "expected revision 0");
     assert(container.textContent?.includes("Restore project"), "expected 1-click Restore button");
+    assert(
+      container.textContent?.includes(
+        "This project is archived. Restore it before changing its access policy.",
+      ),
+      "expected archived policy lock explanation",
+    );
+    assert(
+      !Array.from(container.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("Save policy"),
+      ),
+      "Save policy must be omitted while archived",
+    );
   });
 
   // 1-click restore works without re-typing key and preserves prior-runs note.
@@ -256,7 +268,7 @@ async function main() {
   const restoreBtn = Array.from(container.querySelectorAll("button")).find((b) =>
     b.textContent?.includes("Restore project"),
   );
-  assert(restoreBtn, "expected Restore project button");
+  assert(restoreBtn && !restoreBtn.disabled, "expected enabled Restore project button");
   await act(async () => {
     restoreBtn.click();
   });
@@ -265,6 +277,37 @@ async function main() {
     assert(lastRestoreBody?.confirmation === "alpha", "expected confirmation on restore");
     assert(lastRestoreBody?.expected_revision === 1, "expected revision 1 on restore");
     assert(changes.join(",") === "true,false", `expected lifecycle callback transitions, got ${changes}`);
+  });
+
+  // 403 (non-operator) & 501 omit lifecycle card cleanly; archived={true} still locks policy.
+  lifecycleStatus = 403;
+  await act(async () => {
+    root.render(React.createElement("div"));
+  });
+  await act(async () => {
+    root.render(
+      React.createElement(
+        LocaleProvider,
+        null,
+        React.createElement(ProjectSettings, {
+          project: "alpha",
+          block: null,
+          archived: true,
+          hosted: false,
+          onToast: () => {},
+        }),
+      ),
+    );
+  });
+  await settle(() => {
+    assert(!container.textContent?.includes("Project lifecycle"), "403 must omit lifecycle card");
+    assert(!container.querySelector("[role='alert']"), "403 must not show error alert");
+    assert(
+      container.textContent?.includes(
+        "This project is archived. Restore it before changing its access policy.",
+      ),
+      "archived prop must still lock policy card on 403 lifecycle",
+    );
   });
 
   // 501 omits lifecycle card cleanly.

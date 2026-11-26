@@ -106,7 +106,9 @@ fn project_archive_hides_reads_refuses_mutations_and_restores_cleanly() {
     let member = login(&rig, MEMBER, "member");
     let owner = login(&rig, OWNER, "owner");
 
-    // Non-operator/member callers cannot archive or restore.
+    // Non-operator/member callers cannot read lifecycle or archive/restore.
+    let (status, _) = raw_get(&rig, &member, "/api/projects/visible/lifecycle");
+    assert_eq!(status, 403, "member must not read project lifecycle");
     let (status, _) = send_json(
         &rig,
         "POST",
@@ -258,6 +260,11 @@ fn project_archive_hides_reads_refuses_mutations_and_restores_cleanly() {
             "POST",
             "/api/issues/VIS-2/comments",
             json!({"body": "blocked comment"}),
+        ),
+        (
+            "POST",
+            "/api/projects/visible/policy",
+            json!({"visibility": "workspace-visible", "members": []}),
         ),
     ] {
         let (status, body) = send_json(&rig, method, &owner, path, payload);
