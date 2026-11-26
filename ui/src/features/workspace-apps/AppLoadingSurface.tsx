@@ -8,10 +8,12 @@ export type AppLoadingVariant = "page" | "drawer" | "canvas";
  */
 export default function AppLoadingSurface({
   label,
+  title,
   variant = "page",
   className,
 }: {
   label: string;
+  title?: string;
   variant?: AppLoadingVariant;
   className?: string;
 }) {
@@ -27,7 +29,11 @@ export default function AppLoadingSurface({
     <div className={classes} role="status" aria-label={label}>
       <span className="sr-only">{label}</span>
       <div className="wa-loading-header" aria-hidden="true">
-        <span className="wa-loading-bar wa-skel-pulse" style={{ width: variant === "drawer" ? "48%" : "11rem", height: "1rem" }} />
+        {title && variant === "page" ? (
+          <span className="wa-loading-title">{title}</span>
+        ) : (
+          <span className="wa-loading-bar wa-skel-pulse" style={{ width: variant === "drawer" ? "48%" : "11rem", height: "1rem" }} />
+        )}
         {variant === "page" && (
           <span className="wa-loading-bar wa-skel-pulse" style={{ width: "5.5rem", height: "0.85rem", marginLeft: "auto" }} />
         )}

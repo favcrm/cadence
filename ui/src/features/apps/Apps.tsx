@@ -4,7 +4,20 @@ import { resources } from "../../lib/resources";
 import { navigate, useHref } from "../../lib/useLocation";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { localizedAppCategory, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
-import { appExplorer, notifyAppsChanged, APPS_CHANGED_EVENT, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
+import {
+  appExplorer,
+  notifyAppsChanged,
+  prefetchAppScope,
+  readAppFavoritesFresh,
+  readAppFavoritesSnapshot,
+  readAppHomeFresh,
+  readAppHomeSnapshot,
+  writeAppFavoritesSnapshot,
+  APPS_CHANGED_EVENT,
+  type HomeInstallation,
+  type FavoritesPayload,
+  type Installation,
+} from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
@@ -47,7 +60,14 @@ type FilterKey = "all" | "pinned" | "attention" | `cat:${string}`;
  * app icons, Spotlight-style search & filter bar, quick-pin dock, and grid/list
  * toggle. Cards open the app itself; an operator's settings action opens Manage.
  */
-export default function Apps({ viewer }: { viewer: Viewer }) {
+export default function Apps({
+  viewer,
+  installationsList,
+}: {
+  viewer: Viewer;
+  /** Optional parent-supplied `/api/app-installations` list to avoid a duplicate read. */
+  installationsList?: Installation[] | null;
+}) {
   const { locale, t } = useLocale();
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
@@ -75,9 +95,9 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
 
   // CAD-1189: every list here loads with the shared busy backoff, keeps
   // its last good answer on a failed refresh, and never reads an error as
-  // "no apps".
-  const homeLoad = useBackoffLoad((signal) => appExplorer.home(signal).then((r) => r.installations), revision);
-  const favLoad = useBackoffLoad((signal) => appExplorer.favorites(signal), revision);
+  // "no apps". Seed with the tab-scoped SWR snapshot on return visits.
+  const homeLoad = useBackoffLoad((signal) => readAppHomeFresh(signal), revision, undefined, readAppHomeSnapshot());
+  const favLoad = useBackoffLoad((signal) => readAppFavoritesFresh(signal), revision, undefined, readAppFavoritesSnapshot());
   const home = homeLoad.data;
   const [pinned, setPinned] = useState<FavoritesPayload | null>(null);
   useEffect(() => setPinned(null), [favLoad.data]);
@@ -95,7 +115,8 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   const overview = useResource(resources.overview);
   const needs = homeNeeds(overview.data?.needs_me);
   // Only the operator may read the installation list; others keep the legacy link.
-  const installs = useInstallations(isOp, revision).list;
+  const fallbackInstalls = useInstallations(isOp && installationsList === undefined, revision).list;
+  const installs = installationsList !== undefined ? installationsList : fallbackInstalls;
   const allApiApps = projectApps.data ?? [];
   const projectRows = useMemo(
     () => allApiApps.filter((row) => Boolean(row.project?.trim())),
@@ -199,7 +220,10 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
     setActionError(null);
     setPinned(favs ? { ...favs, favorites: next } : { favorites: next, workspace_default: [], recent: [] });
     void appExplorer.putFavorites(next)
-      .then((saved) => { setPinned(saved); })
+      .then((saved) => {
+        setPinned(saved);
+        writeAppFavoritesSnapshot(saved);
+      })
       .catch((e: unknown) => {
         setPinned(null);
         setActionError(t(appErrorCopy(e, "Couldn't save favorites. Try again in a moment.")));
@@ -314,7 +338,24 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
           )}
           {retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
           {home === null ? (
-            loadError === null && !retrying && <p className="text-label text-ink-400" role="status">{t("Loading your apps…")}</p>
+            loadError === null && !retrying && (
+              <div
+                className="apps-grid apps-skeleton-grid"
+                role="status"
+                aria-live="polite"
+                aria-label={t("Loading your apps…")}
+              >
+                <span className="sr-only">{t("Loading your apps…")}</span>
+                {Array.from({ length: 6 }, (_, i) => (
+                  <div key={i} className="card app-card apps-skeleton-card" aria-hidden="true">
+                    <span className="apps-skeleton-icon wa-loading-bar wa-skel-pulse" />
+                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "62%", height: "0.9rem" }} />
+                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "86%", height: "0.75rem" }} />
+                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "44%", height: "0.7rem", marginTop: "auto" }} />
+                  </div>
+                ))}
+              </div>
+            )
           ) : (
             <>
               {emptyWorkspace && (
@@ -464,6 +505,8 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                                 href={openUrl}
                                 className="apps-pinned-open"
                                 onClick={() => opened(h.install_id)}
+                                onMouseEnter={() => prefetchAppScope(h.install_id)}
+                                onFocus={() => prefetchAppScope(h.install_id)}
                                 aria-label={`${t("Open")} ${title}`}
                               >
                                 <AppGlyph name={h.name} icon={h.icon} title={title} size="sm" />
@@ -678,6 +721,8 @@ function InstalledCard({
           aria-labelledby={nameId}
           aria-describedby={statusId}
           onClick={onOpen}
+          onMouseEnter={() => prefetchAppScope(h.install_id)}
+          onFocus={() => prefetchAppScope(h.install_id)}
         >
           {body}
         </Link>

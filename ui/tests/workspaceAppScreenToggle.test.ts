@@ -171,7 +171,7 @@ async function main() {
   mounts.length = 0;
   await render();
   assert(mountCount() === 1 && frame(), "A themed mount still mounts the screen");
-  assert(frame()?.getAttribute("src") === `${receipt.mount}?theme=light`, "The pick rides the frame URL");
+  assert(frame()?.getAttribute("src") === `${receipt.mount}?inline=1&theme=light`, "The pick rides the frame URL");
   const live: any[] = [];
   frame()!.contentWindow!.addEventListener("message", (event: any) => live.push(event.data));
   document.documentElement.setAttribute("data-theme", "dark");
@@ -182,7 +182,7 @@ async function main() {
   await React.act(async () => root.unmount()); root = createRoot(host);
   mounts.length = 0;
   await render();
-  assert(frame()?.getAttribute("src") === receipt.mount, "System leaves the frame URL query-less");
+  assert(frame()?.getAttribute("src") === `${receipt.mount}?inline=1`, "System leaves the frame URL query-less");
   document.documentElement.removeAttribute("data-theme");
   await React.act(async () => root.unmount()); root = createRoot(host);
 
@@ -200,7 +200,7 @@ async function main() {
   await React.act(async () => { release(); holdMount = null; await new Promise(resolve => setTimeout(resolve, 0)); });
   await flush(); await flush();
   assert(mountCount() === 1, "A pick change during the mount still mounts once");
-  assert(frame()?.getAttribute("src") === `${receipt.mount}?theme=dark`, "The pending mount uses the pick current at frame creation");
+  assert(frame()?.getAttribute("src") === `${receipt.mount}?inline=1&theme=dark`, "The pending mount uses the pick current at frame creation");
   document.documentElement.removeAttribute("data-theme");
   await React.act(async () => root.unmount()); root = createRoot(host);
 
@@ -297,6 +297,68 @@ async function main() {
     await React.act(async () => { recordsRoot.unmount(); });
     recordsHost.remove();
     globalThis.fetch = previousFetch;
+  }
+
+  // Screen-bundled fast path: with initialScope + suppressLoadingOverlay,
+  // WorkspaceApp mounts ScreenHost immediately without blocking on /api/agents
+  // or /api/connections, and omits any legacy "Workspace app" header or inner loader.
+  const fastHost = document.createElement("section");
+  fastHost.className = "app-shell-outlet";
+  document.body.append(fastHost);
+  const fastRoot = createRoot(fastHost);
+  const fastInstall = { ...installation, install_id: "install-fast" };
+  const fastContexts = [
+    { id: "context-b", install_id: "install-fast", revision: 1, state: "active", digest: "brand-digest", config: { schema: 1, label: "Brand B", input_defaults: {} } },
+  ];
+  const fastFetches: string[] = [];
+  const restoreFastFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input), "http://localhost").pathname;
+    fastFetches.push(path);
+    if (path === "/api/agents" || path === "/api/connections") {
+      throw new Error(`Fast-path screen app must not block on ${path}`);
+    }
+    if (init?.method === "POST" && path === "/api/app-installations/install-fast/screens/main/mount") {
+      return json({
+        mount: `/api/app-screen/${"e".repeat(64)}`,
+        bridge_nonce: "f".repeat(64),
+        generation: 1,
+        tag: "main",
+      });
+    }
+    if (path === "/api/app-installations/install-fast/bindings") return json({ bindings: [] });
+    if (path === "/api/app-runs") return json({ runs: [] });
+    if (path === "/api/app-installations/install-fast/effects") return json({ effects: [] });
+    if (path === "/api/app-installations/install-fast/automatic-updates") return json({ install_id: "install-fast", automatic: false });
+    if (path.startsWith("/api/social-publishes")) return json({ intents: [] });
+    if (path === "/api/app-screen-tools/results") return json({ results: [] });
+    if (path === "/api/app-installations/install-fast/publishing/destinations") return json({ destinations: [] });
+    throw new Error(`Unexpected fast-path fetch ${path}`);
+  };
+  try {
+    await React.act(async () => {
+      fastRoot.render(
+        React.createElement(LocaleProvider, null,
+          React.createElement(WorkspaceApp, {
+            installId: "install-fast",
+            appKey: "social-content",
+            contextId: "context-b",
+            viewer: { operator: true, readOnly: false },
+            initialScope: { installation: fastInstall as any, contexts: fastContexts as any },
+            suppressLoadingOverlay: true,
+          }),
+        ),
+      );
+    });
+    await flush(); await flush(); await flush();
+    assert(fastHost.querySelector("iframe"), "screen-bundled WorkspaceApp mounts iframe immediately via initialScope");
+    assert(!fastHost.textContent?.includes("Loading this workspace app"), "suppressLoadingOverlay prevents duplicate WorkspaceApp loader");
+    assert(!fastHost.textContent?.includes("Workspace app"), "screen-bundled fast path omits legacy Workspace app header");
+    assert(!fastFetches.includes("/api/agents") && !fastFetches.includes("/api/connections"), "fast path skips /api/agents and /api/connections");
+  } finally {
+    await React.act(async () => { fastRoot.unmount(); });
+    fastHost.remove();
+    globalThis.fetch = restoreFastFetch;
   }
 
   console.log("workspace app screen host checks passed");

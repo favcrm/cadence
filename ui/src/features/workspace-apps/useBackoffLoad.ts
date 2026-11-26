@@ -24,8 +24,9 @@ export function useBackoffLoad<T>(
   load: (signal: AbortSignal) => Promise<T>,
   refreshKey: unknown,
   enabled = true,
+  initialData: T | null = null,
 ): BackoffLoad<T> {
-  const [data, setData] = useState<T | null>(null);
+  const [data, setData] = useState<T | null>(() => initialData);
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [loading, setLoading] = useState(false);

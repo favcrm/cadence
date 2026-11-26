@@ -170,6 +170,10 @@ globalThis.fetch = async (input, init) => {
   if (url.pathname === "/api/app-favorites")
     return json({ owner: "operator", is_default: false, favorites: [] });
   if (url.pathname === "/api/app-requests") return json({ requests: [] });
+  if (url.pathname === "/api/app-installations/inst-site")
+    return json({ install_id: "inst-site", name: app.name, title: app.title, version: "0.1.0", digest: "d-site", catalog_generation: "g-1", approved: true, storage_kind: "workspace", files: ["screens/main/screens.json"], capabilities: {}, connection_slots: [] });
+  if (url.pathname === "/api/app-installations/inst-site/contexts")
+    return json({ contexts: [] });
   throw new Error(`Unexpected request ${url.pathname}`);
 };
 function assert(value: unknown, what: string): asserts value {
@@ -397,6 +401,60 @@ async function main() {
   assert(
     !host.textContent?.includes("New post"),
     "list action opens the app instead of promising an immediately available run",
+  );
+  // Operator view with parent-supplied installationsList skips duplicate
+  // /api/app-installations (mocked fetch would throw on that path), seeds
+  // immediately from SWR snapshots on remount, and prefetches scope on hover.
+  await React.act(() =>
+    renderWithNavigation(
+      React.createElement(Apps, {
+        viewer: { readOnly: false, operator: true },
+        installationsList: [
+          {
+            install_id: "inst-site",
+            name: app.name,
+            title: app.title,
+            version: "0.1.0",
+            digest: "d-site",
+            catalog_generation: "g-1",
+            approved: true,
+            executable: true,
+            project_link: "site",
+            storage_kind: "workspace",
+            files: ["screens/main/screens.json"],
+            capabilities: {},
+            connection_slots: [],
+          } as any,
+        ],
+      }),
+    ),
+  );
+  assert(
+    !host.querySelector(".apps-skeleton-grid") && host.querySelector("a.app-card-link"),
+    "remounting Apps paints SWR-cached cards immediately without skeleton flicker",
+  );
+  const firstCardLink = host.querySelector<HTMLAnchorElement>("a.app-card-link");
+  assert(firstCardLink, "cached app card link exists for prefetch");
+  const prefetchedScope: string[] = [];
+  const origFetchForPrefetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const pathname = new URL(String(input), "http://localhost").pathname;
+    if (pathname.startsWith("/api/app-installations/inst-")) prefetchedScope.push(pathname);
+    return origFetchForPrefetch(input, init);
+  };
+  try {
+    await React.act(async () => {
+      firstCardLink.dispatchEvent(new win.FocusEvent("focusin", { bubbles: true }));
+    });
+    await flush();
+    await flush();
+  } finally {
+    globalThis.fetch = origFetchForPrefetch;
+  }
+  assert(
+    prefetchedScope.includes("/api/app-installations/inst-site") &&
+      prefetchedScope.includes("/api/app-installations/inst-site/contexts"),
+    "hovering/focusing an app card prefetches detail and contexts scope",
   );
   await React.act(() => root.unmount());
   console.log("apps view tests passed");

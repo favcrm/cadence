@@ -34,6 +34,7 @@ import {
   workspaceApps,
   readWorkspaceAppSnapshot,
   readWorkspaceAppSnapshotFresh,
+  readWorkspaceScreenSnapshotFresh,
   dropWorkspaceAppSnapshot,
   type AppContext,
   type Installation,
@@ -232,6 +233,9 @@ export default function WorkspaceApp({
   restoreDrawer,
   onRestoreDrawerConsumed,
   automaticUpdatesEnabled = true,
+  initialScope,
+  onScreenState,
+  suppressLoadingOverlay = false,
 }: {
   installId: string;
   viewer: Viewer;
@@ -260,6 +264,12 @@ export default function WorkspaceApp({
   onScreenClosed?: () => void;
   /** Whether the board serves per-install automatic-update preferences. */
   automaticUpdatesEnabled?: boolean;
+  /** Verified `(installation, contexts)` passed down from AppShell so framed screens mount immediately. */
+  initialScope?: { installation: Installation; contexts: AppContext[] };
+  /** Report child ScreenHost lifecycle state back to AppShell's unified loading overlay. */
+  onScreenState?: (state: "loading" | "ready" | "fallback") => void;
+  /** Suppress child ScreenOutlet loading overlay when AppShell owns the single unified loading surface. */
+  suppressLoadingOverlay?: boolean;
 }) {
   const t = useTranslate();
   // CAD-1137: a revisit mounts with the last session's snapshot already
@@ -294,6 +304,13 @@ export default function WorkspaceApp({
   const href = useHref();
   const hrefRef = useRef(href);
   hrefRef.current = href;
+  const initialScopeRef = useRef(initialScope);
+  initialScopeRef.current = initialScope;
+  const isNativeBackdoor = new URLSearchParams(href.split("?")[1] ?? "").get("screen") === "native";
+  const effectiveInstallation = data?.installation ?? initialScope?.installation ?? null;
+  const effectiveContexts = data?.contexts ?? initialScope?.contexts ?? [];
+  const effectiveTag = effectiveInstallation && screenTag(effectiveInstallation);
+  const useScreenFastPath = !!initialScope && !!effectiveTag && !isNativeBackdoor;
   const destination = useMemo(() => parseSocialDestination(href, installId, appKey), [href, installId, appKey]);
   const linkSignature = destination
     ? JSON.stringify([installId, destination.contextId, destination.conversationId])
@@ -430,7 +447,10 @@ export default function WorkspaceApp({
     const readFor = { visitKey: destinationVisitRef.current, installId };
     setLoading(true);
     try {
-      const snapshot = await readWorkspaceAppSnapshotFresh(installId, controller.signal);
+      const scoped = initialScopeRef.current;
+      const snapshot = useScreenFastPath && scoped
+        ? await readWorkspaceScreenSnapshotFresh(installId, scoped, controller.signal)
+        : await readWorkspaceAppSnapshotFresh(installId, controller.signal);
       if (!controller.signal.aborted) {
         ownerReadReceipt.current = readFor;
         setAccessDenied(false);
@@ -446,7 +466,7 @@ export default function WorkspaceApp({
       if (activeRead.current === controller) activeRead.current = null;
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, [installId, viewer.operator, clearPrivate]);
+  }, [installId, viewer.operator, clearPrivate, useScreenFastPath]);
   useEffect(() => {
     // Re-entry paints this session's last snapshot for the route's
     // installation; a first (or stale) visit gets the skeleton instead.
@@ -715,7 +735,7 @@ export default function WorkspaceApp({
   // operator-only list and tagged with its scope; the projection pushes it
   // only while that tag still matches the route install and context. The
   // read follows the scope (plus a slow refresh), not the 5 s board poll.
-  const screenInstall = data && screenTag(data.installation) ? data.installation.install_id : null;
+  const screenInstall = effectiveInstallation && screenTag(effectiveInstallation) ? effectiveInstallation.install_id : null;
   useEffect(() => {
     if (screenInstall !== installId || accessDenied) return;
     let controller = new AbortController();
@@ -773,14 +793,14 @@ export default function WorkspaceApp({
   const sourceBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "source" && value.state === "configured" && value.config.bundle_digest === data.installation.digest);
   const imageBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "image" && value.state === "configured" && value.config.bundle_digest === data.installation.digest);
   const contexts =
-    data?.contexts.filter((value) => value.state === "active") ?? [];
+    effectiveContexts.filter((value) => value.state === "active");
   const selectedContext = contexts.find(value => value.id === contextId);
-  const workflowInputs = Object.fromEntries((data?.installation.workflows ?? []).map(value => [value.name, value.inputs]));
+  const workflowInputs = Object.fromEntries((effectiveInstallation?.workflows ?? []).map(value => [value.name, value.inputs]));
   // CAD-1171: a host-executed workflow runs its capability step in-process
   // for the operator's own click — no PM/reader team and no separate approve
   // round. A missing field (older daemon) keeps the agent path unchanged.
   const hostWorkflow = (name: string) =>
-    (data?.installation.workflows ?? []).some(value => value.name === name && value.execution === "host");
+    (effectiveInstallation?.workflows ?? []).some(value => value.name === name && value.execution === "host");
   const hostSource = hostWorkflow("source-instagram");
   const supportsContentPrompt = Object.values(workflowInputs).some(inputs => inputs.some(input => input.name === "content_prompt"));
   const supportsImagePrompt = Object.values(workflowInputs).some(inputs => inputs.some(input => input.name === "image_prompt"));
@@ -798,10 +818,11 @@ export default function WorkspaceApp({
         (agent.provider === "fake" && agent.endpoint_kind === "fake")),
   );
   // CAD-1123 HP1: the board reads behind the screen.v2 projection.
+  const workersKnown = data !== null && (!useScreenFastPath || data.agents.length > 0);
   const screenExtras = useScreenExtras({
     enabled: !!screenInstall && screenInstall === installId && !accessDenied && viewer.operator === true,
-    installation: data?.installation ?? null, installId, contextId,
-    runs: data?.runs ?? [], bindings: data?.bindings ?? [], workers: data ? workers.length : null,
+    installation: effectiveInstallation, installId, contextId,
+    runs: data?.runs ?? [], bindings: data?.bindings ?? [], workers: workersKnown ? workers.length : null,
     onDenied: clearPrivate,
   });
   // CAD-1123 HP3: the verbs a mounted screen may use, only for the operator's
@@ -1143,10 +1164,10 @@ export default function WorkspaceApp({
     );
   }
   if (!viewer.operator) return <main className="workspace-app" aria-label={t("Workspace app")}><h1>{t("Workspace app")}</h1><p className="wa-alert">{t("Sign in as the operator to inspect this installation.")}</p><Button href="/apps">{t("All apps")}</Button></main>;
-  const tag = data && screenTag(data.installation);
+  const tag = effectiveTag;
   let projection = null;
-  if (data && tag && !accessDenied && !loadError) {
-    try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects, intentRead, screenExtras.extras); }
+  if (effectiveInstallation && tag && !accessDenied && !loadError && (data || useScreenFastPath)) {
+    try { projection = screenProjection(effectiveInstallation, tag, contextId, effectiveContexts, data?.runs ?? [], data?.effects ?? [], intentRead, screenExtras.extras); }
     catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
   const contextPicker = () => (
@@ -1204,7 +1225,7 @@ export default function WorkspaceApp({
       onReinstall={data && reinstallSource ? reinstall(data.installation, reinstallSource) : undefined} />
   );
   const screen = (fallback: React.ReactNode) => projection
-    ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} onToolInvoked={screenExtras.reloadTools} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} drawerTarget={drawerTarget} restoreDrawer={restoreDrawer} onRestoreDrawerConsumed={onRestoreDrawerConsumed} socialSources={socialSources} socialVisit={scopeVisit.current.visit} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
+    ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} onToolInvoked={screenExtras.reloadTools} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} drawerTarget={drawerTarget} restoreDrawer={restoreDrawer} onRestoreDrawerConsumed={onRestoreDrawerConsumed} socialSources={socialSources} socialVisit={scopeVisit.current.visit} suppressLoadingOverlay={suppressLoadingOverlay} onStateChange={onScreenState} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}<AppVersion version={data.installation.version} /></h1><Button href="/apps">All apps</Button></header>

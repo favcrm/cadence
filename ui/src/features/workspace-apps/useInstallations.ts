@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { loadFailureMessage, loadWithBackoff } from "./installationsLoad";
-import { appExplorer, readInstallationsFresh, readInstallationsSnapshot, type Installation } from "./workspaceApps";
+import {
+  appExplorer,
+  dropInstallationsSnapshot,
+  readInstallationsSnapshot,
+  workspaceApps,
+  writeInstallationsSnapshot,
+  type Installation,
+} from "./workspaceApps";
 
 export interface InstallationsState {
   /** The last good list; `null` until one answer has arrived. Kept across failed refreshes. */
@@ -49,6 +56,7 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
   useEffect(() => {
     if (!enabled) {
       // Not the operator (any more): drop the last operator list and state.
+      dropInstallationsSnapshot();
       setList(null); setError(null); setRetrying(false); setLoading(false);
       return;
     }
@@ -58,10 +66,18 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
     const controller = new AbortController();
     setLoading(true);
     setRetrying(false);
-    loadWithBackoff(() => source === "home" ? memberRows(controller.signal) : readInstallationsFresh(controller.signal), {
-      signal: controller.signal,
-      onRetry: () => { if (!controller.signal.aborted) setRetrying(true); },
-    }).then(
+    loadWithBackoff(
+      () => source === "home"
+        ? memberRows(controller.signal)
+        : workspaceApps.installations(controller.signal).then((rows) => {
+            if (Array.isArray(rows)) writeInstallationsSnapshot(rows);
+            return rows;
+          }),
+      {
+        signal: controller.signal,
+        onRetry: () => { if (!controller.signal.aborted) setRetrying(true); },
+      },
+    ).then(
       (value) => {
         if (controller.signal.aborted) return;
         if (!Array.isArray(value)) { setError("The server returned an invalid app list."); }
