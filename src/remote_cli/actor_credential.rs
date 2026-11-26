@@ -398,6 +398,20 @@ fn bearer_for_with(
         return Ok((login, ActorSource::HumanLogin));
     }
 
+    // AOS-777: the review job verbs are decided by the tenant against the
+    // caller's enrolled CLI login. An implicit harness must send that login's
+    // own credential rather than be refused as an assistant identity it never
+    // claimed; an assistant-only login or an explicit non-human actor stays
+    // refused.
+    if matches!(surface, Surface::Cli)
+        && matches!(verb, "review_claim" | "review_diff" | "review_submit")
+    {
+        if assistant_login || cli_actor_is_explicit_non_human() {
+            return Err(non_human_authority_refusal(verb, assistant_login));
+        }
+        return Ok((login, ActorSource::HumanLogin));
+    }
+
     let implicit_assistant_enrolled_allowed = !assistant_login
         && actor
             .as_ref()

@@ -646,14 +646,29 @@ fn verb_for(
                     validate_review_id(review_id)?;
                     args.insert("review_id".into(), json!(review_id));
                     if let Some(cursor) = cursor {
-                        // `page:char-offset`, the shape the pinned reader returns.
-                        let valid = cursor.len() <= 64
-                            && cursor.split_once(':').is_some_and(|(page, offset)| {
-                                !page.is_empty()
-                                    && page.parse::<u32>().is_ok_and(|page| page >= 1)
-                                    && !offset.is_empty()
-                                    && offset.parse::<usize>().is_ok()
-                            });
+                        // The pinned reader's own grammar: page 1-300 with no
+                        // leading zero, then a 1-9 digit offset.
+                        let valid = {
+                            let mut parts = cursor.split(':');
+                            match (parts.next(), parts.next(), parts.next()) {
+                                (Some(page), Some(offset), None) => {
+                                    let digits = |value: &str| {
+                                        !value.is_empty()
+                                            && value.bytes().all(|byte| byte.is_ascii_digit())
+                                    };
+                                    digits(page)
+                                        && !page.starts_with('0')
+                                        && page.len() <= 4
+                                        && page
+                                            .parse::<u32>()
+                                            .is_ok_and(|page| (1..=300).contains(&page))
+                                        && digits(offset)
+                                        && offset.len() <= 9
+                                        && cursor.len() <= 64
+                                }
+                                _ => false,
+                            }
+                        };
                         if !valid {
                             return Err(Error::rejected(
                                 "a review diff cursor must be `page:offset` from the previous page",
@@ -5981,10 +5996,21 @@ mod read_contract_tests {
             parse(&argv)
         };
         let long = "x".repeat(65);
-        for cursor in ["abc", "0:0", "2:x", long.as_str()] {
+        for cursor in [
+            "abc",
+            "0:0",
+            "2:x",
+            "02:0",
+            "301:0",
+            "2:1000000000",
+            long.as_str(),
+        ] {
             let refused = with_cursor(cursor);
             assert!(outcome(&refused.command).is_err(), "{cursor} was accepted");
         }
+        // The largest cursor the reader can return is still accepted.
+        let (_, body) = outcome(&with_cursor("300:999999999").command).unwrap();
+        assert_eq!(body["cursor"], "300:999999999");
     }
     #[test]
     fn hosted_review_workflow_refuses_invalid_shapes() {
