@@ -154,6 +154,12 @@ function failureSentence(reason: CompactionFailureReason | null): string | null 
  * projection, the board wire behavior and the execution guards. Only declared
  * tools are installed, and every execution revalidates the live authority.
  */
+/** Keep deferred progress persistence disabled while flushing visible preview text every 40ms. */
+export const HOSTED_PROGRESS_POLICY = {
+  persistWithinMs: 0,
+  partialIntervalMs: 40,
+} as const;
+
 export class HostedSession<
   Env extends object = Record<string, unknown>,
 > extends DurableObject<Env> {
@@ -348,8 +354,12 @@ export class HostedSession<
             onWake,
             // Keep the deferred progress window at zero, rather than adopting
             // the new one-second default for hosted conversation state.
+            // Flush in-flight preview updates every 40ms instead of 100ms.
             // CAD-2414: compact before the gateway's 256 KiB request limit.
-            settings: { progress: { persistWithinMs: 0 }, compaction: HOSTED_COMPACTION_POLICY },
+            settings: {
+              progress: HOSTED_PROGRESS_POLICY,
+              compaction: HOSTED_COMPACTION_POLICY,
+            },
             telemetry: this.modelTaskContext.telemetry,
           },
           context,

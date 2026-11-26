@@ -1133,6 +1133,21 @@ pre {
   padding: 0;
   color: var(--color-ink-200);
 }
+.answer[data-kind="preview"][data-streaming="true"] .answer-body > :is(p, li):last-child::after {
+  content: "";
+  display: inline-block;
+  width: .38em;
+  height: .92em;
+  margin-left: .18rem;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: var(--color-accent);
+  animation: preview-caret 900ms steps(2, start) infinite;
+}
+@keyframes preview-caret {
+  0%, 49% { opacity: .9; }
+  50%, 100% { opacity: .2; }
+}
 .answer .issue-reader > :last-child,
 .chat-bubble.issue-reader > :last-child {
   margin-block-end: 0;
@@ -1421,7 +1436,8 @@ textarea.agentform-input { height: auto; width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   .typing-dots i,
-  .banner-spinner {
+  .banner-spinner,
+  .answer[data-kind="preview"][data-streaming="true"] .answer-body > :is(p, li):last-child::after {
     animation: none;
   }
 }

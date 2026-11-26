@@ -37,6 +37,7 @@ import {
 } from "./thread";
 import { carriesSecret } from "../app-shell/chat/directive";
 import { useConversationPreview } from "../app-shell/chat/conversationPreview";
+import { useSmoothedPreview } from "../app-shell/chat/useSmoothedPreview";
 import { fileKind } from "./fileKind";
 import { AttachmentNamesContext, HomeTurnStagedCards, TurnSkillDraftCards, TurnSources, TurnStagedCards } from "./TurnRichCards";
 import { turnSources } from "./turnCards";
@@ -1300,7 +1301,10 @@ export function ThreadTurn({
   // committed answer, and it is never presented as a stored reply.
   const previewText =
     preview === null || previewTransform === undefined ? preview : previewTransform(preview);
+  const displayedPreview = useSmoothedPreview(previewText, generating);
+  const shownPreviewText = displayedPreview ?? previewText;
   const hasPreview = previewText !== null && previewText.trim() !== "";
+  const hasVisiblePreview = shownPreviewText !== null && shownPreviewText.trim() !== "";
   // CAD-2411: a step's words commit as a note and fold into the trace when
   // its tool call starts. Until the next step has live text, the latest note
   // stays where the preview was, so the words do not vanish between steps.
@@ -1354,10 +1358,15 @@ export function ThreadTurn({
       {/* Its name row and trace say the turn is live; this is the only
           place its own words appear before the committed answer replaces
           them. No timestamp, no copy, no stored row. */}
-      {hasPreview && previewText !== null && (
-        <div className="answer" data-kind="preview" aria-live="off">
+      {hasVisiblePreview && shownPreviewText !== null && (
+        <div
+          className="answer"
+          data-kind="preview"
+          data-streaming={generating ? "true" : undefined}
+          aria-live="off"
+        >
           <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
-            <Md text={healStreamingMarkdown(previewText)} onOpen={onOpenIssue} idTokens />
+            <Md text={healStreamingMarkdown(shownPreviewText)} onOpen={onOpenIssue} idTokens />
           </div>
         </div>
       )}

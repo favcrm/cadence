@@ -89,3 +89,52 @@ index 7f4a0ba59df6d5870248c60c055dd188fdab51c4..f9e0c0b31c4dde02fe1e9f6519c87378
  export {};
  //# sourceMappingURL=types.d.ts.map
 \ No newline at end of file
+diff --git a/dist/harness/generation.js b/dist/harness/generation.js
+--- a/dist/harness/generation.js
++++ b/dist/harness/generation.js
+@@ -509,6 +509,8 @@ async function streamResponse(runtime, model, messages, options, attempt, contex
+     let timer;
+     let inFlight;
+     let stopped = false;
++    let flushedVisibleText = false;
++    const hasVisibleText = (partial) => partial.content.some((part) => part.type === "text" && part.text.length > 0);
+     const changes = new PartialChanges();
+     const flush = () => {
+         timer = undefined;
+@@ -541,8 +543,15 @@ async function streamResponse(runtime, model, messages, options, attempt, contex
+         })
+             .finally(() => {
+             inFlight = undefined;
+-            if (pending !== undefined && !stopped)
+-                timer = runtime.setTimer(flush, interval);
++            if (pending !== undefined && !stopped) {
++                if (!flushedVisibleText && hasVisibleText(pending)) {
++                    flushedVisibleText = true;
++                    flush();
++                }
++                else {
++                    timer = runtime.setTimer(flush, interval);
++                }
++            }
+         });
+     };
+     try {
+@@ -554,8 +563,17 @@ async function streamResponse(runtime, model, messages, options, attempt, contex
+                 continue;
+             changes.observe(event);
+             pending = event.partial;
+-            if (timer === undefined && inFlight === undefined)
++            if (!flushedVisibleText && hasVisibleText(event.partial)) {
++                if (inFlight === undefined) {
++                    flushedVisibleText = true;
++                    timer?.();
++                    timer = undefined;
++                    flush();
++                }
++            }
++            else if (timer === undefined && inFlight === undefined) {
+                 timer = runtime.setTimer(flush, interval);
++            }
+         }
+         return await events.result();
+     }
