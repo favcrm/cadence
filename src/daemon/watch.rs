@@ -491,6 +491,8 @@ impl Shared {
             }
             // CAD-199: off unless configured; sweeps at most hourly.
             self.agent_gc_tick();
+            // CAD-2835: deterministic status sweep and scheduled tool-less tidy-up.
+            self.assistant_memory_tidy_tick();
             // CAD-96: idle auto-stop — checks at most once a minute.
             self.auto_stop_tick();
             // CAD-413: work queued for an auto-stopped agent resumes it.

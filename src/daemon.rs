@@ -241,6 +241,8 @@ mod protected_management_rpc;
 // Both compile only under `test-seam`; production carries neither.
 #[path = "daemon/assistant_memory.rs"]
 mod assistant_memory;
+#[path = "daemon/assistant_memory_tidy.rs"]
+mod assistant_memory_tidy;
 #[cfg(all(test, feature = "test-seam"))]
 #[path = "daemon/automatic_upgrade_consent.rs"]
 mod automatic_upgrade_consent;
@@ -920,6 +922,10 @@ pub struct Shared {
     slot_clock: Arc<dyn Fn() -> f64 + Send + Sync>,
     /// CAD-199: the opt-in, records-only agent-gc timer.
     agent_gc: AgentGcTimer,
+    /// CAD-2835: last automatic memory sweep/tidy check instant.
+    memory_tidy_at: Mutex<Option<Instant>>,
+    /// CAD-2835: ensures only one background memory-tidy pass runs at a time.
+    memory_tidy_running: AtomicBool,
     /// CAD-96: the idle auto-stop timer (default ON, resumable).
     auto_stop: AutoStopTimer,
     /// CAD-339: a report was filed — the report router scans at once.
@@ -1571,6 +1577,8 @@ impl Shared {
             slots: Mutex::new(slots),
             slot_clock,
             agent_gc: AgentGcTimer::new(opts.agent_gc.clone()),
+            memory_tidy_at: Mutex::new(None),
+            memory_tidy_running: AtomicBool::new(false),
             reports_dirty: AtomicBool::new(false),
             router_every: match opts.report_router {
                 None => Some(Duration::from_secs(30)),
