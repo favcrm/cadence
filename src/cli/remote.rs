@@ -721,7 +721,7 @@ fn verb_for(
             }
             let repo = match repo {
                 Some(repo) => repo.clone(),
-                None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(|| {
+                None => cadence_ops::audit::origin_slug(&std::env::current_dir()?).ok_or_else(|| {
                     Error::rejected(
                         "no github.com origin remote in the cwd — pass --repo owner/name; nothing was sent",
                     )

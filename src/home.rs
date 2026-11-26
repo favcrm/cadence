@@ -809,10 +809,8 @@ fn real_home() -> Option<PathBuf> {
 /// this module and in `sandbox`: they share `HOME` and `CADENCE_*`.
 #[cfg(any(
     test,
-    all(
-        debug_assertions,
-        any(feature = "test-seam", feature = "ops-test-support")
-    )
+    feature = "ops-test-support",
+    all(debug_assertions, feature = "test-seam")
 ))]
 #[cfg_attr(not(test), doc(hidden))]
 pub static CAD1922_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

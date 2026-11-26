@@ -23,12 +23,11 @@ pub use cadence_agent::contract_fixture;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub use cadence_agent::send_row_gate_take;
 use cadence_agent::{
-    adapter, agent_uid, backup, board_identity, business_templates, client, cloud_agent, confine,
-    daemon, delivery, doctor, error, fd_fs, gh_guard, home, ident, inbox, issue, issuer_transport,
-    lease, master, master_perm, memory, needs_dismiss, operator_auth, output, pi_policy, platform,
-    printed_command, proc, proto, reaper, remote_auth, remote_cli, remote_enrollment, rollout,
-    sandbox, secret, skill, slots, store, test_seam, thread_search, ui, wiki, worktree,
-    WORKSPACE_MANIFEST_DIR,
+    adapter, agent_uid, backup, board_identity, business_templates, client, confine, daemon,
+    delivery, doctor, error, gh_guard, home, ident, inbox, issue, issuer_transport, master,
+    master_perm, memory, needs_dismiss, operator_auth, output, platform, printed_command, proc,
+    proto, reaper, remote_auth, remote_cli, remote_enrollment, rollout, sandbox, secret, skill,
+    slots, store, test_seam, thread_search, ui, worktree, WORKSPACE_MANIFEST_DIR,
 };
 
 #[path = "../../../src/assistant_actor.rs"]

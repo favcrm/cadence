@@ -3268,7 +3268,7 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
     Ok(cred)
 }
 
-#[cfg(any(test, all(debug_assertions, feature = "ops-test-support")))]
+#[cfg(any(test, feature = "ops-test-support"))]
 thread_local! {
     #[doc(hidden)]
     pub static CREDENTIAL_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -3339,10 +3339,7 @@ fn private_lock_inner(
     dir: &Path,
     slug: &str,
     deadline: Instant,
-    #[cfg_attr(
-        not(any(test, all(debug_assertions, feature = "ops-test-support"))),
-        allow(unused_variables)
-    )]
+    #[cfg_attr(not(any(test, feature = "ops-test-support")), allow(unused_variables))]
     observe_assignment_wait: bool,
 ) -> Result<File> {
     private_directory(dir)?;
@@ -3364,7 +3361,7 @@ fn private_lock_inner(
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(file);
         }
-        #[cfg(any(test, all(debug_assertions, feature = "ops-test-support")))]
+        #[cfg(any(test, feature = "ops-test-support"))]
         if observe_assignment_wait {
             CREDENTIAL_WAITING.with(|observer| {
                 if let Some(sender) = observer.borrow_mut().take() {

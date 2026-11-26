@@ -51,7 +51,7 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                 "protocolVersion":request.pointer("/params/protocolVersion")
                     .and_then(Value::as_str).unwrap_or("2025-11-25"),
                 "capabilities":{"tools":{}},
-                "serverInfo":{"name":"cadence-agent","version":env!("CARGO_PKG_VERSION")}
+                "serverInfo":{"name":"cadence-agent","version":cadence_agent::HOST_VERSION}
             }}),
             Some("tools/list") => {
                 let list = discovered.get_or_insert_with(|| platform_tools(state_dir));
