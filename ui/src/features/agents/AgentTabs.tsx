@@ -88,6 +88,10 @@ export interface TabContext {
   /** Whether the role is known yet. A profile that names none has nothing to wait for. */
   roleRead: "read" | "reading" | "failed";
   retryRole: () => void;
+  /** The agent ID or alias is the caller's private personal assistant (My assistant). */
+  personalAssistant?: boolean;
+  /** Friendly human-facing name for personal assistants (`assistant_<32 hex>`). */
+  displayName?: string;
   /** The Instructions document: draft, revision and save state. It lives on the
    *  page, so a tab trip keeps the draft and the caret. */
   doc: InstructionsDoc;
@@ -1134,7 +1138,7 @@ export function OptInTools({ c }: { c: TabContext }) {
   const toolState = isPersonal
     ? { disabled_tools: [], enabled_tools: c.doc.personalEnabledTools ?? [] }
     : profile!;
-  const canToggle = isPersonal ? c.operator && c.writable : c.writable;
+  const enabledCount = OPT_IN_TOOL_GROUPS.filter((g) => toolGroupOn(toolState, g.id)).length;
 
   async function toggle(group: string, on: boolean) {
     if (saving) return;
@@ -1149,27 +1153,46 @@ export function OptInTools({ c }: { c: TabContext }) {
   }
 
   return (
-    <div className="sk-list" data-work-panel="opt-in-tools">
-      {OPT_IN_TOOL_GROUPS.map((group) => {
-        const on = toolGroupOn(toolState, group.id);
-        return (
-          <div key={group.id} className="sk-card">
-            <span className="sk-title">
-              <b>{t(group.label)}</b>
-            </span>
-            <span className="sk-desc">{t(group.text)}</span>
-            <NativeToggle
-              name={group.label}
-              required={false}
-              enabled={on}
-              canToggle={canToggle}
-              pending={saving !== null}
-              onToggle={() => void toggle(group.id, !on)}
-            />
-          </div>
-        );
-      })}
-    </div>
+    <section className="sk-optin-section" data-work-panel="opt-in-tools">
+      <div className="ap-panel-h">
+        <h3>{t("Opt-in tools")}</h3>
+        <span className="text-micro text-ink-400 num">
+          {t("{on} / {total} enabled")
+            .replace("{on}", String(enabledCount))
+            .replace("{total}", String(OPT_IN_TOOL_GROUPS.length))}
+        </span>
+      </div>
+      <div className="sk-list">
+        {OPT_IN_TOOL_GROUPS.map((group) => {
+          const on = toolGroupOn(toolState, group.id);
+          const groupCanToggle = isPersonal
+            ? c.writable && (c.operator || group.memberSafe)
+            : c.writable;
+          const ownerOnlyLocked = isPersonal && !c.operator && !group.memberSafe;
+          return (
+            <div key={group.id} className="sk-card">
+              <div className="sk-body">
+                <span className="sk-title">
+                  <b>{t(group.label)}</b>
+                  {ownerOnlyLocked && (
+                    <span className="sk-owner-chip">{t("Workspace owner only")}</span>
+                  )}
+                </span>
+                <span className="sk-desc">{t(group.text)}</span>
+              </div>
+              <NativeToggle
+                name={group.label}
+                required={false}
+                enabled={on}
+                canToggle={groupCanToggle}
+                pending={saving !== null}
+                onToggle={() => void toggle(group.id, !on)}
+              />
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 

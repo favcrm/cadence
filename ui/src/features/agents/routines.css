@@ -21,6 +21,17 @@
   flex: 1 1 16rem;
 }
 
+.rtn-callout {
+  padding: 0.55rem 0.75rem;
+  border-radius: 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 28%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-accent) 6%, var(--color-ink-875));
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .rtn-row {
   display: flex;
   align-items: center;

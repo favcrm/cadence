@@ -3501,6 +3501,13 @@ Object.assign(zhTW, {
   "Your assistant’s skills are not edited here yet.": "此處暫時無法編輯你的助理的技能。",
   "Your assistant ID could not be loaded.": "無法載入你的助理 ID。",
   "Opt-in tool groups are managed by the workspace owner.": "選用工具群組由工作區擁有者管理。",
+  "Opt-in tools": "選用工具",
+  "{on} / {total} enabled": "已啟用 {on} / {total}",
+  "Workspace owner only": "僅限工作區擁有者",
+  "Private to you": "僅限你私人使用",
+  "You can enable personal-safe tools here. Workspace-level tools are managed by the workspace owner.": "你可在此啟用個人安全工具。工作區層級工具由工作區擁有者管理。",
+  "Run a Playbook (.md) routine on a recurring schedule or verified incoming event.": "依固定排程或已驗證的傳入事件執行 Playbook (.md) 例行任務。",
+  "Personal routines run inside your private hosted assistant session under your own workspace role. Only you can view or manage them; incoming emails and webhooks are treated as untrusted data.": "個人例行任務會在你私人的託管助理工作階段中以你自己的工作區角色執行。只有你可以檢視或管理；傳入電郵與 Webhook 均會視為不受信任的資料。",
 });
 
 // CAD-2363: assistant turns — tool labels, the elapsed clock, raw calls and ID tokens.

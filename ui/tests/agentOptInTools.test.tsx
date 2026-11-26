@@ -22,7 +22,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import AgentTabBody, { type TabContext } from "../src/features/agents/AgentTabs";
 import { profileBody, type DocDeps } from "../src/features/agents/instructionsDoc";
-import { toolGroupOn } from "../src/features/agents/profileTools";
+import { isMemberSafeToolGroup, toolGroupOn } from "../src/features/agents/profileTools";
 import { useInstructionsDoc, type InstructionsDoc } from "../src/features/agents/useInstructionsDoc";
 import { ApiError } from "../src/lib/apiError";
 import type { StoredAgentProfile } from "../src/lib/types";
@@ -134,8 +134,11 @@ async function main() {
   });
   assert(JSON.stringify(sent[sent.length - 1]) === "[]", "an owner turning it off saves an empty enabled_tools");
 
+  assert(isMemberSafeToolGroup("cadence_writes") && isMemberSafeToolGroup("whatsapp_read"), "cadence_writes and whatsapp_read are member-safe");
+  assert(!isMemberSafeToolGroup("whatsapp_stage") && !isMemberSafeToolGroup("whatsapp_manage") && !isMemberSafeToolGroup("channels_post"), "workspace-level opt-in groups stay owner-only");
+
   await mount(profile({ enabled_tools: ["cadence_writes", "whatsapp_manage"] }), false);
-  assert(sw() === null && sw("WhatsApp read") === null && sw("WhatsApp lifecycle") === null, "a non-owner gets no switch");
+  assert(sw() === null && sw("WhatsApp read") === null && sw("WhatsApp lifecycle") === null, "a non-owner gets no switch on workspace agents");
   const states = Array.from(host.querySelectorAll('[data-work-panel="opt-in-tools"] .sk-switch')).map((el) =>
     `${el.getAttribute("data-state")}:${el.textContent}`,
   );
@@ -144,6 +147,35 @@ async function main() {
     `a non-owner still sees all opt-in states read-only: ${JSON.stringify(states)}`,
   );
   assert(sent.length === 5, "a non-owner sends nothing");
+
+  // Personal assistant member view: self-service on member-safe groups + Workspace owner only lock on others.
+  await React.act(async () => {
+    const personalMemberCtx = {
+      alias: "assistant",
+      personalAssistant: true,
+      operator: false,
+      writable: true,
+      hostedBoard: true,
+      role: null,
+      roleRead: "read",
+      toast: (_k: string, text: string) => toasts.push(text),
+      doc: {
+        kind: "personal",
+        read: "ready",
+        personalEnabledTools: ["cadence_writes"],
+        saveEnabledTools: async (tools: string[]) => {
+          sent.push(tools);
+          return { kind: "saved" };
+        },
+      },
+    } as unknown as TabContext;
+    root.render(React.createElement(AgentTabBody, { tab: "tools", c: personalMemberCtx }));
+  });
+  assert(host.textContent?.includes("1 / 5 enabled"), "Opt-in tools section header shows active counter");
+  assert(host.textContent?.includes("Workspace owner only"), "Personal member sees Workspace owner only chip on restricted tools");
+  assert(sw("Cadence writes") !== null && !sw("Cadence writes")!.disabled, "member can toggle personal-safe Cadence writes");
+  assert(sw("WhatsApp read") !== null && !sw("WhatsApp read")!.disabled, "member can toggle personal-safe WhatsApp read");
+  assert(sw("WhatsApp lifecycle") === null && sw("Proactive channel posting") === null, "member cannot toggle owner-only tools on personal assistant");
 
   // The real hook: body is the stored fields plus enabled_tools at the page's revision; a 409 is a conflict.
   const writes: object[] = [];

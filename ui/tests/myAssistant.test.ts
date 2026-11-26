@@ -85,6 +85,7 @@ const hostedRoster = (extra: Partial<AgentsPayload> = {}) =>
 let memberStateReads = 0;
 let aliasReads = 0;
 let masterReads = 0;
+let connectionsReads = 0;
 let threadReads: string[] = [];
 let directoryReads = 0;
 let directoryAvailable = true;
@@ -134,8 +135,13 @@ globalThis.fetch = async (input, init) => {
     const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
     lastPersonalPatch = body;
     if (body.expected_revision !== personalRev) return json({ code: "revision_conflict", message: "stale revision" }, 409);
-    if (body.enabled_tools !== undefined && operator !== true) {
-      return json({ code: "owner_required", message: "Only workspace owners may change opt-in tool groups." }, 403);
+    if (Array.isArray(body.enabled_tools) && operator !== true) {
+      const restricted = body.enabled_tools.filter(
+        (g): g is string => typeof g === "string" && g !== "cadence_writes" && g !== "whatsapp_read",
+      );
+      if (restricted.length > 0) {
+        return json({ code: "owner_required", message: "Only workspace owners may change workspace opt-in tool groups." }, 403);
+      }
     }
     if (typeof body.instructions === "string") personalInstructions = body.instructions.trim() || null;
     if (Array.isArray(body.skills)) personalSkills = body.skills.filter((s): s is string => typeof s === "string");
@@ -220,6 +226,7 @@ globalThis.fetch = async (input, init) => {
     });
   }
   if (path === "/api/connections" && personalSettingsMode) {
+    connectionsReads += 1;
     return json({ connections: [] });
   }
   if (path.startsWith("/api/threads/")) {
@@ -589,23 +596,46 @@ async function main() {
     "toggling an opt-in tool sends expected_revision and enabled_tools to /api/member-assistant/profile",
   );
 
-  // Non-owner member: Routines & Tools are owner-gated, while personal Skills stay writable without library management.
+  // Non-owner member: owns their personal Routines, Incoming endpoints, Skills, and personal-safe Tools; owner-only tools stay locked.
   operator = false;
+  personalEnabledTools = [];
+  const connectionsBeforeMember = connectionsReads;
   await at("/agents/assistant?tab=routines");
+  assert(host.textContent?.includes("Private to you"), "member sees Private to you indicator in personal assistant header");
+  assert(routineListAliases.at(-1) === personalAssistantId, "member Routines tab queries by their personal assistant_id");
+  assert(endpointQueryAgents.at(-1) === personalAssistantId, "member Incoming endpoints queries by their personal assistant_id");
+  assert(connectionsReads === connectionsBeforeMember, "member Routines tab never calls owner-only /api/connections");
   assert(
-    host.textContent?.includes("Routines and script approvals are managed by the workspace owner."),
-    "member sees owner-gated message on Routines tab",
+    host.textContent?.includes("Inbox digest") &&
+      host.textContent?.includes("nova.company@cadencecloud.app") &&
+      host.textContent?.includes("private hosted assistant session"),
+    "member sees personal routines, incoming email endpoint, and hosted session/privacy callout",
   );
+  const newRoutineBtn = Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.includes("+ New routine"));
+  assert(newRoutineBtn !== undefined, "member sees + New routine button for personal assistant");
   await at("/agents/assistant?tab=tools");
-  const memberToolSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='Cadence writes']");
-  assert(memberToolSwitch === null, "member sees opt-in tool switches read-only without a toggle button");
-  assert(host.textContent?.includes("Opt-in tool groups are managed by the workspace owner."), "member sees owner-gated note on Tools tab");
+  const memberSafeSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='Cadence writes']");
+  const memberWhatsappReadSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='WhatsApp read']");
+  const memberLockedSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='WhatsApp lifecycle']");
+  assert(memberSafeSwitch && !memberSafeSwitch.disabled, "member can toggle personal-safe Cadence writes tool");
+  assert(memberWhatsappReadSwitch && !memberWhatsappReadSwitch.disabled, "member can toggle personal-safe WhatsApp read tool");
+  assert(memberLockedSwitch === null, "member sees workspace-owner-only tool groups read-only without a toggle switch");
+  assert(host.textContent?.includes("Workspace owner only"), "member sees Workspace owner only indicator on locked tools");
+  assert(
+    host.textContent?.includes("You can enable personal-safe tools here."),
+    "member sees updated opt-in tools note on Tools tab",
+  );
+  await click(memberWhatsappReadSwitch);
+  assert(
+    readPatch()?.expected_revision === 3 && JSON.stringify(readPatch()?.enabled_tools) === JSON.stringify(["whatsapp_read"]),
+    "member toggling WhatsApp read saves enabled_tools to /api/member-assistant/profile",
+  );
   await at("/agents/assistant?tab=skills");
   assert(!host.textContent?.includes("New skill"), "member does not see library management button on Skills tab");
   const memberSkillSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='weekly-report']");
   await click(memberSkillSwitch);
   assert(
-    readPatch()?.expected_revision === 3 && JSON.stringify(readPatch()?.skills) === JSON.stringify([]),
+    readPatch()?.expected_revision === 4 && JSON.stringify(readPatch()?.skills) === JSON.stringify([]),
     "member can toggle their own assistant skills",
   );
   assert(aliasReads === 0, "personal assistant tabs never fall back to /api/agents/assistant");
