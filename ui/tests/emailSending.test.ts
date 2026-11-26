@@ -158,7 +158,10 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
   };
   const button = (label: string) =>
     Array.from(document.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === label) as HTMLButtonElement | undefined;
-  await React.act(async () => { root.render(React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress })); });
+  const render = async (focusSenders = false) => {
+    await React.act(async () => { root.render(React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress, focusSenders })); });
+  };
+  await render();
   // A row is a name and one line; everything else is in the drawer it opens.
   const open = async (name: string) => {
     await settle(() => assert(rowFor(name), `row ${name}`));
@@ -188,6 +191,7 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
     flush,
     React,
     mainText,
+    render,
     unmount: async () => {
       await React.act(async () => root.unmount());
       host.remove();
@@ -430,6 +434,19 @@ async function main() {
     await m.settle(() => assert(m.button("Retry"), "the drawer offers Retry"));
     await m.click(m.button("Retry"));
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "Retry recovers"));
+    await m.unmount();
+  }
+  // The two Email routes share a mounted page; returning still focuses App senders.
+  {
+    const m = await mount(fresh());
+    await m.render(true);
+    assert(document.activeElement?.id === "app-senders", "first deep link focuses App senders");
+    await m.render(false);
+    await m.settle(() => assert(m.button("Add email"), "Accounts loaded after leaving App senders"));
+    m.button("Add email")?.focus();
+    assert(document.activeElement?.textContent?.trim() === "Add email", "focus moved within Accounts");
+    await m.render(true);
+    assert(document.activeElement?.id === "app-senders", "returning deep link refocuses App senders");
     await m.unmount();
   }
   // A hosted workspace can manage its enrolled sender, not add a duplicate.

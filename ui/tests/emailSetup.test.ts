@@ -6,8 +6,6 @@ import type * as ReactDomModule from "react-dom/client";
 import type * as LocaleModule from "../src/lib/locale";
 import type * as EmailSetupModule from "../src/features/settings/EmailSetup";
 import type { Connection } from "../src/lib/types";
-import type * as NavigationModule from "../screen-ui/src/navigation";
-import type * as HostNavigationModule from "../src/ui/hostNavigation";
 
 function assert(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
 let act: typeof reactAct;
@@ -37,12 +35,9 @@ async function main() {
   act = React.act;
   const { createRoot } = require("react-dom/client") as typeof ReactDomModule;
   const { LocaleProvider } = require("../src/lib/locale") as typeof LocaleModule;
-  const EmailSetupView = (require("../src/features/settings/EmailSetup") as typeof EmailSetupModule).default;
-  const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof NavigationModule;
-  const { hostNavigation } = require("../src/ui/hostNavigation") as typeof HostNavigationModule;
-  const EmailSetup = (props: ReactModule.ComponentProps<typeof EmailSetupView>) =>
-    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(EmailSetupView, props) });
+  const EmailSetup = (require("../src/features/settings/EmailSetup") as typeof EmailSetupModule).default;
   const posts: { account: string; scopes: string[]; username: string }[] = [];
+  const protectedPosts: unknown[] = [];
   let protectedState: unknown = { configured: false, protected: false, origin: null, board_origin: "http://localhost" };
   let refuse = false;
   const gate: { hold: boolean; release?: () => void } = { hold: false };
@@ -50,6 +45,10 @@ async function main() {
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = new URL(String(input), "http://localhost").pathname;
     if (path === "/api/protected-entry") return protectedState === null ? json({}, 500) : json(protectedState);
+    if (path === "/api/credential-requests" && init?.method === "POST") {
+      protectedPosts.push(JSON.parse(String(init.body)));
+      return json({ request: { entry_url: "https://unexpected.example/connections/enroll/12345678-1234-1234-1234-1234567890ab" } });
+    }
     if (path === "/api/connection-providers") return json({ providers: [{ provider: "smtp", descriptor_available: true, descriptor: { enrollment_shapes: ["smtp"], capabilities: [{ effect: "send", scopes: ["email:send"] }, { effect: "read", scopes: ["email:read"] }] } }] });
     if (path === "/api/connections" && init?.method === "POST") {
       posts.push(JSON.parse(String(init.body)));
@@ -91,8 +90,15 @@ async function main() {
   act(() => root2.render(React.createElement(LocaleProvider, null, React.createElement(EmailSetup, { hostedSmtp: false, rows: [], onSaved: () => {}, onClose: () => {} }))));
   await settle(() => { const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Continue") as HTMLButtonElement; assert(button && !button.disabled, "reviewed SMTP available"); });
   click("Continue");
-  await settle(() => assert(document.querySelector('a[href="/settings/connections/new/smtp"]'), "protected enrollment links to board setup"));
-  assert(!document.querySelector("#hs-password"), "protected profile never shows password");
+  await settle(() => assert(text().includes("Enter the SMTP details only on the separate trusted credential page."), "protected profile offers trusted entry"));
+  assert(!document.querySelector('input[type="password"]'), "protected profile never shows password");
+  click("Continue on secure entry…");
+  await settle(() => assert(text().includes("The trusted credential page could not be confirmed."), "mismatched entry origin is refused"));
+  assert(
+    JSON.stringify(protectedPosts) === JSON.stringify([{ provider: "smtp", verb: "enroll", shape: "smtp", scopes: ["email:send"] }]),
+    "protected enrollment sends only reviewed request metadata",
+  );
+  assert(location.origin === "http://localhost" && !document.querySelector('input[type="password"]'), "refusal stays on the board without offering password input");
   click("Back");
   assert(document.activeElement?.id === "email-method", "Back returns focus to method");
   await act(async () => root2.unmount());
@@ -107,7 +113,7 @@ async function main() {
     await settle(() => { const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Continue") as HTMLButtonElement; assert(button && !button.disabled, "native SMTP available"); });
     click("Continue");
     await settle(() => assert(text().includes("Credential entry could not be checked."), "ambiguous metadata fails closed"));
-    assert(!document.querySelector('a[href="/settings/connections/new/smtp"]'), "ambiguous metadata cannot redirect to legacy credential input");
+    assert(!text().includes("Continue on secure entry…"), "ambiguous metadata cannot start secure entry");
     assert(!document.querySelector("#hs-password"), "ambiguous metadata never shows password");
     await act(async () => testRoot.unmount());
   }
@@ -127,6 +133,7 @@ async function main() {
   assert((Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Cancel") as HTMLButtonElement).disabled, "Cancel disabled during verification");
   act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
   assert(document.querySelector("#hs-password"), "Escape cannot dismiss during verification");
+  assert(!document.querySelector('[role="dialog"][data-closing="true"]'), "Escape does not start closing while verification is pending");
   assert(gate.release, "verification request is pending");
   await act(async () => { gate.release!(); });
   await settle(() => assert(Number(saved) === 1, "native enrollment completes"));

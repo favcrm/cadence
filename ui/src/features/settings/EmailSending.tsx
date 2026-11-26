@@ -117,6 +117,7 @@ export default function EmailSending({
   const sendersFocused = useRef(false);
   const accountsLoaded = rows !== null;
   useEffect(() => {
+    if (!focusSenders || viewer.operator !== true) sendersFocused.current = false;
     if (viewer.operator !== true) return;
     if (accountAdded.current && accountsLoaded) {
       accountAdded.current = false;

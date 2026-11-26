@@ -1,10 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import type { Connection, ConnectionProvider } from "../../lib/types";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import Select from "../../ui/Select";
+import { entryHref, errorCopy } from "../connections/credentialRequestView";
 import { useProtectedEntry } from "../connections/useProtectedEntry";
 import { enrollmentSupport } from "./connectionsView";
 import HostedSmtpConnect, { type ConnectDetails } from "./HostedSmtpConnect";
@@ -24,6 +24,7 @@ export default function EmailSetup({ rows, hostedSmtp, onSaved, onClose }: {
   const [provider, setProvider] = useState<ConnectionProvider | null>(null);
   const [catalog, setCatalog] = useState<"loading" | "ready" | "failed">(hostedSmtp ? "ready" : "loading");
   const [pending, setPending] = useState(false);
+  const [protectedError, setProtectedError] = useState<string | null>(null);
   const live = useRef(true);
   const generation = useRef(0);
   const heading = useRef<HTMLHeadingElement>(null);
@@ -79,6 +80,27 @@ export default function EmailSetup({ rows, hostedSmtp, onSaved, onClose }: {
     }
   };
 
+  const openProtected = async (origin: string) => {
+    const generationAtStart = ++generation.current;
+    const current = () => live.current && generation.current === generationAtStart;
+    setPending(true);
+    setProtectedError(null);
+    try {
+      const { request } = await api.credentialRequestCreate({ provider: "smtp", verb: "enroll", shape: "smtp", scopes });
+      if (!current()) return;
+      const href = entryHref(request);
+      if (href === null || !href.startsWith(`${origin}/`)) {
+        setProtectedError("The trusted credential page could not be confirmed. No password was collected.");
+      } else {
+        window.location.assign(href);
+      }
+    } catch (e) {
+      if (current()) setProtectedError(errorCopy(e instanceof ApiError ? e.code : null));
+    } finally {
+      if (current()) setPending(false);
+    }
+  };
+
   const cancel = () => {
     onClose();
     window.setTimeout(() => {
@@ -125,8 +147,8 @@ export default function EmailSetup({ rows, hostedSmtp, onSaved, onClose }: {
             <h2 ref={heading} tabIndex={-1} className="text-cardtitle font-medium text-ink-100">{t("SMTP configuration")}</h2>
             {hostedSmtp
               ? <HostedSmtpConnect connected={null} onConnect={connect} />
-              : <NativeSmtpEntry account={account} onAccountChange={setAccount} onConnect={connect} />}
-            <div className="crm-toolbar"><Button disabled={pending} onClick={() => { focusMethod.current = true; setStep(1); }}>{t("Back")}</Button><Button disabled={pending} onClick={cancel}>{t("Cancel")}</Button></div>
+              : <NativeSmtpEntry account={account} onAccountChange={setAccount} onConnect={connect} onProtected={openProtected} pending={pending} error={protectedError} />}
+            <div className="crm-toolbar"><Button disabled={pending} onClick={() => { focusMethod.current = true; setProtectedError(null); setStep(1); }}>{t("Back")}</Button><Button disabled={pending} onClick={cancel}>{t("Cancel")}</Button></div>
           </>
         )}
       </div>
@@ -134,16 +156,29 @@ export default function EmailSetup({ rows, hostedSmtp, onSaved, onClose }: {
   );
 }
 
-function NativeSmtpEntry({ account, onAccountChange, onConnect }: {
+function NativeSmtpEntry({ account, onAccountChange, onConnect, onProtected, pending, error }: {
   account: string;
   onAccountChange: (value: string) => void;
   onConnect: (details: ConnectDetails, acceptRisk: boolean) => Promise<void>;
+  onProtected: (origin: string) => Promise<void>;
+  pending: boolean;
+  error: string | null;
 }) {
   const t = useTranslate();
   const entry = useProtectedEntry();
   if (entry.status === "loading") return <p role="status" className="text-label text-ink-400">{t("Checking credential entry…")}</p>;
   if (entry.status === "ready" && entry.entry?.configured === true && entry.entry.protected === true) {
-    return <Link href="/settings/connections/new/smtp" className="lnk text-label">{t("Continue to protected setup")}</Link>;
+    const { origin } = entry.entry;
+    if (typeof origin !== "string" || origin === "") {
+      return <p role="alert" className="text-label text-fail">{t(errorCopy("unsupported_deployment"))}</p>;
+    }
+    return (
+      <div className="grid gap-2">
+        <p className="text-label text-ink-400">{t("Enter the SMTP details only on the separate trusted credential page.")}</p>
+        <div><Button variant="primary" loading={pending} disabled={pending} onClick={() => void onProtected(origin)}>{t("Continue on secure entry…")}</Button></div>
+        {error && <p role="alert" className="text-label text-fail">{t(error)}</p>}
+      </div>
+    );
   }
   if (entry.status !== "ready" || entry.entry?.configured !== false || entry.entry.protected !== false || entry.entry.origin !== null) {
     return <p role="alert" className="text-label text-fail">{t("Credential entry could not be checked. No password can be entered here.")}</p>;
