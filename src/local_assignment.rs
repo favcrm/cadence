@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -771,9 +770,9 @@ impl<H: CoordHttp> Coordinator<H> {
                 ));
             }
         }
-        let _lock = remote_cli::private_lock(
+        let _lock = remote_cli::assignment_coordination_lock(
             &ledger,
-            "local-assign",
+            remote_cli::AssignmentCoordinationLock::Ledger,
             Instant::now() + Duration::from_secs(5),
         )?;
         Ok(Self {
@@ -792,9 +791,9 @@ impl<H: CoordHttp> Coordinator<H> {
     }
 
     fn with_ledger<T>(&self, body: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
-        let _lock = remote_cli::private_lock(
+        let _lock = remote_cli::assignment_coordination_lock(
             &self.ledger,
-            "local-assign",
+            remote_cli::AssignmentCoordinationLock::Ledger,
             Instant::now() + Duration::from_secs(5),
         )?;
         let mut ledger = Ledger::load(&self.ledger, &self.org_id)?;
@@ -802,14 +801,13 @@ impl<H: CoordHttp> Coordinator<H> {
         ledger.save(&self.ledger, &self.org_id)?;
         Ok(out)
     }
-    fn assignment_lock(&self, assignment: &str) -> Result<File> {
-        let mut lock_key = Sha256::new();
-        lock_key.update((self.org_id.len() as u64).to_be_bytes());
-        lock_key.update(self.org_id.as_bytes());
-        lock_key.update(assignment.as_bytes());
-        remote_cli::private_lock(
+    fn assignment_lock(&self, assignment: &str) -> Result<remote_cli::AssignmentCoordinationGuard> {
+        remote_cli::assignment_coordination_lock(
             &self.ledger,
-            &format!("local-reassign-{:x}", lock_key.finalize()),
+            remote_cli::AssignmentCoordinationLock::Assignment {
+                organization: &self.org_id,
+                assignment,
+            },
             Instant::now() + Duration::from_secs(5),
         )
     }

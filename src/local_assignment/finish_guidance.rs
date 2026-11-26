@@ -69,9 +69,9 @@ pub fn release_cancelled<H: CoordHttp>(
     assignment: &str,
     state_dir: &Path,
 ) -> Result<Value> {
-    let lock = remote_cli::private_lock(
+    let lock = remote_cli::assignment_coordination_lock(
         &coordinator.ledger,
-        "local-assign",
+        remote_cli::AssignmentCoordinationLock::Ledger,
         Instant::now() + Duration::from_secs(5),
     )?;
     let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;
@@ -169,9 +169,9 @@ fn release_bound<H: CoordHttp>(
         .map(|id| coordinator.assignment_lock(id))
         .collect::<Result<Vec<_>>>()?;
     let lock_and_validate = || {
-        let lock = remote_cli::private_lock(
+        let lock = remote_cli::assignment_coordination_lock(
             &coordinator.ledger,
-            "local-assign",
+            remote_cli::AssignmentCoordinationLock::Ledger,
             Instant::now() + Duration::from_secs(5),
         )?;
         let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;
@@ -417,9 +417,9 @@ fn bound_lane<H: CoordHttp>(
     selected: Option<&Path>,
     assignment: Option<&str>,
 ) -> Result<Option<BoundLane>> {
-    let lock = remote_cli::private_lock(
+    let lock = remote_cli::assignment_coordination_lock(
         &coordinator.ledger,
-        "local-assign",
+        remote_cli::AssignmentCoordinationLock::Ledger,
         Instant::now() + Duration::from_secs(5),
     )?;
     let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;

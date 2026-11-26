@@ -62,7 +62,7 @@ existing authority recheck and absolute deadline.
 | [src/remote_auth.rs](../src/remote_auth.rs), [src/remote_enrollment.rs](../src/remote_enrollment.rs), [src/remote_result_outbox.rs](../src/remote_result_outbox.rs), [src/cli/remote_result.rs](../src/cli/remote_result.rs) | Distinct issuer sign-in, protected hosted child enrollment, immutable offline result custody and explicit sender CLI. The sender uses the issuer-bound record and original outbox pin; it does not enable a production gateway or grant daemon authority. See [issuer/enrollment contract](REMOTE-AUTH.md). |
 | [src/daemon.rs](../src/daemon.rs), [src/daemon/shared.rs](../src/daemon/shared.rs), [src/daemon/](../src/daemon/), [crates/cadence-daemon/Cargo.toml](../crates/cadence-daemon/Cargo.toml) | Shared runtime coordination and central dispatch; area RPC handlers, identity, timers and actor lifecycle. |
 | [src/store/mod.rs](../src/store/mod.rs), [src/store/schema.rs](../src/store/schema.rs), [src/store/](../src/store/) | SQLite schema/migrations and durable transitions, partitioned by domain; store tests live under `src/store/tests/`. |
-| [src/backup/](../src/backup/) | Online-backup manifests, secret-scanned exports, restore with repository remap. |
+| [src/backup/](../src/backup/) | Online-backup manifests, secret-scanned exports, restore with repository remap. Backup and portable backup stay in `cadence-agent` with their pinned SQLite paths and custody guards. |
 | [src/adapter/mod.rs](../src/adapter/mod.rs), [src/adapter/registry.rs](../src/adapter/registry.rs) | Common adapter types and provider capability descriptors. |
 | [src/adapter/](../src/adapter/), [src/adapter/pty/](../src/adapter/pty/) | Structured provider transports and owned terminal lifecycle. Check the registry for accepted combinations; screen classification is not provider approval. |
 | [src/issue/](../src/issue/), [src/context_pack.rs](../src/context_pack.rs) | Project/issue files, start/dispatch/finish, history, report intake, relay and read-only retros. Context planner: deterministic task manifest, source dispositions, delivery/restore plan and supply receipts for issue-bound turns. |
@@ -84,6 +84,11 @@ primitives in `src/daemon/shared.rs`). Dependencies run one way:
 crates may also use `cadence-agent` directly). The root agent retains shared
 daemon primitives needed by its own modules; it does not depend on the daemon
 crate in production.
+
+The operational tier uses named assignment locks and typed portable migration
+requests. The root agent owns lock files, issuer validation, HTTP request
+shapes and deadlines; downstream crates receive neither a lock file handle nor
+a raw issuer transport.
 
 ## Work and evidence flow
 

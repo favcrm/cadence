@@ -3274,9 +3274,76 @@ thread_local! {
     pub static CREDENTIAL_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
 }
 
+/// The fixed coordination namespaces used by the local assignment protocol.
 #[doc(hidden)]
-pub fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
+pub enum AssignmentCoordinationLock<'a> {
+    Ledger,
+    Assignment {
+        organization: &'a str,
+        assignment: &'a str,
+    },
+    EventConfig,
+    EventInbox,
+    WorkspaceOwner {
+        organization: &'a str,
+    },
+}
+
+/// Holds the coordination lock until dropped, without exposing its file.
+#[doc(hidden)]
+pub struct AssignmentCoordinationGuard {
+    _file: File,
+}
+
+#[doc(hidden)]
+pub fn assignment_coordination_lock(
+    dir: &Path,
+    lock: AssignmentCoordinationLock<'_>,
+    deadline: Instant,
+) -> Result<AssignmentCoordinationGuard> {
+    let (name, observe_assignment_wait) = match lock {
+        AssignmentCoordinationLock::Ledger => (std::borrow::Cow::Borrowed("local-assign"), false),
+        AssignmentCoordinationLock::Assignment {
+            organization,
+            assignment,
+        } => {
+            let mut key = Sha256::new();
+            key.update((organization.len() as u64).to_be_bytes());
+            key.update(organization.as_bytes());
+            key.update(assignment.as_bytes());
+            (format!("local-reassign-{:x}", key.finalize()).into(), true)
+        }
+        AssignmentCoordinationLock::EventConfig => {
+            (std::borrow::Cow::Borrowed("hosted-event-config"), false)
+        }
+        AssignmentCoordinationLock::EventInbox => {
+            (std::borrow::Cow::Borrowed("hosted-event-inbox"), false)
+        }
+        AssignmentCoordinationLock::WorkspaceOwner { organization } => {
+            if organization.contains('/') || organization.contains('\0') {
+                return Err(reject("invalid workspace coordination identity"));
+            }
+            (format!("hosted-workspace-{organization}").into(), false)
+        }
+    };
+    Ok(AssignmentCoordinationGuard {
+        _file: private_lock_inner(dir, &name, deadline, observe_assignment_wait)?,
+    })
+}
+
+pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
+    private_lock_inner(dir, slug, deadline, false)
+}
+
+fn private_lock_inner(
+    dir: &Path,
+    slug: &str,
+    deadline: Instant,
+    #[cfg_attr(not(any(test, debug_assertions)), allow(unused_variables))]
+    observe_assignment_wait: bool,
+) -> Result<File> {
     private_directory(dir)?;
+
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -3295,11 +3362,13 @@ pub fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
             return Ok(file);
         }
         #[cfg(any(test, debug_assertions))]
-        CREDENTIAL_WAITING.with(|observer| {
-            if let Some(sender) = observer.borrow_mut().take() {
-                let _ = sender.send(());
-            }
-        });
+        if observe_assignment_wait {
+            CREDENTIAL_WAITING.with(|observer| {
+                if let Some(sender) = observer.borrow_mut().take() {
+                    let _ = sender.send(());
+                }
+            });
+        }
         if Instant::now() >= deadline {
             return Err(Error::busy_coded(
                 "timeout",

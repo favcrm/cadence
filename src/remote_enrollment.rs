@@ -11,6 +11,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -1471,7 +1472,7 @@ fn web_upload_file_path(path: &str) -> bool {
 /// path refuses before a request exists. No retries live here: the caller
 /// decides, and a mutation whose answer was lost stays outcome-unknown for
 /// reconciliation rather than being re-sent.
-pub enum MigrationBody<'a> {
+enum MigrationBody<'a> {
     /// No body (GET `/:operationId`).
     None,
     /// A JSON object body (preflight, begin, commit, rollback).
@@ -1493,7 +1494,7 @@ pub enum MigrationBody<'a> {
 /// keep short, bounded caps. These are transport timeouts only — they are not
 /// the `--wake-timeout` budget, and no request is re-sent on expiry.
 #[derive(Clone, Copy)]
-pub enum MigrationTimeout {
+enum MigrationTimeout {
     /// Small JSON calls: preflight, begin, status, rollback.
     Json,
     /// POST `/:operationId/manifest` (bounded 4 MiB upload).
@@ -1505,8 +1506,7 @@ pub enum MigrationTimeout {
 }
 
 impl MigrationTimeout {
-    #[doc(hidden)]
-    pub fn cap(self) -> Duration {
+    fn cap(self) -> Duration {
         match self {
             Self::Json => Duration::from_secs(30),
             Self::Manifest => Duration::from_secs(60),
@@ -1519,7 +1519,7 @@ impl MigrationTimeout {
     /// list — a full-inventory pack can legitimately fill megabytes — so pack
     /// answers share the 4 MiB manifest bound; every other answer stays at
     /// the ordinary small-response cap.
-    pub(crate) fn response_cap(self) -> u64 {
+    fn response_cap(self) -> u64 {
         match self {
             Self::Pack => 4 * 1024 * 1024,
             _ => MAX_RESPONSE,
@@ -1527,38 +1527,251 @@ impl MigrationTimeout {
     }
 }
 
-/// The request the native portable-migration flow may send. `workspace` is
-/// the registered workspace id (`X-Cadence-Workspace`), `bearer` the renewed
-pub struct MigrationRequest<'a, 'b> {
-    pub method: &'a str,
-    pub path: &'a str,
-    pub workspace: &'a str,
-    pub bearer: &'a str,
-    pub timeout: MigrationTimeout,
-    /// The body borrows the caller's buffer independently — a streamed pack
-    /// reader must not force the header borrows to outlive it.
-    pub body: MigrationBody<'b>,
+const PORTABLE_MIGRATIONS: &str = "/v1/hosted-cadence/portable-migrations";
+
+/// Operations available to the portable migration client. Routes, methods,
+/// body formats and timeout classes are fixed by the transport.
+#[doc(hidden)]
+pub enum PortableMigrationRequest<'a> {
+    Preflight {
+        digest: &'a str,
+        schema_version: i64,
+        member_count: usize,
+        manifest_bytes: usize,
+    },
+    Begin {
+        request_id: &'a str,
+        digest: &'a str,
+        destination_digest: Option<&'a str>,
+        generation: Option<&'a str>,
+        replace: bool,
+    },
+    Status {
+        operation_id: &'a str,
+    },
+    StatusByRequest {
+        request_id: &'a str,
+    },
+    Inputs {
+        operation_id: &'a str,
+    },
+    Rollback {
+        operation_id: &'a str,
+        request_id: &'a str,
+        destination_digest: &'a str,
+        generation: &'a str,
+    },
+    Manifest {
+        operation_id: &'a str,
+        bytes: &'a [u8],
+    },
+    Pack {
+        operation_id: &'a str,
+        index: usize,
+        reader: &'a mut dyn Read,
+    },
+    Part {
+        operation_id: &'a str,
+        index: usize,
+        part: u64,
+        reader: &'a mut dyn Read,
+    },
+    Finalize {
+        operation_id: &'a str,
+        index: usize,
+    },
+    Commit {
+        operation_id: &'a str,
+        request_id: &'a str,
+    },
+}
+
+impl PortableMigrationRequest<'_> {
+    fn timeout(&self) -> MigrationTimeout {
+        match self {
+            Self::Manifest { .. } => MigrationTimeout::Manifest,
+            Self::Pack { .. } | Self::Part { .. } | Self::Finalize { .. } => MigrationTimeout::Pack,
+            Self::Commit { .. } => MigrationTimeout::Commit,
+            _ => MigrationTimeout::Json,
+        }
+    }
+}
+
+/// Send only a named portable-migration operation to the pinned issuer.
+#[doc(hidden)]
+pub fn portable_migration_request(
+    dir: &Path,
+    issuer: &str,
+    workspace: &str,
+    bearer: &str,
+    operation: PortableMigrationRequest<'_>,
+) -> Result<(u16, Option<Value>)> {
+    use PortableMigrationRequest::*;
+
+    let segment = match &operation {
+        Preflight { .. } | Begin { .. } => None,
+        StatusByRequest { request_id } => Some(*request_id),
+        Status { operation_id }
+        | Inputs { operation_id }
+        | Rollback { operation_id, .. }
+        | Manifest { operation_id, .. }
+        | Pack { operation_id, .. }
+        | Part { operation_id, .. }
+        | Finalize { operation_id, .. }
+        | Commit { operation_id, .. } => Some(*operation_id),
+    };
+    if segment.is_some_and(|value| !id(value)) {
+        return Err(reject("Hosted portable-migration path refused"));
+    }
+    let timeout = operation.timeout();
+    let deadline = Instant::now() + timeout.cap() + Duration::from_secs(5);
+    let payload;
+    let (method, path, body) = match operation {
+        Preflight {
+            digest,
+            schema_version,
+            member_count,
+            manifest_bytes,
+        } => {
+            payload = json!({
+                "packageManifestSha256": digest,
+                "schemaVersion": schema_version,
+                "memberCount": member_count,
+                "manifestBytes": manifest_bytes,
+            });
+            (
+                "POST",
+                format!("{PORTABLE_MIGRATIONS}/preflight").into(),
+                MigrationBody::Json(&payload),
+            )
+        }
+        Begin {
+            request_id,
+            digest,
+            destination_digest,
+            generation,
+            replace,
+        } => {
+            let (mode, consent) = if replace {
+                ("replace", "confirm-replace-retain-rollback")
+            } else {
+                ("inactive", "confirm-inactive-restore")
+            };
+            payload = json!({
+                "requestId": request_id,
+                "packageManifestSha256": digest,
+                "expectedDestinationDigest": destination_digest,
+                "expectedGeneration": generation,
+                "mode": mode,
+                "consent": consent,
+            });
+            (
+                "POST",
+                Cow::Borrowed(PORTABLE_MIGRATIONS),
+                MigrationBody::Json(&payload),
+            )
+        }
+        Status { operation_id } => (
+            "GET",
+            format!("{PORTABLE_MIGRATIONS}/{operation_id}").into(),
+            MigrationBody::None,
+        ),
+        StatusByRequest { request_id } => (
+            "GET",
+            format!("{PORTABLE_MIGRATIONS}/by-request/{request_id}").into(),
+            MigrationBody::None,
+        ),
+        Inputs { operation_id } => (
+            "GET",
+            format!("{PORTABLE_MIGRATIONS}/{operation_id}/inputs").into(),
+            MigrationBody::None,
+        ),
+        Rollback {
+            operation_id,
+            request_id,
+            destination_digest,
+            generation,
+        } => {
+            payload = json!({
+                "requestId": request_id,
+                "expectedDestinationDigest": destination_digest,
+                "expectedGeneration": generation,
+                "consent": "confirm-rollback-retained-root",
+            });
+            (
+                "POST",
+                format!("{PORTABLE_MIGRATIONS}/{operation_id}/rollback").into(),
+                MigrationBody::Json(&payload),
+            )
+        }
+        Manifest {
+            operation_id,
+            bytes,
+        } => (
+            "POST",
+            format!("{PORTABLE_MIGRATIONS}/{operation_id}/manifest").into(),
+            MigrationBody::Bytes(bytes),
+        ),
+        Pack {
+            operation_id,
+            index,
+            reader,
+        } => (
+            "PUT",
+            format!("{PORTABLE_MIGRATIONS}/{operation_id}/input-packs/{index}").into(),
+            MigrationBody::Stream(reader),
+        ),
+        Part {
+            operation_id,
+            index,
+            part,
+            reader,
+        } => (
+            "PUT",
+            format!("{PORTABLE_MIGRATIONS}/{operation_id}/input-packs/{index}/parts/{part}").into(),
+            MigrationBody::Stream(reader),
+        ),
+        Finalize {
+            operation_id,
+            index,
+        } => (
+            "POST",
+            format!("{PORTABLE_MIGRATIONS}/{operation_id}/input-packs/{index}/finalize").into(),
+            MigrationBody::Empty,
+        ),
+        Commit {
+            operation_id,
+            request_id,
+        } => {
+            payload = json!({"requestId": request_id});
+            (
+                "POST",
+                format!("{PORTABLE_MIGRATIONS}/{operation_id}/commit").into(),
+                MigrationBody::Json(&payload),
+            )
+        }
+    };
+    migration_issuer_request(
+        dir, issuer, method, &path, workspace, bearer, timeout, body, deadline,
+    )
 }
 
 /// Send one portable-migration request. Returns `(status, body)` with `body`
 /// `None` when the answer is not JSON. Redirects, oversized answers and every
 /// path outside the namespace are refused; the raw failure body is never
 /// surfaced to the caller beyond this function's parsed envelope.
-#[doc(hidden)]
-pub fn migration_issuer_request(
+#[allow(clippy::too_many_arguments)]
+fn migration_issuer_request(
     dir: &Path,
     issuer: &str,
-    request: MigrationRequest<'_, '_>,
+    method: &str,
+    path: &str,
+    workspace: &str,
+    bearer: &str,
+    timeout: MigrationTimeout,
+    body: MigrationBody<'_>,
     deadline: Instant,
 ) -> Result<(u16, Option<Value>)> {
-    let MigrationRequest {
-        method,
-        path,
-        workspace,
-        bearer,
-        timeout,
-        body,
-    } = request;
     if !portable_migration_path(path) {
         return Err(reject("Hosted portable-migration path refused"));
     }
@@ -1688,8 +1901,7 @@ fn portable_migration_shape_admitted(path: &str, method: &str, body: &MigrationB
 /// Per-operation paths admit manifest, input-packs, inputs (read-only), commit,
 /// rollback and status only. Query, fragment, encoded separators and traversal refuse.
 fn portable_migration_path(path: &str) -> bool {
-    const BASE: &str = "/v1/hosted-cadence/portable-migrations";
-    if !path.starts_with(BASE)
+    if !path.starts_with(PORTABLE_MIGRATIONS)
         || path.len() > 512
         || path.contains('?')
         || path.contains('#')
@@ -1700,7 +1912,7 @@ fn portable_migration_path(path: &str) -> bool {
     {
         return false;
     }
-    match &path[BASE.len()..] {
+    match &path[PORTABLE_MIGRATIONS.len()..] {
         "" | "/preflight" => true,
         rest => {
             let Some(tail) = rest.strip_prefix('/') else {

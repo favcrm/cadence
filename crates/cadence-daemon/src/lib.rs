@@ -18,7 +18,7 @@ mod console_macros;
 #[cfg(not(test))]
 use cadence_agent::ui;
 use cadence_agent::{
-    adapter, agent_roles, agent_settings, agent_uid, app_assistant, attachment_image,
+    adapter, agent_roles, agent_settings, agent_uid, app_assistant, attachment_image, backup,
     board_identity, business_templates, cli_actor, client, cloud_agent, confine, context_pack,
     continuity, contract_fixture, delivery, doctor, error, fd_fs, gh_guard, home, inbox, issue,
     issuer_transport, lease, managed_section, master, master_perm, memory, model_defaults,
@@ -31,7 +31,7 @@ use cadence_agent::{web_publish, web_sites};
 #[cfg(all(test, feature = "test-seam"))]
 use cadence_ops::briefing;
 use cadence_ops::{
-    assistant_actor, audit, backup, board_membership, business_export, delegation, device_login,
+    assistant_actor, audit, board_membership, business_export, delegation, device_login,
     devin_catalog, local_assignment, notify_bridge, notify_host, overview, review, test_queue,
     update, web_push,
 };

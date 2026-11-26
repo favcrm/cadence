@@ -121,8 +121,7 @@ pub use endpoint::AgentEndpoint;
 #[doc(hidden)]
 pub use monitors::{ProjectMonitorView, MAX_MONITOR_TASKS};
 mod business_templates;
-#[doc(hidden)]
-pub use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
+pub(crate) use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
 pub use business_templates::{BusinessDocument, TemplateVersion};
 mod artifacts;
 pub use artifacts::{
@@ -196,8 +195,7 @@ pub use seal::StoreConn;
 #[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) use seal::StoreConn;
 pub use seal::WriteTxn;
-#[doc(hidden)]
-pub use seal::{preflight_writer_guard, require_legacy_writer_tx};
+pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx};
 #[cfg(all(
     target_os = "linux",
     feature = "test-seam",

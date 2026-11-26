@@ -37,6 +37,7 @@ pub mod audit {
     #[doc(hidden)]
     pub const APPROVAL_UNVERIFIED: &str = "unverified until CAD-280";
 }
+pub mod backup;
 pub mod board_identity;
 /// Kickoff guidance constant shared with [`issue::dispatch::kickoff`] and [`store::kickoff`].
 pub mod briefing {

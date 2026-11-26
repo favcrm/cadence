@@ -17,22 +17,22 @@ pub(super) fn run(
     attest_chat_custody_absent: bool,
 ) -> Result<i32> {
     if !portable {
-        print_json(&cadence_ops::backup::export(&state_dir, &out)?);
+        print_json(&cadence_agent::backup::export(&state_dir, &out)?);
         return Ok(0);
     }
     let tracker = tracker.ok_or_else(|| Error::usage("--portable needs --tracker <PATH>"))?;
-    let opts = cadence_ops::backup::portable::PortableExportOptions {
-        scope: cadence_ops::backup::portable::Scope::Coordination,
+    let opts = cadence_agent::backup::portable::PortableExportOptions {
+        scope: cadence_agent::backup::portable::Scope::Coordination,
         tracker,
         redact_history_secrets,
         attest_chat_custody_absent,
     };
     let report = if snapshot_working_tree {
-        cadence_ops::backup::portable::export_portable_snapshot_selected(
+        cadence_agent::backup::portable::export_portable_snapshot_selected(
             &state_dir, &out, &opts, &apps,
         )?
     } else {
-        cadence_ops::backup::portable::export_portable_selected(&state_dir, &out, &opts, &apps)?
+        cadence_agent::backup::portable::export_portable_selected(&state_dir, &out, &opts, &apps)?
     };
     print_json(&report);
     Ok(0)

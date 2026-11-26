@@ -35,10 +35,8 @@ pub fn load_paths(
 
 /// Keep the admitted namespace descriptors and record fd for the caller's
 /// entire operation. No key bytes, crypto state, grant or recovery ledger.
-#[doc(hidden)]
-pub struct Config {
-    #[doc(hidden)]
-    pub paths: EncryptedCustodyConfig,
+pub(crate) struct Config {
+    pub(crate) paths: EncryptedCustodyConfig,
     state: Directories,
     key_parent: Directories,
     vault: Option<Directories>,
@@ -46,8 +44,7 @@ pub struct Config {
     state_path: PathBuf,
 }
 impl Config {
-    #[doc(hidden)]
-    pub fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         self.state.check().map_err(|_| refused())?;
         self.key_parent.check().map_err(|_| refused())?;
         if let Some(vault) = &self.vault {
@@ -76,8 +73,7 @@ impl Config {
     /// Compare the actual artifact tree, not all ancestors of the key.
     /// A reusable key-parent root refuses; a fresh disjoint sibling bundle
     /// can pass. The caller must separately reserve/publish exclusively.
-    #[doc(hidden)]
-    pub fn refuse_output(&self, output: &Path) -> Result<()> {
+    pub(crate) fn refuse_output(&self, output: &Path) -> Result<()> {
         self.check()?;
         let output = resolve_output(output)?;
         for protected in [
@@ -177,8 +173,7 @@ fn missing_is_legacy(state: &Directories, state_path: &Path) -> Result<bool> {
 /// `pm_root` supplies an already-known daemon root, never directory discovery.
 /// Artifacts have explicit core/app inventory and compare their actual output
 /// tree independently; they do not open a tracker to discover credentials.
-#[doc(hidden)]
-pub fn load(state_dir: &Path, pm_root: Option<&Path>) -> Result<Option<Config>> {
+pub(crate) fn load(state_dir: &Path, pm_root: Option<&Path>) -> Result<Option<Config>> {
     let state_path = absolute(state_dir)?;
     match std::fs::symlink_metadata(&state_path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -278,8 +273,7 @@ pub fn load(state_dir: &Path, pm_root: Option<&Path>) -> Result<Option<Config>> 
 
 // Classification only. The subsequent output namespace must remain pinned;
 // this alone is not permission to perform pathname replacement or cleanup.
-#[doc(hidden)]
-pub fn resolve_output(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_output(path: &Path) -> Result<PathBuf> {
     let absolute = absolute(path)?;
     let mut ancestor = absolute.as_path();
     let mut missing = Vec::new();

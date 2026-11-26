@@ -1,4 +1,4 @@
-//! Downstream operational and workflow tier: audit, backup, briefing,
+//! Downstream operational and workflow tier: audit, briefing,
 //! delegation, local assignment, overview, review, setup, update/upgrade.
 
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
@@ -23,9 +23,9 @@ pub use cadence_agent::contract_fixture;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub use cadence_agent::send_row_gate_take;
 use cadence_agent::{
-    adapter, agent_uid, board_identity, business_templates, client, cloud_agent, confine, daemon,
-    delivery, doctor, error, fd_fs, gh_guard, home, ident, inbox, issue, issuer_transport, lease,
-    master, master_perm, memory, needs_dismiss, operator_auth, output, pi_policy, platform,
+    adapter, agent_uid, backup, board_identity, business_templates, client, cloud_agent, confine,
+    daemon, delivery, doctor, error, fd_fs, gh_guard, home, ident, inbox, issue, issuer_transport,
+    lease, master, master_perm, memory, needs_dismiss, operator_auth, output, pi_policy, platform,
     printed_command, proc, proto, reaper, remote_auth, remote_cli, remote_enrollment, rollout,
     sandbox, secret, skill, slots, store, test_seam, thread_search, ui, wiki, worktree,
     WORKSPACE_MANIFEST_DIR,
@@ -35,8 +35,6 @@ use cadence_agent::{
 pub mod assistant_actor;
 #[path = "../../../src/audit/mod.rs"]
 pub mod audit;
-#[path = "../../../src/backup/mod.rs"]
-pub mod backup;
 #[path = "../../../src/board_membership.rs"]
 pub mod board_membership;
 #[path = "../../../src/briefing.rs"]
