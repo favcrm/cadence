@@ -74,7 +74,7 @@ export function IssueList({ issues, project, onOpen, trackerEmpty }: { issues: I
     </button>
   );
   return (
-    <section className="card overflow-hidden reveal" aria-label={t("Project issue list")}>
+    <section className="card board-list-card overflow-hidden reveal" aria-label={t("Project issue list")}>
       <div className="sm:hidden divide-y divide-ink-700/70">
         {rows.map((issue) => (
           <div key={issue.id} className="w-full text-left px-3.5 py-3.5 hover:bg-ink-850">
@@ -304,10 +304,10 @@ export default function Board({
         return (
           <section
             key={key}
-            className={`snap-start rounded-lg border bg-ink-875 ${
+            className={`snap-start board-column ${
               lane === "" ? "min-h-[26rem]" : "min-h-[7rem]"
-            } flex flex-col reveal transition-colors ${
-              over === cell ? "border-accent/60" : "border-ink-700"
+            } reveal ${
+              over === cell ? "is-drag-over" : ""
             }`}
             style={{ animationDelay: `${120 + ci * 45}ms` }}
             onDragOver={(e) => {
@@ -339,7 +339,7 @@ export default function Board({
             <header
               className={`${
                 lane === "" ? "lg:sticky lg:top-[2.85rem] z-[5] " : ""
-              }flex items-center gap-2 px-3.5 h-10 border-b border-ink-700 shrink-0 bg-ink-875 rounded-t-lg`}
+              }board-column-head`}
             >
               <i className={`w-1.5 h-1.5 rounded-full ${COL_DOT[key]}`} />
               <h2 className="text-secondary font-semibold text-ink-100">

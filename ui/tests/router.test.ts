@@ -43,6 +43,7 @@ const paths: [string, Route][] = [
   ["/projects", { screen: "projects", slug: null, section: "overview" }],
   ["/projects/cadence", { screen: "projects", slug: "cadence", section: "overview" }],
   ["/projects/cadence/issues", { screen: "projects", slug: "cadence", section: "issues" }],
+  ["/projects/cadence/plan", { screen: "projects", slug: "cadence", section: "plan" }],
   ["/projects/cadence/context", { screen: "projects", slug: "cadence", section: "context" }],
   ["/projects/cadence/epics", { screen: "projects", slug: "cadence", section: "epics" }],
   ["/projects/cadence/milestones", { screen: "projects", slug: "cadence", section: "milestones" }],

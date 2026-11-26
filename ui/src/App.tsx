@@ -32,6 +32,7 @@ import IssuePage from "./features/issues/IssuePage";
 import { issuePath, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
+import Plan from "./features/projects/Plan";
 import Timeline from "./features/projects/Timeline";
 import MasterPermissions from "./features/settings/MasterPermissions";
 import CanvasDrawer from "./features/canvas/CanvasDrawer";
@@ -69,7 +70,6 @@ import MyWork from "./features/home/MyWork";
 import { useHomeCount } from "./features/home/todoLocal";
 import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
-import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
 import MobileNavigation from "./ui/MobileNavigation";
 import { NavList, ProjectsSection } from "./ui/NavList";
@@ -1538,7 +1538,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 on: route.screen === "projects" && route.section === "timeline",
               }]),
               {
-                label: "Issues",
+                label: "Work",
                 href: hrefFor({
                   screen: "projects",
                   slug: route.screen === "issue" ? route.project : route.slug,
@@ -1547,40 +1547,22 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 on: route.screen === "issue" || route.section === "issues",
               },
               {
-                label: "Epics",
+                label: "Plan",
                 href: hrefFor({
                   screen: "projects",
                   slug: route.screen === "issue" ? route.project : route.slug,
-                  section: "epics",
+                  section: "plan",
                 }),
-                on: route.screen === "projects" && route.section === "epics",
+                on: route.screen === "projects" && (route.section === "plan" || route.section === "milestones" || route.section === "epics"),
               },
-              ...(!milestonesOn ? [] : [{
-                label: "Milestones",
-                href: hrefFor({
-                  screen: "projects",
-                  slug: route.screen === "issue" ? route.project : route.slug,
-                  section: "milestones",
-                }),
-                on: route.screen === "projects" && route.section === "milestones",
-              }]),
-              ...(!workflowsOn ? [] : [{
-                label: "Workflows",
-                href: hrefFor({
-                  screen: "projects",
-                  slug: route.screen === "issue" ? route.project : route.slug,
-                  section: "workflows",
-                }),
-                on: route.screen === "projects" && route.section === "workflows",
-              }]),
-              ...(!wikiAvailable(meta) ? [] : [{
+              ...(!wikiAvailable(meta) && !workflowsOn ? [] : [{
                 label: "Context",
                 href: hrefFor({
                   screen: "projects",
                   slug: route.screen === "issue" ? route.project : route.slug,
-                  section: "context",
+                  section: wikiAvailable(meta) ? "context" : "workflows",
                 }),
-                on: route.screen === "projects" && route.section === "context",
+                on: route.screen === "projects" && (route.section === "context" || route.section === "workflows"),
               }]),
               // CAD-1950: access is a property of the project, so its
               // control lives on the project page rather than in a list.
@@ -1723,6 +1705,19 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onAgents={() => goRoute({ screen: "agents", alias: null })}
           />
         )}
+        {route.screen === "projects" && route.slug && route.section === "plan" && (
+          <Plan
+            project={route.slug}
+            issues={viewedProjectArchived ? archivedIssuesState : issuesState}
+            viewer={{ ...viewer, readOnly: projectReadOnly }}
+            milestonesEnabled={milestonesOn}
+            onOpenIssue={openIssue}
+            onRetry={() => {
+              if (!viewedProjectArchived) void resources.issues.refresh();
+              else setLifecycleVersion((v) => v + 1);
+            }}
+          />
+        )}
         {route.screen === "projects" && route.slug && route.section === "epics" && (
           <Epics
             project={route.slug}
@@ -1750,11 +1745,23 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "projects" && route.slug && route.section === "workflows" && (
           workflowsOn ? (
-            <Workflows
+            <Context
+              noWiki={!wikiAvailable(meta)}
+              hosted={hosted}
+              viewerSub={viewerSub}
+              readOnly={projectReadOnly}
+              readOnlyReason={projectWriteBlock}
+              actor={actor}
+              onToast={say}
+              navHref={hrefFor}
               project={route.slug}
-              viewer={{ ...viewer, readOnly: projectReadOnly }}
-              onOpenIssue={openIssue}
-              onHome={() => goRoute({ screen: "home" })}
+              workflowsEnabled={workflowsOn}
+              initialSubtab="workflows"
+              workflowsProps={{
+                viewer: { ...viewer, readOnly: projectReadOnly },
+                onOpenIssue: openIssue,
+                onHome: () => goRoute({ screen: "home" }),
+              }}
             />
           ) : (
             <PageState title={t("Workflows live in Apps")} actions={<Button href="/apps">{t("Apps")}</Button>}>
@@ -1773,6 +1780,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onToast={say}
             navHref={hrefFor}
             project={project}
+            workflowsEnabled={workflowsOn}
+            initialSubtab="knowledge"
+            workflowsProps={{
+              viewer: { ...viewer, readOnly: projectReadOnly },
+              onOpenIssue: openIssue,
+              onHome: () => goRoute({ screen: "home" }),
+            }}
           />
         )}
         {route.screen === "apps" && !route.project && (

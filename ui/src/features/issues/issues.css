@@ -38,10 +38,10 @@
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  padding: 0.875rem 1rem;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  background: var(--color-ink-850);
+  padding: 14px 18px;
+  border: 0;
+  border-radius: 0.625rem;
+  background: var(--board-surface-card);
   color: var(--color-ink-400);
   font-size: var(--text-secondary);
 }
@@ -51,9 +51,22 @@
 .issue-read-notice strong {
   color: var(--color-ink-100);
 }
+.issue-workspace .card {
+  border: 0;
+  border-radius: 0.625rem;
+  background: var(--board-surface-card);
+}
+.issue-workspace main > .card,
+.issue-workspace main section.card,
+.issue-workspace aside > .card {
+  padding: 18px 20px 20px;
+}
+.issue-workspace .card h2 {
+  margin: 0;
+}
 .issue-workspace [data-testid="lane-card"],
 .issue-workspace [data-testid="lane-conversation"] {
-  padding: 1rem;
+  padding: 18px 20px 20px;
   display: grid;
   gap: 0.875rem;
 }

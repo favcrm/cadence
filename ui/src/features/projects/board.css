@@ -37,11 +37,11 @@
 }
 .issue-peek-act {
   display: grid;
-  gap: 0.1rem;
-  padding: 0.45rem 0.55rem;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.3rem;
-  background: var(--color-ink-850);
+  gap: 0.15rem;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 0.45rem;
+  background: var(--board-surface-recessed);
   font-size: var(--text-secondary);
   color: var(--color-ink-300);
 }
@@ -60,7 +60,7 @@
   display: grid;
   gap: 0.55rem;
   padding-top: 0.75rem;
-  border-top: 1px solid var(--color-ink-700);
+  border-top: 1px solid var(--board-surface-hairline);
 }
 .issue-peek-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
 .issue-peek-status { min-width: 7rem; }

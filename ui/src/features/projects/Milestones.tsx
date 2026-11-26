@@ -9,8 +9,8 @@ import { checkpointDate, checkpointLabel, checkpointWork, scheduleLabel } from "
 import { useMilestones } from "./useMilestones";
 import { healthView, progressView } from "./work";
 
-export default function Milestones({ project, issues, onOpenIssue }: {
-  project: string; issues: ResourceState<IssueCard[]>; onOpenIssue: (id: string) => void;
+export default function Milestones({ project, issues, onOpenIssue, embedded = false }: {
+  project: string; issues: ResourceState<IssueCard[]>; onOpenIssue: (id: string) => void; embedded?: boolean;
 }) {
   const t = useTranslate();
   const { state, retry } = useMilestones(project, issues.asOf);
@@ -20,20 +20,26 @@ export default function Milestones({ project, issues, onOpenIssue }: {
   const visible = rows.filter((m) => showClosed || !closed.includes(m));
   const undefinedCount = rows.filter((m) => !m.configured).length;
   const errors = [...new Set(rows.map((m) => m.config_error).filter(Boolean))];
-  return <main className="px-4 lg:px-8 pt-5 pb-9 min-w-0" aria-label={t("milestones")}>
+  const Wrap = embedded ? "section" : "main";
+  return <Wrap className={embedded ? "mb-8 min-w-0" : "px-4 lg:px-8 pt-5 pb-9 min-w-0"} aria-label={t("milestones")}>
     <div className="flex flex-wrap items-center gap-3 mb-2">
-      <h1 className="text-section font-semibold text-ink-100">{t("Milestones")}</h1><StaleChip state={state} />
+      {embedded ? (
+        <h2 className="text-section font-semibold text-ink-100 m-0">{t("Milestones")}</h2>
+      ) : (
+        <h1 className="text-section font-semibold text-ink-100">{t("Milestones")}</h1>
+      )}
+      <StaleChip state={state} />
       {closed.length > 0 && <button className="lnk text-label ml-auto" aria-pressed={showClosed} onClick={() => setShowClosed(!showClosed)}>{showClosed ? t("Hide achieved & cancelled") : t("Show achieved & cancelled")} ({closed.length})</button>}
     </div>
-    <p className="text-label text-ink-500 mb-5">{t("Delivery checkpoints: what needs to be true, who owns it, and when it’s due.")}</p>
+    {!embedded && <p className="text-label text-ink-500 mb-5">{t("Delivery checkpoints: what needs to be true, who owns it, and when it’s due.")}</p>}
     <ResourceGate state={state} loading="Loading roadmap…" failed="Could not load milestones" onRetry={retry} />
-    {errors.map((error) => <p key={error} className="card p-3 mb-3 text-label text-warn" role="note">{error}</p>)}
+    {errors.map((error) => <p key={error} className="project-summary-card p-3 mb-3 text-label text-warn" role="note">{error}</p>)}
     {undefinedCount > 0 && <p className="roadmap-notice" role="note">{undefinedCount} {undefinedCount === 1 ? t("checkpoint needs a definition") : t("checkpoints need definitions")}. {t("Tasks are linked, but the goal, owner, dates, and completion criteria haven’t been set.")}</p>}
-    {state.data && visible.length === 0 && <p className="card project-card-padding text-secondary text-ink-400">{rows.length ? t("No upcoming or active milestones.") : t("No delivery checkpoints yet.")}</p>}
+    {state.data && visible.length === 0 && <p className="project-summary-card text-secondary text-ink-400">{rows.length ? t("No upcoming or active milestones.") : t("No delivery checkpoints yet.")}</p>}
     <ol className="milestone-roadmap" aria-label={t("Delivery roadmap")}>
       {visible.map((milestone) => <MilestoneCheckpoint key={milestone.id} milestone={milestone} rows={rows} onOpenIssue={onOpenIssue} />)}
     </ol>
-  </main>;
+  </Wrap>;
 }
 
 export function MilestoneCheckpoint({ milestone: m, rows, onOpenIssue }: {

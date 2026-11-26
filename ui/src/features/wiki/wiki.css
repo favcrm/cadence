@@ -257,6 +257,7 @@
 /* Context fills the space below the project tabs, using the Wiki split. */
 .context-workspace {
   display: flex;
+  flex-direction: column;
   flex: 1;
   min-width: 0;
   min-height: 0;

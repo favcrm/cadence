@@ -2,6 +2,8 @@ import { useWriteBlock } from "../auth/WriteGate";
 import { issuePath } from "../issues/model";
 import { PRIORITY_CHIP } from "../issues/chips";
 import { prefetchIssue } from "../../lib/resources";
+import { navigate } from "../../lib/useLocation";
+import { useNavigation } from "../../../screen-ui/src/navigation";
 import type { IssueCard } from "../../lib/types";
 import Link from "../../ui/Link";
 import { useLocale } from "../../lib/locale";
@@ -40,7 +42,13 @@ export default function Card({
   onOpen,
 }: Props) {
   const { t: tr, formatNumber } = useLocale();
+  const navigation = useNavigation();
   const t = issue;
+  const openIssuePage = () => {
+    const dest = issuePath(t.project, t.id);
+    if (navigation) navigation.navigate(dest);
+    else navigate(dest);
+  };
   const derived = t.status_source !== "file";
   const block = useWriteBlock(!canDrag);
   const noDrag = noDragReason(t) ?? block;
@@ -75,8 +83,13 @@ export default function Card({
         e.currentTarget.classList.add("opacity-35");
       }}
       onDragEnd={(e) => e.currentTarget.classList.remove("opacity-35")}
-      className={`card tcard p-3 ${t.status === "done" ? "opacity-70" : ""} ${
-        noDrag ? "cursor-default" : "cursor-grab active:cursor-grabbing"
+      onMouseEnter={() => prefetchIssue(t.id)}
+      onClick={(e) => {
+        if ((e.target as Element | null)?.closest("a, button")) return;
+        openIssuePage();
+      }}
+      className={`card board-issue-card ${t.status === "done" ? "opacity-70" : ""} ${
+        noDrag ? "cursor-pointer" : "cursor-pointer active:cursor-grabbing"
       }`}
     >
       <div className="flex items-center gap-1.5 flex-wrap">
@@ -177,7 +190,7 @@ export default function Card({
           {tr(t.blocked ? "waits on" : "after")} {t.blocked_by.join(" · ")}
         </div>
       )}
-      <button type="button" className="board-preview-link mt-3" aria-label={`${tr("Preview")} ${t.id}`} onClick={() => onOpen(t.id)}>{tr("Preview")}</button>
+      <button type="button" className="board-preview-link mt-3" aria-label={`${tr("Preview")} ${t.id}`} onClick={(e) => { e.stopPropagation(); onOpen(t.id); }}>{tr("Preview")}</button>
     </article>
   );
 }

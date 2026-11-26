@@ -32,11 +32,13 @@ export default function Workflows({
   viewer,
   onOpenIssue,
   onHome,
+  embedded = false,
 }: {
   project: string;
   viewer: Viewer;
   onOpenIssue: (id: string) => void;
   onHome: () => void;
+  embedded?: boolean;
 }) {
   const t = useTranslate();
   const state = useQuery(resources.workflows(project));
@@ -52,24 +54,29 @@ export default function Workflows({
     if (run && (state.data ?? []).some((r) => r.name === run && !r.app)) setOpen(run);
   }, [run, state.data]);
 
+  const Wrap = embedded ? "section" : "main";
   return (
-    <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="workflows">
+    <Wrap className={embedded ? "flex-1 overflow-y-auto px-4 lg:px-8 pt-4 pb-9 min-w-0" : "px-4 lg:px-8 pt-4 pb-9 min-w-0"} aria-label={t("Workflows")}>
       <div className="flex flex-wrap items-center gap-2 mb-3">
-        <h1 className="text-section font-semibold text-ink-100">{t("Workflows")}</h1>
+        {embedded ? (
+          <h2 className="text-section font-semibold text-ink-100 m-0">{t("Workflows")}</h2>
+        ) : (
+          <h1 className="text-section font-semibold text-ink-100">{t("Workflows")}</h1>
+        )}
         <StaleChip state={state} />
 
       </div>
       <p className="text-label text-ink-500 mb-5">{t("Start repeatable work from a workflow. Review its plan before agents begin.")}</p>
       <ResourceGate state={state} loading="loading workflows…" failed="could not load workflows" onRetry={() => void resources.workflows(project).invalidate()} />
       {state.data && rows.length === 0 && (
-        <div className="card project-card-padding text-secondary text-ink-400">
+        <div className="project-summary-card text-secondary text-ink-400">
           <h2 className="text-section text-ink-100 font-semibold">{t("No workflows yet")}</h2>
           <p className="mt-2 max-w-xl">{t("Workflows turn recurring work into a repeatable plan. Installed apps can also provide workflows.")}</p>
           <Link href="/apps" className="lnk inline-block mt-4">{t("Explore apps")} ↗</Link>
           <details className="mt-4 text-label"><summary className="cursor-pointer text-ink-500">{t("Add a project workflow")}</summary><p className="mt-2">{t("Use")} <code className="num">cadence workflow add</code> {t("to store a workflow for")} {project}.</p></details>
         </div>
       )}
-      <ul className="space-y-2.5">
+      <ul className="space-y-3">
         {rows.map((row) => (
           <WorkflowCard
             key={row.name}
@@ -82,7 +89,7 @@ export default function Workflows({
           />
         ))}
       </ul>
-    </main>
+    </Wrap>
   );
 }
 
@@ -106,11 +113,11 @@ function WorkflowCard({
   const blocked = gateBlock(row);
   const app = row.app ?? null;
   return (
-    <li className="card min-w-0" data-workflow={row.name}>
+    <li className="project-summary-card p-0 min-w-0" data-workflow={row.name}>
       <div className="project-card-padding min-w-0">
         {app ? (
-          <div className="w-full text-left flex items-start gap-2 min-w-0">
-            <span className="num text-label text-accent shrink-0 pt-px">{row.name}</span>
+          <div className="w-full text-left flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:gap-2 min-w-0">
+            <span className="num text-label text-accent break-all sm:break-normal shrink-0">{row.name}</span>
             <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
               {row.title ?? row.name}
             </span>
@@ -123,12 +130,14 @@ function WorkflowCard({
             aria-label={`${open ? "close" : "new run of"} ${row.name}`}
             className="w-full text-left flex items-start gap-2 min-w-0 rounded hover:text-accent"
           >
-            <span className="num text-label text-accent shrink-0 pt-px">{row.name}</span>
-            <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
-              {row.title ?? row.name}
+            <span className="flex-1 min-w-0 flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:gap-2">
+              <span className="num text-label text-accent break-all sm:break-normal shrink-0">{row.name}</span>
+              <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
+                {row.title ?? row.name}
+              </span>
             </span>
             <IconChevron
-              className={`shrink-0 mt-1.5 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`}
+              className={`shrink-0 mt-1 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`}
             />
           </button>
         )}
