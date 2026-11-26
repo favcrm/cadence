@@ -250,10 +250,47 @@ export default function AppShell({
   // owns a fixed panel/scrim and hands the primary its portal target, so the
   // drawer is a separate child mount.
   const [independentDrawer, setIndependentDrawer] = useState<string | null>(null);
+  const [independentClosing, setIndependentClosing] = useState(false);
+  const independentDrawerRef = useRef<string | null>(null);
+  independentDrawerRef.current = independentDrawer;
+  const independentClosingRef = useRef(false);
+  independentClosingRef.current = independentClosing;
+  const independentCloseTimer = useRef<number | null>(null);
   // CAD-1932 — the open's validated width hint; `narrow` is today's panel.
   const [independentSize, setIndependentSize] = useState<ScreenDrawerSize>("narrow");
   const [drawerTarget, setDrawerTarget] = useState<HTMLElement | null>(null);
   const attachDrawerTarget = useCallback((node: HTMLElement | null) => setDrawerTarget(node), []);
+  const clearIndependentCloseTimer = useCallback(() => {
+    if (independentCloseTimer.current !== null) {
+      window.clearTimeout(independentCloseTimer.current);
+      independentCloseTimer.current = null;
+    }
+  }, []);
+  const finishIndependentClose = useCallback(() => {
+    clearIndependentCloseTimer();
+    independentClosingRef.current = false;
+    independentDrawerRef.current = null;
+    setIndependentClosing(false);
+    setIndependentDrawer(null);
+  }, [clearIndependentCloseTimer]);
+  const drawerPanelRef = useRef<HTMLDivElement | null>(null);
+  const closeIndependentDrawer = useCallback(() => {
+    if (independentDrawerRef.current === null || independentClosingRef.current) return;
+    const panel = drawerPanelRef.current;
+    const reduced = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const dur = panel && typeof getComputedStyle === "function"
+      ? Number.parseFloat(getComputedStyle(panel).transitionDuration || "0")
+      : 0;
+    if (reduced || !Number.isFinite(dur) || dur <= 0) {
+      finishIndependentClose();
+      return;
+    }
+    independentClosingRef.current = true;
+    setIndependentClosing(true);
+    clearIndependentCloseTimer();
+    independentCloseTimer.current = window.setTimeout(finishIndependentClose, 260);
+  }, [clearIndependentCloseTimer, finishIndependentClose]);
+  useEffect(() => clearIndependentCloseTimer, [clearIndependentCloseTimer]);
   // CAD-1615: the drawer is a write-shaped action. A read-only or
   // screen-reader view may render the screen, but it never drives the shell
   // drawer — the frame's callback and the presentation are withheld, so the
@@ -269,15 +306,23 @@ export default function AppShell({
     // exclusive: the new mechanism never promotes the primary frame.
     if (independent) {
       setScreenDrawer(null);
-      setIndependentDrawer(mode === "drawer" ? (surface ?? "") : null);
-      if (mode === "drawer") setIndependentSize(size ?? "narrow");
+      if (mode === "drawer") {
+        clearIndependentCloseTimer();
+        const nextSurface = surface ?? "";
+        independentClosingRef.current = false;
+        independentDrawerRef.current = nextSurface;
+        setIndependentClosing(false);
+        setIndependentDrawer(nextSurface);
+        setIndependentSize(size ?? "narrow");
+      } else {
+        closeIndependentDrawer();
+      }
       return;
     }
-    setIndependentDrawer(null);
+    finishIndependentClose();
     setScreenDrawer(mode === "drawer" ? (surface ?? "") : null);
-  }, [canDriveScreen]);
+  }, [canDriveScreen, clearIndependentCloseTimer, closeIndependentDrawer, finishIndependentClose]);
   const closeScreenDrawer = useCallback(() => setScreenDrawer(null), []);
-  const closeIndependentDrawer = useCallback(() => setIndependentDrawer(null), []);
   // The return hint is single-use: once the outlet has re-opened the surface
   // (or the screen cannot mount), the URL stops asking for a drawer, so a
   // reload shows the operator's next state rather than a drawer they closed.
@@ -299,12 +344,11 @@ export default function AppShell({
   }, [installId, href, installation]);
   // A different installation or scope is a different screen: the drawer never
   // outlives the frame that opened it.
-  useEffect(() => { setScreenDrawer(null); setIndependentDrawer(null); }, [installId, contextId]);
+  useEffect(() => { setScreenDrawer(null); finishIndependentClose(); }, [installId, contextId, finishIndependentClose]);
   // A read-only or signed-out view lends no drawer callback, so any drawer a
   // stale frame asked for closes with that capability.
-  useEffect(() => { if (!canDriveScreen) { setScreenDrawer(null); setIndependentDrawer(null); } }, [canDriveScreen]);
+  useEffect(() => { if (!canDriveScreen) { setScreenDrawer(null); finishIndependentClose(); } }, [canDriveScreen, finishIndependentClose]);
   const outletRef = useRef<HTMLElement | null>(null);
-  const drawerPanelRef = useRef<HTMLDivElement | null>(null);
   const drawerScrimRef = useRef<HTMLDivElement | null>(null);
   const drawerReturn = useRef<{ focus: HTMLElement | null; windowX: number; windowY: number; outletTop: number } | null>(null);
   const independentReturn = useRef<{ focus: HTMLElement | null; windowX: number; windowY: number; outletTop: number } | null>(null);
@@ -480,11 +524,11 @@ export default function AppShell({
         .some((dialog) => dialog.matches(":modal"));
       if (modal) return;
       setScreenDrawer(null);
-      setIndependentDrawer(null);
+      closeIndependentDrawer();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [screenDrawer, independentOpen]);
+  }, [screenDrawer, independentOpen, closeIndependentDrawer]);
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
   // CAD-1560: one shell-owned scope for every active app view. The
   // in-workspace selection (Social's picker, a screen's saved-context
@@ -1315,7 +1359,7 @@ export default function AppShell({
 
   return (
     <div className="app-shell" data-app-shell-outlet={installId} data-screen-drawer={drawerOpen ? "true" : undefined} data-screen-drawer-surface={screenDrawer || undefined}>
-      {(drawerOpen || independentOpen) && <div ref={independentOpen ? drawerScrimRef : undefined} className="app-shell-screen-scrim" aria-hidden="true" onClick={independentOpen ? closeIndependentDrawer : closeScreenDrawer} />}
+      {(drawerOpen || independentOpen) && <div ref={independentOpen ? drawerScrimRef : undefined} className="app-shell-screen-scrim" data-closing={independentOpen && independentClosing ? "true" : undefined} aria-hidden="true" onClick={independentOpen ? closeIndependentDrawer : closeScreenDrawer} />}
       {header?.breadcrumbs && createPortal(
         <span className="app-header-location" inert={drawerOpen || independentOpen}>
           <span className="text-ink-600" aria-hidden="true">/</span>
@@ -1573,10 +1617,23 @@ export default function AppShell({
           the scrim above) is modal. The close control lives above the child
           frame, so it survives a failed child mount. */}
       {independentOpen && (
-        <div ref={drawerPanelRef} className="app-shell-screen-drawer" data-size={independentSize} role="dialog" aria-modal="true" tabIndex={-1}
-             aria-label={`${title} ${t("Details")}`}>
+        <div
+          ref={drawerPanelRef}
+          className="app-shell-screen-drawer"
+          data-size={independentSize}
+          data-closing={independentClosing ? "true" : undefined}
+          role="dialog"
+          aria-modal="true"
+          tabIndex={-1}
+          aria-label={`${title} ${independentDrawer === "create" ? t("New design") : t("Details")}`}
+          onTransitionEnd={(e) => {
+            if (independentClosing && e.target === e.currentTarget && e.propertyName === "transform") {
+              finishIndependentClose();
+            }
+          }}
+        >
           <div className="app-shell-screen-drawer-bar">
-            <span className="truncate text-label text-ink-300">{t("Details")}</span>
+            <span className="truncate text-label text-ink-300">{independentDrawer === "create" ? t("New design") : t("Details")}</span>
             <Button size="sm" variant="ghost" icon={<IconClose size={15} />} onClick={closeIndependentDrawer} aria-label={t("Close")} />
           </div>
           <div ref={attachDrawerTarget} className="app-shell-screen-drawer-body" />

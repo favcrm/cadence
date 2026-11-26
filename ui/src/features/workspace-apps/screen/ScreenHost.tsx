@@ -6,7 +6,7 @@ import ScreenOutlet from "./ScreenOutlet";
 import { screenProjection } from "./screenProjection";
 import { useScreenExtras } from "./useScreenExtras";
 import type { AssetLoader, ScreenActions } from "./screenLifecycle";
-import type { ScreenPush } from "./screenProtocol";
+import { ACTION_VERBS, type ScreenPush } from "./screenProtocol";
 
 /**
  * Host around a mounted app screen. The app screen is all a viewer sees: no
@@ -128,7 +128,8 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
       v: 2, op: "screen", install_id: installation.install_id, digest: installation.digest, tag: tag ?? "", context_id: contextId,
       installation: { install_id: installation.install_id, name: installation.name, title: installation.title, version: installation.version, digest: installation.digest, summary: installation.summary },
       contexts: contexts.filter(c => c.install_id === installation.install_id && c.state === "active").map(c => ({ id: c.id, label: c.config.label })),
-      runs: [], outbox: [], publish_intents: { status: "ok", withheld: 0, rows: [] }, readiness: { ok: true, blockers: [] }, actions: [], now: Math.floor(Date.now() / 1000),
+      runs: [], outbox: [], publish_intents: { status: "ok", withheld: 0, rows: [] }, readiness: { ok: true, blockers: [] },
+      actions: admitted && !callbacks.readOnly ? [...ACTION_VERBS] : [], now: Math.floor(Date.now() / 1000),
     };
     if (scopedSnapshot === null || tag === null) return empty;
     // Intent state is publish-intent state (social's concern) and stays absent
@@ -140,7 +141,7 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
       // An oversized or otherwise unavailable scope keeps today's behaviour.
       return empty;
     }
-  }, [scopedSnapshot, runs, installation, contexts, contextId, tag, extras]);
+  }, [scopedSnapshot, runs, installation, contexts, contextId, tag, extras, admitted, callbacks.readOnly]);
   const actions = useMemo(() => {
     const ctx = () => ({ installation, installId: installation.install_id, contextId, runs, onChanged: () => reread.current(true) });
     return { call: (verb: Parameters<typeof runCall>[1], args: Parameters<typeof runCall>[2], ui: Parameters<typeof runCall>[3]) => runCall(ctx(), verb, args, ui), planner: makePlanner(ctx) };

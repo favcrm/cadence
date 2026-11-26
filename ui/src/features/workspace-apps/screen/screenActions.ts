@@ -728,7 +728,8 @@ async function planRunStart(ctx: ActionContext, args: Record<string, unknown>): 
   let totalMicros = 0;
   try {
     for (const slot of slots) {
-      const quoted = await workspaceApps.bindingQuote(installId, slot, contextId || undefined);
+      const requestedModel = slot === "image" && typeof inputs.model === "string" ? inputs.model.trim() : "";
+      const quoted = await workspaceApps.bindingQuote(installId, slot, contextId || undefined, undefined, requestedModel || undefined);
       const quote = checkedQuote(quoted.quote);
       // A malformed or unsafe quote number refuses the slot itself — no
       // confirmation is drawn and no start can ever be attempted.
