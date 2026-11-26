@@ -302,3 +302,78 @@ fn git_log(pm_dir: &Path, issue: &Issue) -> Vec<HistoryEntry> {
     }
     entries
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn git_log_cache_invalidates_on_head_and_packed_refs() {
+        let root = tempfile::tempdir().unwrap();
+        let pm = root.path().join("pm");
+        std::fs::create_dir_all(pm.join("demo/CAD-1")).unwrap();
+        std::fs::write(pm.join("demo/project.yaml"), "key: demo\nprefix: CAD\n").unwrap();
+        std::fs::write(
+            pm.join("demo/CAD-1/issue.md"),
+            "---\nid: CAD-1\ntitle: first\nstatus: doing\npriority: P2\n\
+             created: '2026-01-01T00:00:00Z'\n---\nbody\n",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&pm)
+                .args(["-c", "user.name=test", "-c", "user.email=test@test"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "CAD-1: created"]);
+        let first_head = git(&["rev-parse", "HEAD"]);
+
+        let issues = crate::issue::board::load_all(&pm, Some("demo")).unwrap();
+        let issue = issues.iter().find(|i| i.front.id == "CAD-1").unwrap();
+
+        let first = git_log(&pm, issue);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(resolve_head_sha(&pm).as_deref(), Some(first_head.as_str()));
+
+        // Pack refs so loose refs/heads/main is removed and packed-refs is exercised.
+        git(&["pack-refs", "--all", "--prune"]);
+        assert!(
+            !pm.join(".git/refs/heads/main").exists(),
+            "loose ref should be pruned by pack-refs"
+        );
+        assert_eq!(resolve_head_sha(&pm).as_deref(), Some(first_head.as_str()));
+
+        let cached = git_log(&pm, issue);
+        assert_eq!(cached.len(), 1, "{cached:?}");
+
+        // Second commit updates HEAD and invalidates the cached git_log entry.
+        std::fs::write(
+            pm.join("demo/CAD-1/issue.md"),
+            "---\nid: CAD-1\ntitle: second\nstatus: doing\npriority: P2\n\
+             created: '2026-01-01T00:00:00Z'\n---\nupdated\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "CAD-1: set title"]);
+        let second_head = git(&["rev-parse", "HEAD"]);
+        assert_ne!(first_head, second_head);
+        assert_eq!(resolve_head_sha(&pm).as_deref(), Some(second_head.as_str()));
+
+        let after = git_log(&pm, issue);
+        assert_eq!(after.len(), 2, "{after:?}");
+
+        // Reftable repos fail closed to None rather than parsing binary tables.
+        std::fs::create_dir_all(pm.join(".git/reftable")).unwrap();
+        assert_eq!(resolve_head_sha(&pm), None);
+    }
+}

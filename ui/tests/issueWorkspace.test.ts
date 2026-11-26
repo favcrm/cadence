@@ -50,8 +50,10 @@ const IssuePageComponent = require("../src/features/issues/IssuePage")
   .default as typeof import("../src/features/issues/IssuePage").default;
 const IssuePage = (props: React.ComponentProps<typeof IssuePageComponent>) =>
   React.createElement(LocaleProvider, null, React.createElement(IssuePageComponent, props));
-const { resources } =
+const { prefetchIssue, resources } =
   require("../src/lib/resources") as typeof import("../src/lib/resources");
+const { allowPrivateReads: allowReads, pausePrivateReads: pauseReads } =
+  require("../src/lib/privateSession") as typeof PrivateSessionModule;
 type Detail = import("../src/lib/types").IssueDetail;
 const detail = (id: string): Detail => ({
   id,
@@ -337,6 +339,33 @@ async function run() {
     assert(text().includes("Work CAD-3"), "Initial failure retry recovers");
     id = "CAD-1";
     await render();
+  }
+  if (scenario === "all" || scenario === "prefetch") {
+    details["CAD-8"] = detail("CAD-8");
+    const readsBefore = resources.issue("CAD-8").get().data !== null;
+    assert(!readsBefore, "CAD-8 starts unloaded before prefetch");
+    pauseReads();
+    try {
+      await React.act(async () => {
+        prefetchIssue("CAD-8");
+      });
+      await flush();
+      assert(
+        resources.issue("CAD-8").get().data === null &&
+          !resources.issue("CAD-8").get().inFlight,
+        "prefetchIssue is a no-op when private reads are paused",
+      );
+    } finally {
+      allowReads();
+    }
+    await React.act(async () => {
+      prefetchIssue("CAD-8");
+    });
+    await flush();
+    assert(
+      resources.issue("CAD-8").get().data?.id === "CAD-8",
+      "prefetchIssue warms the issue store once private reads are allowed",
+    );
   }
   if (scenario === "all" || scenario === "issue") {
     errors.add("/api/issues/CAD-1");

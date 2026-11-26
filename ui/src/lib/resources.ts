@@ -3,7 +3,7 @@ import { normalizeAgentsPayload } from "./agentOn";
 import { myWorkApiQuery, myWorkViewKey, type MyWorkView } from "./myWorkQuery";
 import { QueryCache, type Resource } from "./cache";
 import { loadThread, type PageReader, type ThreadState } from "../features/home/thread";
-import { onPrivateReadsPaused, onPrivateSessionReset } from "./privateSession";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed } from "./privateSession";
 
 /** Page reads of one agent's thread. */
 export function threadReader(alias: string): PageReader {
@@ -336,7 +336,7 @@ export const resources = {
 
 /** Warm an issue detail store on hover/focus without disrupting loaded state. */
 export function prefetchIssue(id: string): void {
-  if (!id) return;
+  if (!id || !privateReadsAllowed()) return;
   const resource = resources.issue(id);
   const snap = resource.get();
   if (!snap.inFlight && (snap.asOf === null || snap.status === "stale" || Date.now() - snap.asOf >= 5_000)) {
