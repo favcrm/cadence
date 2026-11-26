@@ -2353,6 +2353,7 @@ Object.assign(zhTW, {
   "SMTP configuration": "SMTP 設定",
   "Checking credential entry…": "正在檢查憑證輸入方式…",
   "Credential entry could not be checked. No password can be entered here.": "無法確認憑證輸入方式，因此不能在此輸入密碼。",
+  "Continue to protected setup": "繼續前往受保護的設定",
   "This protected profile collects credentials only on its separately served trusted entry page. Use `cadence connection enroll smtp` to create the request, complete it there, then return here.": "此受保護的設定檔僅在獨立的可信頁面收集憑證。請使用 `cadence connection enroll smtp` 建立請求，在該頁面完成後再返回這裡。",
   "Sender details": "寄件者資料",
   "Server settings": "伺服器設定",
@@ -2387,9 +2388,9 @@ Object.assign(zhTW, {
   "Last read failed": "最近讀取失敗",
   "The saved email account can't be read. Replace it in Connections.": "無法讀取已儲存的電子郵件帳戶。請在「連線」中取代它。",
   "Gmail / Google Workspace": "Gmail / Google Workspace",
-  "Microsoft 365": "Microsoft 365",
+  "Microsoft 365 (legacy SMTP)": "Microsoft 365（傳統 SMTP）",
   "Use an app password, not your normal password: turn on 2-Step Verification, then create one at myaccount.google.com/apppasswords.": "請使用應用程式密碼，而非一般密碼：開啟兩步驗證，然後在 myaccount.google.com/apppasswords 建立應用程式密碼。",
-  "Use your Microsoft 365 address. If your account asks for one, use an app password. SMTP sending must be on for the mailbox.": "請使用你的 Microsoft 365 地址。如帳戶要求應用程式密碼，請使用該密碼。信箱必須已啟用 SMTP 寄送。",
+  "Your organization and mailbox must allow password-based SMTP AUTH. OAuth is not supported for app senders.": "組織與信箱都必須允許以密碼進行 SMTP 驗證。應用程式寄件者不支援 OAuth。",
   "Use your provider's SMTP server with port 465 (SSL/TLS) or 587 (STARTTLS).": "使用你的供應商 SMTP 伺服器，連接埠 465（SSL/TLS）或 587（STARTTLS）。",
 });
 

@@ -3,6 +3,7 @@ import { api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import type { Connection, ConnectionProvider } from "../../lib/types";
 import Button from "../../ui/Button";
+import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import { useProtectedEntry } from "../connections/useProtectedEntry";
 import { enrollmentSupport } from "./connectionsView";
@@ -22,14 +23,23 @@ export default function EmailSetup({ rows, hostedSmtp, onSaved, onClose }: {
   const [account, setAccount] = useState("");
   const [provider, setProvider] = useState<ConnectionProvider | null>(null);
   const [catalog, setCatalog] = useState<"loading" | "ready" | "failed">(hostedSmtp ? "ready" : "loading");
+  const [pending, setPending] = useState(false);
   const live = useRef(true);
   const generation = useRef(0);
   const heading = useRef<HTMLHeadingElement>(null);
+  const opener = useRef(typeof document === "undefined" ? null : document.activeElement);
+  const focusMethod = useRef(false);
 
   useLayoutEffect(() => {
     live.current = true;
     return () => { live.current = false; generation.current += 1; };
   }, []);
+  useLayoutEffect(() => {
+    if (step === 1 && focusMethod.current) {
+      focusMethod.current = false;
+      document.getElementById("email-method")?.focus();
+    }
+  }, [step]);
   useEffect(() => {
     if (hostedSmtp) return;
     let active = true;
@@ -53,19 +63,31 @@ export default function EmailSetup({ rows, hostedSmtp, onSaved, onClose }: {
     if (hostedSmtp && rows.some((row) => row.provider === "smtp" && row.account === HOSTED_ACCOUNT)) {
       throw new Error("Account already exists");
     }
-    await api.connectionCreate({
-      provider: "smtp", account: name, shape: "smtp",
-      scopes: hostedSmtp ? [SMTP_SEND_SCOPE] : scopes,
-      host: details.host, port: details.port, tls_mode: details.tls_mode,
-      username: details.username, secret: details.password, sender: details.sender,
-      ...(details.sender_name ? { sender_name: details.sender_name } : {}),
-      ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
-    });
-    if (live.current && generation.current === request) onSaved();
+    setPending(true);
+    try {
+      await api.connectionCreate({
+        provider: "smtp", account: name, shape: "smtp",
+        scopes: hostedSmtp ? [SMTP_SEND_SCOPE] : scopes,
+        host: details.host, port: details.port, tls_mode: details.tls_mode,
+        username: details.username, secret: details.password, sender: details.sender,
+        ...(details.sender_name ? { sender_name: details.sender_name } : {}),
+        ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
+      });
+      if (live.current && generation.current === request) onSaved();
+    } finally {
+      if (live.current) setPending(false);
+    }
+  };
+
+  const cancel = () => {
+    onClose();
+    window.setTimeout(() => {
+      if (opener.current instanceof HTMLElement && opener.current.isConnected) opener.current.focus();
+    }, 0);
   };
 
   return (
-    <SettingsDrawer title={t("Add email")} onClose={onClose}>
+    <SettingsDrawer title={t("Add email")} onClose={onClose} preventClose={pending}>
       <div className="grid gap-4 min-w-0">
         <div>
           <p className="text-micro text-ink-500">{step === 1 ? t("Email · Step 1 of 2") : t("Email · Step 2 of 2")}</p>
@@ -94,7 +116,7 @@ export default function EmailSetup({ rows, hostedSmtp, onSaved, onClose }: {
             {!hostedSmtp && catalog === "ready" && !nativeSupported && <p className="text-label text-ink-400">{t("SMTP sending is not available from a reviewed provider on this board.")}</p>}
             <p className="text-label text-ink-400 rounded border border-ink-700 p-3">{t("Adding an account doesn’t change any app’s sender.")}</p>
             <div className="crm-toolbar justify-end">
-              <Button onClick={onClose}>{t("Cancel")}</Button>
+              <Button onClick={cancel}>{t("Cancel")}</Button>
               <Button variant="primary" disabled={!supported} onClick={() => { setStep(2); requestAnimationFrame(() => heading.current?.focus()); }}>{t("Continue")}</Button>
             </div>
           </>
@@ -104,7 +126,7 @@ export default function EmailSetup({ rows, hostedSmtp, onSaved, onClose }: {
             {hostedSmtp
               ? <HostedSmtpConnect connected={null} onConnect={connect} />
               : <NativeSmtpEntry account={account} onAccountChange={setAccount} onConnect={connect} />}
-            <div className="crm-toolbar"><Button onClick={() => { generation.current += 1; setStep(1); }}>{t("Back")}</Button><Button onClick={onClose}>{t("Cancel")}</Button></div>
+            <div className="crm-toolbar"><Button disabled={pending} onClick={() => { focusMethod.current = true; setStep(1); }}>{t("Back")}</Button><Button disabled={pending} onClick={cancel}>{t("Cancel")}</Button></div>
           </>
         )}
       </div>
@@ -120,7 +142,11 @@ function NativeSmtpEntry({ account, onAccountChange, onConnect }: {
   const t = useTranslate();
   const entry = useProtectedEntry();
   if (entry.status === "loading") return <p role="status" className="text-label text-ink-400">{t("Checking credential entry…")}</p>;
-  if (entry.status === "failed") return <p role="alert" className="text-label text-fail">{t("Credential entry could not be checked. No password can be entered here.")}</p>;
-  if (entry.entry.configured || entry.entry.protected) return <p className="text-label text-ink-400">{t("This protected profile collects credentials only on its separately served trusted entry page. Use `cadence connection enroll smtp` to create the request, complete it there, then return here.")}</p>;
+  if (entry.status === "ready" && entry.entry?.configured === true && entry.entry.protected === true) {
+    return <Link href="/settings/connections/new/smtp" className="lnk text-label">{t("Continue to protected setup")}</Link>;
+  }
+  if (entry.status !== "ready" || entry.entry?.configured !== false || entry.entry.protected !== false || entry.entry.origin !== null) {
+    return <p role="alert" className="text-label text-fail">{t("Credential entry could not be checked. No password can be entered here.")}</p>;
+  }
   return <HostedSmtpConnect connected={null} onConnect={onConnect} accountLabel={account} onAccountLabelChange={onAccountChange} />;
 }

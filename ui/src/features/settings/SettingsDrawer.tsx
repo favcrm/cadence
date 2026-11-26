@@ -5,10 +5,12 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 export default function SettingsDrawer({
   title,
   onClose,
+  preventClose,
   children,
 }: {
   title: string;
   onClose: () => void;
+  preventClose?: boolean;
   children: ReactNode;
 }) {
   return (
@@ -20,6 +22,7 @@ export default function SettingsDrawer({
       size="md"
       label={title}
       title={title}
+      preventClose={preventClose}
       onClose={onClose}
     >
       <div className="grid gap-3 min-w-0">{children}</div>

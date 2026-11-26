@@ -191,7 +191,7 @@ export default function HostedSmtpConnect({
         <p className="text-micro text-ink-500">{t("Leave blank to use your email address.")}</p>
       </div>
       <div className="crm-field">
-        <label className="text-label text-ink-300" htmlFor="hs-password">{preset.id === "other" ? t("SMTP password") : t("App password")}</label>
+        <label className="text-label text-ink-300" htmlFor="hs-password">{preset.id === "gmail" ? t("App password") : t("SMTP password")}</label>
         <input id="hs-password" className="field" type="password" autoComplete="current-password" spellCheck={false}
           value={password} onChange={(e) => setPassword(e.target.value)} disabled={pending} />
       </div>

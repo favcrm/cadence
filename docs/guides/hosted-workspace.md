@@ -828,8 +828,9 @@ Open **Settings → Connections → Email** as the workspace operator.
 Under **Accounts**, use **Add email** to verify and connect an SMTP sender,
 or **Manage** to replace credentials on an existing account. A hosted
 workspace can enroll one SMTP account. Gmail SMTP uses an app password
-where Google allows it; Microsoft 365 legacy SMTP works only where the
-mailbox allows password-based SMTP authentication.
+where Google allows it. Microsoft 365 legacy SMTP works only if both the
+organization and the mailbox allow password-based SMTP authentication.
+OAuth is not available for app senders.
 
 Under **App senders**, choose the account each app context sends from.
 Connecting an account does not assign it to any app or approve a send.

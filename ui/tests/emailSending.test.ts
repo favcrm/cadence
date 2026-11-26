@@ -26,6 +26,9 @@ interface World {
   origin: { unsubscribe_origin: string | null; stored: boolean };
   posts: { path: string; body: any }[];
   failConnectionsOnce?: boolean;
+  connectionsPartial?: boolean;
+  failContextsOnce?: boolean;
+  reads?: string[];
   failShowOnce?: boolean;
 }
 
@@ -76,17 +79,26 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
     const url = new URL(String(input), "http://localhost");
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    if (method === "GET") world.reads?.push(url.pathname);
     if (method === "POST") world.posts.push({ path: url.pathname, body });
     switch (`${method} ${url.pathname}`) {
       case "GET /api/app-installations":
         return json(world.installations ?? [{ install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true }, { install_id: "install-social", name: "social-content", title: "Social" }]);
-      case "GET /api/app-installations/install-crm/contexts": return json({ contexts: world.contexts });
+      case "GET /api/app-installations/install-crm/contexts":
+        if (world.failContextsOnce) {
+          world.failContextsOnce = false;
+          return json({ error: "contexts are unavailable" }, 503);
+        }
+        return json({ contexts: world.contexts });
       case "GET /api/connections":
         if (world.failConnectionsOnce) {
           world.failConnectionsOnce = false;
           return json({ error: "connections are unavailable" }, 503);
         }
-        return json({ connections: world.connections, hosted_smtp: world.hostedSmtp });
+        return json({
+          connections: world.connections, hosted_smtp: world.hostedSmtp,
+          ...(world.connectionsPartial ? { connections_unavailable: { code: "unavailable" } } : {}),
+        });
       case "POST /api/crm-smtp/show": {
         if (world.failShowOnce) {
           world.failShowOnce = false;
@@ -341,12 +353,70 @@ async function main() {
     assert(!m.button("Save") && !m.host.querySelector("#email-origin"), "no origin write controls");
     await m.unmount();
   }
-  // A failed read offers Retry, and Retry recovers.
+  // An account failure leaves app bindings and unsubscribe policy independent.
   {
-    const m = await mount(fresh({ failConnectionsOnce: true }));
-    await m.settle(() => assert(m.button("Retry"), "a failed read offers Retry"));
+    const a = smtpRow("conn-a");
+    const world = fresh({ failConnectionsOnce: true, binding: bindingFor(a), reads: [] });
+    const m = await mount(world);
+    await m.settle(() => {
+      assert(m.button("Retry"), "account read offers Retry");
+      assert(m.rowFor("CRM · Acme")?.textContent?.includes("conn-a@example.com"), "binding remains truthful");
+      assert(m.rowFor("Unsubscribe links"), "unsubscribe remains available");
+    });
+    assert(!m.button("Add email") && !m.host.textContent!.includes("No email accounts connected"), "failed list is not empty");
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "drawer still shows binding"));
+    assert(!m.host.querySelector('[role="combobox"]') && !m.button("Switch to this sender"), "failed list cannot assign");
+    const appReads = world.reads!.filter((p) => p === "/api/app-installations").length;
     await m.click(m.button("Retry"));
-    await m.settle(() => assert(m.rowFor("CRM · Acme"), "Retry loads the page"));
+    await m.settle(() => assert(m.button("Add email"), "account retry recovers"));
+    equal(world.reads!.filter((p) => p === "/api/app-installations").length, appReads, "account retry does not reload apps");
+    assert(m.host.querySelector("[data-state=live]"), "account retry preserves the open sender drawer");
+    await m.unmount();
+  }
+  // A partial response retains known account management but cannot authorize adds or assignment.
+  {
+    const a = smtpRow("conn-a");
+    const world = fresh({ connectionsPartial: true, binding: bindingFor(a), reads: [] });
+    const m = await mount(world);
+    await m.settle(() => assert(m.host.querySelector("[data-state=connections-partial]"), "partial list notice"));
+    assert(m.host.textContent!.includes("Some connected accounts couldn't be loaded"), "partial notice explains the list");
+    assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "known account remains manageable");
+    assert(!m.button("Add email") && !m.host.textContent!.includes("No email accounts connected"), "partial list does not imply empty or permit Add");
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "known binding is displayed"));
+    assert(!m.host.querySelector('[role="combobox"]') && !m.button("Switch to this sender"), "partial list cannot assign");
+    world.connectionsPartial = false;
+    const appReads = world.reads!.filter((p) => p === "/api/app-installations").length;
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.host.querySelector('[role="combobox"]'), "complete retry restores sender controls"));
+    equal(world.reads!.filter((p) => p === "/api/app-installations").length, appReads, "partial retry only reloads accounts");
+    await m.unmount();
+  }
+  {
+    const m = await mount(fresh({ connections: [], connectionsPartial: true }));
+    await m.settle(() => assert(m.host.querySelector("[data-state=connections-partial]"), "empty partial response"));
+    assert(!m.host.textContent!.includes("No email accounts connected") && !m.button("Add email"), "empty partial response does not assert empty");
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.host.querySelector("[data-state=unbound]"), "unbound status remains visible"));
+    assert(!m.host.textContent!.includes("No email sender is available.") && !m.button("Use this sender"), "partial response cannot imply no sender or bind");
+    await m.unmount();
+  }
+  // Context discovery can fail independently without hiding account management.
+  {
+    const world = fresh({ failContextsOnce: true, reads: [] });
+    const m = await mount(world);
+    await m.settle(() => {
+      assert(m.button("Retry"), "context discovery offers Retry");
+      assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "account remains manageable");
+      assert(m.button("Add email"), "account add remains available");
+      assert(m.rowFor("Unsubscribe links"), "unsubscribe remains available");
+    });
+    assert(!m.host.querySelector("[data-state=no-apps]"), "failed discovery is not empty");
+    const accountReads = world.reads!.filter((p) => p === "/api/connections").length;
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.rowFor("CRM · Acme"), "context retry recovers"));
+    equal(world.reads!.filter((p) => p === "/api/connections").length, accountReads, "discovery retry does not reload accounts");
     await m.unmount();
   }
   // A failed sender read inside the drawer offers Retry too.

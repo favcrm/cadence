@@ -104,46 +104,65 @@ export default function EmailSending({
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [rows, setRows] = useState<Connection[] | null>(null);
   const [hostedSmtp, setHostedSmtp] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [attempt, setAttempt] = useState(0);
+  const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [targetsError, setTargetsError] = useState<string | null>(null);
+  const [partial, setPartial] = useState(false);
+  const [accountsAttempt, setAccountsAttempt] = useState(0);
+  const [targetsAttempt, setTargetsAttempt] = useState(0);
   // One drawer at a time: rows stay reachable by keyboard behind an open one.
   const [openRow, setOpenRow] = useState<string | null>(null);
   const sendersHeading = useRef<HTMLHeadingElement>(null);
   const accountsHeading = useRef<HTMLHeadingElement>(null);
   const accountAdded = useRef(false);
+  const sendersFocused = useRef(false);
   const accountsLoaded = rows !== null;
   useEffect(() => {
-    if (!accountsLoaded || viewer.operator !== true || error !== null) return;
-    if (accountAdded.current) {
+    if (viewer.operator !== true) return;
+    if (accountAdded.current && accountsLoaded) {
       accountAdded.current = false;
       accountsHeading.current?.focus();
-    } else if (focusSenders) {
+    } else if (!accountAdded.current && focusSenders && !sendersFocused.current) {
       sendersHeading.current?.focus();
+      sendersFocused.current = true;
     }
-  }, [focusSenders, accountsLoaded, viewer.operator, error]);
+  }, [focusSenders, accountsLoaded, viewer.operator]);
 
-  const canAdd = viewer.operator === true && !viewer.readOnly && rows !== null
+  const canAdd = viewer.operator === true && !viewer.readOnly && rows !== null && !partial
     && !(hostedSmtp && rows.some((row) => row.provider === "smtp" && row.account === HOSTED_ACCOUNT));
 
   useEffect(() => {
-    // CAD-1193: unresolved role (null) waits; only a proven operator
-    // issues the sender-target and account reads.
     if (viewer.operator !== true) return;
     const controller = new AbortController();
-    Promise.all([loadTargets(controller.signal), api.connections()]).then(
-      ([nextTargets, list]) => {
+    api.connections().then(
+      (list) => {
         if (controller.signal.aborted) return;
-        setTargets(nextTargets);
         setRows(list.connections ?? []);
         setHostedSmtp(list.hosted_smtp === true);
-        setError(null);
+        setPartial(list.connections_unavailable !== undefined);
+        setAccountsError(null);
       },
       (e: unknown) => {
-        if (!controller.signal.aborted) setError(friendlySendError(e));
+        if (!controller.signal.aborted) setAccountsError(friendlySendError(e));
       },
     );
     return () => controller.abort();
-  }, [viewer.operator, attempt]);
+  }, [viewer.operator, accountsAttempt]);
+
+  useEffect(() => {
+    if (viewer.operator !== true) return;
+    const controller = new AbortController();
+    loadTargets(controller.signal).then(
+      (nextTargets) => {
+        if (controller.signal.aborted) return;
+        setTargets(nextTargets);
+        setTargetsError(null);
+      },
+      (e: unknown) => {
+        if (!controller.signal.aborted) setTargetsError(friendlySendError(e));
+      },
+    );
+    return () => controller.abort();
+  }, [viewer.operator, targetsAttempt]);
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="email-sending-title">
@@ -170,38 +189,45 @@ export default function EmailSending({
         </PageState>
       ) : !viewer.operator ? (
         <PageState title={t("Operator access required")}>{t("Email sending is available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
-      ) : error !== null ? (
-        <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
-          {error}
-          <Button
-            size="sm"
-            onClick={() => {
-              setError(null);
-              setAttempt((n) => n + 1);
-            }}
-          >{t("Retry")}</Button>
-        </p>
-      ) : targets === null || rows === null ? (
-        <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
       ) : (
         <div className="grid gap-6 min-w-0">
-          <EmailAccounts headingRef={accountsHeading} rows={rows} canAdd={canAdd} hostedSmtp={hostedSmtp} onAdd={() => setOpenRow("add")} />
+          <EmailAccounts headingRef={accountsHeading} rows={rows ?? []} complete={rows !== null && !partial && accountsError === null} canAdd={canAdd} hostedSmtp={hostedSmtp} onAdd={() => setOpenRow("add")} />
+          {accountsError !== null ? (
+            <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
+              {accountsError}
+              <Button size="sm" onClick={() => { setAccountsError(null); setRows(null); setAccountsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+            </p>
+          ) : rows === null ? (
+            <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
+          ) : partial ? (
+            <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert" data-state="connections-partial">
+              {t("Some connected accounts couldn't be loaded, so this list may be incomplete.")}
+              <Button size="sm" onClick={() => { setRows(null); setAccountsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+            </p>
+          ) : null}
           <section aria-labelledby="app-senders">
             <h2 ref={sendersHeading} id="app-senders" tabIndex={-1} className="text-cardtitle font-medium text-ink-100">{t("App senders")}</h2>
             <p className="text-label text-ink-400 mt-1 mb-2">{t("Choose the account each app sends from.")}</p>
-            {targets.length === 0 && (
+            {targetsError !== null ? (
+              <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
+                {targetsError}
+                <Button size="sm" onClick={() => { setTargetsError(null); setTargets(null); setTargetsAttempt((n) => n + 1); }}>{t("Retry")}</Button>
+              </p>
+            ) : targets === null ? (
+              <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
+            ) : targets.length === 0 && (
               <p className="text-label text-ink-400 mb-2" data-state="no-apps">{t("No installed app sends email, so there is nothing to choose yet.")}</p>
             )}
-            {(targets.length > 0 || !fixedUnsubscribeAddress) && (
+            {((targets?.length ?? 0) > 0 || !fixedUnsubscribeAddress) && (
               <div className="settings-rows" aria-label={t("Apps that send email")}>
-                {targets.map((target) => (
+                {(targets ?? []).map((target) => (
                   <SenderRow
                     key={`${target.scope.installId}:${target.scope.contextId}`}
                     open={openRow === `${target.scope.installId}:${target.scope.contextId}`}
                     onOpen={() => setOpenRow(`${target.scope.installId}:${target.scope.contextId}`)}
                     onClose={() => setOpenRow(null)}
                     target={target}
-                    rows={rows}
+                    rows={rows !== null && !partial && accountsError === null ? rows : null}
                     hostedSmtp={hostedSmtp}
                     viewer={viewer}
                   />
@@ -217,7 +243,7 @@ export default function EmailSending({
               </div>
             )}
           </section>
-          {canAdd && openRow === "add" && (
+          {canAdd && rows !== null && openRow === "add" && (
             <EmailSetup
               rows={rows}
               hostedSmtp={hostedSmtp}
@@ -226,7 +252,7 @@ export default function EmailSending({
                 accountAdded.current = true;
                 setOpenRow(null);
                 setRows(null);
-                setAttempt((n) => n + 1);
+                setAccountsAttempt((n) => n + 1);
                 void resources.connections.invalidate();
               }}
             />
@@ -243,7 +269,7 @@ function SenderRow({ target, rows, hostedSmtp, viewer, open, onOpen, onClose }: 
   onOpen: () => void;
   onClose: () => void;
   target: Target;
-  rows: Connection[];
+  rows: Connection[] | null;
   hostedSmtp: boolean;
   viewer: Viewer;
 }) {
@@ -324,9 +350,10 @@ function OriginRow({ viewer, open, onOpen, onClose }: {
   );
 }
 
-function EmailAccounts({ headingRef, rows, canAdd, hostedSmtp, onAdd }: {
+function EmailAccounts({ headingRef, rows, complete, canAdd, hostedSmtp, onAdd }: {
   headingRef: React.Ref<HTMLHeadingElement>;
   rows: Connection[];
+  complete: boolean;
   canAdd: boolean;
   hostedSmtp: boolean;
   onAdd: () => void;
@@ -343,7 +370,7 @@ function EmailAccounts({ headingRef, rows, canAdd, hostedSmtp, onAdd }: {
         {canAdd && <Button variant="primary" onClick={onAdd}>{t("Add email")}</Button>}
       </header>
       {accounts.length === 0 ? (
-        <p className="settings-rows p-3 text-label text-ink-400">{t("No email accounts connected")}</p>
+        complete && <p className="settings-rows p-3 text-label text-ink-400">{t("No email accounts connected")}</p>
       ) : (
         <ul className="settings-rows" aria-label={t("Sending accounts")}>
           {accounts.map((row) => {
@@ -385,7 +412,7 @@ function SenderCard({
   onClose,
 }: {
   target: Target;
-  rows: Connection[];
+  rows: Connection[] | null;
   hostedSmtp: boolean;
   viewer: Viewer;
   onClose: () => void;
@@ -416,7 +443,7 @@ function SenderCard({
     return () => controller.abort();
   }, [target.scope.installId, target.scope.contextId, attempt]);
 
-  const { usable, unusable } = senderChoices(rows);
+  const { usable, unusable } = senderChoices(rows ?? []);
   const choice = usable.find((r) => r.id === picked) ?? usable.find((r) => binding && r.id === binding.connectionId) ?? usable[0];
   const chosenId = choice?.id ?? "";
 
@@ -441,7 +468,7 @@ function SenderCard({
       )}
       {binding === null && (
         <p className="text-label text-ink-400" data-state="unbound">
-          {hostedSmtp ? t("No sender chosen yet.") : t("No sender chosen yet. Pick one below.")}
+          {hostedSmtp || rows === null ? t("No sender chosen yet.") : t("No sender chosen yet. Pick one below.")}
         </p>
       )}
       {binding && live !== null && (
@@ -453,7 +480,7 @@ function SenderCard({
         </p>
       )}
       {binding && live === null && (
-        <p className="text-label text-fail" role="alert" data-state="stale">{t("The chosen sender needs re-checking. Choose it again below to continue sending.")}</p>
+        <p className="text-label text-fail" role="alert" data-state="stale">{rows === null ? t("The chosen sender needs re-checking") : t("The chosen sender needs re-checking. Choose it again below to continue sending.")}</p>
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
@@ -477,7 +504,7 @@ function SenderCard({
           ))}
         </ul>
       )}
-      {usable.length === 0 && (
+      {rows !== null && usable.length === 0 && (
         <p className="text-label text-ink-500">
           {hostedSmtp ? t("No workspace email account is available.") : t("No email sender is available.")}{" "}
           <Link href={EMAIL_CONNECTIONS_HREF} onClick={onClose}>{t("Manage email accounts")}</Link>.

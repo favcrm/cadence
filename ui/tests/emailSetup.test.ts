@@ -6,6 +6,8 @@ import type * as ReactDomModule from "react-dom/client";
 import type * as LocaleModule from "../src/lib/locale";
 import type * as EmailSetupModule from "../src/features/settings/EmailSetup";
 import type { Connection } from "../src/lib/types";
+import type * as NavigationModule from "../screen-ui/src/navigation";
+import type * as HostNavigationModule from "../src/ui/hostNavigation";
 
 function assert(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
 let act: typeof reactAct;
@@ -35,16 +37,26 @@ async function main() {
   act = React.act;
   const { createRoot } = require("react-dom/client") as typeof ReactDomModule;
   const { LocaleProvider } = require("../src/lib/locale") as typeof LocaleModule;
-  const EmailSetup = (require("../src/features/settings/EmailSetup") as typeof EmailSetupModule).default;
+  const EmailSetupView = (require("../src/features/settings/EmailSetup") as typeof EmailSetupModule).default;
+  const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof NavigationModule;
+  const { hostNavigation } = require("../src/ui/hostNavigation") as typeof HostNavigationModule;
+  const EmailSetup = (props: ReactModule.ComponentProps<typeof EmailSetupView>) =>
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(EmailSetupView, props) });
   const posts: { account: string; scopes: string[]; username: string }[] = [];
   let protectedState: unknown = { configured: false, protected: false, origin: null, board_origin: "http://localhost" };
   let refuse = false;
+  const gate: { hold: boolean; release?: () => void } = { hold: false };
   const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = new URL(String(input), "http://localhost").pathname;
     if (path === "/api/protected-entry") return protectedState === null ? json({}, 500) : json(protectedState);
     if (path === "/api/connection-providers") return json({ providers: [{ provider: "smtp", descriptor_available: true, descriptor: { enrollment_shapes: ["smtp"], capabilities: [{ effect: "send", scopes: ["email:send"] }, { effect: "read", scopes: ["email:read"] }] } }] });
-    if (path === "/api/connections" && init?.method === "POST") { posts.push(JSON.parse(String(init.body))); return refuse ? json({ code: "smtp_not_provisioned" }, 400) : json({ connection: { id: "new" } }); }
+    if (path === "/api/connections" && init?.method === "POST") {
+      posts.push(JSON.parse(String(init.body)));
+      // The test target predates Promise.withResolvers.
+      if (gate.hold) await new Promise<void>((resolve) => { gate.release = resolve; });
+      return refuse ? json({ code: "smtp_not_provisioned" }, 400) : json({ connection: { id: "new" } });
+    }
     throw new Error(`Unexpected ${path}`);
   }) as typeof fetch;
   const host = document.createElement("div"); document.body.append(host);
@@ -59,6 +71,13 @@ async function main() {
   render(true);
   click("Continue");
   await settle(() => assert(document.querySelector("#hs-password"), "hosted setup does not require native metadata"));
+  assert(document.querySelector('label[for="hs-password"]')?.textContent === "App password", "Gmail uses app password label");
+  act(() => (document.querySelector("#hs-preset") as HTMLButtonElement).click());
+  const microsoft = Array.from(document.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes("Microsoft 365 (legacy SMTP)")) as HTMLElement;
+  assert(microsoft, "Microsoft legacy SMTP preset available");
+  act(() => microsoft.click());
+  assert(document.querySelector('label[for="hs-password"]')?.textContent === "SMTP password", "Microsoft uses SMTP password label");
+  assert(text().includes("Your organization and mailbox must allow password-based SMTP AUTH. OAuth is not supported for app senders."), "Microsoft prerequisites are explicit");
   fill("#hs-address", "sender@example.com"); fill("#hs-password", "secret");
   refuse = true; click("Connect email");
   await settle(() => assert(text().includes("Email sending isn't set up for this workspace yet."), "relay refusal is shown"));
@@ -72,9 +91,26 @@ async function main() {
   act(() => root2.render(React.createElement(LocaleProvider, null, React.createElement(EmailSetup, { hostedSmtp: false, rows: [], onSaved: () => {}, onClose: () => {} }))));
   await settle(() => { const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Continue") as HTMLButtonElement; assert(button && !button.disabled, "reviewed SMTP available"); });
   click("Continue");
-  await settle(() => assert(text().includes("This protected profile collects credentials"), "protected entry guidance"));
+  await settle(() => assert(document.querySelector('a[href="/settings/connections/new/smtp"]'), "protected enrollment links to board setup"));
   assert(!document.querySelector("#hs-password"), "protected profile never shows password");
+  click("Back");
+  assert(document.activeElement?.id === "email-method", "Back returns focus to method");
   await act(async () => root2.unmount());
+
+  for (const state of [
+    { configured: false, protected: false, origin: "https://trusted.example" },
+    { protected: false, origin: null },
+  ]) {
+    const node = document.createElement("div"); document.body.append(node); const testRoot = createRoot(node);
+    protectedState = state;
+    act(() => testRoot.render(React.createElement(LocaleProvider, null, React.createElement(EmailSetup, { hostedSmtp: false, rows: [], onSaved: () => {}, onClose: () => {} }))));
+    await settle(() => { const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Continue") as HTMLButtonElement; assert(button && !button.disabled, "native SMTP available"); });
+    click("Continue");
+    await settle(() => assert(text().includes("Credential entry could not be checked."), "ambiguous metadata fails closed"));
+    assert(!document.querySelector('a[href="/settings/connections/new/smtp"]'), "ambiguous metadata cannot redirect to legacy credential input");
+    assert(!document.querySelector("#hs-password"), "ambiguous metadata never shows password");
+    await act(async () => testRoot.unmount());
+  }
 
   const host3 = document.createElement("div"); document.body.append(host3); const root3 = createRoot(host3);
   protectedState = { configured: false, protected: false, origin: null, board_origin: "http://localhost" };
@@ -85,7 +121,14 @@ async function main() {
   await settle(() => assert(document.querySelector("#hs-account"), "native account field available"));
   fill("#hs-account", "newsletter"); fill("#hs-address", "sender@example.com");
   fill("#hs-username", "mailer"); fill("#hs-password", "secret");
+  gate.hold = true;
   click("Connect email");
+  assert((Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Back") as HTMLButtonElement).disabled, "Back disabled during verification");
+  assert((Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Cancel") as HTMLButtonElement).disabled, "Cancel disabled during verification");
+  act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+  assert(document.querySelector("#hs-password"), "Escape cannot dismiss during verification");
+  assert(gate.release, "verification request is pending");
+  await act(async () => { gate.release!(); });
   await settle(() => assert(Number(saved) === 1, "native enrollment completes"));
   assert(posts[1].account === "newsletter" && posts[1].username === "mailer", "native account and username used");
   assert(posts[1].scopes.join() === "email:send", "native grants reviewed send scopes only");
