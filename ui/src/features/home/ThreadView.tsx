@@ -1201,6 +1201,7 @@ export function StreamBanner({ onRetry, progress }: {
 export function ThreadTurn({
   items,
   running = false,
+  readOnly = false,
   density = "full",
   allowLegacy = false,
   onOpenIssue,
@@ -1222,6 +1223,7 @@ export function ThreadTurn({
   /** False on a later segment of the same send (`clockRuns`): one clock per turn. */
   clock?: boolean;
   running?: boolean;
+  readOnly?: boolean;
   density?: Density;
   /** The conversation whose live preview text this turn may paint, when the
    *  host has one. Absent (an app that never sends previews) changes nothing. */
@@ -1264,10 +1266,17 @@ export function ThreadTurn({
   // Streaming is a turn the host says is running AND that has no answer yet:
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
-  // CAD-2548: data cards (record, view, connect, artifact) wait for the
+  // CAD-2548 / CAD-2838: data cards (record, view, connect, artifact, ticket) wait for the
   // answer like TurnSources and TurnStagedCards. Image and video job cards
   // show their own progress and forms are unchanged, so both stay live.
-  const dataCards: ThreadItem[] = artifacts.filter((item) => item.type === "record" || item.type === "view" || item.type === "connect" || item.type === "artifact");
+  const dataCards: ThreadItem[] = artifacts.filter(
+    (item) =>
+      item.type === "record" ||
+      item.type === "view" ||
+      item.type === "connect" ||
+      item.type === "artifact" ||
+      item.type === "ticket",
+  );
   const shownCards = streaming ? artifacts.filter((item) => !dataCards.includes(item)) : artifacts;
   const sawStreaming = useRef(false);
   if (streaming) sawStreaming.current = true;
@@ -1384,6 +1393,10 @@ export function ThreadTurn({
               <div key={item.key} data-item-key={item.key} {...fadeProps}><RecordCard entry={item.entry} density={density} /></div>
             ) : item.type === "view" ? (
               <div key={item.key} data-item-key={item.key} {...fadeProps}><ViewCard entry={item.entry} density={density} /></div>
+            ) : item.type === "ticket" ? (
+              <div key={item.key} data-item-key={item.key} {...fadeProps}>
+                <TicketProposalCard entry={item.entry} onOpenIssue={onOpenIssue} readOnly={readOnly} density={density} />
+              </div>
             ) : item.type === "share" ? (
               <div key={item.key} data-item-key={item.key}><ShareRequestCard entry={item.entry} density={density} /></div>
             ) : item.type === "artifact" || item.type === "image" || item.type === "video" ? (

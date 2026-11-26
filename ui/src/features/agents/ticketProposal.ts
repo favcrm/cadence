@@ -110,6 +110,126 @@ export type CreateAndAssignOutcome =
   /** The ticket exists but this card did not (or cannot) assign it. */
   | { ticket: string; state: "replayed" | "owned" | "unconfirmed"; error?: string };
 
+export type ProposalCapabilityGroup = {
+  id: string;
+  label: string;
+  optIn: boolean;
+  tools: string[];
+};
+
+const CAPABILITY_DEFS: ReadonlyArray<{
+  id: string;
+  label: string;
+  optIn: boolean;
+  tools: ReadonlySet<string>;
+}> = [
+  {
+    id: "dispatch_documents",
+    label: "Documents",
+    optIn: true,
+    tools: new Set(["template", "document_render", "browser_pdf"]),
+  },
+  {
+    id: "dispatch_media",
+    label: "Media",
+    optIn: true,
+    tools: new Set(["media_generate", "job_status"]),
+  },
+  {
+    id: "repo_read",
+    label: "GitHub read-only",
+    optIn: true,
+    tools: new Set(["repo_tree", "repo_read_file", "pr_diff"]),
+  },
+  {
+    id: "cadence_writes",
+    label: "Board writes",
+    optIn: true,
+    tools: new Set(["cadence_find", "cadence_use"]),
+  },
+  {
+    id: "channels_post",
+    label: "Channel posting",
+    optIn: true,
+    tools: new Set(["channel_post"]),
+  },
+  {
+    id: "board",
+    label: "Board",
+    optIn: false,
+    tools: new Set([
+      "board_list_issues",
+      "board_read_issue",
+      "board_review_draft",
+      "board_create_issue",
+      "board_pending_actions",
+      "board_get_review_draft",
+      "ticket_comment",
+      "ticket_attach",
+      "ticket_artifact_read",
+      "ticket_result",
+      "ticket_review",
+      "artifact_put",
+    ]),
+  },
+  {
+    id: "wiki",
+    label: "Wiki",
+    optIn: false,
+    tools: new Set(["wiki_search", "wiki_read", "wiki_list"]),
+  },
+  {
+    id: "apps",
+    label: "Apps",
+    optIn: false,
+    tools: new Set([
+      "app_call",
+      "app_describe",
+      "app_skill",
+      "catalog_search",
+      "catalog_describe",
+      "catalog_call",
+      "catalog_result_read",
+    ]),
+  },
+  {
+    id: "web",
+    label: "Web",
+    optIn: false,
+    tools: new Set(["web_search", "web_read"]),
+  },
+  {
+    id: "skills",
+    label: "Skills",
+    optIn: false,
+    tools: new Set(["workspace_skill", "activate_skill", "read_skill_resource"]),
+  },
+  {
+    id: "channels",
+    label: "Channels",
+    optIn: false,
+    tools: new Set(["channel_list", "channel_read"]),
+  },
+];
+
+/** Group raw dispatched tool names into user-facing capability chips while
+ *  preserving every exact tool name for the expandable disclosure. */
+export function proposalCapabilities(tools: readonly string[]): ProposalCapabilityGroup[] {
+  const groups: ProposalCapabilityGroup[] = [];
+  const claimed = new Set<string>();
+  for (const def of CAPABILITY_DEFS) {
+    const matched = tools.filter((tool) => def.tools.has(tool));
+    if (matched.length === 0) continue;
+    for (const tool of matched) claimed.add(tool);
+    groups.push({ id: def.id, label: def.label, optIn: def.optIn, tools: matched });
+  }
+  const rest = tools.filter((tool) => !claimed.has(tool));
+  if (rest.length > 0) {
+    groups.push({ id: "other", label: "Other", optIn: false, tools: rest });
+  }
+  return groups;
+}
+
 export async function createAndAssign(
   client: TicketProposalClient,
   proposal: TicketProposal,

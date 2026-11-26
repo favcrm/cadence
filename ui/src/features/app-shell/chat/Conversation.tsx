@@ -468,6 +468,7 @@ function HomeList({
               startedAt={turnStartMs(items, run.items)}
               clock={clocks.has(run.key)}
               running={busy}
+              readOnly={readOnly}
               allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
               previewConversation={conversation}
