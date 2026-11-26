@@ -58,17 +58,21 @@ for (const name of ["addEventListener", "removeEventListener", "dispatchEvent"])
 }
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-if (!("matchMedia" in win)) {
-  Object.defineProperty(win, "matchMedia", {
-    value: () => ({
-      matches: false,
-      addEventListener() {},
-      removeEventListener() {},
-      addListener() {},
-      removeListener() {},
-    }),
-  });
-}
+let reducedMotion = false;
+const matchMediaImpl = (query: string) => ({
+  get matches() {
+    return typeof query === "string" && query.includes("prefers-reduced-motion") ? reducedMotion : false;
+  },
+  media: query,
+  onchange: null,
+  addEventListener() {},
+  removeEventListener() {},
+  addListener() {},
+  removeListener() {},
+  dispatchEvent() { return false; },
+});
+Object.defineProperty(win, "matchMedia", { value: matchMediaImpl, configurable: true, writable: true });
+Object.defineProperty(globalThis, "matchMedia", { value: matchMediaImpl, configurable: true, writable: true });
 
 const loader = require("module");
 const originalRequire = loader.prototype.require;
@@ -335,6 +339,22 @@ async function checkAppShellDrawerTitleAndMotion() {
   await React.act(async () => { closingPanel!.dispatchEvent(trEv); });
   await flush();
   assert(host.querySelector(".app-shell-screen-drawer") === null, "drawer unmounts after transform transitionend");
+
+  // Under prefers-reduced-motion: reduce, close completes immediately without waiting on transitionend.
+  reducedMotion = true;
+  try {
+    await React.act(async () => { drive("drawer", "create", true, "narrow"); });
+    await flush();
+    const rmPanel = host.querySelector(".app-shell-screen-drawer") as HTMLElement | null;
+    assert(rmPanel !== null, "drawer reopens before reduced-motion close check");
+    rmPanel.style.transitionDuration = "0.2s";
+    const rmClose = rmPanel.querySelector("button[aria-label='Close']") as HTMLElement;
+    await React.act(async () => { rmClose.click(); });
+    await flush();
+    assert(host.querySelector(".app-shell-screen-drawer") === null, "prefers-reduced-motion closes drawer immediately");
+  } finally {
+    reducedMotion = false;
+  }
 
   await React.act(async () => root.unmount());
   host.remove();
