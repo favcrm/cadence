@@ -89,7 +89,15 @@ let threadReads: string[] = [];
 let directoryReads = 0;
 let directoryAvailable = true;
 const routineListAliases: (string | null)[] = [];
-globalThis.fetch = async (input) => {
+const endpointQueryAgents: (string | null)[] = [];
+const personalAssistantId = "assistant_0123456789abcdef0123456789abcdef";
+let personalSettingsMode = false;
+let personalRev = 1;
+let personalInstructions: string | null = "Personal prompt";
+let personalSkills: string[] = [];
+let personalEnabledTools: string[] = [];
+let lastPersonalPatch: Record<string, unknown> | null = null;
+globalThis.fetch = async (input, init) => {
   const url = new URL(String(input), "http://localhost");
   const path = url.pathname;
   if (path === "/api/team/members") {
@@ -103,16 +111,142 @@ globalThis.fetch = async (input) => {
   }
   if (path === "/api/member-assistant/state") {
     memberStateReads += 1;
-    return json({ assistant: { alias: "assistant-1", identity: { name: "Nova", tone: null, look: "robot", revision: 1 } }, conversation_id: "c1" });
+    return json({
+      assistant: {
+        assistant_id: personalAssistantId,
+        alias: "assistant-1",
+        identity: { name: "Nova", tone: null, look: "robot", revision: personalRev },
+      },
+      conversation_id: "c1",
+    });
+  }
+  if (path === "/api/member-assistant/instructions") {
+    if (!personalSettingsMode) return json({ error: "not found" }, 404);
+    return json({
+      instructions: personalInstructions,
+      revision: personalRev,
+      built_in_instruction_tokens: 120,
+      skills: personalSkills,
+      enabled_tools: personalEnabledTools,
+    });
+  }
+  if (path === "/api/member-assistant/profile" && personalSettingsMode) {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    lastPersonalPatch = body;
+    if (body.expected_revision !== personalRev) return json({ code: "revision_conflict", message: "stale revision" }, 409);
+    if (body.enabled_tools !== undefined && operator !== true) {
+      return json({ code: "owner_required", message: "Only workspace owners may change opt-in tool groups." }, 403);
+    }
+    if (typeof body.instructions === "string") personalInstructions = body.instructions.trim() || null;
+    if (Array.isArray(body.skills)) personalSkills = body.skills.filter((s): s is string => typeof s === "string");
+    if (Array.isArray(body.enabled_tools)) {
+      personalEnabledTools = body.enabled_tools.filter((g): g is string => typeof g === "string");
+    }
+    personalRev += 1;
+    return json({
+      assistant: {
+        assistant_id: personalAssistantId,
+        alias: "assistant-1",
+        identity: { name: "Nova", tone: null, look: "robot", revision: personalRev },
+      },
+      conversation_id: "c1",
+      action: "update",
+      skills: personalSkills,
+      enabled_tools: personalEnabledTools,
+      applies: "next_turn",
+    });
   }
   // CAD-2354: an API that predates the instructions routes.
-  if (path === "/api/member-assistant/instructions" || path === "/api/master/instructions") return json({ error: "not found" }, 404);
+  if (path === "/api/master/instructions") return json({ error: "not found" }, 404);
+  if (path === "/api/workspace-skills" && personalSettingsMode) {
+    return json({
+      skills: [
+        {
+          name: "weekly-report",
+          description: "Summarize the week",
+          approved: true,
+          latest_revision: 1,
+          latest_digest: "abc",
+          approved_revision: 1,
+          approved_digest: "abc",
+          used_by: [],
+        },
+        {
+          name: "draft-skill",
+          description: "Unapproved draft",
+          approved: false,
+          latest_revision: 1,
+          latest_digest: "def",
+          approved_revision: null,
+          approved_digest: null,
+          used_by: [],
+        },
+      ],
+    });
+  }
+  if (path === "/api/endpoints" && personalSettingsMode) {
+    endpointQueryAgents.push(url.searchParams.get("agent"));
+    return json({
+      endpoints: [
+        {
+          id: "ep_123",
+          agent_uid: personalAssistantId,
+          kind: "email",
+          slug: "nova",
+          state: "active",
+          verified: true,
+          config_revision: 1,
+          deleted_at: null,
+          sender_allowlist: [],
+          target_kind: "isolated_inbox",
+          routine_id: null,
+          binding_workflow: "",
+          binding_digest: "",
+          owner_subject_id: "viewer",
+          auth_mode: null,
+          secret_hint: null,
+          secret_rotated_at: null,
+          prev_secret_expires_at: null,
+          rate_limit_rpm: 60,
+          webhook_url: null,
+          hold_capacity: 50,
+          created_at: 1,
+          updated_at: 1,
+          address: "nova.acme@cadencecloud.app",
+          enabled: true,
+          event_source: "email.inbound",
+        },
+      ],
+    });
+  }
+  if (path === "/api/connections" && personalSettingsMode) {
+    return json({ connections: [] });
+  }
   if (path.startsWith("/api/threads/")) {
     threadReads.push(path);
     return json({ entries: [], cursor: 0, more_before: false });
   }
   if (path === "/api/routines") {
     routineListAliases.push(url.searchParams.get("agent"));
+    if (personalSettingsMode && url.searchParams.get("agent") === personalAssistantId) {
+      return json({
+        routines: [
+          {
+            id: "rt_personal_1",
+            name: "Inbox digest",
+            trigger_kind: "event",
+            event_source: "email.inbound",
+            agent_alias: personalAssistantId,
+            target_kind: "markdown",
+            markdown_path: "wiki:global/playbooks/digest.md",
+            status: "on",
+            thread_id: "c1",
+          },
+        ],
+        staged_proposals: [],
+        waiting_runs: [],
+      });
+    }
     return json({ routines: [], staged_proposals: [
       { id: "omitted", state: "pending", title: "Alias omitted", kind: "routine_propose", payload: {}, proposed_by: "assistant" },
       { id: "padded", state: "pending", title: "Alias padded", kind: "routine_propose", payload: { agent_alias: " master " }, proposed_by: "assistant" },
@@ -414,6 +548,68 @@ async function main() {
   await at("/agents");
   assert(seats()[0].startsWith("master"), "native: Master is unchanged");
   assert(directoryReads === legacyReads, "legacy and native boards do not read the directory");
+
+  // Aligned personal assistant tabs: Instructions | Routines | Skills | Tools + owner/member gating.
+  personalSettingsMode = true;
+  hostedBoard = true;
+  operator = true;
+  payload = hostedRoster();
+  await at("/agents/assistant");
+  const personalTabLabels = Array.from(host.querySelectorAll(".ap-tabs [role=tab]")).map((el) => el.textContent);
+  assert(
+    JSON.stringify(personalTabLabels) === JSON.stringify(["Instructions", "Routines", "Skills", "Tools"]),
+    "My assistant renders Instructions, Routines, Skills, and Tools tabs",
+  );
+  assert(
+    host.querySelector("[role=tab][aria-selected=true]")?.textContent === "Instructions",
+    "default route on /agents/assistant lands on Instructions",
+  );
+  await at("/agents/assistant?tab=routines");
+  assert(routineListAliases.at(-1) === personalAssistantId, "Routines tab queries by personal assistant_id");
+  assert(endpointQueryAgents.at(-1) === personalAssistantId, "Incoming endpoints queries by personal assistant_id");
+  assert(
+    host.textContent?.includes("Inbox digest") && host.textContent?.includes("nova.company@cadencecloud.app"),
+    "owner sees personal routines and incoming email endpoint",
+  );
+  const readPatch = () => lastPersonalPatch;
+  await at("/agents/assistant?tab=skills");
+  assert(host.textContent?.includes("weekly-report") && host.textContent?.includes("New skill"), "owner sees workspace skills and New skill action");
+  const skillSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='weekly-report']");
+  await click(skillSwitch);
+  assert(
+    readPatch()?.expected_revision === 1 && JSON.stringify(readPatch()?.skills) === JSON.stringify(["weekly-report"]),
+    "toggling a skill sends expected_revision and skills to /api/member-assistant/profile",
+  );
+  await at("/agents/assistant?tab=tools");
+  const toolSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='Cadence writes']");
+  assert(toolSwitch && !toolSwitch.disabled, "owner can toggle opt-in tool groups");
+  await click(toolSwitch);
+  assert(
+    readPatch()?.expected_revision === 2 && JSON.stringify(readPatch()?.enabled_tools) === JSON.stringify(["cadence_writes"]),
+    "toggling an opt-in tool sends expected_revision and enabled_tools to /api/member-assistant/profile",
+  );
+
+  // Non-owner member: Routines & Tools are owner-gated, while personal Skills stay writable without library management.
+  operator = false;
+  await at("/agents/assistant?tab=routines");
+  assert(
+    host.textContent?.includes("Routines and script approvals are managed by the workspace owner."),
+    "member sees owner-gated message on Routines tab",
+  );
+  await at("/agents/assistant?tab=tools");
+  const memberToolSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='Cadence writes']");
+  assert(memberToolSwitch === null, "member sees opt-in tool switches read-only without a toggle button");
+  assert(host.textContent?.includes("Opt-in tool groups are managed by the workspace owner."), "member sees owner-gated note on Tools tab");
+  await at("/agents/assistant?tab=skills");
+  assert(!host.textContent?.includes("New skill"), "member does not see library management button on Skills tab");
+  const memberSkillSwitch = host.querySelector<HTMLButtonElement>("button[role=switch][aria-label*='weekly-report']");
+  await click(memberSkillSwitch);
+  assert(
+    readPatch()?.expected_revision === 3 && JSON.stringify(readPatch()?.skills) === JSON.stringify([]),
+    "member can toggle their own assistant skills",
+  );
+  assert(aliasReads === 0, "personal assistant tabs never fall back to /api/agents/assistant");
+
   await React.act(() => root.unmount());
   resetPrivateSession();
   console.log("my assistant checks passed");

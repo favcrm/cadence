@@ -299,7 +299,19 @@ export default function Agents({
     );
   }
   if (open === PERSONAL_ALIAS && personal) {
-    return shell(<MyAssistantPage row={personal} onBack={() => setOpen(null)} onToast={onToast} rosterStale={state.status === "stale" || (payload != null && state.status === "failed")} />);
+    return shell(
+      <MyAssistantPage
+        row={personal}
+        tab={tab}
+        onTab={onTab}
+        operator={operator === true}
+        hostedBoard={hostedBoard}
+        scopedRoster={scopedRoster}
+        onBack={() => setOpen(null)}
+        onToast={onToast}
+        rosterStale={state.status === "stale" || (payload != null && state.status === "failed")}
+      />,
+    );
   }
   const detailUnavailable = (scopedRoster && open === PERSONAL_ALIAS) || (openProfileId && !selectedProfile);
   if (detailUnavailable || (scopedRoster && open === MASTER && operator !== true)) {

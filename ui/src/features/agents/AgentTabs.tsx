@@ -770,6 +770,8 @@ type Library = { state: "reading" } | { state: "failed" } | { state: "absent" } 
 export function WorkspaceSkills({
   doc,
   writable,
+  canManageLibrary = writable,
+  agentName,
   toast,
   absent = null,
   deps = liveSkillDeps,
@@ -778,6 +780,10 @@ export function WorkspaceSkills({
 }: {
   doc: InstructionsDoc;
   writable: boolean;
+  /** Whether the viewer may create, edit, or approve skills in the workspace library. */
+  canManageLibrary?: boolean;
+  /** Display name for this agent when it has no hosted profile object. */
+  agentName?: string;
   toast: TabContext["toast"];
   /** Shown instead when the board does not serve the library. */
   absent?: React.ReactNode;
@@ -821,7 +827,14 @@ export function WorkspaceSkills({
   // A control that goes away when it is used hands focus to the section, not the page.
   const toHeading = () => setTimeout(() => heading.current?.focus(), 0);
 
-  const assigned = doc.read === "ready" && doc.profile ? doc.profile.skills : null;
+  const assigned =
+    doc.read === "ready"
+      ? doc.kind === "personal"
+        ? (doc.personalSkills ?? [])
+        : doc.profile
+          ? doc.profile.skills
+          : null
+      : null;
   const canAssign = writable && assigned !== null && stale === null;
   const skills = library.state === "ready" ? library.skills : [];
   const replace = (skill: WorkspaceSkillSummary) =>
@@ -951,7 +964,7 @@ export function WorkspaceSkills({
               {t("{n} of {m} on").replace("{n}", String(count.assigned)).replace("{m}", String(count.approved))}
             </small>
           )}
-          {writable && deps.draft !== undefined && library.state === "ready" && (
+          {canManageLibrary && deps.draft !== undefined && library.state === "ready" && (
             <Button size="sm" onClick={() => { setCreateError(null); setCreating(true); }}>
               {t("New skill")}
             </Button>
@@ -988,7 +1001,7 @@ export function WorkspaceSkills({
                 {assigned !== null && (
                   <span className="sk-switch" data-state={on && !draft ? "on" : "off"}>
                     {draft ? (
-                      writable ? (
+                      canManageLibrary ? (
                         <>
                           {t("Approve first")}
                           <Switch checked={false} disabled label={`${t("On for this agent")}: ${skill.name}`} onToggle={() => {}} />
@@ -1048,8 +1061,8 @@ export function WorkspaceSkills({
           key={open}
           name={open}
           profileId={doc.profile?.id ?? null}
-          agentName={doc.profile?.name ?? t("this agent")}
-          writable={writable}
+          agentName={agentName ?? doc.profile?.name ?? t("this agent")}
+          writable={canManageLibrary}
           scopedRoster={scopedRoster}
           deps={deps}
           toast={toast}
@@ -1105,21 +1118,28 @@ export function WorkspaceSkills({
   );
 }
 
-/** AOS-679: opt-in tool groups on a hosted profile. State is `enabled_tools`;
- *  only the owner (`writable`) can change it, everyone else reads it. */
-function OptInTools({ c }: { c: TabContext }) {
+/** AOS-679: opt-in tool groups on a hosted or personal profile. State is `enabled_tools`;
+ *  only the owner (`writable` for hosted, `operator && writable` for personal) can change it, everyone else reads it. */
+export function OptInTools({ c }: { c: TabContext }) {
   const t = useTranslate();
   const [saving, setSaving] = useState<string | null>(null);
-  if (c.doc.kind !== "hosted") return null;
+  if (c.doc.kind !== "hosted" && c.doc.kind !== "personal") return null;
+  if (c.doc.read === "unsupported") return <Note>{t("Your assistant’s tools are not configured here yet.")}</Note>;
   if (c.doc.read === "reading") return <Note>{t("Loading tools…")}</Note>;
   if (c.doc.read === "failed") return <Note>{t("These tools couldn’t be read.")}</Note>;
+  const isPersonal = c.doc.kind === "personal";
   const profile = c.doc.read === "ready" ? c.doc.profile : null;
-  if (!profile) return null;
+  if (!isPersonal && !profile) return null;
+  if (c.doc.read !== "ready") return null;
+  const toolState = isPersonal
+    ? { disabled_tools: [], enabled_tools: c.doc.personalEnabledTools ?? [] }
+    : profile!;
+  const canToggle = isPersonal ? c.operator && c.writable : c.writable;
 
   async function toggle(group: string, on: boolean) {
-    if (!profile || saving) return;
+    if (saving) return;
     setSaving(group);
-    const out = await c.doc.saveEnabledTools(withEnabledGroup(profile, group, on));
+    const out = await c.doc.saveEnabledTools(withEnabledGroup(toolState, group, on));
     setSaving(null);
     if (out.kind === "saved") c.toast("ok", `${t("Saved.")} ${t("It applies when a session next loads this profile.")}`);
     else if (out.kind === "conflict") c.toast("warn", t("Someone else changed this agent, so nothing was saved. Reload to see the current tools."));
@@ -1131,7 +1151,7 @@ function OptInTools({ c }: { c: TabContext }) {
   return (
     <div className="sk-list" data-work-panel="opt-in-tools">
       {OPT_IN_TOOL_GROUPS.map((group) => {
-        const on = toolGroupOn(profile, group.id);
+        const on = toolGroupOn(toolState, group.id);
         return (
           <div key={group.id} className="sk-card">
             <span className="sk-title">
@@ -1142,7 +1162,7 @@ function OptInTools({ c }: { c: TabContext }) {
               name={group.label}
               required={false}
               enabled={on}
-              canToggle={c.writable}
+              canToggle={canToggle}
               pending={saving !== null}
               onToggle={() => void toggle(group.id, !on)}
             />
