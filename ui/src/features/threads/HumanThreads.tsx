@@ -708,7 +708,8 @@ export function HumanRoomTimeline({
       if (unreadBoundaryId !== null) {
         const divider = root.querySelector<HTMLElement>("[data-unread-divider]");
         if (divider) {
-          root.scrollTop = Math.max(0, divider.offsetTop - 24);
+          const delta = divider.getBoundingClientRect().top - root.getBoundingClientRect().top;
+          root.scrollTop = Math.max(0, root.scrollTop + delta - 16);
           pinnedToTailRef.current = root.scrollHeight - root.scrollTop - root.clientHeight <= 48;
           initialScrollAppliedRef.current.applied = true;
           tailPostRef.current = { room: id, id: lastId, initialized: true };

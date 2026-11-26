@@ -211,6 +211,7 @@
   margin-left: auto;
 }
 .threads-messages {
+  position: relative;
   display: grid;
   align-content: start;
   gap: 0;
@@ -1308,8 +1309,9 @@
   margin: 0.5rem -0.25rem 0;
   padding: 0.55rem 0.7rem;
   border-radius: 0.5rem;
-  background: color-mix(in srgb, var(--color-ink-950) 28%, transparent);
-  color: var(--color-ink-200);
+  border: 1px solid color-mix(in srgb, var(--color-ink-100) 10%, transparent);
+  background: color-mix(in srgb, var(--color-ink-100) 6%, transparent);
+  color: var(--color-ink-100);
   font-size: 0.78rem;
   line-height: 1.55;
   white-space: pre-wrap;

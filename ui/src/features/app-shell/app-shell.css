@@ -730,7 +730,13 @@
   align-items: center;
   gap: 0.45rem 0.75rem;
   min-width: 0;
-  color: var(--color-ink-200);
+  padding: 0.4rem 0.65rem;
+  border-radius: 0.5rem;
+  background: rgb(16 18 24 / 0.88);
+  color: #f4f4f6;
+}
+.sentlight-bar span.num {
+  color: #cbd5e1;
 }
 .sentlight-bar b {
   min-width: 0;
@@ -741,6 +747,7 @@
 }
 .sentlight-bar .lnk {
   flex: none;
+  color: #93c5fd;
 }
 button.sentchip {
   font: inherit;
