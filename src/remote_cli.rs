@@ -6833,10 +6833,11 @@ fn review_job_board_too_old(verb: &str, status: u16) -> Option<Error> {
     ))
 }
 
-/// AOS-777: the tenant admits these verbs only for an owner-approved enrolled
-/// login. A human login or an unenrolled agent gets `403 not_permitted`; say
-/// so instead of the generic refusal, and never fall back to the human bearer.
-fn review_job_not_enrolled(verb: &str, status: u16, code: Option<&str>) -> Option<Error> {
+/// AOS-791: the tenant admits these verbs only for the agent credential whose
+/// subject names the job's slot profile. A human login or another profile gets
+/// `403 not_permitted`; name that instead of the generic refusal, and never fall
+/// back to the human bearer.
+fn review_job_wrong_profile(verb: &str, status: u16, code: Option<&str>) -> Option<Error> {
     if !matches!(verb, "review_claim" | "review_diff" | "review_submit")
         || status != 403
         || code != Some("not_permitted")
@@ -6844,9 +6845,9 @@ fn review_job_not_enrolled(verb: &str, status: u16, code: Option<&str>) -> Optio
         return None;
     }
     Some(Error::rejected(
-        "this login is not an owner-approved reviewer enrollment for this job; the tenant \
-         refused it, and the client never falls back to a human login. Ask the owner to approve \
-         `cadence agent enroll` for the job's profile. Nothing was changed",
+        "this login is not the agent credential for the job's profile; the tenant refused it, \
+         and the client never falls back to a human login. Run the review as the agent that \
+         holds the profile the project policy names for that slot. Nothing was changed",
     ))
 }
 
@@ -7869,7 +7870,7 @@ fn call_verb_until_retry(
         if let Some(error) = review_job_board_too_old(verb, status) {
             return Err(error);
         }
-        if let Some(error) = review_job_not_enrolled(verb, status, refusal_code.as_deref()) {
+        if let Some(error) = review_job_wrong_profile(verb, status, refusal_code.as_deref()) {
             return Err(error);
         }
         if let Some(why) = timeline_board_too_old(verb, status, refusal_code.as_deref(), &arguments)
