@@ -50,6 +50,15 @@ Before writing code or diagnosing a bridge bug, inspect the target repository's 
 - **No Shell Metacharacters in `package.json` `cadence.dev`:** `cadence.dev` enforces a single command—rejecting newlines (`\n`/`\r`), unescaped backticks, and `$()` command substitution everywhere (even inside quotes) plus unquoted `;`, `&`, `|`, `<`, `>`, `(`, and `)`—whereas `cadence.check` runs via `sh -c`. Put multi-step dev orchestration in a script file.
 - **Synthetic Data Only:** All test fixtures, `cadence app fixtures` seeds, docs, and examples must use synthetic, non-sensitive data—never real customer records, credentials, host paths, or commercial secrets.
 
+## Shared Workspace Brand Kit (`global/brands/<slug>/`)
+
+Apps and agents that author, design, market, or publish customer-facing content (Social Content, Ads Studio, Designer Studio, Website Builder, Company Outputs, and Workspace Assistants) must share the single workspace brand hierarchy in Workspace Wiki rather than inventing per-app brand stores or duplicate config files:
+
+- **Canonical location:** `global/brands/<slug>/` (default slug: `default`; slug regex `^[a-z0-9][a-z0-9-]{0,47}$`), with optional channel/destination mapping at `global/brands/_map.json`.
+- **Standard files:** `brand.md` (voice, positioning, audience, locale, CTA style), `guardrails.md` (protected terms, forbidden claims, required disclaimers), `examples.md` (few-shot exemplars), `visual.md` (palette hex tokens, typography feel, visual direction), and `assets/` (brand reference visuals).
+- **UI & state alignment:** Surface the active brand switcher (`Brand: <slug>`) in the app header and provide a dedicated `Brand` tab or settings view inspecting `global/brands/<slug>/`; persist `brand_slug` in shared context defaults and support per-item/draft overrides.
+- **Security boundary:** Read/write strictly through Workspace Wiki ACLs (operator/member writable under `global/`). Strip control characters, bound lengths, and inject brand text into model prompts only as quoted reference data—never executable instructions.
+
 ## Standard Engineering Loop
 
 1. **Inspect pinned contracts & existing manifests** before planning changes (`@cadence/app-kit`, `@cadence/screen-ui`, hosted `app-storage/v1` if used, and `./app/*` manifests).
