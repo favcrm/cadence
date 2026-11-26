@@ -98,6 +98,42 @@ let personalInstructions: string | null = "Personal prompt";
 let personalSkills: string[] = [];
 let personalEnabledTools: string[] = [];
 let lastPersonalPatch: Record<string, unknown> | null = null;
+let memoryFiles: Record<string, { text: string; sha: string }> = {
+  "SOUL.md": {
+    text: "# Soul\n\n<!-- cadence:managed-begin tone -->\nTone: Concise\n<!-- cadence:managed-end tone -->\n\n<!-- cadence:managed-begin soul_body -->\nLead with conclusions.\n<!-- cadence:managed-end soul_body -->\n",
+    sha: "sha_soul_1",
+  },
+  "USER.md": {
+    text: "# User preferences\n\n<!-- cadence:managed-begin user_name -->\nUsername: Lee\n<!-- cadence:managed-end user_name -->\n",
+    sha: "sha_user_1",
+  },
+  "MEMORY.md": {
+    text: "# Memory\n\n- 2026-11-26: Weekly summary goes out on Fridays.\n",
+    sha: "sha_mem_1",
+  },
+  "memory/preferences.md": {
+    text: "# preferences\n\n- Prefers tables over paragraphs.\n",
+    sha: "sha_pref_1",
+  },
+};
+let memoryHistory: Array<{
+  id: string;
+  at: string;
+  op: string;
+  target: string;
+  actor: string;
+  turn_id: string;
+  before_exists: boolean;
+  before_sha: string;
+  after_sha: string;
+  before_text: string;
+  added: string[];
+  removed: string[];
+  undone_by: string | null;
+}> = [];
+let memorySeq = 1;
+let lastMemoryEdit: Record<string, unknown> | null = null;
+let lastMemoryUndo: string | null = null;
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input), "http://localhost");
   const path = url.pathname;
@@ -159,6 +195,89 @@ globalThis.fetch = async (input, init) => {
       action: "update",
       skills: personalSkills,
       enabled_tools: personalEnabledTools,
+      applies: "next_turn",
+    });
+  }
+  if (path === "/api/member-assistant/memory-get" && personalSettingsMode) {
+    return json({
+      files: ["SOUL.md", "USER.md", "MEMORY.md"].map((target) => {
+        const entry = memoryFiles[target] ?? { text: "", sha: "empty" };
+        return {
+          target,
+          text: entry.text,
+          sha: entry.sha,
+          line_count: entry.text.trimEnd() === "" ? 0 : entry.text.trimEnd().split("\n").length,
+          ...(target === "MEMORY.md" ? { cap: 200 } : {}),
+        };
+      }),
+      topics: Object.entries(memoryFiles)
+        .filter(([k]) => k.startsWith("memory/"))
+        .map(([target, entry]) => ({
+          slug: target.slice("memory/".length, -".md".length),
+          target,
+          text: entry.text,
+          sha: entry.sha,
+          line_count: entry.text.trimEnd() === "" ? 0 : entry.text.trimEnd().split("\n").length,
+        })),
+      history: memoryHistory.map(({ before_text: _bt, ...rest }) => rest),
+      applies: "next_turn",
+    });
+  }
+  if (path === "/api/member-assistant/memory-edit" && personalSettingsMode) {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      target: string;
+      content: string;
+      expected_sha?: string;
+    };
+    lastMemoryEdit = body;
+    const prev = memoryFiles[body.target];
+    if (body.expected_sha !== undefined && prev && body.expected_sha !== prev.sha) {
+      return json({ ok: false, error: { code: "revision_conflict", message: `${body.target} changed since it was loaded` } }, 409);
+    }
+    memorySeq += 1;
+    const nextSha = `sha_${memorySeq}`;
+    const histId = `mem_${memorySeq}`;
+    memoryHistory.unshift({
+      id: histId,
+      at: "2026-11-26T09:00:00Z",
+      op: "member_edit",
+      target: body.target,
+      actor: "users/viewer",
+      turn_id: "member-ui",
+      before_exists: prev !== undefined,
+      before_sha: prev?.sha ?? "",
+      after_sha: nextSha,
+      before_text: prev?.text ?? "",
+      added: [body.content.trim().split("\n").at(-1) ?? ""],
+      removed: [],
+      undone_by: null,
+    });
+    memoryFiles[body.target] = { text: body.content, sha: nextSha };
+    return json({ target: body.target, sha: nextSha, history_id: histId, applies: "next_turn" });
+  }
+  if (path === "/api/member-assistant/memory-undo" && personalSettingsMode) {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { history_id: string };
+    lastMemoryUndo = body.history_id;
+    const idx = memoryHistory.findIndex((h) => h.id === body.history_id);
+    if (idx < 0 || memoryHistory[idx]!.undone_by) {
+      return json({ ok: false, error: { code: "revision_conflict", message: "cannot undo" } }, 409);
+    }
+    const item = memoryHistory[idx]!;
+    memorySeq += 1;
+    const undoId = `mem_${memorySeq}`;
+    item.undone_by = undoId;
+    if (item.before_exists) {
+      memoryFiles[item.target] = { text: item.before_text, sha: item.before_sha };
+    } else {
+      delete memoryFiles[item.target];
+    }
+    return json({
+      undone: item.id,
+      undo_history_id: undoId,
+      op: item.op,
+      target: item.target,
+      sha: item.before_sha,
+      revision_sha: item.before_sha,
       applies: "next_turn",
     });
   }
@@ -564,8 +683,8 @@ async function main() {
   await at("/agents/assistant");
   const personalTabLabels = Array.from(host.querySelectorAll(".ap-tabs [role=tab]")).map((el) => el.textContent);
   assert(
-    JSON.stringify(personalTabLabels) === JSON.stringify(["Instructions", "Routines", "Skills", "Tools"]),
-    "My assistant renders Instructions, Routines, Skills, and Tools tabs",
+    JSON.stringify(personalTabLabels) === JSON.stringify(["Instructions", "Memory", "Routines", "Skills", "Tools"]),
+    "My assistant renders Instructions, Memory, Routines, Skills, and Tools tabs",
   );
   assert(
     host.querySelector("[role=tab][aria-selected=true]")?.textContent === "Instructions",
@@ -638,6 +757,59 @@ async function main() {
     readPatch()?.expected_revision === 4 && JSON.stringify(readPatch()?.skills) === JSON.stringify([]),
     "member can toggle their own assistant skills",
   );
+
+  // Memory tab: inspect SOUL.md / MEMORY.md / topics, save edit with expected_sha, Undo, and 409 conflict recovery.
+  await at("/agents/assistant?tab=memory");
+  await new Promise((r) => setTimeout(r, 0));
+  assert(
+    host.textContent?.includes("SOUL.md") &&
+      host.textContent?.includes("MEMORY.md") &&
+      host.textContent?.includes("memory/preferences.md"),
+    "Memory tab renders SOUL.md, MEMORY.md, and topic pills",
+  );
+  const memArea = host.querySelector<HTMLTextAreaElement>("textarea[aria-label='MEMORY.md']");
+  assert(memArea !== null, "Memory tab renders textarea for MEMORY.md");
+  await React.act(async () => {
+    const desc = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")!;
+    desc.set!.call(memArea, "# Memory\n\n- 2026-11-26: Weekly summary goes out on Fridays.\n- 2026-11-26: Updated fact.\n");
+    memArea!.dispatchEvent(new Event("input", { bubbles: true }));
+    memArea!.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  const saveMemBtn = Array.from(host.querySelectorAll("button")).find((b) => b.textContent === "Save");
+  assert(saveMemBtn && !saveMemBtn.disabled, "Save button activates when Memory draft is dirty");
+  await click(saveMemBtn);
+  assert(
+    lastMemoryEdit?.target === "MEMORY.md" && lastMemoryEdit?.expected_sha === "sha_mem_1",
+    "Save posts target, content, and expected_sha to /api/member-assistant/memory-edit",
+  );
+  assert(host.textContent?.includes("Updated fact."), "Memory history renders diff line after save");
+
+  // External revision bump -> 409 conflict banner on next save.
+  const staleSha = memoryFiles["MEMORY.md"]!.sha;
+  memoryFiles["MEMORY.md"] = { text: "# Memory\n\n- External edit.\n", sha: "sha_external" };
+  const memArea2 = host.querySelector<HTMLTextAreaElement>("textarea[aria-label='MEMORY.md']");
+  await React.act(async () => {
+    const desc = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")!;
+    desc.set!.call(memArea2, "# Memory\n\n- Stale client edit.\n");
+    memArea2!.dispatchEvent(new Event("input", { bubbles: true }));
+    memArea2!.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  const saveMemBtn2 = Array.from(host.querySelectorAll("button")).find((b) => b.textContent === "Save");
+  await click(saveMemBtn2);
+  assert(host.textContent?.includes("changed on disk"), "409 conflict displays reload banner");
+  const reloadBtn = Array.from(host.querySelectorAll("button")).find((b) => b.textContent === "Reload latest");
+  await click(reloadBtn);
+  assert(
+    host.querySelector<HTMLTextAreaElement>("textarea[aria-label='MEMORY.md']")?.value.includes("External edit.") &&
+      staleSha !== memoryFiles["MEMORY.md"]!.sha,
+    "Reload latest refreshes content and SHA after conflict",
+  );
+
+  const histUndoBtn = host.querySelector<HTMLButtonElement>(".ap-mem-hlist button.ap-link");
+  assert(histUndoBtn !== null, "history list offers 1-click Undo button");
+  await click(histUndoBtn);
+  assert(lastMemoryUndo === memoryHistory[0]!.id, "history Undo posts history_id to memory-undo");
+
   assert(aliasReads === 0, "personal assistant tabs never fall back to /api/agents/assistant");
 
   await React.act(() => root.unmount());

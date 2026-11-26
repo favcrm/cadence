@@ -4793,3 +4793,56 @@ button.turnsource:hover {
     max-width: 11.5rem;
   }
 }
+
+/* CAD-2834: compact inline context receipts and diff lines */
+.ctx-receipt {
+  margin-top: .25rem;
+  padding: .45rem .65rem;
+  border-radius: .45rem;
+  border: 1px solid color-mix(in srgb, var(--color-ink-700) 75%, transparent);
+  background: color-mix(in srgb, var(--color-ink-850) 80%, transparent);
+  display: grid;
+  gap: .35rem;
+  max-width: 100%;
+  min-width: 0;
+}
+.ctx-receipt-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+  font-size: var(--text-micro);
+  min-width: 0;
+}
+.ctx-receipt-badge {
+  color: var(--color-ink-200);
+  font-weight: 500;
+}
+.ctx-receipt-target {
+  color: var(--color-ink-500);
+  overflow-wrap: anywhere;
+}
+.ctx-receipt-act {
+  font-size: var(--text-micro);
+}
+.ctx-receipt-status {
+  color: var(--color-ok);
+  margin-left: auto;
+}
+.ctx-receipt-undo {
+  margin-left: auto;
+}
+.ctx-receipt-diff {
+  list-style: none;
+  margin: 0;
+  padding: .35rem .5rem;
+  border-radius: .35rem;
+  background: var(--color-ink-900);
+  display: grid;
+  gap: .15rem;
+  font-size: var(--text-micro);
+  overflow-wrap: anywhere;
+}
+.ctx-diff-add { color: var(--color-ok); }
+.ctx-diff-rem { color: var(--color-warn); }
+.ctx-receipt-err { margin: 0; }

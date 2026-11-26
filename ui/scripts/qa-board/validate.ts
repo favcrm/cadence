@@ -622,6 +622,17 @@ function fixtureFetch(
       case "POST /api/browser/stop": return json(fx["browser-stop"]);
       case "POST /api/member-assistant/state": return json(fx["member-assistant-state"]);
       case "POST /api/member-assistant/history": return json(fx["member-assistant-history"]);
+      case "POST /api/member-assistant/memory-get":
+        return json({
+          files: [
+            { target: "SOUL.md", text: "# Soul\n", sha: "qa_soul", line_count: 1 },
+            { target: "USER.md", text: "# User\n", sha: "qa_user", line_count: 1 },
+            { target: "MEMORY.md", text: "# Memory\n", sha: "qa_mem", line_count: 1, cap: 200 },
+          ],
+          topics: [],
+          history: [],
+          applies: "next_turn",
+        });
       case "POST /api/member-assistant/profile": return json(fx["member-assistant-profile"]);
       case "POST /api/member-assistant/send": return json({ ...(fx["member-assistant-send"] as object), message: request.message });
       default: return new Response("{}", { status: 404 });

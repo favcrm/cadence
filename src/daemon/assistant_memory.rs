@@ -749,19 +749,23 @@ pub fn undo(root: &Path, history_id: &str, actor: &str, turn_id: &str) -> Result
     };
     let entry = rows[idx].clone();
     if entry.undone_by.is_some() {
-        return Err(Error::rejected(format!(
-            "history entry '{history_id}' was already undone"
-        )));
+        return Err(Error::conflict_coded(
+            "already_undone",
+            format!("history entry '{history_id}' was already undone"),
+        ));
     }
     let (dir_fd, filename, cap) = resolve_target_dir(&root_fd, &entry.target)?;
     let current = read_child_text(&dir_fd, &filename, cap)?
         .ok_or_else(|| Error::rejected(format!("target '{}' no longer exists", entry.target)))?;
     let current_sha = sha256_hex(current.as_bytes());
     if current_sha != entry.after_sha {
-        return Err(Error::rejected(format!(
-            "cannot undo '{history_id}': '{}' changed since that edit",
-            entry.target
-        )));
+        return Err(Error::conflict_coded(
+            "revision_conflict",
+            format!(
+                "cannot undo '{history_id}': '{}' changed since that edit",
+                entry.target
+            ),
+        ));
     }
     let cname = c_name(&filename)?;
     if entry.before_exists {
@@ -799,8 +803,341 @@ pub fn undo(root: &Path, history_id: &str, actor: &str, turn_id: &str) -> Result
         "undo_history_id": undo_id,
         "op": entry.op,
         "target": entry.target,
+        "sha": entry.before_sha,
         "revision_sha": entry.before_sha,
+        "added": entry.removed,
+        "removed": entry.added,
+        "applies": "next_turn",
     }))
+}
+
+fn line_diff(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
+    let before_lines: Vec<String> = before
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let after_lines: Vec<String> = after
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let before_set: BTreeSet<&str> = before_lines.iter().map(String::as_str).collect();
+    let after_set: BTreeSet<&str> = after_lines.iter().map(String::as_str).collect();
+    let added = after_lines
+        .iter()
+        .filter(|l| !before_set.contains(l.as_str()))
+        .take(25)
+        .cloned()
+        .collect();
+    let removed = before_lines
+        .iter()
+        .filter(|l| !after_set.contains(l.as_str()))
+        .take(25)
+        .cloned()
+        .collect();
+    (added, removed)
+}
+
+/// Inspect `SOUL.md`, `USER.md`, `MEMORY.md`, `memory/*.md`, and recent `.memory-history.jsonl`
+/// rows for the signed-in member's own assistant UI tab. Never reads `AGENTS.md` or `IDENTITY.md`.
+pub fn inspect_member_memory(root: &Path) -> Result<Value> {
+    let root_fd = open_root(root)?;
+    let read_entry = |name: &str, cap: u64, line_cap: Option<usize>| -> Result<Value> {
+        let text = read_child_text(&root_fd, name, cap)?.unwrap_or_default();
+        let sha = sha256_hex(text.as_bytes());
+        let line_count = if text.trim_end().is_empty() {
+            0
+        } else {
+            text.trim_end().lines().count()
+        };
+        let mut obj = json!({
+            "target": name,
+            "text": text,
+            "sha": sha,
+            "line_count": line_count,
+        });
+        if let Some(c) = line_cap {
+            obj["cap"] = json!(c);
+        }
+        Ok(obj)
+    };
+    let files = vec![
+        read_entry(SOUL, FILE_MAX, None)?,
+        read_entry(USER, FILE_MAX, None)?,
+        read_entry(MEMORY, MEMORY_FILE_MAX, Some(MEMORY_INDEX_LINE_CAP))?,
+    ];
+    let mut topics = Vec::new();
+    if let Some(mem_dir) = open_memory_dir(&root_fd, false)? {
+        for name in sorted_md_entries(&mem_dir)?
+            .into_iter()
+            .take(TOPIC_FILES_MAX)
+        {
+            if let Some(slug) = name.strip_suffix(".md") {
+                if valid_topic_slug(slug) {
+                    if let Some(body) = read_child_text(&mem_dir, &name, TOPIC_FILE_MAX)? {
+                        let sha = sha256_hex(body.as_bytes());
+                        let line_count = if body.trim_end().is_empty() {
+                            0
+                        } else {
+                            body.trim_end().lines().count()
+                        };
+                        topics.push(json!({
+                            "slug": slug,
+                            "target": format!("memory/{name}"),
+                            "text": body,
+                            "sha": sha,
+                            "line_count": line_count,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    let history: Vec<Value> = load_history(&root_fd)?
+        .into_iter()
+        .rev()
+        .take(50)
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "at": row.at,
+                "op": row.op,
+                "target": row.target,
+                "actor": row.actor,
+                "turn_id": row.turn_id,
+                "before_exists": row.before_exists,
+                "before_sha": row.before_sha,
+                "after_sha": row.after_sha,
+                "added": row.added,
+                "removed": row.removed,
+                "undone_by": row.undone_by,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "files": files,
+        "topics": topics,
+        "history": history,
+        "applies": "next_turn",
+    }))
+}
+
+/// Apply a direct member edit to `SOUL.md`, `USER.md`, `MEMORY.md`, or `memory/<topic>.md`.
+/// Enforces CAS `expected_sha` (when supplied), secret scanning, size caps, and history logging.
+pub fn edit_member_file(
+    root: &Path,
+    target: &str,
+    content: &str,
+    expected_sha: Option<&str>,
+    actor: &str,
+) -> Result<Value> {
+    let target = target.trim();
+    crate::secret::guard("assistant member file edit", content)?;
+    let root_fd = open_root(root)?;
+
+    let check_cas = |before_exists: bool, before_sha: &str| -> Result<()> {
+        if let Some(expected) = expected_sha {
+            let matches = if before_exists {
+                expected == before_sha
+            } else {
+                expected.is_empty() || expected == before_sha
+            };
+            if !matches {
+                return Err(Error::conflict_coded(
+                    "revision_conflict",
+                    format!("{target} changed since it was loaded"),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    if target == SOUL {
+        let before_opt = read_child_text(&root_fd, SOUL, FILE_MAX)?;
+        let before_text = before_opt
+            .as_ref()
+            .ok_or_else(|| Error::rejected("SOUL.md is missing"))?;
+        let before_sha = sha256_hex(before_text.as_bytes());
+        check_cas(true, &before_sha)?;
+        if !content.contains("cadence:managed-") {
+            let res = update_soul(root, content, None, Some(&before_sha), actor, "member-ui")?;
+            return Ok(json!({
+                "target": SOUL,
+                "sha": res["revision_sha"],
+                "history_id": res["history_id"],
+                "applies": "next_turn",
+            }));
+        }
+        let mut normalized = content.replace("\r\n", "\n");
+        if !normalized.is_empty() && !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+        if normalized.len() as u64 > FILE_MAX {
+            return Err(Error::invalid(
+                "validation_failed",
+                "SOUL.md exceeds maximum size",
+            ));
+        }
+        let _ = crate::managed_section::value(&normalized, "tone")?;
+        let _ = crate::managed_section::read_multiline(&normalized, "soul_body")?;
+        let after_sha = sha256_hex(normalized.as_bytes());
+        let cname = c_name(SOUL)?;
+        replace_child_in_dir(&root_fd, SOUL, &cname, &normalized)?;
+        let (added, removed) = line_diff(before_text, &normalized);
+        let rows = load_history(&root_fd)?;
+        let history_id = next_history_id(&rows, "member_edit", &after_sha);
+        append_history(
+            &root_fd,
+            HistoryEntry {
+                id: history_id.clone(),
+                at: time::iso(time::now_epoch()),
+                op: "member_edit".to_string(),
+                target: SOUL.to_string(),
+                actor: actor.to_string(),
+                turn_id: "member-ui".to_string(),
+                before_exists: true,
+                before_sha,
+                after_sha: after_sha.clone(),
+                before_text: before_text.clone(),
+                added,
+                removed,
+                undone_by: None,
+            },
+        )?;
+        return Ok(json!({
+            "target": SOUL,
+            "sha": after_sha,
+            "history_id": history_id,
+            "applies": "next_turn",
+        }));
+    }
+
+    if target == USER || target == MEMORY {
+        let cap = if target == USER {
+            FILE_MAX
+        } else {
+            MEMORY_FILE_MAX
+        };
+        let before_opt = read_child_text(&root_fd, target, cap)?;
+        let before_exists = before_opt.is_some();
+        let before_text = before_opt.unwrap_or_default();
+        let before_sha = sha256_hex(before_text.as_bytes());
+        check_cas(before_exists, &before_sha)?;
+        let mut normalized = content.replace("\r\n", "\n");
+        if !normalized.is_empty() && !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+        if normalized.len() as u64 > cap {
+            return Err(Error::invalid(
+                "validation_failed",
+                format!("{target} exceeds maximum size"),
+            ));
+        }
+        if target == USER && normalized.contains("cadence:managed-") {
+            let _ = crate::managed_section::value(&normalized, "user_name")?;
+            let _ = crate::managed_section::value(&normalized, "preferences")?;
+        }
+        let after_sha = sha256_hex(normalized.as_bytes());
+        let cname = c_name(target)?;
+        replace_child_in_dir(&root_fd, target, &cname, &normalized)?;
+        let (added, removed) = line_diff(&before_text, &normalized);
+        let rows = load_history(&root_fd)?;
+        let history_id = next_history_id(&rows, "member_edit", &after_sha);
+        append_history(
+            &root_fd,
+            HistoryEntry {
+                id: history_id.clone(),
+                at: time::iso(time::now_epoch()),
+                op: "member_edit".to_string(),
+                target: target.to_string(),
+                actor: actor.to_string(),
+                turn_id: "member-ui".to_string(),
+                before_exists,
+                before_sha,
+                after_sha: after_sha.clone(),
+                before_text,
+                added,
+                removed,
+                undone_by: None,
+            },
+        )?;
+        return Ok(json!({
+            "target": target,
+            "sha": after_sha,
+            "history_id": history_id,
+            "applies": "next_turn",
+        }));
+    }
+
+    if let Some(rest) = target.strip_prefix("memory/") {
+        let slug = rest
+            .strip_suffix(".md")
+            .ok_or_else(|| Error::invalid("invalid_target", "memory topic path must end in .md"))?;
+        check_topic_slug(slug)?;
+        let filename = format!("{slug}.md");
+        let mem_dir = open_memory_dir(&root_fd, true)?
+            .ok_or_else(|| Error::internal("memory directory missing after create"))?;
+        let before_opt = read_child_text(&mem_dir, &filename, TOPIC_FILE_MAX)?;
+        if before_opt.is_none() && sorted_md_entries(&mem_dir)?.len() >= TOPIC_FILES_MAX {
+            return Err(Error::invalid(
+                "validation_failed",
+                format!("cannot exceed {TOPIC_FILES_MAX} topic files in memory/"),
+            ));
+        }
+        let before_exists = before_opt.is_some();
+        let before_text = before_opt.unwrap_or_default();
+        let before_sha = sha256_hex(before_text.as_bytes());
+        check_cas(before_exists, &before_sha)?;
+        let mut normalized = content.replace("\r\n", "\n");
+        if !normalized.is_empty() && !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+        if normalized.len() as u64 > TOPIC_FILE_MAX {
+            return Err(Error::invalid(
+                "validation_failed",
+                format!("topic note exceeds {TOPIC_FILE_MAX} bytes"),
+            ));
+        }
+        let after_sha = sha256_hex(normalized.as_bytes());
+        let cname = c_name(&filename)?;
+        replace_child_in_dir(&mem_dir, &filename, &cname, &normalized)?;
+        let (added, removed) = line_diff(&before_text, &normalized);
+        let rows = load_history(&root_fd)?;
+        let history_id = next_history_id(&rows, "member_edit", &after_sha);
+        let rel_path = format!("memory/{filename}");
+        append_history(
+            &root_fd,
+            HistoryEntry {
+                id: history_id.clone(),
+                at: time::iso(time::now_epoch()),
+                op: "member_edit".to_string(),
+                target: rel_path.clone(),
+                actor: actor.to_string(),
+                turn_id: "member-ui".to_string(),
+                before_exists,
+                before_sha,
+                after_sha: after_sha.clone(),
+                before_text,
+                added,
+                removed,
+                undone_by: None,
+            },
+        )?;
+        return Ok(json!({
+            "target": rel_path,
+            "sha": after_sha,
+            "history_id": history_id,
+            "applies": "next_turn",
+        }));
+    }
+
+    Err(Error::invalid(
+        "invalid_target",
+        format!("target '{target}' is outside the editable personal assistant files"),
+    ))
 }
 
 fn valid_journal_month_file(name: &str) -> bool {

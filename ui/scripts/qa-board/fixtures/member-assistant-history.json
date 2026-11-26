@@ -3,9 +3,27 @@
   "entries": [
     { "id": "csrid_qa_1", "role": "member", "kind": "message", "text": "Get a quote for 500 tote bags from the supplier.", "message": "m_qa_1", "created": 1794600000 },
     { "id": "csrid_qa_2", "role": "agent", "kind": "tool_call", "text": "browser: open shop.example-supplier.test", "message": "m_qa_1", "created": 1794600005 },
-    { "id": "csrid_qa_3", "role": "agent", "kind": "turn_result", "text": "The quote form needs you to sign in. Open the Browser card to take over.", "message": "m_qa_1", "created": 1794600010 }
+    { "id": "csrid_qa_3", "role": "agent", "kind": "turn_result", "text": "The quote form needs you to sign in. Open the Browser card to take over.", "message": "m_qa_1", "created": 1794600010 },
+    {
+      "id": "csrid_qa_4",
+      "role": "agent",
+      "kind": "context_receipt",
+      "text": "+1 fact in MEMORY.md",
+      "message": "m_qa_1",
+      "created": 1794600012,
+      "payload": {
+        "op": "remember",
+        "history_id": "mem_qa_1",
+        "target": "MEMORY.md",
+        "added_count": 1,
+        "removed_count": 0,
+        "added_preview": ["- 2026-11-26: Supplier quotes for 500 tote bags use shop.example-supplier.test"],
+        "removed_preview": [],
+        "undone_history_id": null
+      }
+    }
   ],
-  "cursor": "csc1_3",
+  "cursor": "csc1_4",
   "before_cursor": "csc1_0",
   "more_before": false,
   "more_after": false

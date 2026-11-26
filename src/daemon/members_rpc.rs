@@ -1821,6 +1821,110 @@ impl Shared {
         }))
     }
 
+    /// `member_assist_memory_get` — the signed-in member's own editable
+    /// `SOUL.md`, `USER.md`, `MEMORY.md`, topic notes, and history diffs.
+    pub(super) fn rpc_member_assist_memory_get(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_unknown_fields(params, &["member_envelope"], "member assist memory get")?;
+        let member = self.member_caller(
+            params,
+            peer_pid,
+            "member assist memory get",
+            "assist_state",
+            crate::assistant_actor::AssistScope::Read,
+            None,
+        )?;
+        let root = self.assistant_principal_cwd(&member.org, &member.sub);
+        super::assistant_memory::inspect_member_memory(&root)
+    }
+
+    /// `member_assist_memory_edit` — apply a direct member edit to `SOUL.md`,
+    /// `USER.md`, `MEMORY.md`, or `memory/<topic>.md` without advancing
+    /// `MemberContextTracker.delivered`, so the assistant receives a delta on its next turn.
+    pub(super) fn rpc_member_assist_memory_edit(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_unknown_fields(
+            params,
+            &["member_envelope", "target", "content", "expected_sha"],
+            "member assist memory edit",
+        )?;
+        let member = self.member_caller(
+            params,
+            peer_pid,
+            "member assist memory edit",
+            "assist_send",
+            crate::assistant_actor::AssistScope::Write,
+            None,
+        )?;
+        let target = required_str(params, "target")?;
+        let content = params
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("member assist memory edit requires content"))?;
+        let expected_sha = optional_str(params, "expected_sha");
+        let root = self.assistant_principal_cwd(&member.org, &member.sub);
+        let actor = format!("users/{}", member.sub);
+        let out = super::assistant_memory::edit_member_file(
+            &root,
+            target,
+            content,
+            expected_sha,
+            &actor,
+        )?;
+        let _ = self.store.event_public(
+            &member.alias,
+            "assistant_context_updated",
+            json!({
+                "op": "member_edit",
+                "history_id": out.get("history_id"),
+                "target": out.get("target"),
+            }),
+        );
+        Ok(out)
+    }
+
+    /// `member_assist_memory_undo` — undo one `.memory-history.jsonl` entry on
+    /// behalf of the signed-in member without advancing `MemberContextTracker.delivered`.
+    pub(super) fn rpc_member_assist_memory_undo(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_unknown_fields(
+            params,
+            &["member_envelope", "history_id"],
+            "member assist memory undo",
+        )?;
+        let member = self.member_caller(
+            params,
+            peer_pid,
+            "member assist memory undo",
+            "assist_send",
+            crate::assistant_actor::AssistScope::Write,
+            None,
+        )?;
+        let history_id = required_str(params, "history_id")?;
+        let root = self.assistant_principal_cwd(&member.org, &member.sub);
+        let actor = format!("users/{}", member.sub);
+        let out = super::assistant_memory::undo(&root, history_id, &actor, "member-ui")?;
+        let _ = self.store.event_public(
+            &member.alias,
+            "assistant_context_updated",
+            json!({
+                "op": "undo",
+                "history_id": out.get("undo_history_id"),
+                "target": out.get("target"),
+            }),
+        );
+        Ok(out)
+    }
+
     /// Read only the member's bound assistant conversation. Positions are
     /// opaque and member-bound; operator-only rows are excluded before paging.
     pub(super) fn rpc_member_assist_history(&self, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -4078,6 +4182,44 @@ impl Shared {
                 _ => Vec::new(),
             };
             self.record_member_self_refresh(&binding.alias, &running_id, &root, &targets);
+            let target_str = out
+                .get("target")
+                .or_else(|| out.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or(super::bootstrap_files::MEMORY);
+            let (added_lines, removed_lines) = match op {
+                "remember" => (
+                    out.get("line")
+                        .and_then(Value::as_str)
+                        .map(|s| vec![s.to_string()])
+                        .unwrap_or_default(),
+                    Vec::new(),
+                ),
+                "forget" => (
+                    Vec::new(),
+                    out.get("removed")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+                _ => (Vec::new(), Vec::new()),
+            };
+            if let Some(conv_id) = binding.conversation_id.as_deref() {
+                self.append_context_receipt_entry(
+                    conv_id,
+                    &running_id,
+                    op,
+                    target_str,
+                    &out,
+                    added_lines,
+                    removed_lines,
+                );
+            }
             let _ = self.store.event_public(
                 &binding.alias,
                 "assistant_context_updated",
@@ -4158,6 +4300,37 @@ impl Shared {
                 .unwrap_or_default(),
         };
         self.record_member_self_refresh(&binding.alias, &running.id, &root, &targets);
+        if let Some(conv_id) = binding.conversation_id.as_deref() {
+            let added_lines = out
+                .get("added")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let removed_lines = out
+                .get("removed")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.append_context_receipt_entry(
+                conv_id,
+                &running.id,
+                "undo",
+                target,
+                &out,
+                added_lines,
+                removed_lines,
+            );
+        }
         let _ = self.store.event_public(
             &binding.alias,
             "assistant_context_updated",
@@ -4168,6 +4341,57 @@ impl Shared {
             }),
         );
         Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_context_receipt_entry(
+        &self,
+        conv_id: &str,
+        running_id: &str,
+        op: &str,
+        target: &str,
+        out: &Value,
+        added_lines: Vec<String>,
+        removed_lines: Vec<String>,
+    ) {
+        let history_id = if op == "undo" {
+            out.get("undo_history_id").and_then(Value::as_str)
+        } else {
+            out.get("history_id").and_then(Value::as_str)
+        };
+        let added_count = added_lines.len();
+        let removed_count = removed_lines.len();
+        let summary_text = match op {
+            "remember" => "+1 fact in MEMORY.md".to_string(),
+            "forget" => format!(
+                "-{removed_count} {} in MEMORY.md",
+                if removed_count == 1 { "fact" } else { "facts" }
+            ),
+            "update_soul" => "Updated SOUL.md".to_string(),
+            "write_topic" => format!("Updated {target}"),
+            "undo" => format!("Undid change to {target}"),
+            _ => format!("Updated {target}"),
+        };
+        let payload = json!({
+            "op": op,
+            "history_id": history_id,
+            "target": target,
+            "added_count": added_count,
+            "removed_count": removed_count,
+            "added_preview": added_lines.into_iter().take(3).collect::<Vec<_>>(),
+            "removed_preview": removed_lines.into_iter().take(3).collect::<Vec<_>>(),
+            "undone_history_id": out.get("undone").and_then(Value::as_str),
+        });
+        let _ = self.store.thread_append_to(
+            conv_id,
+            crate::store::NewEntry {
+                role: crate::store::ROLE_AGENT,
+                kind: crate::store::KIND_CONTEXT_RECEIPT,
+                text: &summary_text,
+                payload: Some(payload),
+                message_id: Some(running_id),
+            },
+        );
     }
 
     pub(super) fn rpc_assistant_skill_show(&self, params: &Value, peer_pid: u32) -> Result<Value> {

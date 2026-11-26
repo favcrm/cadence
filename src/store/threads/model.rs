@@ -26,6 +26,9 @@ pub const KIND_HIRE_PROPOSAL: &str = "hire_proposal";
 /// `createSurface` envelope. Inert: an answer is an ordinary operator
 /// message. Its `text` is the daemon-written fallback.
 pub const KIND_SURFACE: &str = "surface";
+/// CAD-2834: durable inline receipt when the personal assistant updates or
+/// undoes its own `SOUL.md` / `MEMORY.md` / `memory/<topic>.md` context.
+pub const KIND_CONTEXT_RECEIPT: &str = "context_receipt";
 
 /// CAD-1767: thread entry kinds only the operator reads - artifact cards,
 /// hire proposals and (CAD-2285) forms. The one list every member-facing
@@ -45,6 +48,7 @@ pub(super) const KINDS: &[&str] = &[
     KIND_ARTIFACT,
     KIND_HIRE_PROPOSAL,
     KIND_SURFACE,
+    KIND_CONTEXT_RECEIPT,
 ];
 
 // ECMAScript String.trim whitespace: the Home notifier applies that same

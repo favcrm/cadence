@@ -9,6 +9,7 @@ import { readPersonalIdentity } from "../assistant/identity";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { OptInTools, WorkspaceSkills, type TabContext } from "./AgentTabs";
 import type { AgentTab } from "./agentTabModel";
+import AssistantMemoryTab from "./AssistantMemoryTab";
 import InstructionsEditor from "./InstructionsEditor";
 import { contextOf } from "./instructionsDoc";
 import { PERSONAL_ALIAS } from "./personalAssistant";
@@ -18,6 +19,7 @@ import "./agents.css";
 
 const PERSONAL_TABS = [
   { id: "instructions", label: "Instructions" },
+  { id: "memory", label: "Memory" },
   { id: "routines", label: "Routines" },
   { id: "skills", label: "Skills" },
   { id: "tools", label: "Tools" },
@@ -26,7 +28,15 @@ const PERSONAL_TABS = [
 type PersonalTab = (typeof PERSONAL_TABS)[number]["id"];
 
 function normalizePersonalTab(tab: AgentTab | undefined): PersonalTab {
-  if (tab === "routines" || tab === "skills" || tab === "tools" || tab === "instructions") return tab;
+  if (
+    tab === "memory" ||
+    tab === "routines" ||
+    tab === "skills" ||
+    tab === "tools" ||
+    tab === "instructions"
+  ) {
+    return tab;
+  }
   return "instructions";
 }
 
@@ -215,7 +225,11 @@ export default function MyAssistantPage({
         ))}
       </nav>
       <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
-        {section === "routines" ? (
+        {section === "memory" ? (
+          <div className="ap-body">
+            <AssistantMemoryTab writable={writable} onToast={onToast} />
+          </div>
+        ) : section === "routines" ? (
           assistantRead === "reading" ? (
             <p className="rc-note">{t("Loading routines…")}</p>
           ) : assistantRead === "failed" || !assistantId ? (

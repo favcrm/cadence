@@ -8,12 +8,13 @@ export const AGENT_TABS = [
   { id: "history", label: "History" },
 ] as const;
 
-/** Beyond the strip: `settings` opens the gear drawer over the active tab. */
-export type AgentTab = (typeof AGENT_TABS)[number]["id"] | "settings";
+/** Beyond the strip: `settings` opens the gear drawer; `memory` is on personal assistant pages. */
+export type AgentTab = (typeof AGENT_TABS)[number]["id"] | "settings" | "memory";
 
 /** Where a link to a section that has moved lands. */
 const MOVED_TABS = new Map<string, AgentTab>([
   ["settings", "settings"],
+  ["memory", "memory"],
   ["job", "instructions"],
   ["knowledge", "settings"],
   ["access", "settings"],

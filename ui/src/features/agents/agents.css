@@ -352,3 +352,127 @@
 .ap-cloud-card { border: 1px solid var(--color-line, #e5e5e5); border-radius: 10px; padding: 10px 12px; }
 .ap-cloud-card ul { margin: 6px 0 0; padding-left: 18px; }
 .ap-cloud-card a { text-decoration: underline; }
+
+/* CAD-2834: Personal assistant Memory & Soul tab */
+.ap-mem-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+.ap-mem-editor, .ap-mem-history {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+.ap-mem-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.ap-mem-pill {
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+  color: var(--color-ink-300);
+  border-radius: 999px;
+  padding: 0.28rem 0.7rem;
+  font-size: var(--text-label);
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+.ap-mem-pill:hover {
+  border-color: var(--color-edge-hover);
+  color: var(--color-ink-100);
+}
+.ap-mem-pill.active {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  color: var(--color-accent);
+}
+.ap-mem-pill.add {
+  border-style: dashed;
+}
+.ap-mem-new-topic {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.ap-mem-new-topic .field {
+  flex: 1 1 10rem;
+  min-width: 0;
+  height: 2rem;
+}
+.ap-mem-err {
+  color: var(--color-fail);
+  font-size: var(--text-micro);
+  flex-basis: 100%;
+}
+.ap-mem-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.ap-mem-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.ap-mem-hlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+.ap-mem-hitem {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.45rem;
+  background: var(--color-ink-850);
+  padding: 0.65rem 0.75rem;
+  display: grid;
+  gap: 0.4rem;
+  min-width: 0;
+}
+.ap-mem-hhead, .ap-mem-hfoot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  font-size: var(--text-label);
+}
+.ap-mem-hop {
+  color: var(--color-ink-100);
+  font-weight: 500;
+}
+.ap-mem-htarget {
+  color: var(--color-ink-300);
+  font-size: var(--text-micro);
+  overflow-wrap: anywhere;
+}
+.ap-mem-hactor, .ap-mem-htime {
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+.ap-mem-hdiff {
+  list-style: none;
+  margin: 0;
+  padding: 0.4rem 0.5rem;
+  border-radius: 0.35rem;
+  background: var(--color-ink-900);
+  display: grid;
+  gap: 0.2rem;
+  font-size: var(--text-micro);
+  overflow-wrap: anywhere;
+}
+@media (max-width: 959px) {
+  .ap-mem-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
