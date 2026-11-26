@@ -282,24 +282,35 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
     case "social.radar.show": operation="radar/show"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
     case "social.radar.save": {
       operation="radar/save";
-      const allowed=new Set(["alias","keywords","region","locale","brand_slug"]);
+      const allowed=new Set(["alias","keywords","sources","schedule","region","locale","brand_slug"]);
       if(Object.keys(args).some((k)=>!allowed.has(k))||!Array.isArray(args.keywords)||args.keywords.length>12||args.keywords.some((k)=>typeof k!=="string"||!k.trim()||k.length>60)) return refuse("bad_args","That request is not valid.");
+      if("sources" in args&&(!Array.isArray(args.sources)||args.sources.length===0||args.sources.length>7||args.sources.some((s)=>typeof s!=="string"||!s.trim()||s.length>24))) return refuse("bad_args","That request is not valid.");
+      if("schedule" in args){
+        const sch=args.schedule;
+        const schedKeys=new Set(["cadence","run_time","timezone"]);
+        if(!isObject(sch)||Object.keys(sch).some((k)=>!schedKeys.has(k))) return refuse("bad_args","That request is not valid.");
+        for(const k of Object.keys(sch)){
+          const v=(sch as Record<string,unknown>)[k];
+          if(typeof v!=="string"||!v.trim()||v.length>64) return refuse("bad_args","That request is not valid.");
+        }
+      }
       if("region" in args&&(typeof args.region!=="string"||!args.region.trim()||args.region.length>16)) return refuse("bad_args","That request is not valid.");
       if("locale" in args&&(typeof args.locale!=="string"||!args.locale.trim()||args.locale.length>16)) return refuse("bad_args","That request is not valid.");
       if("brand_slug" in args&&(typeof args.brand_slug!=="string"||!args.brand_slug.trim()||args.brand_slug.length>48)) return refuse("bad_args","That request is not valid.");
-      fields={keywords:args.keywords,...("region" in args?{region:args.region}:{}),...("locale" in args?{locale:args.locale}:{}),...("brand_slug" in args?{brand_slug:args.brand_slug}:{})};
+      fields={keywords:args.keywords,...("sources" in args?{sources:args.sources}:{}),...("schedule" in args?{schedule:args.schedule}:{}),...("region" in args?{region:args.region}:{}),...("locale" in args?{locale:args.locale}:{}),...("brand_slug" in args?{brand_slug:args.brand_slug}:{})};
       break;
     }
     case "social.radar.scan": {
       operation="radar/scan";
-      const allowed=new Set(["alias","request_id","keywords","region","locale","brand_slug","model"]);
+      const allowed=new Set(["alias","request_id","keywords","sources","region","locale","brand_slug","model"]);
       if(Object.keys(args).some((k)=>!allowed.has(k))||typeof args.request_id!=="string"||!args.request_id.length||args.request_id.length>128) return refuse("bad_args","That request is not valid.");
       if("keywords" in args&&(!Array.isArray(args.keywords)||args.keywords.length>12||args.keywords.some((k)=>typeof k!=="string"||!k.trim()||k.length>60))) return refuse("bad_args","That request is not valid.");
+      if("sources" in args&&(!Array.isArray(args.sources)||args.sources.length===0||args.sources.length>7||args.sources.some((s)=>typeof s!=="string"||!s.trim()||s.length>24))) return refuse("bad_args","That request is not valid.");
       if("region" in args&&(typeof args.region!=="string"||!args.region.trim()||args.region.length>16)) return refuse("bad_args","That request is not valid.");
       if("locale" in args&&(typeof args.locale!=="string"||!args.locale.trim()||args.locale.length>16)) return refuse("bad_args","That request is not valid.");
       if("brand_slug" in args&&(typeof args.brand_slug!=="string"||!args.brand_slug.trim()||args.brand_slug.length>48)) return refuse("bad_args","That request is not valid.");
       if("model" in args&&(typeof args.model!=="string"||!args.model.trim()||args.model.length>128)) return refuse("bad_args","That request is not valid.");
-      fields={request_id:args.request_id,...("keywords" in args?{keywords:args.keywords}:{}),...("region" in args?{region:args.region}:{}),...("locale" in args?{locale:args.locale}:{}),...("brand_slug" in args?{brand_slug:args.brand_slug}:{}),...("model" in args?{model:args.model}:{})};
+      fields={request_id:args.request_id,...("keywords" in args?{keywords:args.keywords}:{}),...("sources" in args?{sources:args.sources}:{}),...("region" in args?{region:args.region}:{}),...("locale" in args?{locale:args.locale}:{}),...("brand_slug" in args?{brand_slug:args.brand_slug}:{}),...("model" in args?{model:args.model}:{})};
       break;
     }
     default: return refuse("bad_args","That request is not valid.");
