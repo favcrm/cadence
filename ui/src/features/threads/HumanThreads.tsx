@@ -421,12 +421,30 @@ function MentionOutcomes({ outcomes }: { outcomes: MentionOutcome[] }) {
   );
 }
 
+/** Mobile-only back button to return from an open room/conversation to the Channels list. */
+export function ChannelsBackButton({ onBack }: { onBack?: () => void }) {
+  const t = useTranslate();
+  if (!onBack) return null;
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={onBack}
+      aria-label={t("Back to channels")}
+      className="threads-back-btn"
+    >
+      <span aria-hidden="true">←</span> {t("Channels")}
+    </Button>
+  );
+}
+
 /** An open Channel or DM: header avatar stack, interleaved posts/events, `@mention` + `/note` floating dock. */
 export function HumanRoomTimeline({
   id,
   me,
   refresh,
   onState,
+  onBack,
   onOpenContext,
   detailsOpen = false,
   onInvite,
@@ -440,6 +458,7 @@ export function HumanRoomTimeline({
   me: HumanMe;
   refresh: number;
   onState: (state: HumanRoomState) => void;
+  onBack?: () => void;
   onOpenContext: () => void;
   detailsOpen?: boolean;
   onInvite?: () => void;
@@ -862,6 +881,7 @@ export function HumanRoomTimeline({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
+        <ChannelsBackButton onBack={onBack} />
         <div className="threads-head-title">
           <h2>{headerTitle}</h2>
           {headerSub !== null ? (

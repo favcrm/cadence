@@ -672,7 +672,39 @@ async function main(): Promise<void> {
     "Hosted Channels sidebar does not get stuck displaying 'Loading conversations…' above channels",
   );
 
+  // 9. CAD-2840 Non-operator member (operator=false) transitions from pending /me to resolved without crashing React #310,
+  //    sets data-open state for narrow navigation, and renders the Channels back button inside the room header.
   await React.act(async () => root.unmount());
+  const nonOpHost = document.createElement("div");
+  document.body.appendChild(nonOpHost);
+  const nonOpRoot = createRoot(nonOpHost);
+  holdHumanMe = true;
+  window.history.replaceState(null, "", "/threads?h=room-1");
+  await React.act(async () => {
+    nonOpRoot.render(
+      React.createElement(LocaleProvider, null,
+        React.createElement(ThreadsPage, {
+          operator: false,
+          workConversationsEnabled: false,
+          humanThreadsEnabled: true,
+        }),
+      ),
+    );
+  });
+  await flush();
+  assert(nonOpHost.textContent?.includes("Checking your access…"), "Non-operator sees loading state while human identity resolves");
+  holdHumanMe = false;
+  (releaseHumanMe as (() => void) | null)?.();
+  for (let i = 0; i < 8; i += 1) await flush();
+  assert(
+    nonOpHost.querySelector(".threads-layout")?.getAttribute("data-open") === "1"
+      && nonOpHost.querySelector(".threads-list")?.textContent?.includes("Release Sync")
+      && nonOpHost.querySelector(".threads-back-btn") !== null,
+    "Non-operator transitions cleanly into Channels UI with data-open=1 and back button (no React #310 hook mismatch)",
+  );
+  await React.act(async () => nonOpRoot.unmount());
+  nonOpHost.remove();
+
   host.remove();
   resetPrivateSession();
   console.log("mentions and channels checks passed");
