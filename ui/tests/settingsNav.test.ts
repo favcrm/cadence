@@ -4,6 +4,7 @@ export {};
  * nothing keeps the full list, so deploy order can't hide a working page.
  */
 import { settingsLabel, settingsNavGroups, settingsRedirect } from "../src/features/settings/settingsNav";
+import type { Meta } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, why: string): void {
   const a = JSON.stringify(actual), e = JSON.stringify(expected);
@@ -33,11 +34,37 @@ equal(
   true,
   "a hosted board that lists templates shows the sidebar entry",
 );
-equal(
-  flat({ ...OWNER, platform_account_configured: true }).includes("Billing"),
-  true,
-  "Billing keeps its own flag",
-);
+const BILLING_OWNER = {
+  ...OWNER,
+  hosted: true,
+  platform_account_configured: true,
+  signed_in: true,
+  session: {
+    id: "billing-owner", account_id: "acct_owner", origin: "public", created: 1, idle_expires_at: 2, expires_at: 2,
+    last_used: 1, user_agent: "fixture",
+    user: { sub: "usr_owner", role: "operator", name: "Owner", email: "owner@example.test", handle: "owner" },
+  } satisfies NonNullable<Meta["session"]>,
+};
+const BILLING_MEMBER = {
+  ...BILLING_OWNER,
+  ...MEMBER,
+  session: {
+    ...BILLING_OWNER.session,
+    user: { ...BILLING_OWNER.session.user, sub: "usr_member", role: "member" as const },
+  },
+};
+equal(flat(BILLING_OWNER).includes("Billing"), true, "the configured hosted owner sees Billing");
+equal(settingsRedirect("account", BILLING_OWNER), null, "the owner can open a Billing link");
+equal(flat(BILLING_MEMBER).includes("Billing"), false, "members do not see Billing despite the configured capability");
+equal(settingsRedirect("account", BILLING_MEMBER), "members", "a member's Billing link returns to Settings");
+equal(settingsRedirect("account", { ...BILLING_MEMBER, settings_sections: undefined }), "models", "an older hosted member cannot use a Billing link");
+equal(flat({ ...BILLING_OWNER, session: null }).includes("Billing"), false, "unconfirmed ownership stays hidden");
+equal(flat({ ...BILLING_OWNER, signed_in: false }).includes("Billing"), false, "a signed-out owner cannot see Billing");
+equal(flat({
+  ...BILLING_OWNER,
+  session: { ...BILLING_OWNER.session, user: { ...BILLING_OWNER.session.user, sub: "operator-token:ops_test" } },
+}).includes("Billing"), false, "platform operator credentials are not workspace ownership");
+equal(flat({ platform_account_configured: true }).includes("Billing"), true, "the local connected account stays available");
 equal(settingsLabel("account"), "Billing", "the crumb names Billing");
 equal(settingsRedirect("models", OWNER), "members", "bare /settings opens on a working page");
 equal(settingsRedirect("permissions", OWNER), "members", "a direct link to a hidden section moves");

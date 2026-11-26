@@ -42,11 +42,9 @@ interface Props {
   hiddenScreens?: readonly Screen[];
   /** Hosted workspaces omit local `~/pm` hints. */
   hosted?: boolean;
-  /** Compact hosted billing/trial status pill rendered above the account row. */
-  billingPill?: ReactNode;
 }
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0, noWiki = false, hiddenScreens, hosted = false, billingPill, collapsed, onExpand }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0, noWiki = false, hiddenScreens, hosted = false, collapsed, onExpand }: Props) {
   const { t } = useLocale();
   const [tip, setTip] = useState<{ text: string; top: number; left: number } | null>(null);
   const showTip = (target: EventTarget | null) => {
@@ -87,11 +85,6 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
           </div>
         </div>
       </div>
-      {billingPill && (
-        <div className="sidebar-billing-slot pb-1.5" aria-hidden={collapsed || undefined} inert={collapsed || undefined}>
-          {billingPill}
-        </div>
-      )}
       <div data-sidebar-footer className="pt-1 border-t border-ink-700 text-label text-ink-500">
         {signedIn === true ? account : (
           <div className="px-2 leading-9 truncate">{signedIn === false ? t("not signed in · read only") : "…"}</div>

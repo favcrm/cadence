@@ -889,56 +889,6 @@ export function formatUsagePercent(value: number | null | undefined): string | n
   return `${value.toFixed(1)}%`;
 }
 
-export interface SidebarBillingStatus {
-  labelKind: "plan" | "trial" | "billing";
-  planName?: string;
-  metricKind: "used" | "extra_left" | "depleted";
-  percent: number;
-  tone: "ok" | "warn" | "info" | "fail";
-}
-
-/** Derive compact percentage/health status for the sidebar footer pill (zero raw credits). */
-export function sidebarBillingStatus(
-  account: HostedBillingAccount,
-  offer: HostedBillingOffer | null,
-): SidebarBillingStatus {
-  const summary = resolveUsageSummary(account, offer);
-  const subActive = account.plan?.status === "active" || account.plan?.status === "past_due";
-  const labelKind: SidebarBillingStatus["labelKind"] = subActive
-    ? "plan"
-    : account.trial?.status === "active"
-      ? "trial"
-      : "billing";
-  const planName = subActive ? account.plan?.name : undefined;
-
-  if (summary.mode === "overflow" || summary.mode === "refill_only") {
-    return {
-      labelKind,
-      ...(planName ? { planName } : {}),
-      metricKind: "extra_left",
-      percent: summary.extra.poolRemainingPercent,
-      tone: summary.extra.status === "low" ? "warn" : "info",
-    };
-  }
-  if (summary.mode === "depleted") {
-    return {
-      labelKind,
-      ...(planName ? { planName } : {}),
-      metricKind: "depleted",
-      percent: 100,
-      tone: "fail",
-    };
-  }
-  const used = summary.cycle?.usedPercent ?? 0;
-  return {
-    labelKind,
-    ...(planName ? { planName } : {}),
-    metricKind: "used",
-    percent: used,
-    tone: used >= 80 ? "warn" : "ok",
-  };
-}
-
 /** Integer-derived percentage split between included/trial credits and non-expiring refills. */
 export function creditSplitPercentages(
   includedScaled6: string,

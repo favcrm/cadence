@@ -306,9 +306,6 @@ body {
   opacity: 0;
   pointer-events: none;
 }
-[data-sidebar-rail] .sidebar-billing-slot {
-  display: none;
-}
 [data-sidebar-rail] .navlink {
   position: relative;
   padding: 0 10px;

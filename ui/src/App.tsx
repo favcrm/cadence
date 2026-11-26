@@ -44,11 +44,7 @@ import DocumentsScreen from "./features/documents/DocumentsScreen";
 import { documentsViewer } from "./features/documents/documentsAccess";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
-import {
-  parseHostedBilling,
-  sidebarBillingStatus,
-  type HostedBillingSnapshot,
-} from "./features/settings/accountDisplay";
+import { parseHostedWorkspaces } from "./features/settings/accountDisplay";
 import Connections from "./features/settings/Connections";
 import CredentialEntry from "./features/connections/CredentialEntry";
 import CredentialAuthorize from "./features/connections/CredentialAuthorize";
@@ -546,6 +542,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
 
   // A board that says what Settings it serves never shows a page it doesn't.
   const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
+  const settingsCrumb = route.screen === "settings" ? settingsLabel(settingsTarget ?? route.section) : null;
   useEffect(() => {
     if (settingsTarget) {
       const targetRoute: Route = { screen: "settings", section: settingsTarget };
@@ -558,34 +555,21 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   useEffect(() => {
     if (legacyDocumentsHref) navigate(legacyDocumentsHref, { replace: true });
   }, [legacyDocumentsHref]);
-  // CAD-1312: the header's organisation label is the hosted board's
-  // configured company display name (`GET /api/platform-account`, already
-  // projected server-side). Local and tailnet boards have no configured
-  // organisation — the label stays the neutral "Cadence", never a
-  // hostname, user or project name. One nonblocking read per page load;
-  // a failure or missing name leaves the fallback.
-  const [orgName, setOrgName] = useState("Cadence");
-  const [billingSummary, setBillingSummary] = useState<HostedBillingSnapshot | null>(null);
+  // The breadcrumb uses workspace identity, not the owner's financial data.
+  const [orgIdentity, setOrgIdentity] = useState<{ scope: string; name: string; nameZh: string | null } | null>(null);
   useEffect(() => {
-    if (meta === null) return;
-    if (meta.platform_account_configured !== true) {
-      setOrgName("Cadence");
-      setBillingSummary(null);
-      return;
-    }
+    if (meta.platform_account_configured !== true) return;
     const abort = new AbortController();
     void withPrivateOperation(async (operation) => {
-      if (meta.hosted === true) {
-        const response = await operation.fetch("/api/account/billing", { headers: sessionHeaders() });
-        const data: unknown = response.ok ? await response.json().catch(() => null) : null;
+      if (hostedBoard) {
+        const response = await operation.fetch("/api/account/workspaces", { headers: sessionHeaders() });
+        const data: unknown = response.ok ? await response.json() : null;
         operation.assertCurrent();
-        const snapshot = parseHostedBilling(data);
-        if (!snapshot) {
-          setOrgName("Cadence");
-          setBillingSummary(null);
-          return;
+        const payload = parseHostedWorkspaces(data);
+        const current = payload?.workspaces.find((workspace) => workspace.workspaceId === payload.currentWorkspaceId);
+        if (current) {
+          setOrgIdentity({ scope: personalIdentity, name: current.name, nameZh: current.nameZh });
         }
-        setBillingSummary(snapshot);
         return;
       }
       const response = await operation.fetch("/api/platform-account", { headers: sessionHeaders() });
@@ -593,21 +577,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       operation.assertCurrent();
       const account = data && typeof data === "object" && "account" in data ? data.account : null;
       const company = account && typeof account === "object" && "company" in account ? account.company : null;
-      const name = company && typeof company === "object" && "name" in company && typeof company.name === "string" ? company.name.trim() : "";
-      setBillingSummary(null);
-      setOrgName(name || "Cadence");
+      const name = company && typeof company === "object" && "name" in company && typeof company.name === "string" ? company.name : "";
+      setOrgIdentity({ scope: personalIdentity, name, nameZh: null });
     }, abort.signal).catch(() => undefined);
     return () => abort.abort();
-  }, [meta?.platform_account_configured, meta?.hosted, meta?.session?.id, meta === null]);
-  const headerOrgName =
-    meta?.hosted === true && billingSummary
-      ? (locale === "zh-TW" && billingSummary.workspace.nameZh?.trim()
-          ? billingSummary.workspace.nameZh.trim()
-          : "") ||
-        billingSummary.account?.company.name.trim() ||
-        billingSummary.workspace.name.trim() ||
-        "Cadence"
-      : orgName;
+  }, [meta.platform_account_configured, hostedBoard, personalIdentity]);
+  const headerOrgName = meta.platform_account_configured === true && orgIdentity?.scope === personalIdentity
+    ? (locale === "zh-TW" ? orgIdentity.nameZh?.trim() : "") || orgIdentity.name.trim() || "Cadence"
+    : "Cadence";
 
   useEffect(() => {
     persistBrowserProjectView(view);
@@ -1335,9 +1312,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     />
   );
 
-  const billingHref = meta?.platform_account_configured === true
-    ? hrefFor({ screen: "settings", section: "account" })
-    : undefined;
   const projectsLoaded = projectsState.status === "ok" || projectsState.status === "empty";
   const agentsLoaded = agentsState.status === "ok" || agentsState.status === "empty";
   const nonMasterAgents = (agents?.agents ?? []).filter((agent) => agent.alias !== "master");
@@ -1347,50 +1321,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     agentsLoaded &&
     nonMasterAgents.length === 0 &&
     (agents?.profiles?.length ?? 0) === 0;
-  const sidebarBillingPill = (() => {
-    if (
-      meta?.hosted !== true ||
-      meta?.signed_in !== true ||
-      !billingHref ||
-      !billingSummary?.canManage ||
-      !billingSummary.account
-    ) {
-      return undefined;
-    }
-    const status = sidebarBillingStatus(billingSummary.account, billingSummary.offer);
-    const labelText =
-      status.labelKind === "plan" && status.planName
-        ? status.planName
-        : status.labelKind === "trial"
-          ? t("Free trial")
-          : t("Billing");
-    const metricText =
-      status.metricKind === "extra_left"
-        ? t("Extra · {pct}% left").replace("{pct}", String(status.percent))
-        : status.metricKind === "depleted"
-          ? t("{pct}% used").replace("{pct}", "100")
-          : t("{pct}% used").replace("{pct}", String(status.percent));
-    return (
-      <Link
-        href={billingHref}
-        className="sidebar-billing-pill"
-        data-tone={status.tone}
-        data-low={status.tone === "warn" || status.tone === "fail" ? "true" : undefined}
-        data-testid="sidebar-billing-pill"
-      >
-        <div className="sidebar-pill-row">
-          <span className="sidebar-billing-pill-plan">{labelText}</span>
-          <span className="sidebar-billing-pill-metric">
-            <span className="sidebar-status-dot" aria-hidden="true" />
-            <span>{metricText}</span>
-          </span>
-        </div>
-        <div className="sidebar-mini-track" aria-hidden="true">
-          <div className="sidebar-mini-fill" style={{ width: `${status.percent}%` }} />
-        </div>
-      </Link>
-    );
-  })();
 
   return (
     <WriteGate.Provider value={meta === null
@@ -1426,7 +1356,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
         hosted={meta?.hosted === true}
         signedIn={meta?.signed_in ?? null}
-        billingPill={sidebarBillingPill}
         accountOpen={accountOpen}
         account={<AccountMenu
           onOpenChange={setAccountOpen}
@@ -1435,7 +1364,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           trigger="row"
           placement="above-start"
           settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
-          billingHref={billingHref}
           securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
           footer={versionLine}
         />}
@@ -1477,11 +1405,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
                 <span className="truncate text-ink-100" title={route.slug}>{route.slug}</span>
               </>
-            ) : route.screen === "settings" && settingsLabel(route.section) ? (
+            ) : settingsCrumb ? (
               <>
                 <Link href={hrefFor(settingsHomeRoute)} className="hidden sm:inline truncate text-ink-400">{t("Settings")}</Link>
                 <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
-                <span className="truncate text-ink-100">{t(settingsLabel(route.section) ?? "")}</span>
+                <span className="truncate text-ink-100">{t(settingsCrumb)}</span>
               </>
             ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : t(SCREEN_LABEL[screen])}</span>}
               </>
@@ -1517,7 +1445,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               trigger="avatar"
               placement="below-end"
               settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
-              billingHref={billingHref}
               securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
               footer={versionLine}
             /></div> : <div className="header-local-preferences contents"><LocalLanguage /><ThemeToggle /></div>}
@@ -1585,7 +1512,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               trigger="row"
               placement="above-start"
               settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
-              billingHref={billingHref}
               securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
               footer={versionLine}
             /></div>}
@@ -2086,12 +2012,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 ? { hosted: documentsHosted, viewer, viewerSub }
                 : undefined
             } />}
-            {route.section === "account" && (
-              <PlatformAccount
-                hosted={meta?.hosted === true}
-                onBillingSnapshot={setBillingSummary}
-              />
-            )}
+            {route.section === "account" && <PlatformAccount key={personalIdentity} hosted={hostedBoard} />}
             {route.section === "daemons" && meta?.settings_sections?.includes("daemons") && (
               <Daemons onOpenIssue={openIssue} />
             )}

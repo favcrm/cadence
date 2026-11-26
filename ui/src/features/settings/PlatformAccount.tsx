@@ -37,15 +37,13 @@ import { useLocale, useTranslate } from "../../lib/locale";
 
 export default function PlatformAccount({
   hosted = false,
-  onBillingSnapshot,
   onRedirect,
 }: {
   hosted?: boolean;
-  onBillingSnapshot?: (snapshot: HostedBillingSnapshot | null) => void;
   onRedirect?: (url: string) => void;
 } = {}) {
   return hosted ? (
-    <HostedBilling onBillingSnapshot={onBillingSnapshot} onRedirect={onRedirect} />
+    <HostedBilling onRedirect={onRedirect} />
   ) : (
     <NativePlatformAccount />
   );
@@ -338,10 +336,8 @@ function BillingModal({
 }
 
 function HostedBilling({
-  onBillingSnapshot,
   onRedirect,
 }: {
-  onBillingSnapshot?: (snapshot: HostedBillingSnapshot | null) => void;
   onRedirect?: (url: string) => void;
 }) {
   const { locale, t } = useLocale();
@@ -380,7 +376,6 @@ function HostedBilling({
         op.assertCurrent();
         if (response.status === 404 || response.status === 501) {
           setUnsupported(true);
-          onBillingSnapshot?.(null);
           return;
         }
         if (!response.ok) throw new Error("Billing request failed");
@@ -394,7 +389,6 @@ function HostedBilling({
         setExtraUsageCursor(undefined);
         setLogPage(1);
         setCheckedAt(new Date());
-        onBillingSnapshot?.(parsed);
       }, opts.signal);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
@@ -402,7 +396,7 @@ function HostedBilling({
     } finally {
       if (!opts.background) setLoading(false);
     }
-  }, [onBillingSnapshot]);
+  }, []);
 
   useEffect(() => {
     const abort = new AbortController();
