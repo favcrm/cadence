@@ -119,6 +119,7 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 pub const REMOTE_VERBS: &[&str] = &[
     "review_request",
     "review_claim",
+    "review_diff",
     "review_submit",
     "delivery_ship",
     // cli.read
@@ -314,6 +315,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_identities"
         | "delivery_check"
         | "review_producer"
+        | "review_diff"
         | "audit_scope_project"
         | "audit_designations_project"
         | "audit_digest_project"
@@ -537,6 +539,7 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_identities"
         | "delivery_check"
         | "review_producer"
+        | "review_diff"
         | "audit_scope_project"
         | "audit_designations_project"
         | "audit_digest_project"

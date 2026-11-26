@@ -1467,9 +1467,24 @@ required.
 The project names the profile and required brief for each slot. Selectors can
 be omitted when the request is unambiguous. Eligible slots in a stage can run
 together; a later stage waits for every slot in the preceding stage to pass.
-Requests start isolated, board-managed review sessions. An external CLI
-session cannot claim or submit a staged review by naming its profile; a review
-job still needs its server-validated grant.
+The server starts a board-managed session for each eligible slot.
+
+An enrolled agent claims its job under its own credential; the tenant resolves
+that credential to the agent, requires the agent's profile to be the job's
+nominated profile, and records the claim. Nothing else may claim: a person, an
+MCP assistant, an unenrolled session and a session that names a profile it does
+not hold are all refused, and the client never supplies a review identity.
+
+```sh
+cadence --org acme issue claim <revjob-id>
+cadence --org acme issue review diff <revjob-id> --cursor <next-cursor>
+cadence --org acme issue review submit <revjob-id> --decision pass --text "<report>"
+```
+
+`review diff` prints one page of the pinned target at a time; pass the returned
+`next_cursor` back until it is absent. A staged judgment is evidence the
+protected gate can count, never an approval, and a job whose generation rotates
+refuses the old claim.
 
 Only a live workspace owner can accept the exact artifact. An explicit
 `--override --reason <reason>` skips the project reviews, retains any existing

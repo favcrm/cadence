@@ -642,6 +642,19 @@ fn verb_for(
                     }
                     "review_request"
                 }
+                WorkflowReviewAction::Diff { review_id, cursor } => {
+                    validate_review_id(review_id)?;
+                    args.insert("review_id".into(), json!(review_id));
+                    if let Some(cursor) = cursor {
+                        if cursor.is_empty() || cursor.len() > 64 {
+                            return Err(Error::rejected(
+                                "a review diff cursor must be 1-64 characters",
+                            ));
+                        }
+                        args.insert("cursor".into(), json!(cursor));
+                    }
+                    "review_diff"
+                }
                 WorkflowReviewAction::Submit {
                     review_id,
                     decision,
@@ -3401,11 +3414,10 @@ where
         }
     }
     let (verb, mut args) = verb_for(&command, command_path.as_deref())?;
-    if matches!(verb, "review_claim" | "review_submit") {
-        return Err(Error::rejected(
-            "review claim authority is unavailable: the runtime must provide a server-validated review job grant; no human credential was used",
-        ));
-    }
+    // `review_claim`, `review_diff` and `review_submit` are decided by the
+    // tenant: only an enrolled agent credential whose subject names the job's
+    // profile may claim, and the server refuses a person, an MCP assistant or
+    // an unenrolled session. The client never supplies a review identity.
     if verb == "delivery_ship" {
         refuse_managed(&target, "delivery ship")?;
     }
@@ -5918,6 +5930,53 @@ mod read_contract_tests {
             assert_eq!(actual, verb);
             assert_eq!(body, fixture["calls"][verb]);
         }
+    }
+    #[test]
+    fn issue_review_diff_maps_to_the_scoped_read_verb() {
+        let parse = |argv: &[&str]| {
+            let mut full = vec!["cadence"];
+            full.extend_from_slice(argv);
+            crate::cli::Cli::try_parse_from(full).unwrap()
+        };
+        let parsed = parse(&[
+            "issue",
+            "review",
+            "diff",
+            "revjob_example",
+            "--cursor",
+            "2:40",
+        ]);
+        let (verb, args) = outcome(&parsed.command).unwrap();
+        assert_eq!(verb, "review_diff");
+        assert_eq!(
+            args,
+            json!({
+                "version": "hosted-cadence-review-workflow.v1",
+                "review_id": "revjob_example",
+                "cursor": "2:40",
+            })
+        );
+        // The first page carries no cursor at all.
+        let first = parse(&["issue", "review", "diff", "revjob_example"]);
+        let (_, body) = outcome(&first.command).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "version": "hosted-cadence-review-workflow.v1",
+                "review_id": "revjob_example",
+            })
+        );
+        // Oversized cursors never cross the wire.
+        let long = "x".repeat(65);
+        let refused = parse(&[
+            "issue",
+            "review",
+            "diff",
+            "revjob_example",
+            "--cursor",
+            &long,
+        ]);
+        assert!(outcome(&refused.command).is_err());
     }
     #[test]
     fn hosted_review_workflow_refuses_invalid_shapes() {

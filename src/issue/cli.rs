@@ -109,6 +109,13 @@ pub enum WorkflowReviewAction {
         #[arg(long, conflicts_with = "text")]
         file: Option<PathBuf>,
     },
+    /// Read one page of the pinned diff for a claimed review.
+    Diff {
+        review_id: String,
+        /// `next_cursor` from the previous page; omitted for the first file.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
     /// Submit findings under the current review claim.
     Submit {
         review_id: String,
