@@ -49,12 +49,14 @@ export default function Epics({
   viewer,
   onOpenIssue,
   onRetry,
+  embedded = false,
 }: {
   project: string;
   issues: ResourceState<IssueCard[]>;
   viewer: Viewer;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
+  embedded?: boolean;
 }) {
   const t = useTranslate();
   const [showCompleted, setShowCompleted] = useState(false);
@@ -72,10 +74,15 @@ export default function Epics({
     if (s && s in tally) tally[s] += 1;
   }
 
+  const Wrap = embedded ? "section" : "main";
   return (
-    <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="epics">
+    <Wrap className={embedded ? "min-w-0" : "px-4 lg:px-8 pt-4 pb-9 min-w-0"} aria-label={t("Initiatives")}>
       <div className="flex flex-wrap items-center gap-2 mb-3">
-        <h1 className="text-section font-semibold text-ink-100">{t("Epics")}</h1>
+        {embedded ? (
+          <h2 className="text-section font-semibold text-ink-100 m-0">{t("Initiatives")}</h2>
+        ) : (
+          <h1 className="text-section font-semibold text-ink-100">{t("Initiatives")}</h1>
+        )}
         {completed.length > 0 && <button className="lnk text-label ml-auto" aria-pressed={showCompleted} onClick={() => setShowCompleted(!showCompleted)}>{showCompleted ? t("Hide completed") : t("Show completed")} ({completed.length})</button>}
         <StaleChip state={issues} />
         {epics.length > 0 && (
@@ -84,19 +91,19 @@ export default function Epics({
           </span>
         )}
       </div>
-      <p className="text-label text-ink-500 mb-5">{t("Capability outcomes: their delivery stage, owner, and current work. An epic can contribute to several milestones.")}</p>
-      <ResourceGate state={issues} loading="loading epics…" failed="could not load epics" onRetry={onRetry} />
+      {!embedded && <p className="text-label text-ink-500 mb-5">{t("Stage-gated outcomes, owners, and current work. An initiative can contribute to several milestones.")}</p>}
+      <ResourceGate state={issues} loading="Loading initiatives…" failed="Could not load initiatives" onRetry={onRetry} />
       {notes.map((n) => (
-        <p key={n} className="card mb-3 px-3.5 py-2.5 text-label text-warn break-words" role="note">
+        <p key={n} className="project-summary-card mb-3 px-4 py-3 text-label text-warn break-words" role="note">
           {n}
         </p>
       ))}
       {issues.data && epics.length === 0 && (
-        <div className="card project-card-padding text-secondary text-ink-400">
-          {t("No active epics in")} {project}. {t("Group related tasks into an epic when they deliver one capability or outcome.")}
+        <div className="project-summary-card text-secondary text-ink-400">
+          {t("No active initiatives in")} {project}. {t("Group related work into an initiative when several tasks deliver one stage-gated outcome.")}
         </div>
       )}
-      <ul className="space-y-2.5">
+      <ul className="space-y-3">
         {epics.map((e) => (
           <EpicRow
             key={e.id}
@@ -109,7 +116,7 @@ export default function Epics({
           />
         ))}
       </ul>
-    </main>
+    </Wrap>
   );
 }
 
@@ -138,7 +145,7 @@ function EpicRow({
   const current = kids.filter((k) => !["done", "dropped"].includes(k.status))
     .sort((a, b) => Number(b.blocked || b.status === "review") - Number(a.blocked || a.status === "review"));
   return (
-    <li className="card min-w-0" data-epic={epic.id}>
+    <li className="project-summary-card p-0 min-w-0" data-epic={epic.id}>
       <div className="project-card-padding min-w-0">
         <button
           type="button"
@@ -226,7 +233,7 @@ function EpicDetail({
   };
 
   return (
-    <div className="border-t border-ink-700 project-card-padding grid gap-4 md:grid-cols-2 min-w-0">
+    <div className="border-t border-[color:var(--board-surface-hairline)] project-card-padding grid gap-4 md:grid-cols-2 min-w-0">
       <section className="min-w-0" aria-label={`${epic.id} children`}>
         <div className="slabel mb-1.5">{t("Tasks")} · {kids.length}</div>
         {kids.length === 0 ? (
