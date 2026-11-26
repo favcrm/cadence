@@ -1,4 +1,6 @@
 import type { SettingsSection } from "../../lib/router";
+import type { Meta } from "../../lib/types";
+import { sessionAdmissible } from "../auth/gate";
 
 export type SettingsIcon =
   | "preferences" | "security" | "connections" | "email" | "templates" | "general"
@@ -36,7 +38,19 @@ export type SettingsMeta = {
   hosted?: boolean;
   platform_account_configured?: boolean;
   wiki_managed_files?: boolean;
+  signed_in?: Meta["signed_in"];
+  session?: Meta["session"];
 } | null | undefined;
+
+function offersBilling(meta: SettingsMeta): boolean {
+  if (meta?.platform_account_configured !== true) return false;
+  if (meta.hosted !== true && meta.session?.origin !== "public") return true;
+  // Hosted meta maps the current tenant's owner to the public session's
+  // operator role. A platform operator token is not a workspace owner.
+  const session = meta.session;
+  return meta.signed_in === true && session?.origin === "public" && sessionAdmissible(session)
+    && session.user?.role === "operator" && !session.user.sub.startsWith("operator-token:");
+}
 
 /**
  * Which sections to offer. A board that sends `settings_sections` has said what
@@ -46,7 +60,7 @@ export type SettingsMeta = {
  * General, which holds the company time zone.
  */
 export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
-  const account = meta?.platform_account_configured ? [ENTRIES.account] : [];
+  const account = offersBilling(meta) ? [ENTRIES.account] : [];
   const listed = meta?.settings_sections;
   if (!listed) {
     return [
@@ -76,20 +90,16 @@ const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents", "securi
 
 /**
  * Where a request for `section` should land instead, or null when it is fine.
- * Nothing moves until the board has said what it serves, and an unknown list
- * refuses nothing, so a slow or old board can't lose a working page. The one
- * exception is a hosted-only section: a board that answered without it is
- * native, where that page does not exist — a direct link moves instead of
- * mounting a page that has nothing to read.
+ * Wait for metadata before redirecting. An old board without a section
+ * list keeps its routes except hosted-only pages and restricted hosted Billing.
  */
 export function settingsRedirect(section: SettingsSection, meta: SettingsMeta): SettingsSection | null {
   if (!meta || section === "templates") return null;
   if (section === "documents" && meta.wiki_managed_files && meta.settings_sections?.includes("general")) return "general";
   const groups = settingsNavGroups(meta);
   if (groups.some((group) => group.items.some((item) => item.section === section))) return null;
-  // No list at all: a native board. Only a hosted-only page is refused there;
-  // every other section is one this board still has.
-  if (!meta.settings_sections && !HOSTED_ONLY.includes(section)) return null;
+  if (!meta.settings_sections && !HOSTED_ONLY.includes(section)
+      && !(section === "account" && (meta.hosted === true || meta.session?.origin === "public"))) return null;
   // Workspace leads; a member whose board serves none of it keeps the first group.
   const workspace = groups.find((group) => group.label === "Workspace")?.items[0];
   return workspace?.section ?? groups[0]?.items[0]?.section ?? "preferences";

@@ -28,6 +28,13 @@ explicitly verify your session to return. A fresh hosted sign-in also clears the
 unconfirmed state after the server accepts it; browser notices alone do not
 authorize a view.
 
+## Find workspace billing
+
+Workspace owners can open **Settings → Billing** for the current plan,
+payments, and usage history. Members do not see Billing in Settings or
+in the account menu. A Billing link takes them to an available Settings
+page without showing financial details.
+
 ## Check your connection
 
 `cadence --org <org> doctor` tells you whether this machine's connection to a

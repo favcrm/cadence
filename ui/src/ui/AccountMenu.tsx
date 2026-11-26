@@ -19,7 +19,6 @@ export default function AccountMenu({
   trigger,
   placement,
   settingsHref,
-  billingHref,
   securityHref,
   footer,
   onOpenChange,
@@ -29,7 +28,6 @@ export default function AccountMenu({
   trigger: "avatar" | "row";
   placement: "below-end" | "above-start";
   settingsHref?: string;
-  billingHref?: string;
   securityHref?: string;
   /** Slot at the end of the panel for the version line (CAD-1034). */
   footer?: ReactNode;
@@ -257,11 +255,6 @@ export default function AccountMenu({
           {settingsHref && (
             <Link href={settingsHref} onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">
               {t("Settings")}
-            </Link>
-          )}
-          {billingHref && (
-            <Link href={billingHref} onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">
-              {t("Billing")}
             </Link>
           )}
           {securityHref && (

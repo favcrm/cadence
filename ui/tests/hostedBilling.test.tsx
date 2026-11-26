@@ -278,50 +278,8 @@ async function run(): Promise<void> {
   equal(display.formatUsagePercent(0.04), "<0.1%", "tiny share formats as <0.1%");
   equal(display.formatUsagePercent(1.44), "1.4%", "standard share formats with 1 decimal");
 
-  const sidebarStandby = display.sidebarBillingStatus(
-    { ...syntheticSnapshot.account, plan: { name: "Synth Pro", status: "active", planId: "synth_basic_mo" }, usageSummary: sampleRichUsage },
-    syntheticSnapshot.offer,
-  );
-  equal(sidebarStandby.metricKind, "used", "standby sidebar tracks monthly % used");
-  equal(sidebarStandby.percent, 38, "standby sidebar reports 38% used");
-  equal(sidebarStandby.tone, "ok", "38% used sidebar tone is ok");
-
-  const sidebarOverflow = display.sidebarBillingStatus(
-    {
-      ...syntheticSnapshot.account,
-      plan: { name: "Synth Pro", status: "active", planId: "synth_basic_mo" },
-      usageSummary: {
-        mode: "overflow",
-        cycle: { usedPercent: 100, remainingPercent: 0, resetsAt: "2026-12-01T00:00:00Z" },
-        extra: { hasReserve: true, poolRemainingPercent: 79, poolUsedPercent: 21, status: "active" },
-        denominatorBasis: "monthly_plan",
-      },
-    },
-    syntheticSnapshot.offer,
-  );
-  equal(sidebarOverflow.metricKind, "extra_left", "overflow sidebar switches to extra remaining %");
-  equal(sidebarOverflow.percent, 79, "overflow sidebar shows 79% left");
-  equal(sidebarOverflow.tone, "info", "overflow sidebar tone is info");
-
-  const sidebarDepleted = display.sidebarBillingStatus(
-    {
-      ...syntheticSnapshot.account,
-      plan: { name: "Synth Pro", status: "active", planId: "synth_basic_mo" },
-      usageSummary: {
-        mode: "depleted",
-        cycle: { usedPercent: 100, remainingPercent: 0, resetsAt: "2026-12-01T00:00:00Z" },
-        extra: { hasReserve: false, poolRemainingPercent: 0, poolUsedPercent: 0, status: "depleted" },
-        denominatorBasis: "monthly_plan",
-      },
-    },
-    syntheticSnapshot.offer,
-  );
-  equal(sidebarDepleted.metricKind, "depleted", "depleted sidebar tracks depleted state");
-  equal(sidebarDepleted.tone, "fail", "depleted sidebar tone is fail");
-
   const redirects: string[] = [];
   let redirectSignal = createEventSignal<string>();
-  let reportedSnapshot: unknown = null;
   const host = document.createElement("div");
   document.body.append(host);
 
@@ -332,16 +290,9 @@ async function run(): Promise<void> {
       root.render(
         React.createElement(LocaleProvider, {
           children: React.createElement(
-            PlatformAccount as React.ComponentType<{
-              hosted?: boolean;
-              onBillingSnapshot?: (snapshot: unknown) => void;
-              onRedirect?: (url: string) => void;
-            }>,
+            PlatformAccount as React.ComponentType<{ hosted?: boolean; onRedirect?: (url: string) => void }>,
             {
               hosted: true,
-              onBillingSnapshot: (snap: unknown) => {
-                reportedSnapshot = snap;
-              },
               onRedirect: (url: string) => {
                 redirects.push(url);
                 redirectSignal.emit(url);
@@ -366,7 +317,6 @@ async function run(): Promise<void> {
       "owner billing summary",
     ),
   );
-  assert(reportedSnapshot !== null, "onBillingSnapshot reports parsed snapshot");
   equal(
     host.querySelector('[data-testid="billing-usage-percent"]')?.textContent?.trim(),
     "12%",

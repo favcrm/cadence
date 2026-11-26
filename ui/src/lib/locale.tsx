@@ -4582,7 +4582,6 @@ const CAD2726_ZHTW: Record<string, string> = {
   "of extra usage pool used": "額外用量池已使用",
   "{pct}% remaining": "剩餘 {pct}%",
   "{pct}% used": "已用 {pct}%",
-  "Extra · {pct}% left": "額外 · 剩 {pct}%",
   "Prepaid · Never expires · No surprise overage bills": "預付制 · 永久有效 · 不會產生意外超額帳單",
   "Standby": "待命中",
   "{pct}% left · Applies automatically at 100%": "剩餘 {pct}% · 本月達 100% 時自動啟用",

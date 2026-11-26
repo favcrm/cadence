@@ -107,7 +107,7 @@ async function main(): Promise<void> {
     });
   }) as typeof fetch;
 
-  const mount = (meta: Meta, billingHref?: string) => {
+  const mount = (meta: Meta) => {
     fetchSignal = createEventSignal<void>();
     const host = document.createElement("div");
     document.body.append(host);
@@ -123,7 +123,6 @@ async function main(): Promise<void> {
               trigger: "row",
               placement: "above-start",
               settingsHref: "/settings/preferences",
-              billingHref,
             }),
           }),
         }),
@@ -154,7 +153,7 @@ async function main(): Promise<void> {
   // 2. Hosted signed-in: zero reads while closed, lazy fetch once on open, cached on reopen
   {
     fetches.length = 0;
-    const { host, trigger, panel, done } = mount(baseHosted, "/settings/account");
+    const { host, trigger, panel, done } = mount(baseHosted);
     equal(fetches.filter((p) => p === "/api/account/workspaces").length, 0, "zero fetches while menu is closed");
 
     await React.act(async () => trigger().click());
@@ -183,8 +182,7 @@ async function main(): Promise<void> {
     const createLink = switcher.querySelector('a[href="https://app-v2.agenticos.hk/register?mode=new"]');
     assert(createLink && createLink.textContent?.includes("Create another workspace"), "create workspace link rendered");
 
-    const billingLink = panel()?.querySelector('a[href="/settings/account"]');
-    assert(billingLink && billingLink.textContent === "Billing", "Billing shortcut rendered in AccountMenu");
+    assert(!panel()?.querySelector('a[href="/settings/account"]'), "Billing is not an account menu shortcut");
 
     // Close and reopen -> cache hit (still 1 fetch)
     await React.act(async () => trigger().click());
@@ -205,7 +203,6 @@ async function main(): Promise<void> {
     win.localStorage.setItem("cadence-locale", "zh-TW");
     const { host, trigger, panel, done } = mount(
       { ...baseHosted, session: { ...baseHosted.session, id: "sess-ws-zh" } } as unknown as Meta,
-      "/settings/account",
     );
     await React.act(async () => trigger().click());
     await waitForDom(
