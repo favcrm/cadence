@@ -315,7 +315,6 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_identities"
         | "delivery_check"
         | "review_producer"
-        | "review_diff"
         | "audit_scope_project"
         | "audit_designations_project"
         | "audit_digest_project"
@@ -335,6 +334,9 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "template_blob_read"
         | "document_show" => &["cli.read"],
         "agent_enroll_start" | "agent_enroll_status" => &["cli.read", "cli.write"],
+        // The tenant requires `cli.write` for the review job surface, including
+        // the read-only diff: the claim it reads through is a write capability.
+        "review_claim" | "review_diff" | "review_submit" => &["cli.write"],
         "agent_enroll_list" => &["cli.read", "audit.approve"],
         "agent_enroll_approve" | "agent_enroll_revoke" => &["cli.write", "audit.approve"],
         // CAD-2286: the tenant admits `document_submit` with cli.write alone.

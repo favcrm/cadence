@@ -646,9 +646,17 @@ fn verb_for(
                     validate_review_id(review_id)?;
                     args.insert("review_id".into(), json!(review_id));
                     if let Some(cursor) = cursor {
-                        if cursor.is_empty() || cursor.len() > 64 {
+                        // `page:char-offset`, the shape the pinned reader returns.
+                        let valid = cursor.len() <= 64
+                            && cursor.split_once(':').is_some_and(|(page, offset)| {
+                                !page.is_empty()
+                                    && page.parse::<u32>().is_ok_and(|page| page >= 1)
+                                    && !offset.is_empty()
+                                    && offset.parse::<usize>().is_ok()
+                            });
+                        if !valid {
                             return Err(Error::rejected(
-                                "a review diff cursor must be 1-64 characters",
+                                "a review diff cursor must be `page:offset` from the previous page",
                             ));
                         }
                         args.insert("cursor".into(), json!(cursor));
@@ -5966,17 +5974,17 @@ mod read_contract_tests {
                 "review_id": "revjob_example",
             })
         );
-        // Oversized cursors never cross the wire.
+        // Oversized, malformed and zero-page cursors never cross the wire.
+        let with_cursor = |cursor: &str| {
+            let mut argv = vec!["issue", "review", "diff", "revjob_example", "--cursor"];
+            argv.push(cursor);
+            parse(&argv)
+        };
         let long = "x".repeat(65);
-        let refused = parse(&[
-            "issue",
-            "review",
-            "diff",
-            "revjob_example",
-            "--cursor",
-            &long,
-        ]);
-        assert!(outcome(&refused.command).is_err());
+        for cursor in ["abc", "0:0", "2:x", long.as_str()] {
+            let refused = with_cursor(cursor);
+            assert!(outcome(&refused.command).is_err(), "{cursor} was accepted");
+        }
     }
     #[test]
     fn hosted_review_workflow_refuses_invalid_shapes() {
