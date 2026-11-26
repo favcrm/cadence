@@ -227,7 +227,7 @@
 .cv-tab[data-kind="session"] .cv-tab-label { display: inline-flex; align-items: center; gap: 6px; }
 .cv-tab[data-kind="session"] .cv-tab-label svg { flex: none; }
 @keyframes bz-pulse { 50% { opacity: 0.35; } }
-.bz-badge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--c, var(--color-accent)) 16%, transparent); color: var(--c, var(--color-accent)); font: 500 var(--text-micro) var(--font-sans); }
+.bz-badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--c, var(--color-accent)) 16%, transparent); color: var(--c, var(--color-accent)); font: 500 var(--text-micro) var(--font-sans); }
 .arttype:has(> svg), .bz-globe { color: var(--color-accent); }
 .bz-title b[tabindex]:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: 2px; }
 .canvas-drawer:focus { outline: none; }
@@ -265,6 +265,17 @@
 .bz-says { flex: none; display: grid; gap: 2px; }
 .bz-says small { color: var(--color-ink-500); font-size: var(--text-micro); }
 .bz-says p { margin: 0; max-height: 9rem; overflow-y: auto; color: var(--color-ink-100); font-size: var(--text-body); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.bz-says .bz-says-note { margin-top: 4px; color: var(--color-ink-500); font-size: var(--text-label); line-height: 1.4; }
+
+.bz-empty { margin: auto; width: min(100%, 340px); display: grid; gap: 10px; justify-items: center; }
+.bz-empty .sempty { width: 100%; border: 0; background: transparent; padding: 0; }
+.bz-launch { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; width: 100%; }
+.bz-url-input { flex: 1 1 180px; min-width: 0; height: 30px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--color-ink-700); background: var(--color-ink-875); color: var(--color-ink-100); font: 400 var(--text-label) var(--font-mono); }
+.bz-url-input:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.bz-launch .btn { height: 30px; }
+.bz-quota { margin: 0; color: var(--color-ink-500); font: 400 var(--text-micro) var(--font-mono); }
+.bz-preview { flex: 1; min-height: 0; display: flex; align-items: flex-start; justify-content: center; overflow: auto; background: var(--color-ink-900); }
+.bz-preview img { display: block; width: 100%; height: auto; object-fit: contain; }
 
 /* The actions that apply, in the header. */
 .bz-actions { flex: none; display: flex; align-items: center; gap: 6px; }

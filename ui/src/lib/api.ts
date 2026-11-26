@@ -352,6 +352,10 @@ export interface MemberAssistProfileRequest {
   look?: AvatarLook;
   /** CAD-2354: the member's own instructions; blank clears, omitted keeps. */
   instructions?: string;
+  /** Personal assistant workspace skills; omitted keeps. */
+  skills?: string[];
+  /** Personal assistant opt-in tool groups (owner-only); omitted keeps. */
+  enabled_tools?: string[];
 }
 
 /** CAD-2354: `POST /api/master/instructions` (owners) and
@@ -361,10 +365,14 @@ export interface InstructionsRead<R> {
   instructions: string | null;
   revision: R;
   built_in_instruction_tokens?: number;
+  skills?: string[];
+  enabled_tools?: string[];
 }
 
 export interface MemberAssistProfileResult extends MemberAssistState {
   action: MemberAssistProfileAction;
+  skills?: string[];
+  enabled_tools?: string[];
   applies: "next_turn";
 }
 

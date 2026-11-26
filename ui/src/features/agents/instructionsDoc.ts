@@ -35,6 +35,8 @@ export interface OwnDoc {
   text: string;
   revision: string | number;
   builtInInstructionTokens?: number;
+  skills?: string[];
+  enabledTools?: string[];
 }
 
 /** The calls behind those two kinds. A board without the routes answers
@@ -43,6 +45,8 @@ export interface OwnDeps {
   read: (kind: OwnKind) => Promise<OwnDoc>;
   /** Writes `text` over `base` and answers the committed document. */
   write: (kind: OwnKind, base: OwnDoc, text: string) => Promise<OwnDoc>;
+  /** Writes personal `skills` and/or `enabled_tools` over `base` and answers the committed document. */
+  writePersonalFields?: (base: OwnDoc, patch: { skills?: string[]; enabled_tools?: string[] }) => Promise<OwnDoc>;
 }
 
 /** An older board: the routes are not there, so nothing is editable. */
