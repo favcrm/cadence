@@ -24,9 +24,16 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { canvasSnapshot, onArtifactFocus, onArtifactsEmptied, showDrawer } from "./canvasStore";
 import { onPrivateSessionReset } from "../../lib/privateSession";
-import { readBrowser, stopBrowser, type BrowserSession } from "./browserClient";
+import {
+  readBrowser,
+  startBrowser,
+  stopBrowser,
+  takeoverBrowser,
+  type BrowserSession,
+} from "./browserClient";
 
 export type StopPhase = "idle" | "confirm" | "stopping" | "failed";
+export type BrowserActionPhase = "idle" | "starting" | "taking_over" | "quota_limit";
 
 export interface BrowserTabState {
   conversation: string | null;
@@ -47,6 +54,7 @@ export interface BrowserTabState {
   /** The Browser tab is the active tab. */
   focused: boolean;
   stop: StopPhase;
+  action: BrowserActionPhase;
 }
 
 const POLL = { active: 3000, handoff: 2000, turn: 2000, probe: 30_000 } as const;
@@ -90,6 +98,7 @@ function empty(conversation: string | null): BrowserTabState {
     open: false,
     focused: false,
     stop: "idle",
+    action: "idle",
   };
 }
 
@@ -171,7 +180,16 @@ function schedule(): void {
 }
 
 const sameSession = (a: BrowserSession | null, b: BrowserSession | null): boolean =>
-  a === b || (a !== null && b !== null && a.state === b.state && a.signedIn === b.signedIn && a.url === b.url && a.instructions === b.instructions);
+  a === b || (
+    a !== null &&
+    b !== null &&
+    a.state === b.state &&
+    a.signedIn === b.signedIn &&
+    a.url === b.url &&
+    a.instructions === b.instructions &&
+    a.quota?.active === b.quota?.active &&
+    a.quota?.limit === b.quota?.limit
+  );
 
 function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
   if (read.kind === "unavailable") {
@@ -182,7 +200,7 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
       else retrying = false; // a definite answer, with nothing live to lose sight of
       return;
     }
-    set({ ...state, availability: "unavailable", session: null, loadError: false, probeFailed: false, open: false, focused: false, stop: "idle" });
+    set({ ...state, availability: "unavailable", session: null, loadError: false, probeFailed: false, open: false, focused: false, stop: "idle", action: "idle" });
     return;
   }
   failedReads = 0;
@@ -192,6 +210,7 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
   // A new takeover request brings a hidden tab back.
   const asked = next.state === "handoff" && prev !== "handoff";
   const over = next.state === "ended" || next.state === "none";
+  const quotaCleared = next.quota && next.quota.active < next.quota.limit;
   const nextState: BrowserTabState = {
     ...state,
     availability: "available",
@@ -203,6 +222,7 @@ function apply(read: Awaited<ReturnType<typeof readBrowser>>): void {
     hidden: asked ? false : state.hidden,
     // A failed stop is about the phase it failed in.
     stop: over || (state.stop === "failed" && prev !== next.state) ? "idle" : state.stop,
+    action: !over || (state.action === "quota_limit" && quotaCleared) ? "idle" : state.action,
   };
   // An unchanged answer is no change: a `set` would re-render every card.
   const same = (Object.keys(nextState) as (keyof BrowserTabState)[]).every((k) => nextState[k] === state[k]);
@@ -422,8 +442,75 @@ export async function confirmStop(): Promise<void> {
   set({
     ...state,
     stop: "idle",
+    action: "idle",
     loadError: false,
     session: prior ? { ...prior, state: "ended", instructions: null } : prior,
   });
   void refreshBrowser();
+}
+
+/** User-initiated browser start into human handoff. */
+export async function startBrowserSession(url?: string): Promise<boolean> {
+  const conversation = state.conversation;
+  if (conversation === null || state.action === "starting") return false;
+  const mine = epoch;
+  set({ ...state, action: "starting" });
+  try {
+    const res = await startBrowser(conversation, url);
+    if (mine !== epoch) return false;
+    if (res.kind === "session") {
+      apply({ kind: "session", session: res.session });
+      if (state.action !== "idle") set({ ...state, action: "idle" });
+      return true;
+    }
+    if (res.kind === "limit") {
+      const prior = state.session;
+      set({
+        ...state,
+        action: "quota_limit",
+        session: prior && res.quota ? { ...prior, quota: res.quota } : prior,
+      });
+      alertBrowser("Workspace browser limit reached.");
+      return false;
+    }
+    set({ ...state, action: "idle" });
+    alertBrowser("Starting a browser from here isn't supported on this board yet.");
+    return false;
+  } catch (error) {
+    if (mine === epoch) {
+      set({ ...state, action: "idle" });
+      alertBrowser(error instanceof Error && error.message ? error.message : "Couldn't start the browser.");
+    }
+    return false;
+  }
+}
+
+/** User-initiated takeover during an active reading session. */
+export async function takeoverBrowserSession(): Promise<boolean> {
+  const conversation = state.conversation;
+  if (conversation === null || state.action === "taking_over") return false;
+  const mine = epoch;
+  set({ ...state, action: "taking_over" });
+  try {
+    const res = await takeoverBrowser(conversation);
+    if (mine !== epoch) return false;
+    if (res.kind === "session") {
+      apply({ kind: "session", session: res.session });
+      if (state.action !== "idle") set({ ...state, action: "idle" });
+      return true;
+    }
+    set({ ...state, action: "idle" });
+    if (res.kind === "unsupported") {
+      alertBrowser("Taking over a reading session isn't supported on this board yet.");
+    } else {
+      void refreshBrowser();
+    }
+    return false;
+  } catch {
+    if (mine === epoch) {
+      set({ ...state, action: "idle" });
+      alertBrowser("Couldn't take over the browser.");
+    }
+    return false;
+  }
 }
