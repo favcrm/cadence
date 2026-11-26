@@ -76,6 +76,9 @@ pub(super) enum RouteId {
     ArtifactRead,
     ArtifactVersions,
     ProjectPolicy,
+    ProjectLifecycle,
+    ProjectArchive,
+    ProjectRestore,
 }
 
 /// How one bound parameter is validated, and what a failure answers.
@@ -447,6 +450,24 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     row!(
         ProjectPolicy,
         "/api/projects/{key}/policy",
+        OperatorOnly,
+        PROJECT_KEY
+    ),
+    get!(
+        ProjectLifecycle,
+        "/api/projects/{key}/lifecycle",
+        OperatorOnly,
+        PROJECT_KEY
+    ),
+    row!(
+        ProjectArchive,
+        "/api/projects/{key}/archive",
+        OperatorOnly,
+        PROJECT_KEY
+    ),
+    row!(
+        ProjectRestore,
+        "/api/projects/{key}/restore",
         OperatorOnly,
         PROJECT_KEY
     ),

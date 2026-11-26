@@ -1173,6 +1173,7 @@ fn verb_for(
                     sort,
                     limit,
                     fields,
+                    archived,
                     json: _,
                 },
         } => {
@@ -1180,17 +1181,27 @@ fn verb_for(
                 ("--sort", sort.is_some()),
                 ("--limit", limit.is_some()),
                 ("--fields", !fields.is_empty()),
+                ("--archived", *archived),
             ] {
                 if present {
                     return Err(unsupported(
                         "project ls",
                         flag,
-                        "the hosted project read returns the registry as it is; \
-                         sorting, truncating and field selection are local transforms",
+                        "the hosted project read returns the active registry as it is; \
+                         sorting, truncating, field selection and archived filters are local transforms",
                     ));
                 }
             }
             "project_ls"
+        }
+        Commands::Project {
+            action: ProjectCmd::Archive { .. } | ProjectCmd::Restore { .. },
+        } => {
+            return Err(unsupported(
+                "project archive/restore",
+                "remote org",
+                "project archive and restore on a hosted org run via the hosted board or /api/projects/<key>/{archive,restore}",
+            ));
         }
         // CAD-1999: `issue project ls` reads the hosted registry, which
         // includes projects that exist only as their tickets' key. The
@@ -1204,6 +1215,7 @@ fn verb_for(
                             sort,
                             limit,
                             fields,
+                            archived,
                             json: _,
                         },
                 },
@@ -1212,17 +1224,32 @@ fn verb_for(
                 ("--sort", sort.is_some()),
                 ("--limit", limit.is_some()),
                 ("--fields", !fields.is_empty()),
+                ("--archived", *archived),
             ] {
                 if present {
                     return Err(unsupported(
                         "issue project ls",
                         flag,
-                        "the hosted project read returns the registry as it is; \
-                         sorting, truncating and field selection are local transforms",
+                        "the hosted project read returns the active registry as it is; \
+                         sorting, truncating, field selection and archived filters are local transforms",
                     ));
                 }
             }
             "project_ls"
+        }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Archive { .. }
+                        | cadence_agent::issue::cli::ProjectAction::Restore { .. },
+                },
+        } => {
+            return Err(unsupported(
+                "issue project archive/restore",
+                "remote org",
+                "project archive and restore on a hosted org run via the hosted board or /api/projects/<key>/{archive,restore}",
+            ));
         }
         // CAD-2240: `issue project timeline <key>` reads one project's
         // timeline. `--since` takes the grammar other listers accept and
@@ -6463,6 +6490,7 @@ mod read_contract_tests {
                 sort: None,
                 limit: None,
                 fields: vec![],
+                archived: false,
                 json: false,
             },
         })
@@ -6475,6 +6503,7 @@ mod read_contract_tests {
                 sort: None,
                 limit: Some(5),
                 fields: vec![],
+                archived: false,
                 json: false,
             },
         })
@@ -6487,6 +6516,7 @@ mod read_contract_tests {
                     sort: None,
                     limit: None,
                     fields: vec![],
+                    archived: false,
                     json: false,
                 },
             },
@@ -6547,6 +6577,7 @@ mod read_contract_tests {
                     sort: Some("key".into()),
                     limit: None,
                     fields: vec![],
+                    archived: false,
                     json: false,
                 },
             },

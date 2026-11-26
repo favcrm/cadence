@@ -672,6 +672,12 @@ mod tests {
             intake: None,
             id: None,
             policy: None,
+            archived: false,
+            archived_at: None,
+            archived_by: None,
+            archive_revision: 0,
+            archive_changed_at: None,
+            archive_changed_by: None,
         }
     }
 

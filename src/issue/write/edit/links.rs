@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 
 use super::super::{
     attach_foreign, attach_post_warnings, blocked_warnings_best_effort, check_rev, check_structure,
-    commit_scoped, file_preimage, issue_dir, load_front, restore_preimage, save_front, Ref,
+    commit_scoped, file_preimage, issue_dir, load_front, require_project_active, restore_preimage,
+    save_front, Ref,
 };
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front};
@@ -108,6 +109,10 @@ pub fn link(
     model::check_link_kind(kind)?;
     model::check_id(target)?;
     let (_project, dir) = issue_dir(pm, id)?;
+    require_project_active(&_project)?;
+    if let Ok((target_project, _)) = issue_dir(pm, target) {
+        require_project_active(&target_project)?;
+    }
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
@@ -197,6 +202,10 @@ pub fn add_ref(
     model::check_ref_kind(kind)?;
     model::check_ref_value(target)?;
     let (_project, dir) = issue_dir(pm, id)?;
+    require_project_active(&_project)?;
+    if let Ok((target_project, _)) = issue_dir(pm, target) {
+        require_project_active(&target_project)?;
+    }
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
@@ -237,6 +246,10 @@ pub fn add_ref(
 #[track_caller]
 pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Result<()> {
     let (_project, dir) = issue_dir(pm, id)?;
+    require_project_active(&_project)?;
+    if let Ok((target_project, _)) = issue_dir(pm, target) {
+        require_project_active(&target_project)?;
+    }
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let (mut front, body) = load_front(&dir)?;
     let mut hit = false;

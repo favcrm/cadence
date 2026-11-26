@@ -115,7 +115,7 @@ import Toast, { type ToastMsg } from "./ui/Toast";
 import { IconList, IconSidebarCollapse, IconSidebarExpand } from "./ui/icons";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
-import { RESOURCE_NAMES } from "./lib/cache";
+import { RESOURCE_NAMES, type ResourceState } from "./lib/cache";
 import { noteThreadsChanged } from "./features/threads/threadsClient";
 import { noteMasterChanged } from "./lib/masterChanged";
 import { applyThemePref } from "./lib/theme";
@@ -152,7 +152,7 @@ import {
   persistBrowserProjectView,
   type ProjectView,
 } from "./lib/urlState";
-import type { Health, IssueCard, Meta } from "./lib/types";
+import type { Health, IssueCard, Meta, Project } from "./lib/types";
 
 /** The location as the app reads it — the URL is the only copy. */
 function currentLocation(): AppLocation {
@@ -407,6 +407,116 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const boardReadOnly = meta?.read_only ?? false;
   const block = writeBlock(meta);
   const readOnly = block !== null;
+  const [lifecycleVersion, setLifecycleVersion] = useState(0);
+  const [archivedProjectsState, setArchivedProjectsState] = useState<{
+    supported: boolean;
+    projects: Project[] | null;
+    loading: boolean;
+    error: string | null;
+  }>({ supported: true, projects: null, loading: false, error: null });
+  const [archivedIssuesState, setArchivedIssuesState] = useState<ResourceState<IssueCard[]>>({
+    status: "loading",
+    data: null,
+    error: null,
+    inFlight: false,
+    asOf: null,
+  });
+
+  const onProjectsIndex = route.screen === "projects" && route.slug === null && route.section === "overview";
+  const viewedProjectSlug =
+    route.screen === "issue" ? route.project : route.screen === "projects" ? route.slug : null;
+  const viewedProjectMissingFromActive =
+    viewedProjectSlug !== null &&
+    (projectsState.status === "ok" || projectsState.status === "empty") &&
+    !projects.some((p) => p.key === viewedProjectSlug);
+  const needsArchivedLookup =
+    viewedProjectMissingFromActive &&
+    !(archivedProjectsState.projects?.some((p) => p.key === viewedProjectSlug) ?? false);
+
+  useEffect(() => {
+    if (!onProjectsIndex && !needsArchivedLookup && lifecycleVersion === 0) return;
+    if (archivedProjectsState.supported === false) return;
+    let active = true;
+    setArchivedProjectsState((prev) => ({ ...prev, loading: true, error: null }));
+    api
+      .archivedProjects()
+      .then((res) => {
+        if (!active) return;
+        setArchivedProjectsState({
+          supported: res.archive_supported !== false,
+          projects: res.projects,
+          loading: false,
+          error: null,
+        });
+      })
+      .catch((e: unknown) => {
+        if (!active) return;
+        if (e instanceof ApiError && (e.status === 404 || e.status === 501)) {
+          setArchivedProjectsState({ supported: false, projects: null, loading: false, error: null });
+          return;
+        }
+        setArchivedProjectsState((prev) => ({
+          ...prev,
+          loading: false,
+          error: e instanceof Error ? e.message : "Could not load archived projects",
+        }));
+      });
+    return () => {
+      active = false;
+    };
+  }, [onProjectsIndex, needsArchivedLookup, lifecycleVersion, archivedProjectsState.supported]);
+
+  const viewedProjectArchived =
+    viewedProjectMissingFromActive &&
+    (archivedProjectsState.projects?.some((p) => p.key === viewedProjectSlug) ?? false);
+
+  useEffect(() => {
+    if (!viewedProjectArchived || !viewedProjectSlug) return;
+    let active = true;
+    setArchivedIssuesState((prev) => ({
+      ...prev,
+      status: prev.data ? prev.status : "loading",
+      inFlight: true,
+      error: null,
+    }));
+    api
+      .archivedProjectIssues(viewedProjectSlug)
+      .then((res) => {
+        if (!active) return;
+        setArchivedIssuesState({
+          status: res.issues.length === 0 ? "empty" : "ok",
+          data: res.issues,
+          error: null,
+          inFlight: false,
+          asOf: Date.now(),
+        });
+      })
+      .catch((e: unknown) => {
+        if (!active) return;
+        setArchivedIssuesState((prev) => ({
+          ...prev,
+          status: prev.data ? prev.status : "failed",
+          inFlight: false,
+          error: e instanceof Error ? e.message : "Could not load archived issues",
+        }));
+      });
+    return () => {
+      active = false;
+    };
+  }, [viewedProjectArchived, viewedProjectSlug, lifecycleVersion]);
+
+  const handleLifecycleChange = useCallback(() => {
+    setLifecycleVersion((v) => v + 1);
+    void resources.projects.refresh();
+    void resources.issues.refresh();
+    if (overviewWantedRef.current) void resources.overview.refresh();
+    if (personalWanted.current) void resources.myWork.refresh();
+  }, []);
+
+  const projectWriteBlock = viewedProjectArchived
+    ? t("This project is archived. Restore it in Project settings to make changes.")
+    : block;
+  const projectReadOnly = projectWriteBlock !== null;
   const documentFollowUps: DocumentFollowUpState | undefined = managedFiles && meta?.signed_in === true
     ? overviewState.status === "failed"
       ? { status: "unavailable" }
@@ -1596,15 +1706,42 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             ]}
           />
         )}
+        {viewedProjectArchived && viewedProjectSlug && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 lg:px-8 py-2 text-label text-ink-200"
+          >
+            <span>{t("This project is archived · Read-only")}</span>
+            {!(route.screen === "projects" && route.section === "settings") && (
+              <Link
+                className="lnk"
+                href={hrefFor({ screen: "projects", slug: viewedProjectSlug, section: "settings" })}
+              >
+                {t("Manage in settings")}
+              </Link>
+            )}
+          </div>
+        )}
         {route.screen === "projects" && route.section === "overview" && (
           <ProjectsOverview
             project={project}
             projects={projects}
-            issues={issuesState}
+            issues={viewedProjectArchived ? archivedIssuesState : issuesState}
             onOpenIssue={openIssue}
-            onRetry={() => void resources.issues.refresh()}
+            onRetry={() => {
+              if (!viewedProjectArchived) void resources.issues.refresh();
+              else setLifecycleVersion((v) => v + 1);
+            }}
             milestonesEnabled={milestonesOn}
             workflowsEnabled={workflowsOn}
+            archivedTab={route.slug === null && route.archived === true}
+            activeHref={hrefFor({ screen: "projects", slug: null, section: "overview" })}
+            archivedHref={hrefFor({ screen: "projects", slug: null, section: "overview", archived: true })}
+            archivedProjects={archivedProjectsState.projects}
+            archivedLoading={archivedProjectsState.loading}
+            archivedError={archivedProjectsState.error}
+            archivedSupported={archivedProjectsState.supported}
+            onRetryArchived={() => setLifecycleVersion((v) => v + 1)}
           />
         )}
         {route.screen === "projects" && route.slug && route.section === "timeline" && hosted !== undefined && (
@@ -1620,7 +1757,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <ProjectSettings
             project={route.slug}
             block={policyBlock(meta)}
+            archived={viewedProjectArchived}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
+            openIssuesCount={
+              issues.filter(
+                (card) =>
+                  card.project === route.slug &&
+                  card.status !== "done" &&
+                  card.status !== "dropped" &&
+                  !card.container,
+              ).length
+            }
+            onLifecycleChange={handleLifecycleChange}
             onToast={(text) => say("ok", text)}
           />
         )}
@@ -1630,11 +1778,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             id={route.id}
             tab={route.tab}
             tabHref={(tab) => locationHref({ ...loc, route: { ...route, tab } }, search)}
-            issues={issues}
+            issues={viewedProjectArchived ? (archivedIssuesState.data ?? issues) : issues}
             agents={agents ?? null}
-            readOnly={readOnly}
-            writeBlock={block}
-            kickoffBlock={operatorKickoffBlock(meta)}
+            readOnly={projectReadOnly}
+            writeBlock={projectWriteBlock}
+            kickoffBlock={projectWriteBlock ?? operatorKickoffBlock(meta)}
             hosted={meta?.hosted === true}
             canLocalDispatch={meta?.settings_sections?.includes("daemons") === true}
             daemonsHref={meta?.settings_sections?.includes("daemons") ? hrefFor({ screen: "settings", section: "daemons" }) : undefined}
@@ -1659,8 +1807,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "projects" && route.section === "issues" && (
           <Board
-            issues={issuesState}
-            onRetry={() => void resources.issues.refresh()}
+            issues={viewedProjectArchived ? archivedIssuesState : issuesState}
+            onRetry={() => {
+              if (!viewedProjectArchived) void resources.issues.refresh();
+              else setLifecycleVersion((v) => v + 1);
+            }}
             projects={projects}
             agents={agents}
             health={health}
@@ -1668,7 +1819,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             view={view}
             onView={setView}
             query={query}
-            readOnly={readOnly || meta === null}
+            readOnly={projectReadOnly || meta === null}
             sessionId={meta === null ? undefined : meta.session?.id ?? null}
             hosted={meta?.hosted === true}
             actor={actor}
@@ -1685,15 +1836,22 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {route.screen === "projects" && route.slug && route.section === "epics" && (
           <Epics
             project={route.slug}
-            issues={issuesState}
-            viewer={viewer}
+            issues={viewedProjectArchived ? archivedIssuesState : issuesState}
+            viewer={{ ...viewer, readOnly: projectReadOnly }}
             onOpenIssue={openIssue}
-            onRetry={() => void resources.issues.refresh()}
+            onRetry={() => {
+              if (!viewedProjectArchived) void resources.issues.refresh();
+              else setLifecycleVersion((v) => v + 1);
+            }}
           />
         )}
         {route.screen === "projects" && route.slug && route.section === "milestones" && (
           milestonesOn ? (
-            <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
+            <Milestones
+              project={route.slug}
+              issues={viewedProjectArchived ? archivedIssuesState : issuesState}
+              onOpenIssue={openIssue}
+            />
           ) : (
             <PageState title={t("Milestones are not available here")} actions={<Button href={hrefFor({ screen: "projects", slug: route.slug, section: "overview" })}>{t("Project overview")}</Button>}>
               {t("This hosted workspace does not serve project milestones.")}
@@ -1704,7 +1862,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           workflowsOn ? (
             <Workflows
               project={route.slug}
-              viewer={viewer}
+              viewer={{ ...viewer, readOnly: projectReadOnly }}
               onOpenIssue={openIssue}
               onHome={() => goRoute({ screen: "home" })}
             />
@@ -1719,8 +1877,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             noWiki={!wikiAvailable(meta)}
             hosted={hosted}
             viewerSub={viewerSub}
-            readOnly={readOnly}
-            readOnlyReason={block}
+            readOnly={projectReadOnly}
+            readOnlyReason={projectWriteBlock}
             actor={actor}
             onToast={say}
             navHref={hrefFor}

@@ -947,9 +947,29 @@ pub enum ProjectAction {
         /// Keep only these keys in each row (comma-joined).
         #[arg(long, value_delimiter = ',')]
         fields: Vec<String>,
+        /// Show archived projects instead of active ones.
+        #[arg(long)]
+        archived: bool,
         /// Output is JSON already — accepted for grammar parity.
         #[arg(long)]
         json: bool,
+    },
+    /// Archive a project locally (hides from active listings and refuses writes).
+    Archive {
+        /// Project key.
+        key: String,
+        /// Exact project key confirmation (`--confirm <key>`).
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// Restore an archived project locally without restarting prior jobs.
+    #[command(visible_alias = "unarchive")]
+    Restore {
+        /// Project key.
+        key: String,
+        /// Optional confirmation (`--confirm <key>`).
+        #[arg(long)]
+        confirm: Option<String>,
     },
     /// Approve the project's PROJECT.md gate keys (`stages`,
     /// `operator_stages`) and its `delivery:` policy as they are now —

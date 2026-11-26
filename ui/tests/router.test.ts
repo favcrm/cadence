@@ -494,3 +494,28 @@ equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects
     "clearing actionId preserves ?chat=assistant on Home",
   );
 }
+
+// CAD-2830: /projects?archived=1 selects the Archived tab on the all-projects overview and clears when leaving.
+{
+  const archivedProjects = readLocation("/projects", "?archived=1");
+  equal(
+    archivedProjects.route,
+    { screen: "projects", slug: null, section: "overview", archived: true },
+    "readLocation parses ?archived=1 on /projects overview",
+  );
+  equal(
+    locationHref(archivedProjects, "?archived=1"),
+    "/projects?archived=1",
+    "/projects?archived=1 round-trips",
+  );
+  equal(
+    locationHref(goTo(archivedProjects, { screen: "projects", slug: null, section: "overview" }), "?archived=1", archivedProjects.route),
+    "/projects",
+    "switching back to Active tab drops ?archived=1",
+  );
+  equal(
+    locationHref(goTo(archivedProjects, { screen: "workspaceAppKey", appKey: "crm" }), "?archived=1&keep=1", archivedProjects.route),
+    "/apps/crm?keep=1",
+    "leaving /projects?archived=1 to an app drops ?archived=1",
+  );
+}

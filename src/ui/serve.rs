@@ -1897,6 +1897,21 @@ fn read_dispatch(
                 (key == "install").then(|| install.to_string())
             })
         }
+        endpoints::RouteId::ProjectLifecycle => {
+            let key = bound.get("key").unwrap_or_default();
+            match Pm::at(pm_dir) {
+                Ok(pm) => {
+                    match crate::issue::write::project_lifecycle_checked(&pm, state_dir, key) {
+                        Ok(out) => json_response(out),
+                        Err(Error::Rejected(m)) if m.starts_with("no project ") => {
+                            err_response(404, "unknown project")
+                        }
+                        Err(e) => err_response(503, &e.to_string()),
+                    }
+                }
+                Err(error) => err_response(503, &error.to_string()),
+            }
+        }
         _ => err_response(500, "a write row reached the read dispatcher"),
     }
 }
@@ -2694,7 +2709,19 @@ fn handle(
             };
             match Pm::at(pm_dir) {
                 Ok(pm) => {
-                    let readable = super::project_policy::readable(&pm, &actor);
+                    let mut readable = super::project_policy::readable(&pm, &actor);
+                    let list = match project::list(&pm.dir) {
+                        Ok(list) => list,
+                        Err(e) => {
+                            send(request, err_response(503, &e.to_string()));
+                            return;
+                        }
+                    };
+                    for proj in list {
+                        if proj.archived {
+                            readable.remove(&proj.key);
+                        }
+                    }
                     super::project_policy::retain_overview(&mut overview, &readable);
                     if actor == "operator"
                         && operator::admit_operator_read(&request, state_dir, opts).is_ok()
@@ -2779,7 +2806,12 @@ fn handle(
                 // AOS-274: a project this caller may not read contributes
                 // no row, and no issue count, to the listing.
                 let readable = super::project_policy::readable(&pm, &actor);
-                let mut payload = read_model::get(state_dir, pm_dir).projects(&pm);
+                let model = read_model::get(state_dir, pm_dir);
+                let mut payload = if query("archived").as_deref() == Some("1") {
+                    model.archived_projects(&pm)
+                } else {
+                    model.projects(&pm)
+                };
                 if let Some(rows) = payload.get_mut("projects").and_then(|v| v.as_array_mut()) {
                     rows.retain(|row| {
                         row.get("key")
@@ -2836,6 +2868,18 @@ fn handle(
                 // AOS-274: filter before the slice and the card, so a
                 // restricted project contributes no row or count.
                 let readable = super::project_policy::readable(&pm, &actor);
+                let want_archived = query("archived").as_deref() == Some("1");
+                let archived_keys: HashSet<String> = match project::list(&pm.dir) {
+                    Ok(list) => list
+                        .into_iter()
+                        .filter(|p| p.archived)
+                        .map(|p| p.key)
+                        .collect(),
+                    Err(e) => {
+                        send(request, err_response(503, &e.to_string()));
+                        return;
+                    }
+                };
                 let model = read_model::get(state_dir, pm_dir);
                 let read = if actor == "operator" {
                     model.board(&pm, filter.as_deref())
@@ -2862,7 +2906,15 @@ fn handle(
                     issues: read
                         .views
                         .iter()
-                        .filter(|v| slice.matches(v) && readable.contains(&v.issue.project))
+                        .filter(|v| {
+                            slice.matches(v)
+                                && readable.contains(&v.issue.project)
+                                && if want_archived && filter.is_some() {
+                                    archived_keys.contains(&v.issue.project)
+                                } else {
+                                    !archived_keys.contains(&v.issue.project)
+                                }
+                        })
                         .map(|v| read.card_item(&ctx, v))
                         .collect(),
                     freshness: read.freshness.clone(),

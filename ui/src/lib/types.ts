@@ -294,6 +294,26 @@ export interface Project {
   default_owner?: string;
   repos: { path?: string; remote?: string }[];
   issues: number;
+  archived?: boolean;
+  archived_at?: string | null;
+  archived_by?: string | null;
+}
+
+export interface ProjectLifecycle {
+  archive_capability?: string;
+  project: string;
+  archived: boolean;
+  revision: number;
+  archived_at: string | null;
+  archived_by: string | null;
+  changed_at: string | null;
+  changed_by: string | null;
+  blockers: string[];
+}
+
+export interface ArchivedProjectsPayload {
+  archive_supported: boolean;
+  projects: Project[];
 }
 
 export type ContextRole = "pm" | "dev" | "qa" | "devops";

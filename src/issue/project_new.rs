@@ -408,6 +408,12 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
                     visibility: req.visibility,
                     members: grants.clone(),
                 }),
+                archived: false,
+                archived_at: None,
+                archived_by: None,
+                archive_revision: 0,
+                archive_changed_at: None,
+                archive_changed_by: None,
             })
             .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
             let file = dir.join("project.yaml");

@@ -75,7 +75,7 @@ export type ConnectionPage =
 
 export type Route =
   | { screen: "home"; privateChat?: true; actionId?: string }
-  | { screen: "projects"; slug: string | null; section: ProjectSection }
+  | { screen: "projects"; slug: string | null; section: ProjectSection; archived?: boolean }
   | { screen: "issue"; project: string; id: string; tab: IssueTab }
   | { screen: "apps"; project: string | null; name: string | null }
   | { screen: "appsExplore" }
@@ -478,6 +478,9 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   if (route.screen === "projects" && route.section === "overview" && q.has("view")) {
     route = { ...route, section: "issues" };
   }
+  if (route.screen === "projects" && route.slug === null && route.section === "overview" && q.get("archived") === "1") {
+    route = { ...route, archived: true };
+  }
   if (route.screen === "home") {
     const privateChat = q.get("chat") === "assistant";
     const rawAction = q.get("action")?.trim();
@@ -541,11 +544,14 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
 function scopedRoute(route: Route, project: string): Route {
   if (route.screen !== "projects") return route;
   const slug = project === "all" ? null : project;
-  return { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" };
+  const section = slug ? route.section : route.section === "overview" ? "overview" : "issues";
+  return {
+    screen: "projects",
+    slug,
+    section,
+    ...(slug === null && section === "overview" && route.archived ? { archived: true } : {}),
+  };
 }
-
-/** Query parameters the Documents screen owns (CAD-2286). */
-const DOCUMENTS_PARAMS = ["archived", "stage"] as const;
 
 /** Query parameters only a mounted app route owns. `install` is the
  *  CAD-1438 pin of a generated contextual link — the immutable install id
@@ -642,7 +648,10 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   // CAD-2286: Documents owns `archived` and `stage` and drops them elsewhere,
   // except on a mounted app route, whose own query may use either name. Leaving
   // Documents for an app route drops them too: there they are still Documents'.
-  if (!isAppRoute(route) || from?.screen === "documents") for (const key of DOCUMENTS_PARAMS) q.delete(key);
+  if (!isAppRoute(route) || from?.screen === "documents" || from?.screen === "projects") {
+    q.delete("archived");
+    if (!isAppRoute(route) || from?.screen === "documents") q.delete("stage");
+  }
   if (!isAppRoute(route) || from?.screen === "wiki") q.delete("wiki_scope");
   // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
   // `workspaceApp` compat route) own these; they stay on the app's own
@@ -674,6 +683,8 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
     if (route.section === "issues") {
       q.set("view", loc.view);
       writeFilters(q, loc.filters);
+    } else if (route.slug === null && route.section === "overview" && route.archived) {
+      q.set("archived", "1");
     }
   } else if (projectFilter(route) && loc.project !== "all") {
     q.set("project", loc.project);
@@ -756,9 +767,15 @@ export function goTo(current: AppLocation, route: Route): AppLocation {
   }
   if (route.screen === "projects") {
     const slug = route.slug ?? (carriedProject(current) === "all" ? null : carriedProject(current));
+    const section = slug ? route.section : route.section === "overview" ? "overview" : "issues";
     return {
       ...current,
-      route: { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" },
+      route: {
+        screen: "projects",
+        slug,
+        section,
+        ...(slug === null && section === "overview" && route.archived ? { archived: true } : {}),
+      },
       project: slug ?? "all",
     };
   }

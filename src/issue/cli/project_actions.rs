@@ -89,10 +89,30 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 )?);
                 Ok(0)
             }
+            ProjectAction::Archive { key, confirm } => {
+                let Some(conf) = confirm.as_deref() else {
+                    return Err(Error::rejected(format!(
+                        "archive requires exact key confirmation: pass --confirm {key}"
+                    )));
+                };
+                let pm = open_pm()?;
+                let blockers = write::project_blockers(&pm, state_dir, key)?;
+                let out = write::archive_project(&pm, key, conf, None, &blockers, "")?;
+                print_json(&out);
+                Ok(0)
+            }
+            ProjectAction::Restore { key, confirm } => {
+                let conf = confirm.as_deref().unwrap_or(key.as_str());
+                let pm = open_pm()?;
+                let out = write::restore_project(&pm, key, conf, None, "")?;
+                print_json(&out);
+                Ok(0)
+            }
             ProjectAction::Ls {
                 sort,
                 limit,
                 fields,
+                archived,
                 json: _,
             } => {
                 let pm = open_pm()?;
@@ -103,6 +123,7 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 let approvals = crate::issue::delivery_policy::fetch_approvals(state_dir);
                 let mut rows: Vec<Value> = projects
                     .iter()
+                    .filter(|p| p.archived == *archived)
                     .map(|p| {
                         let file = crate::issue::delivery_policy::load(&pm.dir, &p.key);
                         let eff = crate::issue::delivery_policy::effective(
@@ -110,7 +131,7 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                             file.map_err(|e| e.to_string()),
                             approvals.get(&p.key),
                         );
-                        json!({
+                        let mut row = json!({
                             "key": p.key, "prefix": p.prefix,
                             "components": p.components,
                             "tags": p.tags,
@@ -123,7 +144,13 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                                 "digest": eff.digest,
                                 "note": eff.note,
                             },
-                        })
+                        });
+                        if p.archived {
+                            row["archived"] = json!(true);
+                            row["archived_at"] = json!(p.archived_at);
+                            row["archived_by"] = json!(p.archived_by);
+                        }
+                        row
                     })
                     .collect();
                 if let Some(spec) = sort {
