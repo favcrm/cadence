@@ -1,45 +1,6 @@
-import { useEffect, useId, useState, type CSSProperties } from "react";
+import { useId, useState, type CSSProperties } from "react";
 import { useLocaleTag } from "../../../lib/locale";
-import { beginPrivateOperation, type PrivateOperation } from "../../../lib/privateSession";
 import type { SheetCell, SheetCellStyle, WorkbookSheets } from "./vendor/xlsx-sheets";
-import "./workbook.css";
-
-const MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-const MAX_BYTES = 25 * 1024 * 1024;
-
-type State = { status: "loading" } | { status: "error" } | { status: "ready"; workbook: WorkbookSheets };
-
-async function readBytes(href: string, operation: PrivateOperation): Promise<ArrayBuffer> {
-  const url = new URL(href, window.location.href);
-  if (url.origin !== window.location.origin) throw new Error("Cross-origin attachment");
-  const response = await operation.fetch(url, { credentials: "same-origin", redirect: "error" });
-  if (!response.ok || response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== MIME || !response.body) {
-    throw new Error("Unavailable workbook");
-  }
-  const length = response.headers.get("content-length");
-  if (length && Number(length) > MAX_BYTES) throw new Error("Workbook too large");
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > MAX_BYTES) {
-        await reader.cancel();
-        throw new Error("Workbook too large");
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return bytes.buffer;
-}
 
 function columnName(index: number): string {
   let number = index + 1;
@@ -62,48 +23,10 @@ function cellStyle(cell: SheetCell | undefined, style: SheetCellStyle | undefine
   };
 }
 
-export default function WorkbookPreview({ href, title }: { href: string; title: string }) {
+export default function WorkbookPreview({ workbook, title }: { workbook: WorkbookSheets; title: string }) {
   const zh = useLocaleTag() === "zh-TW";
   const id = useId();
-  const [state, setState] = useState<State>({ status: "loading" });
   const [selected, setSelected] = useState(0);
-
-  useEffect(() => {
-    let operation: PrivateOperation | undefined;
-    let worker: Worker | undefined;
-    let active = true;
-    setState({ status: "loading" });
-    setSelected(0);
-    void (async () => {
-      try {
-        const pending = beginPrivateOperation();
-        operation = pending;
-        pending.signal.addEventListener("abort", () => worker?.terminate(), { once: true });
-        const bytes = await readBytes(href, pending);
-        // This Vite-only module exists in the browser, not in the CommonJS test harness.
-        const { default: workerUrl } = await import("./workbook.worker?worker&url");
-        pending.assertCurrent();
-        worker = new Worker(workerUrl, { type: "module" });
-        worker.onmessage = (event: MessageEvent<{ workbook?: WorkbookSheets }>) => {
-          if (active && !pending.signal.aborted) setState(event.data.workbook ? { status: "ready", workbook: event.data.workbook } : { status: "error" });
-          pending.dispose();
-        };
-        worker.onerror = () => {
-          if (active && !pending.signal.aborted) setState({ status: "error" });
-          pending.dispose();
-        };
-        worker.postMessage(bytes, [bytes]);
-      } catch {
-        if (active && !operation?.signal.aborted) setState({ status: "error" });
-        operation?.dispose();
-      }
-    })();
-    return () => { active = false; operation?.dispose(); };
-  }, [href]);
-
-  if (state.status === "loading") return <div className="workbook-status" role="status">{zh ? "正在載入試算表…" : "Loading workbook…"}</div>;
-  if (state.status === "error") return <div className="workbook-status" role="alert">{zh ? "無法預覽此試算表。檔案可能無法使用、格式不支援或超過大小限制。" : "This workbook cannot be previewed. It may be unavailable, unsupported, or too large."}</div>;
-  const { workbook } = state;
   const sheet = workbook.sheets[selected];
   if (!sheet) return <div className="workbook-status">{zh ? "此活頁簿沒有可顯示的工作表。" : "This workbook has no visible worksheets."}</div>;
   const rows = new Map(sheet.rows.map((row) => [row.index, row]));

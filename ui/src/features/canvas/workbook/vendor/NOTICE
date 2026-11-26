@@ -1,4 +1,5 @@
-Cloudflare OS office-content workbook reader
+Cloudflare OS office-content workbook, document, and slide readers
 Source: https://github.com/cloudflare/cloudflare-os, commit 2ca27fb0ed82923a6e026066eafaa2843eb6700e, packages/office-content/src.
 Licensed under Apache License 2.0; see LICENSE. Original source comments and attributions are retained.
 Cadence change: the workbook reader accepts an optional maximum worksheet count and reports when additional visible worksheets are omitted.
+CAD-2767: require a namespace-bound main XML root in docx-document.ts and pptx-slides.ts using opt-in guards in ooxml.ts and xml.ts. Other DOCX and PPTX reader files retain the pinned source. The readers make no external resource requests.

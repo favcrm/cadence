@@ -2565,6 +2565,8 @@ Object.assign(zhTW, {
   "App": "應用程式",
   "read-only": "唯讀",
   "Preview workbook": "預覽試算表",
+  "Preview document": "預覽文件",
+  "Preview presentation": "預覽簡報",
   "Open in {app}": "在 {app} 開啟",
   "Open in canvas": "在畫布開啟",
   "No access": "沒有存取權限",

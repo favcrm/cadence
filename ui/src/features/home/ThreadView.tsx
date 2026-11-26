@@ -12,7 +12,8 @@ import ArtifactCard from "../canvas/ArtifactCard";
 import ImageBlock from "../canvas/ImageBlock";
 import VideoBlock from "../canvas/VideoBlock";
 import { useImageConversation } from "../canvas/imageConversation";
-import { openWorkbook } from "../canvas/canvasStore";
+import { openOfficeAttachment } from "../canvas/canvasStore";
+import { OFFICE_FORMATS } from "../canvas/workbook/officePreviewTypes";
 import { hostedOrigin } from "../auth/hosted";
 import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import PdfPageAction, { PdfPageTarget } from "./PdfPageAction";
@@ -776,10 +777,12 @@ function AttachmentRows({ files, sent = false }: { files: EntryAttachment[]; sen
               );
             }
           }
-          if (sent && hosted && conversation !== null && f.mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
+          const officeFormat = Object.hasOwn(OFFICE_FORMATS, f.mime) ? OFFICE_FORMATS[f.mime] : undefined;
+          if (sent && hosted && conversation !== null && officeFormat !== undefined) {
+            const previewLabel = t(officeFormat === "docx" ? "Preview document" : officeFormat === "pptx" ? "Preview presentation" : "Preview workbook");
             return (
               <button key={f.id} type="button" className="sentchip" data-kind="text"
-                title={`${title} — ${t("Preview workbook")}`} onClick={() => openWorkbook(conversation, f)}>
+                title={`${title} — ${previewLabel}`} onClick={() => openOfficeAttachment(conversation, f, officeFormat)}>
                 {body}
               </button>
             );

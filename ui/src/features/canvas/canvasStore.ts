@@ -37,6 +37,7 @@ import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed } from
 import { appViewId, appViewRef, appViewTitle, applyRoutePatch, sameRoute, type AppViewRef } from "./appView";
 import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { RecordViewRef } from "./recordView";
+import type { OfficeFormat } from "./workbook/officePreviewTypes";
 import {
   addPane, chooseMode, clampShare, clearSavedLayouts, dropPane, livePanes, readLayout, removePane, replacePane, writeLayout,
   MAX_PANES, type DropZone, type LayoutMode, type PaneLayout, type Placement,
@@ -44,7 +45,7 @@ import {
 
 export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
 /** A tab's kind includes views that are not versioned artifacts. */
-export type TabKind = ArtifactKind | "app" | "record" | "workbook";
+export type TabKind = ArtifactKind | "app" | "record" | "office";
 export const ARTIFACT_KINDS: readonly ArtifactKind[] = ["md", "pdf", "html", "image", "csv"];
 
 /** What a thread card carries — never the content. */
@@ -76,7 +77,7 @@ export interface CanvasTab {
   /** Set exactly for a record view. */
   record?: RecordViewRef;
   /** A retained chat attachment, not an artifact ID or URL. */
-  workbook?: { id: string; conversation: string };
+  office?: { id: string; conversation: string; format: OfficeFormat };
   title: string;
   /** Absent when the version that opened the tab had no known size. */
   bytes?: number;
@@ -95,7 +96,7 @@ export interface CanvasTab {
 
 export type ArtifactTab = CanvasTab & { kind: ArtifactKind };
 export const isArtifactTab = (tab: CanvasTab): tab is ArtifactTab =>
-  tab.kind !== "app" && tab.kind !== "record" && tab.kind !== "workbook";
+  tab.kind !== "app" && tab.kind !== "record" && tab.kind !== "office";
 
 /** The turn running in the thread, and what it is changing in the canvas. */
 export interface Working {
@@ -211,10 +212,10 @@ export function onArtifactsEmptied(listener: () => boolean): void {
   emptiedListeners.add(listener);
 }
 
-const WORKBOOK_TAB_PREFIX = "chat-xlsx:";
+const OFFICE_TAB_PREFIX = "chat-office:";
 
 function saveLayout(conversation: string | null, layout: PaneLayout): void {
-  const panes = layout.panes.filter((id) => !id.startsWith(WORKBOOK_TAB_PREFIX));
+  const panes = layout.panes.filter((id) => !id.startsWith(OFFICE_TAB_PREFIX));
   writeLayout(conversation, panes.length === layout.panes.length ? layout :
     panes.length < 2 ? { ...layout, panes: [], mode: "tabs" } : { ...layout, panes });
 }
@@ -432,12 +433,12 @@ export function openRecordView(ref: RecordViewRef): void {
   artifactFocused("user");
 }
 
-/** Open a retained workbook only in the chat that owns the chip. */
-export function openWorkbook(conversation: string, attachment: { id: string; name: string; size: number }): void {
+/** Open a retained Office attachment only in the chat that owns the chip. */
+export function openOfficeAttachment(conversation: string, attachment: { id: string; name: string; size: number }, format: OfficeFormat): void {
   if (state.conversation !== conversation || !privateReadsAllowed()) return;
-  const id = WORKBOOK_TAB_PREFIX + attachment.id;
+  const id = OFFICE_TAB_PREFIX + attachment.id;
   const tabs = state.tabs.some((t) => t.id === id) ? state.tabs : [...state.tabs, {
-    id, kind: "workbook" as const, workbook: { id: attachment.id, conversation }, title: attachment.name,
+    id, kind: "office" as const, office: { id: attachment.id, conversation, format }, title: attachment.name,
     bytes: attachment.size, latest: 1, selected: 1, follow: false, versions: {}, turn: null,
   }];
   set({ ...state, tabs, ...present(tabs, state.active, state.lastOpened, state.layout, id), lastOpened: id, open: true });
@@ -566,7 +567,7 @@ export function showDrawer(): void {
 
 // An uncertain session pauses reads immediately, even before an identity reset.
 onPrivateReadsPaused(() => {
-  for (const tab of state.tabs) if (tab.workbook) closeTab(tab.id);
+  for (const tab of state.tabs) if (tab.office) closeTab(tab.id);
 });
 
 // A confirmed identity change drops this conversation's tabs: titles and
@@ -603,8 +604,8 @@ export function defaultWidth(kind: TabKind, viewport: number): number {
 }
 
 function defaultRange(kind: TabKind): [number, number, number] {
-  // The sheet scrolls horizontally, so its default can leave room for chat at 1024px.
-  if (kind === "workbook") return [0.45, MIN_WIDTH, 960];
+  // An Office page scales or scrolls at widths that leave room for chat at 1024px.
+  if (kind === "office") return [0.45, MIN_WIDTH, 960];
   return kind === "app" || kind === "html" || kind === "csv" || kind === "pdf" ? [0.55, 560, 960] : [0.45, 480, 760];
 }
 

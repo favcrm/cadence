@@ -51,9 +51,9 @@ const DEFAULT_MAX_ELEMENTS = 250_000;
 export const MAX_ATTRIBUTES = 1024;
 const XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
 
-/** Parses a whole document and returns its root element. */
-export function parseXml(text: string, options: XmlOptions): XmlElement {
-  const tokenizer = new XmlTokenizer(text, options);
+/** Parses a whole document, optionally requiring a canonical namespace-qualified root. */
+export function parseXml(text: string, options: XmlOptions, expectedRoot?: string): XmlElement {
+  const tokenizer = new XmlTokenizer(text, options, expectedRoot);
   let root: XmlElement | undefined;
   for (let token = tokenizer.next(); token; token = tokenizer.next()) {
     if (token.kind === "open") root = buildElement(tokenizer, token, options);
@@ -66,8 +66,8 @@ export function parseXml(text: string, options: XmlOptions): XmlElement {
  * Yields each element at `depth` (the root is depth 0) as a complete subtree, so a large part such
  * as a document body can be converted while holding only one block of it in memory at a time.
  */
-export function* streamElements(text: string, depth: number, options: XmlOptions): Generator<XmlElement> {
-  const tokenizer = new XmlTokenizer(text, options);
+export function* streamElements(text: string, depth: number, options: XmlOptions, expectedRoot?: string): Generator<XmlElement> {
+  const tokenizer = new XmlTokenizer(text, options, expectedRoot);
   for (let token = tokenizer.next(); token; token = tokenizer.next()) {
     if (token.kind === "open" && token.depth === depth) {
       yield* replaced(buildElement(tokenizer, token, options), options);
@@ -166,7 +166,7 @@ class XmlTokenizer {
   #rootSeen = false;
   readonly #maxDepth: number;
 
-  constructor(private readonly text: string, private readonly options: XmlOptions) {
+  constructor(private readonly text: string, private readonly options: XmlOptions, private readonly expectedRoot?: string) {
     this.#maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
   }
 
@@ -195,6 +195,7 @@ class XmlTokenizer {
       }
     }
     if (this.#open.length > 0) throw new XmlError("malformed", `Element <${this.#open[this.#open.length - 1]!.rawName}> is never closed`);
+    if (this.expectedRoot !== undefined && !this.#rootSeen) throw new XmlError("malformed", "Document has no root element");
     return null;
   }
 
@@ -241,9 +242,12 @@ class XmlTokenizer {
     this.#rootSeen = true;
 
     this.#open.push({ rawName, declarations });
+    const checkRoot = depth === 0 && this.expectedRoot !== undefined;
+    const name = this.#resolve(rawName, true, checkRoot);
+    if (checkRoot && name !== this.expectedRoot) throw new XmlError("malformed", `Expected ${this.expectedRoot} as the document root`);
     const token: OpenToken = {
       kind: "open",
-      name: this.#resolve(rawName, true),
+      name,
       attributes: this.#resolveAttributes(rawAttributes),
       selfClosing,
       depth,
@@ -293,13 +297,16 @@ class XmlTokenizer {
   }
 
   /** Maps a qualified name to the caller's prefix for its namespace. Unprefixed attributes have no namespace. */
-  #resolve(rawName: string, isElement: boolean): string {
+  #resolve(rawName: string, isElement: boolean, requireNamespace = false): string {
     const colon = rawName.indexOf(":");
     const prefix = colon === -1 ? "" : rawName.slice(0, colon);
     const local = colon === -1 ? rawName : rawName.slice(colon + 1);
     if (prefix === "" && !isElement) return local;
     const uri = prefix === "xml" ? XML_NAMESPACE : this.#lookupNamespace(prefix);
-    if (uri === undefined || uri === "") return prefix === "" ? local : rawName;
+    if (uri === undefined || uri === "") {
+      if (requireNamespace) throw new XmlError("malformed", "Document root has no namespace");
+      return prefix === "" ? local : rawName;
+    }
     const known = uri === XML_NAMESPACE ? "xml" : this.options.namespaces[uri];
     return known === undefined ? `{${uri}}${local}` : `${known}:${local}`;
   }

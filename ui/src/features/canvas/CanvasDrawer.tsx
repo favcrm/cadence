@@ -20,7 +20,7 @@ import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
 import AppViewBody from "./AppViewBody";
 import RecordViewBody from "./RecordViewBody";
-import WorkbookPreview from "./workbook/WorkbookPreview";
+import OfficeAttachmentPreview from "./workbook/OfficeAttachmentPreview";
 import { attachmentHref } from "../home/AttachmentMedia";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
 import { canvasChrome, setCanvasFull, setChatPeek, useCanvasChrome } from "./canvasChrome";
@@ -609,7 +609,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   useEffect(() => setExpanded(false), [pathname]);
   // Attachment bytes belong to the chat page, including while another page loads.
   useLayoutEffect(() => {
-    for (const tab of canvasSnapshot().tabs) if (tab.workbook) closeTab(tab.id);
+    for (const tab of canvasSnapshot().tabs) if (tab.office) closeTab(tab.id);
   }, [pathname]);
 
   // The active tab stays in view, clear of the Browser tab pinned at the
@@ -843,7 +843,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
                 onClose={closeAll}
                 onPaneClose={paneClose}
               />
-            ) : x.workbook && hosted && !showBrowser && x.workbook.conversation === canvas.conversation ? (
+            ) : x.office && hosted && !showBrowser && x.office.conversation === canvas.conversation ? (
               <>
                 <header className="cv-head">
                   {sheet ? (
@@ -853,7 +853,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
                       </svg>
                     </button>
                   ) : null}
-                  <span className="arttype">XLSX</span>
+                  <span className="arttype">{x.office.format.toUpperCase()}</span>
                   <span className="cv-title">
                     <b title={x.title}>{x.title}</b>
                     <span className="cv-appview-sub">{t("read-only")}</span>
@@ -871,8 +871,8 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
                     </>
                   ) : null}
                 </header>
-                <div className="cv-body" data-canvas-body data-workbook-preview>
-                  <WorkbookPreview key={x.id} href={attachmentHref(x.workbook.id, x.workbook.conversation)} title={x.title} />
+                <div className="cv-body" data-canvas-body data-office-preview>
+                  <OfficeAttachmentPreview key={x.id} href={attachmentHref(x.office.id, x.office.conversation)} title={x.title} format={x.office.format} />
                 </div>
               </>
             ) : x.record ? (

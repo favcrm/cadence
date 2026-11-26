@@ -1,0 +1,19 @@
+.office-preview { display: flex; flex: 1; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; }
+.office-toolbar { display: flex; align-items: center; gap: 8px; color: var(--color-ink-200); font: var(--text-micro) var(--font-sans); }
+.office-toolbar select { max-width: 100%; padding: 4px 8px; border: 1px solid var(--color-ink-700); border-radius: 6px; background: var(--color-ink-850); color: var(--color-ink-100); font: inherit; }
+.office-toolbar select:focus-visible, .office-doc-scroll:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.office-notice, .office-status { margin: 0; color: var(--color-ink-400); font: var(--text-micro) var(--font-sans); line-height: 1.5; }
+.office-doc-scroll, .office-slide-scroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--color-ink-700); border-radius: 6px; background: var(--color-ink-850); }
+.office-document { box-sizing: border-box; width: min(100%, 900px); min-height: 100%; margin: 0 auto; padding: 40px; background: #fff; color: #111; font: 12pt/1.4 var(--font-sans); overflow-wrap: anywhere; }
+.office-document header, .office-document footer { color: #555; }
+.office-paragraph { white-space: pre-wrap; }
+.office-table-scroll { max-width: 100%; overflow-x: auto; }
+.office-doc-table { border-collapse: collapse; color: inherit; font: inherit; }
+.office-doc-table td { min-width: 1px; }
+.office-page-break { border: 0; border-top: 1px dashed #999; margin: 24px 0; }
+.office-slide-scroll { display: flex; align-items: flex-start; justify-content: center; padding: 12px; }
+.office-slide { position: relative; container-type: inline-size; width: min(100%, 960px); flex: none; overflow: hidden; color: #111; text-align: left; font-family: var(--font-sans); }
+.office-slide-text { box-sizing: border-box; display: flex; flex-direction: column; width: 100%; height: 100%; overflow: hidden; }
+.office-slide-table { border-collapse: collapse; table-layout: fixed; width: 100%; height: 100%; }
+.office-slide-table td { box-sizing: border-box; padding: 0; overflow: hidden; vertical-align: top; }
+@media (max-width: 500px) { .office-document { padding: 20px; } }
