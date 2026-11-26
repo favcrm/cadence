@@ -450,6 +450,16 @@ export default function ThreadsPage({
     }
   }, [open?.id, composerKey]);
 
+  const onBackToList = useCallback(
+    () => navigate(`/threads${threadsUrlSearch({ ...url, conversation: null })}`, { replace: true }),
+    [url],
+  );
+  const visibleHumanRooms = useMemo(() => {
+    if (!human.me || url.kind !== "all" || humanRooms.rooms === null) return [];
+    const q = query.trim().toLowerCase();
+    return humanRooms.rooms.filter((r) => q === "" || r.title.toLowerCase().includes(q));
+  }, [human.me, url.kind, humanRooms.rooms, query]);
+
   if (!operator && human.me === null && human.loading) {
     return (
       <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
@@ -498,13 +508,9 @@ export default function ThreadsPage({
   const humanLoading =
     humanThreadsEnabled &&
     (human.loading || (human.me !== null && humanRooms.rooms === null && humanRooms.error === null));
-  const visibleHumanRooms = useMemo(() => {
-    if (!human.me || url.kind !== "all" || humanRooms.rooms === null) return [];
-    const q = query.trim().toLowerCase();
-    return humanRooms.rooms.filter((r) => q === "" || r.title.toLowerCase().includes(q));
-  }, [human.me, url.kind, humanRooms.rooms, query]);
   const hasVisibleRows = visible.length > 0 || visibleHumanRooms.length > 0;
   const sidebarLoading = (workLoading || humanLoading) && !hasVisibleRows;
+  const hasSelection = Boolean(humanId || open || draft);
   const hasFilters =
     query.trim() !== "" ||
     url.kind !== "all" ||
@@ -513,7 +519,7 @@ export default function ThreadsPage({
 
   const page = (
     <section className="threads-page" aria-labelledby="threads-title">
-      <div className="threads-layout">
+      <div className="threads-layout" data-open={hasSelection ? "1" : "0"}>
         <aside className="threads-list" aria-label={t("Conversations")}>
           <div className="threads-list-head">
             <h1 id="threads-title">{t("Channels")}</h1>
@@ -602,6 +608,7 @@ export default function ThreadsPage({
                 me={human.me}
                 refresh={humanRefresh}
                 onState={onHumanState}
+                onBack={onBackToList}
                 onOpenContext={toggleContext}
                 detailsOpen={isDesktop ? desktopContextOpen : mobileContextOpen}
                 onInvite={() => {
@@ -641,6 +648,7 @@ export default function ThreadsPage({
               threadsTick={threadsTick}
               issueProjects={issueProjects}
               agents={agentsState.data?.agents ?? null}
+              onBack={onBackToList}
               onOpenContext={toggleContext}
               detailsOpen={isDesktop ? desktopContextOpen : mobileContextOpen}
               onChanged={() => void loadList()}
@@ -660,6 +668,7 @@ export default function ThreadsPage({
               liveStamp={agentsTick}
               issueProjects={issueProjects}
               agents={agentsState.data?.agents ?? null}
+              onBack={onBackToList}
               reply={dmReplyIntent}
               onReplyCancel={cancelReply}
               onReplySent={sentReply}
@@ -889,6 +898,7 @@ function Timeline({
   threadsTick,
   issueProjects,
   agents,
+  onBack,
   onOpenContext,
   detailsOpen = false,
   onChanged,
@@ -912,6 +922,7 @@ function Timeline({
   /** The `threads` frame revision: a topic or message change on any thread. */
   threadsTick: number;
   openDm: (alias: string) => void;
+  onBack?: () => void;
   onOpenContext: () => void;
   detailsOpen?: boolean;
   onChanged: () => void;
@@ -1123,6 +1134,17 @@ function Timeline({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
+        {onBack && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onBack}
+            aria-label={t("Back to channels")}
+            className="threads-back-btn"
+          >
+            <span aria-hidden="true">←</span> {t("Channels")}
+          </Button>
+        )}
         <div className="threads-kicker">{t(KIND_LABEL[row.kind])}</div>
         <h2>{conversationTitle(row, t)}</h2>
         <div className="threads-head-actions">
@@ -1729,6 +1751,7 @@ function DraftDm({
   liveStamp,
   issueProjects,
   agents,
+  onBack,
   onSent,
   reply,
   onReplyCancel,
@@ -1741,6 +1764,7 @@ function DraftDm({
   issueProjects: IssueProjects;
   /** The live roster; null while it loads. */
   agents: Agent[] | null;
+  onBack?: () => void;
   onSent: () => void;
   /** The contextual reply this draft view is carrying, else null. */
   reply: ReplyIntent | null;
@@ -1778,6 +1802,17 @@ function DraftDm({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
+        {onBack && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onBack}
+            aria-label={t("Back to channels")}
+            className="threads-back-btn"
+          >
+            <span aria-hidden="true">←</span> {t("Channels")}
+          </Button>
+        )}
         <div className="threads-kicker">{t(KIND_LABEL.operator)}</div>
         <h2>{t("You ↔ {alias}").replace("{alias}", () => alias)}</h2>
       </header>

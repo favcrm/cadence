@@ -310,7 +310,7 @@ export default function NewHumanConversation({
               id={`${id}-agent`}
               full
               searchable
-              keepOpenOnPick
+              keepOpenOnPick={agents !== null && agents.length > 1}
               selectedValues={selectedAgents.map((agent) => agent.uid)}
               value=""
               disabled={pending || agents === null}

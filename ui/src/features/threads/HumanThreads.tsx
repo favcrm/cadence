@@ -427,6 +427,7 @@ export function HumanRoomTimeline({
   me,
   refresh,
   onState,
+  onBack,
   onOpenContext,
   detailsOpen = false,
   onInvite,
@@ -440,6 +441,7 @@ export function HumanRoomTimeline({
   me: HumanMe;
   refresh: number;
   onState: (state: HumanRoomState) => void;
+  onBack?: () => void;
   onOpenContext: () => void;
   detailsOpen?: boolean;
   onInvite?: () => void;
@@ -862,6 +864,17 @@ export function HumanRoomTimeline({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
+        {onBack && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onBack}
+            aria-label={t("Back to channels")}
+            className="threads-back-btn"
+          >
+            <span aria-hidden="true">←</span> {t("Channels")}
+          </Button>
+        )}
         <div className="threads-head-title">
           <h2>{headerTitle}</h2>
           {headerSub !== null ? (

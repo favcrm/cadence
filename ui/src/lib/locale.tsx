@@ -4390,6 +4390,7 @@ const CAD2718_ZHTW: Record<string, string> = {
   "Could not load WhatsApp settings.": "無法載入 WhatsApp 設定。",
   "Connect WhatsApp using either a linked device or the Official API.": "選擇使用「已連結裝置」或「官方 API」連接 WhatsApp。",
   "Back to Inbox": "返回收件匣",
+  "Back to channels": "返回頻道",
   "Connection mode": "連線模式",
   "Linked device": "已連結裝置",
   "Scan a QR code from your WhatsApp app": "直接掃描 WhatsApp 手機二維碼配對",
