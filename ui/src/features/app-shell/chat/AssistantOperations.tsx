@@ -688,6 +688,47 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     void poller.current?.written();
   }, [scopeKey, connectionRevision]);
 
+  const hasRunningOperation = visible.operations.some((operation) => operation.status === "running");
+  useEffect(() => {
+    if (!contextReady || !hasRunningOperation) return;
+    const BACKOFF_MS = [5_000, 8_000, 10_000] as const;
+    let cancelled = false;
+    let attempt = 0;
+    let timer: number | undefined;
+    const schedule = () => {
+      if (cancelled || document.hidden) return;
+      const delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        if (cancelled || document.hidden) return;
+        attempt = Math.min(attempt + 1, BACKOFF_MS.length - 1);
+        const handle = poller.current;
+        if (!handle || !handle.alive()) return;
+        void handle.refresh().finally(() => {
+          if (!cancelled) schedule();
+        });
+      }, delay);
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        if (timer !== undefined) {
+          window.clearTimeout(timer);
+          timer = undefined;
+        }
+      } else if (timer === undefined) {
+        attempt = 0;
+        schedule();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    schedule();
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [contextReady, hasRunningOperation, scopeKey]);
+
   const runWrite = async (busyId: string, write: () => Promise<unknown>, failure: string) => {
     const handle = poller.current;
     if (!handle) return;

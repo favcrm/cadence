@@ -89,10 +89,14 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
         <div data-host-slot={view.token.slice(0, 8)} style={{ position: "absolute", left: approvalLeft,
           top: growsUp ? undefined : box.y, bottom: growsUp ? size.h - box.y - box.h : undefined,
           width: approvalWidth, maxHeight: approvalHeight, boxSizing: "border-box",
-          pointerEvents: box.footer ? "auto" : "none", display: "flex", alignItems: "flex-start",
+          pointerEvents: box.footer ? "auto" : "none", display: "flex", alignItems: box.footer ? "center" : "flex-start",
+          gap: box.footer ? 8 : 0,
           justifyContent: box.footer ? "center" : approvalLeft < box.x ? "flex-end" : "flex-start",
           padding: box.footer ? "8px 16px" : 0, background: box.footer ? "var(--surface, var(--ink-900, #111))" : "transparent",
           borderTop: box.footer ? "1px solid var(--line, rgba(128,128,128,.3))" : undefined }}>
+          {box.footer && (
+            <Button disabled={view.pending} onClick={() => onCancel(view.token)}>{t("Cancel")}</Button>
+          )}
           <button type="button" className="btn btn-primary" disabled={view.pending} aria-busy={view.pending}
             style={{ width: box.footer ? "min(100%, 320px)" : "max-content", maxWidth: "100%",
               height: "auto", minHeight: Math.min(box.footer ? 40 : box.h, Math.max(0, approvalHeight - (box.footer ? 17 : 0))),

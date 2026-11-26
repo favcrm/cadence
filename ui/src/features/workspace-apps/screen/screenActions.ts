@@ -666,10 +666,15 @@ function checkedQuote(quote: CapabilityQuote["quote"]): CapabilityQuote["quote"]
   if (typeof revision !== "string" || revision.length === 0 || revision.length > 128) return null;
   return { schema: 1, currency: "USD", unit_price_micros: unit, units, total_price_micros: total, price_revision: revision };
 }
-/** Integer micros to `USD d.mmmmmm` — quotient and 6-digit remainder, never
- *  floating-point rounding. */
-const usdLabel = (micros: number): string =>
-  `USD ${Math.floor(micros / 1_000_000)}.${String(micros % 1_000_000).padStart(6, "0")}`;
+/** Integer micros to `$d.cc` (or more fractional digits if non-zero past cents) —
+ *  quotient and 6-digit remainder, never floating-point rounding. */
+const usdLabel = (micros: number): string => {
+  const whole = Math.floor(micros / 1_000_000);
+  const frac = String(micros % 1_000_000).padStart(6, "0");
+  const trimmed = frac.replace(/0+$/, "");
+  const dec = trimmed.length <= 2 ? frac.slice(0, 2) : trimmed;
+  return `$${whole}.${dec}`;
+};
 /** `run.start`: validate against the installed workflow, fetch the quotes the
  *  daemon will compare with the run's frozen ones, and name the work with the
  *  workflow's own label plus the quoted USD total (host label only — no
@@ -708,19 +713,24 @@ async function planRunStart(ctx: ActionContext, args: Record<string, unknown>): 
   const installId = ctx.installId;
   const contextId = ctx.contextId;
   const expected: Record<string, CapabilityQuote["quote"]> = {};
+  const models: string[] = [];
   let totalMicros = 0;
   try {
     for (const slot of slots) {
-      const quote = checkedQuote((await workspaceApps.bindingQuote(installId, slot, contextId || undefined)).quote);
+      const quoted = await workspaceApps.bindingQuote(installId, slot, contextId || undefined);
+      const quote = checkedQuote(quoted.quote);
       // A malformed or unsafe quote number refuses the slot itself — no
       // confirmation is drawn and no start can ever be attempted.
       if (!quote) return { code: "bad_quote", text: "That isn't available right now. Try again." };
       expected[slot] = quote;
+      const model = typeof quoted.model === "string" ? quoted.model.trim() : "";
+      if (model.length > 0 && model.length <= 80 && !models.includes(model)) models.push(model);
       totalMicros += quote.total_price_micros;
       if (!Number.isSafeInteger(totalMicros)) return { code: "bad_quote", text: "That isn't available right now. Try again." };
     }
   } catch (error) { return plainRefusal(error); }
-  const label = labelBase + (slots.length > 0 ? ` · ${usdLabel(totalMicros)}` : "");
+  const modelSuffix = models.length > 0 ? ` · ${models.join(", ")}` : "";
+  const label = labelBase + (slots.length > 0 ? ` · ${usdLabel(totalMicros)}${modelSuffix}` : "");
   // The frozen closure carries workflow name, inputs copy, request id,
   // install/context and the primitive quoted terms. The daemon's CAS on
   // expected_quotes refuses changed intent; the host never resubmits.

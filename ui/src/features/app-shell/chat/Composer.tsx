@@ -1034,7 +1034,13 @@ export default function Composer({
             {attachControl(true)}
             {modelControls}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
-            {prepareEdit && libraryPin && prepareEdit.sourceMediaTypes.includes(libraryPin.media_type) && <button type="button" className="lnk text-label min-h-8 px-2" disabled={!!block || reserved || !draft.trim()} onClick={prepare}>{t("Prepare edit")}</button>}
+            {prepareEdit && libraryPin && (
+              prepareEdit.sourceMediaTypes.includes(libraryPin.media_type)
+                ? <button type="button" className="lnk text-label min-h-8 px-2" disabled={!!block || reserved || !draft.trim()} onClick={prepare}>{t("Prepare edit")}</button>
+                : <span className="text-micro text-ink-400 px-2" role="status" data-prepare-unsupported={libraryPin.media_type}>
+                    {t("Image edit unavailable for {type} images.").replace("{type}", libraryPin.media_type.replace(/^image\//, "").toUpperCase())}
+                  </span>
+            )}
             {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
           </div>
         </div>
