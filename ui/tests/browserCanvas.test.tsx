@@ -89,7 +89,13 @@ const board = {
   gets: 0,
   views: 0,
   stops: 0,
+  starts: 0,
+  takeovers: 0,
+  previews: 0,
   stopStatus: 200,
+  startStatus: 200,
+  takeoverStatus: 200,
+  previewData: null as string | null,
   viewStatus: 200,
   viewUrl: VIEWER,
   stopHold: false,
@@ -139,6 +145,28 @@ globalThis.fetch = (async (input: unknown, init?: { method?: string; signal?: Ab
     if (board.stopStatus === 503) return new Response(JSON.stringify({ error: "provider_unavailable" }), { status: 503 });
     board.body = { state: "ended", signedIn: false, url: null, instructions: null };
     return new Response(JSON.stringify({ status: "stopped" }), { status: 200 });
+  }
+  if (url.pathname === "/api/browser/start" && method === "POST") {
+    board.starts++;
+    if (board.startStatus === 404) return new Response("{}", { status: 404 });
+    if (board.startStatus === 429) {
+      return new Response(JSON.stringify({ error: { code: "session_limit", message: "Limit reached", quota: { active: 2, limit: 2 } } }), { status: 429 });
+    }
+    const raw = (init as { body?: string } | undefined)?.body;
+    const reqUrl = raw ? (JSON.parse(raw) as { url?: string }).url ?? null : null;
+    board.body = { state: "handoff", signedIn: true, url: reqUrl, instructions: "Started by you.", quota: { active: 1, limit: 2 } };
+    return new Response(JSON.stringify(board.body), { status: 200 });
+  }
+  if (url.pathname === "/api/browser/handoff" && method === "POST") {
+    board.takeovers++;
+    if (board.takeoverStatus === 404) return new Response("{}", { status: 404 });
+    board.body = { ...board.body, state: "handoff", signedIn: true, instructions: "Taken over by you." };
+    return new Response(JSON.stringify(board.body), { status: 200 });
+  }
+  if (url.pathname === "/api/browser/preview" && method === "GET") {
+    board.previews++;
+    if (!board.previewData) return new Response(null, { status: 204 });
+    return new Response(JSON.stringify({ url: board.body.url ?? "https://portal.example.test", data: board.previewData, mimeType: "image/jpeg" }), { status: 200 });
   }
   if (url.pathname === "/api/threads/master/stream") {
     const body = new ReadableStream<Uint8Array>({ start(controller) {
@@ -209,7 +237,7 @@ async function mount() {
 }
 function reset(over: Partial<typeof board> = {}) {
   timers.clear();
-  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, stopStatus: 200, stopHold: false, release: null, late: false, turn: 0, masterTurn: false, getHang: false, viewHang: false, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
+  Object.assign(board, { mode: "ok", body: { state: "none", signedIn: false, url: null, instructions: null }, gets: 0, views: 0, stops: 0, starts: 0, takeovers: 0, previews: 0, stopStatus: 200, startStatus: 200, takeoverStatus: 200, previewData: null, stopHold: false, release: null, late: false, turn: 0, masterTurn: false, getHang: false, viewHang: false, getHold: false, releaseGet: null, viewHold: false, releaseView: null, viewStatus: 200, viewUrl: VIEWER, conversation: "c1" }, over);
   toasts.length = 0;
   store.resetBrowser();
   canvasStore.resetCanvas("c1", "home", "home");
@@ -1438,7 +1466,7 @@ for (const body of [
     assert(el(m.host, '[data-bz-act="view"].btn-primary') && !all(m.host, ".btn-primary").some((x) => x.getAttribute("data-bz-act") !== "view"), "one primary action: Open live view");
     assert(!all(m.host, "p, small").some((x) => /caution|can be wrong|check where/i.test(x.textContent ?? "")), "no caution paragraph");
   }
-  if (body.state === "active") assert(all(m.host, "[data-bz-dock] button").length === 1 && btn(m, "stop"), "active: only Stop");
+  if (body.state === "active") assert(all(m.host, "[data-bz-dock] button").length === 2 && btn(m, "takeover") && btn(m, "stop"), "active: Take over and Stop");
   const card = el(m.host, ".bz-card");
   if (body.state === "active" || body.state === "handoff") {
     assert(card?.tagName === "BUTTON" && !el(card, "button"), `${body.state}: the card is the only action`);
@@ -2104,6 +2132,47 @@ for (const next of ["ended", "none"] as const) {
   equal(Number.parseFloat(document.documentElement.style.getPropertyValue("--canvas-w")), normalWidth, "the Browser control restores the shared canvas width");
   await m.unmount();
   workspace.remove();
+}
+
+// ===== CAD-2829: user Start, Take over, active preview, signed-in badge, quota limit & 404 fallback =====
+{
+  const m = await start({ state: "none", signedIn: false, url: null, instructions: null, quota: { active: 0, limit: 2 } });
+  await openTab(m);
+  assert(text(panel(m)).includes("0 / 2 active"), "empty state shows quiet workspace quota count");
+  const startBtn = btn(m, "start")!;
+  assert(startBtn && text(startBtn) === "Start browser", "Start browser action is available on none");
+  await click(startBtn);
+  equal(board.starts, 1, "clicking Start browser calls POST /api/browser/start");
+  equal(board.views, 1, "Start browser opens Live View immediately");
+  assert(el(m.host, "iframe[data-bz-frame]") !== null, "Live View iframe mounts after start");
+  await m.unmount();
+}
+
+{
+  const m = await start({ state: "active", signedIn: true, url: "https://portal.example.test/rates", instructions: null });
+  board.previewData = "c3ludGhldGlj";
+  await openTab(m);
+  assert(text(el(m.host, ".bz-badge")).includes("Reading · Read-only"), "signed-in active badge indicates Read-only");
+  const img = el(m.host, ".bz-preview img") as HTMLImageElement | null;
+  assert(img && img.src === "data:image/jpeg;base64,c3ludGhldGlj", "active state displays sanitized preview image");
+  const takeBtn = btn(m, "takeover")!;
+  assert(takeBtn && !takeBtn.classList.contains("btn-primary"), "Take over is offered as secondary action");
+  await click(takeBtn);
+  equal(board.takeovers, 1, "Take over calls POST /api/browser/handoff");
+  equal(board.views, 1, "Take over opens Live View");
+  await m.unmount();
+}
+
+{
+  const m = await start({ state: "ended", signedIn: false, url: null, instructions: null, quota: { active: 2, limit: 2 } });
+  board.startStatus = 429;
+  await openTab(m);
+  await click(btn(m, "start")!);
+  assert(text(panel(m)).includes("Workspace browser limit reached"), "429 transitions cleanly to quota_limit state");
+  board.startStatus = 404;
+  await click(btn(m, "start")!);
+  assert(toasts.some((msg) => msg.includes("isn't supported")), "404 on older board degrades with a clear toast");
+  await m.unmount();
 }
 
 console.log("browser canvas tests passed");

@@ -3,7 +3,7 @@ import { useTranslate } from "../../lib/locale";
 import { IconClose } from "../../ui/icons";
 import { useCanvas } from "./canvasStore";
 import { EmptyState } from "../app-shell/shared/States";
-import { viewBrowser } from "./browserClient";
+import { previewBrowser, viewBrowser, type BrowserPreview } from "./browserClient";
 import {
   alertBrowser,
   browserSnapshot,
@@ -14,6 +14,8 @@ import {
   openBrowser,
   refreshBrowser,
   requestStop,
+  startBrowserSession,
+  takeoverBrowserSession,
   useBrowserTab,
   type BrowserTabState,
 } from "./browserStore";
@@ -44,7 +46,11 @@ export function browserStatus(s: BrowserTabState, t: (english: string) => string
   if (s.loadError) return { text: t("Can't load"), tone: "fail", pulse: false };
   switch (s.session?.state) {
     case "active":
-      return { text: t("Reading"), tone: "accent", pulse: true };
+      return {
+        text: s.session.signedIn ? t("Reading · Read-only") : t("Reading"),
+        tone: "accent",
+        pulse: true,
+      };
     case "handoff":
       return { text: t("Needs you"), tone: "warn", pulse: true };
     case "ended":
@@ -169,6 +175,8 @@ function BrowserActions({
   phase,
   fresh,
   wait,
+  takingOver,
+  onTakeover,
   onView,
   onAskStop,
   onKeep,
@@ -179,6 +187,8 @@ function BrowserActions({
   phase: string;
   fresh: boolean;
   wait: boolean;
+  takingOver: boolean;
+  onTakeover: () => void;
   onView: () => void;
   onAskStop: () => void;
   onKeep: () => void;
@@ -217,6 +227,29 @@ function BrowserActions({
   const spin = wait ? <span className="btn-spin" aria-hidden /> : null;
   return (
     <>
+      {phase === "active" ? (
+        <button
+          key="takeover"
+          type="button"
+          className="btn btn-sm"
+          data-bz-act="takeover"
+          aria-disabled={takingOver || undefined}
+          aria-busy={takingOver || undefined}
+          aria-label={t("Take over")}
+          title={t("Take over")}
+          onClick={onTakeover}
+        >
+          {takingOver ? (
+            <span className="btn-spin" aria-hidden />
+          ) : (
+            <Icon>
+              <path d="M18 11V6a2 2 0 0 0-4 0v4M14 10V4a2 2 0 0 0-4 0v6M10 10.5V5a2 2 0 0 0-4 0v9" />
+              <path d="M18 11a2 2 0 1 1 4 0v3a8 8 0 0 1-8 8h-2c-2.5 0-4.2-1-5.8-2.9L3.5 16a2 2 0 0 1 2.9-2.7L6 13.7" />
+            </Icon>
+          )}
+          <span className="bz-lbl">{t("Take over")}</span>
+        </button>
+      ) : null}
       {phase === "handoff" && fresh ? (
         <button
           key="view"
@@ -294,6 +327,8 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, ca
   const t = useTranslate();
   const b = useBrowserTab();
   const [viewer, setViewer] = useState<ViewerState>({ phase: "idle" });
+  const [startUrl, setStartUrl] = useState("");
+  const [preview, setPreview] = useState<BrowserPreview | null>(null);
   const attempt = useRef(0);
   const frames = useRef(0);
   const dockRef = useRef<HTMLDivElement | null>(null);
@@ -322,9 +357,12 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, ca
   const showFrame = viewing && ((phase === "handoff" && !carried) || viewOnly);
   const asking = phase === "handoff" && !stopping && !showFrame;
   const wait = viewer.phase === "connecting" || (viewing && viewer.reopening && phase === "handoff");
-  const frameBusy = wait || (showFrame && viewer.phase === "loading");
+  const starting = b.action === "starting";
+  const takingOver = b.action === "taking_over";
+  const frameBusy = wait || starting || takingOver || (showFrame && viewer.phase === "loading");
   const loadingUrl = showFrame && viewer.phase === "loading" ? viewer.url : null;
   const instructions = b.session?.instructions ?? "";
+  const quota = b.session?.quota ?? null;
 
   // Where the header puts the address: inline while its whole host fits, else
   // on its own row. Measured again when the header or any item in it resizes,
@@ -527,7 +565,32 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, ca
   };
 
   const onView = () => { if (!wait) void openView(); };
+  const onStart = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (starting) return;
+    if (await startBrowserSession(startUrl)) void openView();
+  };
+  const onTakeover = async () => {
+    if (takingOver) return;
+    if (await takeoverBrowserSession()) void openView();
+  };
+
+  useEffect(() => {
+    if (!active || phase !== "active" || showFrame) {
+      setPreview(null);
+      return;
+    }
+    let cancelled = false;
+    void previewBrowser(conversation).then((shot) => {
+      if (!cancelled) setPreview(shot);
+    }).catch(() => {
+      if (!cancelled) setPreview(null);
+    });
+    return () => { cancelled = true; };
+  }, [active, conversation, phase, showFrame, b.session?.url]);
+
   const hasDock = b.stop === "confirm" || stopping || live;
+  const showPreview = phase === "active" && !showFrame && preview !== null;
 
   return (
     <div
@@ -552,7 +615,15 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, ca
         <span className="bz-globe"><GlobeIcon size={14} /></span>
         <span className="bz-title">
           <b id="bz-heading" tabIndex={-1} ref={heading}>{t("Browser")}</b>
-          <span className="bz-badge" style={{ "--c": TONE[st.tone] } as React.CSSProperties} role="status">{st.text}</span>
+          <span className="bz-badge" style={{ "--c": TONE[st.tone] } as React.CSSProperties} role="status">
+            {phase === "active" && b.session?.signedIn ? (
+              <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <rect x="4" y="11" width="16" height="10" rx="2" />
+                <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+              </svg>
+            ) : null}
+            {st.text}
+          </span>
         </span>
         {live && !showFrame && b.session?.url ? <Address url={b.session.url} /> : <span className="bz-gap" />}
         {hasDock ? (
@@ -562,6 +633,8 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, ca
               phase={phase}
               fresh={fresh}
               wait={wait}
+              takingOver={takingOver}
+              onTakeover={() => void onTakeover()}
               onView={onView}
               onAskStop={ask}
               onKeep={keep}
@@ -592,12 +665,50 @@ export default function BrowserPanel({ conversation, active, sheet, expanded, ca
           read): React must never remount the frame, which would load the bearer
           URL again. The frame is inert while the session is being stopped:
           nothing typed into a view that is going away reaches the page. */}
-      <div className="cv-body bz-body" data-canvas-body data-frame={showFrame || undefined}>
-        {!live ? <EmptyState title={phase === "ended" ? t("Session ended") : t("No browser session")} /> : null}
+      <div className="cv-body bz-body" data-canvas-body data-frame={(showFrame || showPreview) || undefined}>
+        {!live ? (
+          <div className="bz-empty">
+            <EmptyState title={b.action === "quota_limit" ? t("Workspace browser limit reached") : phase === "ended" ? t("Session ended") : t("No browser session")}>
+              {b.action === "quota_limit" ? t("Stop an active session or wait for idle close.") : undefined}
+            </EmptyState>
+            <form className="bz-launch" onSubmit={(e) => void onStart(e)}>
+              <input
+                type="url"
+                className="bz-url-input"
+                value={startUrl}
+                onChange={(e) => setStartUrl(e.target.value)}
+                placeholder="https://…"
+                aria-label={t("Starting URL")}
+                disabled={starting}
+              />
+              <button
+                type="submit"
+                className="btn btn-sm btn-primary"
+                data-bz-act="start"
+                aria-disabled={starting || undefined}
+                aria-busy={starting || undefined}
+              >
+                {starting ? <span className="btn-spin" aria-hidden /> : null}
+                <span>{t("Start browser")}</span>
+              </button>
+            </form>
+            {quota ? (
+              <p className="bz-quota">
+                {`${quota.active} / ${quota.limit} ${t("active")}`}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
         {asking && instructions ? (
           <div className="bz-says">
             <small>{t("Your assistant:")}</small>
             <p id="bz-says-t">{instructions}</p>
+            <p className="bz-says-note">{t("Read-only for your assistant once you finish.")}</p>
+          </div>
+        ) : null}
+        {showPreview ? (
+          <div className="bz-preview">
+            <img src={`data:image/jpeg;base64,${preview.data}`} alt={t("Current browser page")} />
           </div>
         ) : null}
         {showFrame && (viewer.phase === "loading" || viewer.phase === "open") ? (
