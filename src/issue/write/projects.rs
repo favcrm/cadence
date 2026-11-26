@@ -625,25 +625,6 @@ pub fn project_blockers(pm: &Pm, state_dir: &Path, key: &str) -> Result<Vec<Stri
         .collect())
 }
 
-/// CAD-2830: read one project's archive lifecycle state (for pure unit callers).
-pub fn project_lifecycle(pm: &Pm, key: &str, blockers: Vec<String>) -> Result<Value> {
-    let key = crate::issue::model::check_key(key)?;
-    let dir = project_dir(pm, &key)?;
-    let yaml_path = dir.join("project.yaml");
-    if !crate::issue::board::is_real_file(&yaml_path) {
-        return Err(Error::rejected(format!(
-            "no project '{key}' — register it with `cadence issue project add`"
-        )));
-    }
-    let project = project::load(&yaml_path)?;
-    let blockers = if project.archived {
-        Vec::new()
-    } else {
-        blockers
-    };
-    Ok(lifecycle_payload(&project, &blockers))
-}
-
 /// CAD-2830: read one project's archive lifecycle state with fail-closed blocker
 /// verification against the live daemon when the project is active.
 pub fn project_lifecycle_checked(pm: &Pm, state_dir: &Path, key: &str) -> Result<Value> {

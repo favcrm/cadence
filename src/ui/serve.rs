@@ -2710,11 +2710,16 @@ fn handle(
             match Pm::at(pm_dir) {
                 Ok(pm) => {
                     let mut readable = super::project_policy::readable(&pm, &actor);
-                    if let Ok(list) = project::list(&pm.dir) {
-                        for proj in list {
-                            if proj.archived {
-                                readable.remove(&proj.key);
-                            }
+                    let list = match project::list(&pm.dir) {
+                        Ok(list) => list,
+                        Err(e) => {
+                            send(request, err_response(503, &e.to_string()));
+                            return;
+                        }
+                    };
+                    for proj in list {
+                        if proj.archived {
+                            readable.remove(&proj.key);
                         }
                     }
                     super::project_policy::retain_overview(&mut overview, &readable);
@@ -2864,12 +2869,17 @@ fn handle(
                 // restricted project contributes no row or count.
                 let readable = super::project_policy::readable(&pm, &actor);
                 let want_archived = query("archived").as_deref() == Some("1");
-                let archived_keys: HashSet<String> = project::list(&pm.dir)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|p| p.archived)
-                    .map(|p| p.key)
-                    .collect();
+                let archived_keys: HashSet<String> = match project::list(&pm.dir) {
+                    Ok(list) => list
+                        .into_iter()
+                        .filter(|p| p.archived)
+                        .map(|p| p.key)
+                        .collect(),
+                    Err(e) => {
+                        send(request, err_response(503, &e.to_string()));
+                        return;
+                    }
+                };
                 let model = read_model::get(state_dir, pm_dir);
                 let read = if actor == "operator" {
                     model.board(&pm, filter.as_deref())

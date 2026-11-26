@@ -55,8 +55,7 @@ impl Snapshot {
     ) -> crate::Result<Self> {
         let pm = Pm::at(pm_dir)?;
         let readable = project_policy::readable(&pm, policy_actor);
-        let archived: BTreeSet<String> = crate::issue::project::list(&pm.dir)
-            .unwrap_or_default()
+        let archived: BTreeSet<String> = crate::issue::project::list(&pm.dir)?
             .into_iter()
             .filter(|p| p.archived)
             .map(|p| p.key)

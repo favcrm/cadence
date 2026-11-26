@@ -1847,7 +1847,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "projects" && route.slug && route.section === "milestones" && (
           milestonesOn ? (
-            <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
+            <Milestones
+              project={route.slug}
+              issues={viewedProjectArchived ? archivedIssuesState : issuesState}
+              onOpenIssue={openIssue}
+            />
           ) : (
             <PageState title={t("Milestones are not available here")} actions={<Button href={hrefFor({ screen: "projects", slug: route.slug, section: "overview" })}>{t("Project overview")}</Button>}>
               {t("This hosted workspace does not serve project milestones.")}
@@ -1858,7 +1862,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           workflowsOn ? (
             <Workflows
               project={route.slug}
-              viewer={viewer}
+              viewer={{ ...viewer, readOnly: projectReadOnly }}
               onOpenIssue={openIssue}
               onHome={() => goRoute({ screen: "home" })}
             />
@@ -1873,8 +1877,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             noWiki={!wikiAvailable(meta)}
             hosted={hosted}
             viewerSub={viewerSub}
-            readOnly={readOnly}
-            readOnlyReason={block}
+            readOnly={projectReadOnly}
+            readOnlyReason={projectWriteBlock}
             actor={actor}
             onToast={say}
             navHref={hrefFor}

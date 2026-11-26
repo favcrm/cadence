@@ -61,9 +61,9 @@ pub use projects::save_front;
 #[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) use projects::save_front;
 pub use projects::{
-    archive_project, private_available, project_add, project_blockers, project_lifecycle,
-    project_lifecycle_checked, read_project_policy, require_project_active, restore_project,
-    set_acceptance, set_project_policy, set_project_remote, PRIVATE_UNAVAILABLE,
+    archive_project, private_available, project_add, project_blockers, project_lifecycle_checked,
+    read_project_policy, require_project_active, restore_project, set_acceptance,
+    set_project_policy, set_project_remote, PRIVATE_UNAVAILABLE,
 };
 pub(crate) use projects::{check_tags, split_tags};
 #[doc(hidden)]
