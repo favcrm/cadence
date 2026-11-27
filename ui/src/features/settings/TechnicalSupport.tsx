@@ -134,7 +134,7 @@ export default function TechnicalSupport({ search }: { search: string }) {
         : t("Could not confirm your request was saved. Your draft is still here; retry without changing it to avoid duplicates."));
     } finally {
       savingRef.current = false;
-      if (!controller?.signal.aborted) setSaving(false);
+      setSaving(false);
     }
   };
 
