@@ -54,12 +54,14 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
       setWorks(null);
       return;
     }
-    let controller: AbortController;
+    let controller: AbortController | undefined;
     const refresh = () => {
       controller?.abort();
-      controller = new AbortController();
-      const request = controller;
-      readInstallationsGuarded(request.signal)
+      const request = controller = new AbortController();
+      // Changes update the warm operator snapshot before the event. Share
+      // its ongoing refresh rather than starting a second install-list read.
+      setWorks(findWorksApp(readInstallationsSnapshot()));
+      void readInstallationsGuarded(request.signal, true)
         .then((rows) => {
           if (!request.signal.aborted) setWorks(findWorksApp(rows));
         })
@@ -67,17 +69,11 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
           // Fail closed silently if installations cannot be loaded.
         });
     };
-    const onAppsChanged = () => {
-      setWorks(findWorksApp(readInstallationsSnapshot()));
-      refresh();
-    };
-    window.addEventListener(APPS_CHANGED_EVENT, onAppsChanged);
-    const cached = findWorksApp(readInstallationsSnapshot());
-    if (cached) setWorks(cached);
+    window.addEventListener(APPS_CHANGED_EVENT, refresh);
     refresh();
     return () => {
-      window.removeEventListener(APPS_CHANGED_EVENT, onAppsChanged);
-      controller.abort();
+      window.removeEventListener(APPS_CHANGED_EVENT, refresh);
+      controller?.abort();
     };
   }, [blocked]);
 

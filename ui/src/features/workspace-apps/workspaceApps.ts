@@ -655,26 +655,31 @@ export const workspaceApps = {
  * re-reads at once instead of waiting for the next navigation. */
 export const APPS_CHANGED_EVENT = "cadence:apps-changed";
 
-/** Apply only the verified lifecycle fields to a previously observed row. */
-export function applyHostedLifecycleToList(rows: Installation[] | null, change: Installation): Installation[] | null {
+function replaceHostedRow<T extends { install_id: string }>(rows: T[] | null, change: Installation, project: (row: T) => T): T[] | null {
   const index = rows?.findIndex((row) => row.install_id === change.install_id) ?? -1;
   if (!rows || index < 0) return rows;
   const next = rows.slice();
-  next[index] = { ...next[index], state: change.state, executable: change.executable, removed_at: change.removed_at, restore_until: change.restore_until };
+  next[index] = project(next[index]);
   return next;
 }
 
+/** Apply only the verified lifecycle fields to a previously observed row. */
+export function applyHostedLifecycleToList(rows: Installation[] | null, change: Installation): Installation[] | null {
+  return replaceHostedRow(rows, change, (row) => ({
+    ...row, state: change.state, executable: change.executable, removed_at: change.removed_at, restore_until: change.restore_until,
+  }));
+}
+
 export function applyHostedLifecycleToHome(rows: HomeInstallation[] | null, change: Installation): HomeInstallation[] | null {
-  const index = rows?.findIndex((row) => row.install_id === change.install_id) ?? -1;
-  if (!rows || index < 0) return rows;
-  const next = rows.slice();
-  const attention = change.state === "removed"
-    ? { state: "removed" as const, message: "Removed", action: "restore", count: 0 }
-    : change.state === "disabled"
-      ? { state: "off" as const, message: "Disabled", action: "restore", count: 0 }
-      : { state: "ok" as const, message: null, action: null, count: 0 };
-  next[index] = { ...next[index], restore_until: change.restore_until, attention };
-  return next;
+  return replaceHostedRow(rows, change, (row) => ({
+    ...row,
+    restore_until: change.restore_until,
+    attention: change.state === "removed"
+      ? { state: "removed", message: "Removed", action: "restore", count: 0 }
+      : change.state === "disabled"
+        ? { state: "off", message: "Disabled", action: "restore", count: 0 }
+        : { state: "ok", message: null, action: null, count: 0 },
+  }));
 }
 
 export function hostedLifecycleFromEvent(event: Event): Installation | undefined {

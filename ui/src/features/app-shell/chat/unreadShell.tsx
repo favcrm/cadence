@@ -84,15 +84,13 @@ function UnreadProbe({ installId }: { installId: string }) {
   return null;
 }
 
-/** Observe every installed app by default; callers may defer offscreen probes during initial paint. */
-export function AssistantUnreadProbes({ apps, observed }: { apps: { installId: string }[] | null; observed?: ReadonlySet<string> }) {
-  // Retire the shell's targets before other subscribers can observe a new
-  // session. Do not clear them on ordinary app/observed-list updates.
+/** One observed list per installed app; ownership reads also resolve queued View. */
+export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] | null }) {
+  // A paused or signed-out shell no longer supplies queued-chat destinations.
   useLayoutEffect(() => () => setKnownInstalls([]), []);
-  useLayoutEffect(() => {
-    const ids = apps === null ? [] : apps.map((app) => app.installId);
-    setKnownInstalls(ids, observed === undefined ? ids : ids.filter((id) => observed.has(id)));
-  }, [apps, observed]);
+  useEffect(() => {
+    setKnownInstalls(apps === null ? [] : apps.map((app) => app.installId));
+  }, [apps]);
   if (apps === null) return null;
-  return <>{apps.filter((app) => observed === undefined || observed.has(app.installId)).map((app) => <UnreadProbe key={app.installId} installId={app.installId} />)}</>;
+  return <>{apps.map((app) => <UnreadProbe key={app.installId} installId={app.installId} />)}</>;
 }

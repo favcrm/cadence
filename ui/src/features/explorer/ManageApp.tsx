@@ -7,7 +7,6 @@ import {
   catalogUpdateHref,
   isSafeCatalogId,
   pendingCatalogUpdates,
-  publishHostedLifecycle,
   readAppCatalogCached,
   readAppCatalogSnapshot,
   workspaceApps,
@@ -19,9 +18,8 @@ import {
   type UpgradeProposal,
   notifyAppsChanged,
 } from "../workspace-apps/workspaceApps";
-import { changeHostedLifecycle, checkHostedLifecycle, hostedRestoreAvailable, pendingHostedLifecycle, type HostedLifecycleAction, type HostedLifecycleResult } from "../workspace-apps/hostedPrivateLifecycle";
+import { hostedRestoreAvailable, pendingHostedLifecycle, runHostedLifecycle, type HostedLifecycleAction, type HostedLifecycleOutcome } from "../workspace-apps/hostedPrivateLifecycle";
 import { privateSessionGeneration } from "../../lib/privateSession";
-import { ApiError } from "../../lib/api";
 import { onPrivateReadsPaused, onPrivateSessionReset } from "../../lib/privateSession";
 import type { Viewer } from "../projects/work";
 import { useInstallations } from "../workspace-apps/useInstallations";
@@ -59,7 +57,7 @@ export default function ManageApp({
   automaticUpdatesEnabled = true,
   appAgentSession,
   hosted = false,
-  hostedRemovalEnabled = false,
+  hostedRemovalEnabled: hostedRemovalPresentationEnabled = false,
 }: {
   installId: string;
   viewer: Viewer;
@@ -317,7 +315,8 @@ export default function ManageApp({
 
   const removed = hosted ? inst.state === "removed" : inst.removed != null || home?.attention.state === "removed";
   const restorable = hosted ? !hostedExpired && inst.state === "removed" && hostedRestoreAvailable(inst.restore_until) : inst.restore_after == null || Date.now() / 1000 <= inst.restore_after;
-  const hostedAllowed = hosted && hostedRemovalEnabled && isOp && inst.install_id === installId && inst.source_kind === "private" && (inst.state === "active" || inst.state === "disabled" || inst.state === "removed");
+  // Presentation only. AOS-776 enforces owner/membership, placement and same-origin on the server.
+  const hostedAllowed = hosted && hostedRemovalPresentationEnabled && isOp && inst.install_id === installId && inst.source_kind === "private" && (inst.state === "active" || inst.state === "disabled" || inst.state === "removed");
   const off = !removed && (home?.attention.state === "off" || inst.approved === false);
   const catalogUpdate = !removed ? pendingCatalogUpdates(catalogCards, [inst]).get(installId) ?? null : null;
   const updateReady = home?.attention.state === "update" || catalogUpdate !== null;
@@ -351,37 +350,19 @@ export default function ManageApp({
     }
   };
 
-  const finishHosted = (result: HostedLifecycleResult, action: HostedLifecycleAction) => {
-    if (result.kind === "uncertain") {
-      setRemoveOpen(false);
-      setHostedPending(action);
-      setNotice("The result could not be confirmed. Check again before making another change.");
-      return;
-    }
-    setHostedPending(null);
+  const finishHosted = (outcome: HostedLifecycleOutcome, action: HostedLifecycleAction) => {
     setRemoveOpen(false);
-    if (result.kind === "denied") {
-      if (result.error instanceof ApiError && result.error.code === "restore_window") {
-        setHostedExpired(true);
-        setNotice("The restore window has closed.");
-      } else if (result.error instanceof ApiError && (result.error.status === 401 || result.error.status === 403)) {
-        setNotice("The app change was denied. Check your workspace access.");
-      } else {
-        setNotice("The app change was not allowed or could not be verified.");
-      }
-      return;
-    }
+    setHostedPending(outcome.kind === "uncertain" ? action : null);
+    setNotice(outcome.message);
+    if (outcome.kind === "denied" && outcome.expired) setHostedExpired(true);
+    if (outcome.kind !== "confirmed") return;
     lifecycleEpoch.current += 1;
     setCatalogBindings(null);
     setWabaSummary(null);
     setGrantsRevision((n) => n + 1);
     setHostedExpired(false);
-    setInst((old) => old ? { ...old, ...result.installation } : result.installation);
+    setInst((old) => old ? { ...old, ...outcome.installation } : outcome.installation);
     setHome(null);
-    setNotice(action === "remove" && result.installation.state === "removed" ? "Removed — its data is retained."
-      : action === "restore" && result.installation.state === "active" ? "Restored — connection grants must be set up again."
-      : "The requested change was not confirmed. The app's current state is shown below.");
-    publishHostedLifecycle(result.installation);
   };
   const hostedChange = (action: HostedLifecycleAction, checkOnly = false) => {
     if (!hostedAllowed || hostedLock.current || (!checkOnly && hostedPending !== null)) return;
@@ -393,9 +374,9 @@ export default function ManageApp({
     focusHostedResult.current = true;
     const generation = privateSessionGeneration();
     setRemoving(action === "remove"); setRestoring(action === "restore"); setNotice(null);
-    void (checkOnly ? checkHostedLifecycle(installId, generation) : changeHostedLifecycle(installId, action, generation))
-      .then((result) => {
-        if (currentInstallId.current === installId && privateSessionGeneration() === generation) finishHosted(result, action);
+    void runHostedLifecycle(installId, action, checkOnly)
+      .then((outcome) => {
+        if (outcome && currentInstallId.current === installId) finishHosted(outcome, action);
       })
       .finally(() => { hostedLock.current = false; if (privateSessionGeneration() === generation) { setRemoving(false); setRestoring(false); } });
   };

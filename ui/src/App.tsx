@@ -346,7 +346,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const humanThreadsOn = boardSupports(meta, "human_threads");
   const credentialRequestsOn = boardSupports(meta, "credential_requests");
   const automaticUpdatesOn = boardSupports(meta, "app_automatic_updates");
-  const hostedRemovalEnabled = hostedBoard && meta.signed_in === true && boardSupports({ ...meta, hosted: hostedBoard }, "app_private_removal");
+  // Visibility only. The AOS-776 tenant independently authorizes each POST.
+  const hostedRemovalEnabled = hostedBoard && meta.signed_in === true && meta.app_private_removal === true;
   // CAD-2286: the document lifecycle is hosted only. Only a hosted board is
   // probed; the nav shows Documents once the probe answers `available`.
   const documentsHosted = meta?.hosted === true;
@@ -1121,29 +1122,28 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
     : null;
-  const observedAssistantApps = useMemo(() => {
-    const visible = appsOpen && ((desktopSidebar && !sidebarCollapsed) || menuOpen);
-    return new Set(installed.filter((app) => visible || app.installId === activeId).map((app) => app.installId));
-  }, [installed, appsOpen, desktopSidebar, sidebarCollapsed, menuOpen, activeId]);
-  const [unreadProbesFallback, setUnreadProbesFallback] = useState(false);
-  useEffect(() => {
-    setUnreadProbesFallback(false);
-    if (!onAppScreen) {
-      const frame = window.requestAnimationFrame(() => setUnreadProbesFallback(true));
-      return () => window.cancelAnimationFrame(frame);
-    }
-    const timer = window.setTimeout(() => setUnreadProbesFallback(true), 2500);
-    return () => window.clearTimeout(timer);
-  }, [onAppScreen, routeInstallId]);
-  const deferWhatsAppProbes = onAppScreen && activeApp === null && !unreadProbesFallback;
-  const [unreadProbesMounted, setUnreadProbesMounted] = useState(() => !onAppScreen);
+  // Keep existing unread subscriptions once mounted. Only defer initial
+  // probes on an Apps route when the sidebar does not display those badges.
+  const browsingApps = onAppsBrowserRoute || route.screen === "appsCatalog" || route.screen === "appsManage";
+  const appsSidebarVisible = appsOpen && (menuOpen || (desktopSidebar && !sidebarCollapsed));
+  const waitForApp = onAppScreen && activeApp === null;
+  const deferUnreadProbes = waitForApp || (browsingApps && !appsSidebarVisible);
+  const [unreadProbesMounted, setUnreadProbesMounted] = useState(false);
   useEffect(() => {
     if (!listReader) {
       setUnreadProbesMounted(false);
       return;
     }
-    if (!deferWhatsAppProbes) setUnreadProbesMounted(true);
-  }, [listReader, deferWhatsAppProbes]);
+    if (unreadProbesMounted) return;
+    if (!deferUnreadProbes) {
+      setUnreadProbesMounted(true);
+      return;
+    }
+    // Bound the delay so a cold visit with a closed sidebar still gets
+    // background notifications. Opening the sidebar cancels the delay.
+    const timer = window.setTimeout(() => setUnreadProbesMounted(true), 2500);
+    return () => window.clearTimeout(timer);
+  }, [listReader, unreadProbesMounted, deferUnreadProbes]);
   // CAD-1193: one viewer for every consumer — `access` splits the
   // `operator: null` unknown into "checking" (a probe is still in
   // flight or has never run) and "unavailable" (a completed probe
@@ -1412,8 +1412,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           {onAppScreen && <div ref={setAppActionsTarget} className="app-header-actions-target" />}
         </header>
 
-        {listReader && <AssistantUnreadProbes apps={installed} observed={unreadProbesFallback ? undefined : observedAssistantApps} />}
-        {listReader && unreadProbesMounted && <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />}
+        {listReader && unreadProbesMounted && (
+          <>
+            <AssistantUnreadProbes apps={installed} />
+            <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />
+          </>
+        )}
 
         {updateBanner && (
           <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">

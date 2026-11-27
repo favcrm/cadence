@@ -1,13 +1,18 @@
 import { ApiError } from "../../lib/api";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
-import { appExplorer, workspaceApps, type Installation } from "./workspaceApps";
+import { appExplorer, publishHostedLifecycle, workspaceApps, type Installation } from "./workspaceApps";
 
 export type HostedLifecycleAction = "remove" | "restore";
-export type HostedLifecycleResult =
-  | { kind: "confirmed"; installation: Installation }
+type HostedLifecycleResult =
+  | { kind: "confirmed"; installation: Installation; restoreDigest?: string }
   | { kind: "uncertain" }
   | { kind: "denied"; error: unknown };
-const attempts = new Map<string, { action: HostedLifecycleAction; busy: boolean; sent: boolean }>();
+export type HostedLifecycleOutcome =
+  | { kind: "confirmed"; installation: Installation; requestedStateReached: boolean; message: string }
+  | { kind: "uncertain"; message: string }
+  | { kind: "denied"; expired: boolean; message: string };
+type Attempt = { action: HostedLifecycleAction; busy: boolean; sent: boolean; restoreDigest?: string };
+const attempts = new Map<string, Attempt>();
 let admissionEpoch = 0;
 onPrivateReadsPaused(() => { admissionEpoch += 1; });
 onPrivateSessionReset(() => { attempts.clear(); });
@@ -42,7 +47,9 @@ async function readLifecycle(id: string, generation: number, epoch: number): Pro
   if (!sessionCurrent(generation, epoch)) return { kind: "uncertain" };
   try {
     const row = await workspaceApps.detail(id);
-    if (sessionCurrent(generation, epoch) && validRow(row, id)) return { kind: "confirmed", installation: row };
+    if (sessionCurrent(generation, epoch) && validRow(row, id) && typeof row.digest === "string" && row.digest.length > 0) {
+      return { kind: "confirmed", installation: row };
+    }
   } catch {
     // A failed read cannot settle an ambiguous mutation.
   }
@@ -50,13 +57,16 @@ async function readLifecycle(id: string, generation: number, epoch: number): Pro
 }
 
 /** Read independently after an ambiguous write; never replay the write. */
-export async function checkHostedLifecycle(id: string, generation: number): Promise<HostedLifecycleResult> {
+async function checkHostedLifecycle(id: string, generation: number): Promise<HostedLifecycleResult> {
   const attempt = attempts.get(id);
   if (attempt?.busy) return { kind: "uncertain" };
   if (attempt) attempt.busy = true;
   try {
     const result = await readLifecycle(id, generation, admissionEpoch);
-    if (result.kind === "confirmed" && attempts.get(id) === attempt) attempts.delete(id);
+    if (result.kind === "confirmed") {
+      result.restoreDigest = attempt?.restoreDigest;
+      if (attempts.get(id) === attempt) attempts.delete(id);
+    }
     return result;
   } finally {
     if (attempt) attempt.busy = false;
@@ -64,10 +74,10 @@ export async function checkHostedLifecycle(id: string, generation: number): Prom
 }
 
 /** Validate the fresh source and deadline, then one write and its receipt. */
-export async function changeHostedLifecycle(id: string, action: HostedLifecycleAction, generation: number): Promise<HostedLifecycleResult> {
+async function changeHostedLifecycle(id: string, action: HostedLifecycleAction, generation: number): Promise<HostedLifecycleResult> {
   const epoch = admissionEpoch;
   if (!sessionCurrent(generation, epoch) || attempts.has(id)) return { kind: "uncertain" };
-  const attempt = { action, busy: true, sent: false };
+  const attempt: Attempt = { action, busy: true, sent: false };
   attempts.set(id, attempt);
   let settled = false;
   try {
@@ -80,6 +90,7 @@ export async function changeHostedLifecycle(id: string, action: HostedLifecycleA
       return { kind: "denied", error: new ApiError("The restore window has closed.", 409, { code: "restore_window" }) };
     }
     if (action === "remove" && row.state === "removed") return before;
+    if (action === "restore") attempt.restoreDigest = row.digest;
     attempt.sent = true;
     try {
       const response = action === "remove" ? await appExplorer.hostedRemove(id) : await appExplorer.hostedRestore(id);
@@ -93,7 +104,7 @@ export async function changeHostedLifecycle(id: string, action: HostedLifecycleA
         if (receipt.restored === true && validRow(receipt.installation, id) && receipt.installation.state === "active" &&
           receipt.digest === receipt.installation.digest && receipt.digest === row.digest) {
           settled = true;
-          return { kind: "confirmed", installation: receipt.installation };
+          return { kind: "confirmed", installation: receipt.installation, restoreDigest: row.digest };
         }
       }
     } catch (error) {
@@ -104,10 +115,40 @@ export async function changeHostedLifecycle(id: string, action: HostedLifecycleA
       }
     }
     const result = await readLifecycle(id, generation, epoch);
-    settled = result.kind === "confirmed";
+    if (result.kind === "confirmed") {
+      result.restoreDigest = attempt.restoreDigest;
+      settled = true;
+    }
     return result;
   } finally {
     attempt.busy = false;
     if ((!attempt.sent || settled) && attempts.get(id) === attempt) attempts.delete(id);
   }
+}
+
+/** Run one command or readback and publish only a current, confirmed result. */
+export async function runHostedLifecycle(id: string, action: HostedLifecycleAction, checkOnly: boolean): Promise<HostedLifecycleOutcome | null> {
+  const generation = privateSessionGeneration();
+  const epoch = admissionEpoch;
+  const result = await (checkOnly ? checkHostedLifecycle(id, generation) : changeHostedLifecycle(id, action, generation));
+  if (!sessionCurrent(generation, epoch)) return null;
+  if (result.kind === "uncertain") {
+    return { kind: "uncertain", message: "The result could not be confirmed. Check again before making another change." };
+  }
+  if (result.kind === "denied") {
+    const expired = result.error instanceof ApiError && result.error.code === "restore_window";
+    const message = expired ? "The restore window has closed."
+      : result.error instanceof ApiError && (result.error.status === 401 || result.error.status === 403)
+        ? "The app change was denied. Check your workspace access."
+        : "The app change was not allowed or could not be verified.";
+    return { kind: "denied", expired, message };
+  }
+  const requestedStateReached = action === "remove"
+    ? result.installation.state === "removed"
+    : result.installation.state === "active" && result.installation.digest === result.restoreDigest;
+  const message = !requestedStateReached ? "The requested change was not confirmed. The app's current state is shown below."
+    : action === "remove" ? "Removed — its data is retained."
+    : "Restored — connection grants must be set up again.";
+  publishHostedLifecycle(result.installation);
+  return { kind: "confirmed", installation: result.installation, requestedStateReached, message };
 }

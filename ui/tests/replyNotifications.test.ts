@@ -39,7 +39,7 @@ const { AssistantUnreadProbes } = require<typeof ShellUnread>("../src/features/a
 const { useHomeUnread, noteHomeSeen } = require<typeof HomeUnread>("../src/features/app-shell/chat/homeUnread");
 const { useAssistantUnread } = require<typeof Unread>("../src/features/app-shell/chat/assistantUnread");
 const { readSeen, writeSeen, announceReply } = require<typeof Seen>("../src/features/app-shell/chat/unreadSeen");
-const { setVisibleConversation, knownInstalls, observedConversationInstalls, onKnownInstallsChanged } = require<typeof Visibility>("../src/features/app-shell/chat/chatVisibility");
+const { setVisibleConversation } = require<typeof Visibility>("../src/features/app-shell/chat/chatVisibility");
 const { useConversationDestination } = require<typeof Navigation>("../src/features/app-shell/chat/conversationNavigation");
 const { NotificationToastProvider } = require<typeof Toast>("../src/features/threads/NotificationToast");
 const { conversationList } = require<typeof Conversations>("../src/features/app-shell/conversationClient");
@@ -211,21 +211,12 @@ async function main() {
     useConversationDestination("general", null, undefined);
     return null;
   }
-  const shell = (showProbes: boolean, observed?: ReadonlySet<string>) => React.createElement(NotificationToastProvider, null,
+  const shell = (showProbes: boolean) => React.createElement(NotificationToastProvider, null,
     React.createElement(Destination),
-    showProbes && React.createElement(AssistantUnreadProbes, { apps, observed }));
+    showProbes && React.createElement(AssistantUnreadProbes, { apps }));
   await React.act(async () => { root.render(shell(true)); });
   await settle();
-  assert(knownInstalls().length === 1 && observedConversationInstalls().length === 1, "shell publishes its conversation targets");
-  const changes: string[][] = [];
-  const off = onKnownInstallsChanged(() => changes.push([...knownInstalls()]));
-  await React.act(async () => { root.render(shell(true, new Set())); });
-  assert(changes.every((ids) => ids.length === 1), "ordinary observation updates do not transiently clear known targets");
-  await React.act(async () => { root.render(shell(true)); });
-  assert(observedConversationInstalls().length === 1, "default observation resumes before list access is lost");
   await React.act(async () => { root.render(shell(false)); });
-  off();
-  assert(knownInstalls().length === 0 && observedConversationInstalls().length === 0, "losing the shell probes clears both target lists");
   const beforeMaster = conversationReads;
   await React.act(async () => { noteMasterChanged(); });
   await settle();
