@@ -23,6 +23,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import HireSheet from "../src/features/agents/HireSheet";
 import { translateUiText } from "../src/lib/locale";
+import { resources } from "../src/lib/resources";
 import type { AgentRole, AgentRolesPayload } from "../src/lib/types";
 
 declare const process: { exit(code?: number): never };
@@ -31,12 +32,32 @@ function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`hireSheet: ${msg}`);
 }
 
-const flush = () => new Promise((r) => setTimeout(r, 30));
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
 async function main() {
+  const appsFetched = deferred();
+  const settingsFetched = deferred();
+  const appsReady = deferred();
+
+  const unsubscribe = resources.apps.subscribe(() => {
+    if (resources.apps.get().data !== undefined) {
+      appsReady.resolve();
+    }
+  });
+  if (resources.apps.get().data !== undefined) {
+    appsReady.resolve();
+  }
+
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes("/api/apps")) {
+      appsFetched.resolve();
       return new Response(
         JSON.stringify({
           apps: [{ name: "social-content", title: "Social Content", project: "main", screens: ["main"] }],
@@ -45,6 +66,7 @@ async function main() {
       );
     }
     if (url.includes("/api/agents/settings")) {
+      settingsFetched.resolve();
       return new Response(
         JSON.stringify({ config: { models: [] } }),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -95,8 +117,10 @@ async function main() {
         onHired={() => undefined}
       />,
     );
-    await flush();
+    await Promise.all([appsFetched.promise, settingsFetched.promise, appsReady.promise]);
+    await Promise.resolve();
   });
+  unsubscribe();
 
   const text = document.body.textContent ?? "";
   assert(text.includes("Marketing"), "shows Marketing category label");
