@@ -7,8 +7,10 @@ import {
   type BoardFilters,
   type Facet,
 } from "../../lib/filters";
+import type { AgentProfile } from "../../lib/generated/board-api";
 import type { IssueCard } from "../../lib/types";
 import type { ProjectView } from "../../lib/urlState";
+import { formatTicketOwner } from "../issues/ownerFormat";
 
 interface Props {
   /** Cards in scope before the chips apply — the facet values and
@@ -19,6 +21,7 @@ interface Props {
   filters: BoardFilters;
   onChange: (f: BoardFilters) => void;
   view: ProjectView;
+  profiles?: readonly AgentProfile[] | null;
 }
 
 /// value → how many cards in scope carry it, most used first.
@@ -30,7 +33,7 @@ function tally(values: (string | null | undefined)[][]): [string, number][] {
   return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
-export default function FilterBar({ scope, issues, filters, onChange, view }: Props) {
+export default function FilterBar({ scope, issues, filters, onChange, view, profiles }: Props) {
   const { t, formatNumber } = useLocale();
   const titleOf = new Map(issues.map((i) => [i.id, i.title]));
   const facets: [Facet, string, [string, number][]][] = [
@@ -73,11 +76,19 @@ export default function FilterBar({ scope, issues, filters, onChange, view }: Pr
             <div className="flex flex-wrap gap-1.5">
               {all.map(([value, n]) => {
                 const on = filters[facet].includes(value);
+                const labelText =
+                  facet === "owners" ? (formatTicketOwner(value, profiles) ?? value) : value;
                 return (
                   <button
                     key={value}
                     aria-pressed={on}
-                    title={facet === "epics" ? titleOf.get(value) : undefined}
+                    title={
+                      facet === "epics"
+                        ? titleOf.get(value)
+                        : labelText !== value
+                          ? value
+                          : undefined
+                    }
                     onClick={() => onChange(toggle(filters, facet, value))}
                     className={`chip !py-[.15rem] transition-colors ${
                       on
@@ -85,7 +96,7 @@ export default function FilterBar({ scope, issues, filters, onChange, view }: Pr
                         : "bg-ink-800 text-ink-400 hover:text-ink-200"
                     }`}
                   >
-                    {value}
+                    {labelText}
                     <span className={on ? "text-accent/70" : "text-ink-500"}>
                       {formatNumber(n)}
                     </span>

@@ -1,6 +1,8 @@
 import { useWriteBlock } from "../auth/WriteGate";
 import { issuePath } from "../issues/model";
+import { formatTicketOwner } from "../issues/ownerFormat";
 import { PRIORITY_CHIP } from "../issues/chips";
+import type { AgentProfile } from "../../lib/generated/board-api";
 import { prefetchIssue } from "../../lib/resources";
 import { navigate } from "../../lib/useLocation";
 import { useNavigation } from "../../../screen-ui/src/navigation";
@@ -23,6 +25,7 @@ interface Props {
   busyBy: string[];
   /** False on a read-only board — cards never start a drag. */
   canDrag?: boolean;
+  profiles?: readonly AgentProfile[] | null;
   onOpen: (id: string) => void;
 }
 
@@ -39,6 +42,7 @@ export default function Card({
   parentTitle,
   busyBy,
   canDrag = true,
+  profiles,
   onOpen,
 }: Props) {
   const { t: tr, formatNumber } = useLocale();
@@ -54,11 +58,16 @@ export default function Card({
   const noDrag = noDragReason(t) ?? block;
   const pr = prLabel(t);
   const meta: React.ReactNode[] = [];
-  if (t.owner) {
+  const ownerLabel = formatTicketOwner(t.owner, profiles);
+  if (ownerLabel) {
     meta.push(
-      <span key="o" className="inline-flex items-center gap-1.5 text-ink-400">
+      <span
+        key="o"
+        className="inline-flex items-center gap-1.5 text-ink-400"
+        title={t.owner && ownerLabel !== t.owner ? t.owner : undefined}
+      >
         {busyBy.length > 0 && <i className="w-1.5 h-1.5 rounded-full bg-info" />}
-        {t.owner}
+        {ownerLabel}
       </span>,
     );
   }

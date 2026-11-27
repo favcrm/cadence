@@ -5,7 +5,9 @@ import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/
 import { activeCount, epicProgress, matches, type BoardFilters } from "../../lib/filters";
 import { agentOn } from "../../lib/agentOn";
 import type { ResourceState } from "../../lib/cache";
+import type { AgentProfile } from "../../lib/generated/board-api";
 import { issuePath } from "../issues/model";
+import { formatTicketOwner } from "../issues/ownerFormat";
 import { STATUS_CHIP } from "../issues/chips";
 import { prefetchIssue } from "../../lib/resources";
 import Link from "../../ui/Link";
@@ -55,7 +57,7 @@ const byPriority = (a: IssueCard, b: IssueCard) =>
   a.priority.localeCompare(b.priority) ||
   a.id.localeCompare(b.id, undefined, { numeric: true });
 
-export function IssueList({ issues, project, onOpen, trackerEmpty }: { issues: IssueCard[]; project: string; onOpen: (id: string) => void; trackerEmpty: boolean }) {
+export function IssueList({ issues, project, onOpen, trackerEmpty, profiles }: { issues: IssueCard[]; project: string; onOpen: (id: string) => void; trackerEmpty: boolean; profiles?: readonly AgentProfile[] | null }) {
   const { t, formatNumber } = useLocale();
   const [sort, setSort] = useState<{ key: "id" | "title" | "status" | "priority" | "owner"; direction: "asc" | "desc" }>({ key: "status", direction: "asc" });
   const sortRows = (key: typeof sort.key) => setSort((current) => ({
@@ -63,8 +65,22 @@ export function IssueList({ issues, project, onOpen, trackerEmpty }: { issues: I
     direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
   }));
   const rows = issues.slice().sort((a, b) => {
-    const av = sort.key === "status" ? LIST_ORDER.get(a.status) ?? 99 : sort.key === "priority" ? a.priority : (a[sort.key] ?? "");
-    const bv = sort.key === "status" ? LIST_ORDER.get(b.status) ?? 99 : sort.key === "priority" ? b.priority : (b[sort.key] ?? "");
+    const av =
+      sort.key === "status"
+        ? LIST_ORDER.get(a.status) ?? 99
+        : sort.key === "priority"
+          ? a.priority
+          : sort.key === "owner"
+            ? formatTicketOwner(a.owner, profiles) ?? ""
+            : (a[sort.key] ?? "");
+    const bv =
+      sort.key === "status"
+        ? LIST_ORDER.get(b.status) ?? 99
+        : sort.key === "priority"
+          ? b.priority
+          : sort.key === "owner"
+            ? formatTicketOwner(b.owner, profiles) ?? ""
+            : (b[sort.key] ?? "");
     const result = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv), undefined, { numeric: true });
     return (sort.direction === "asc" ? result : -result) || byPriority(a, b);
   });
@@ -92,7 +108,7 @@ export function IssueList({ issues, project, onOpen, trackerEmpty }: { issues: I
               {issue.title}
             </Link>
             <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-micro text-ink-500">
-              <span>{issue.owner ?? t("unassigned")}</span>
+              <span>{formatTicketOwner(issue.owner, profiles) ?? t("unassigned")}</span>
               <span>{issue.component ?? t("no component")}</span>
               <span>{formatNumber(issue.checks.done)}/{formatNumber(issue.checks.total)} {t("checks")}</span>
               {project === "all" && <span>{issue.project}</span>}
@@ -138,7 +154,15 @@ export function IssueList({ issues, project, onOpen, trackerEmpty }: { issues: I
                   <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{t(issue.status)}</span>
                 </td>
                 <td className="px-3 py-3 align-top num text-ink-300">{t(issue.priority)}</td>
-                <td className="px-3 py-3 align-top num text-ink-400">{issue.owner ?? t("unassigned")}</td>
+                <td
+                  className="px-3 py-3 align-top num text-ink-400"
+                  title={(() => {
+                    const label = formatTicketOwner(issue.owner, profiles);
+                    return label && issue.owner && label !== issue.owner ? issue.owner : undefined;
+                  })()}
+                >
+                  {formatTicketOwner(issue.owner, profiles) ?? t("unassigned")}
+                </td>
                 <td className="px-3 py-3 align-top min-w-[11rem]">
                   <span className="text-ink-400">{issue.component ?? "—"}</span>
                   {(issue.tags ?? []).length > 0 && (
@@ -371,6 +395,7 @@ export default function Board({
                     }
                     busyBy={busy.get(t.id) ?? []}
                     canDrag={!readOnly}
+                    profiles={agents?.profiles}
                     onOpen={onOpen}
                   />
                 ))
@@ -619,11 +644,12 @@ export default function Board({
           filters={filters}
           onChange={onFilters}
           view={view}
+          profiles={agents?.profiles}
         />
       )}
 
       {!loaded ? null : view === "list" ? (
-        <IssueList issues={visible} project={project} onOpen={onOpen} trackerEmpty={issues.length === 0} />
+        <IssueList issues={visible} project={project} onOpen={onOpen} trackerEmpty={issues.length === 0} profiles={agents?.profiles} />
       ) : !filters.groupByEpic ? (
         columns(visible, "")
       ) : (
