@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { cache, resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
@@ -90,7 +90,7 @@ function bindingResource(scope: HostScope) {
 function invalidateAccounts() {
   resources.connections.markInvalid();
   cache.invalidate("email-binding");
-  void resources.smtpConnections.invalidate();
+  cache.invalidate("smtp-connections");
 }
 
 // Stored status note: a UI-owned key (plus data), translated at render.
@@ -124,7 +124,7 @@ export default function EmailSending({
   const t = useTranslate();
   const targetState = useMaybeResource(viewer.operator === true ? targetsResource : null);
   const targets = targetState?.data ?? null;
-  const accountResource = viewer.operator === true ? resources.smtpConnections : null;
+  const accountResource = viewer.operator === true ? resources.smtpConnections(fixedUnsubscribeAddress ? "hosted" : "native") : null;
   const accountState = useMaybeResource(accountResource);
   const rows = accountState?.data?.connections?.filter(isSmtpSender) ?? null;
   const hostedSmtp = accountState?.data?.hosted_smtp === true;
@@ -194,7 +194,12 @@ export default function EmailSending({
       ) : (
         <div className="grid gap-6 min-w-0">
           <EmailAccounts headingRef={accountsHeading} rows={rows ?? []} complete={accountCurrent} canAdd={canAdd} hostedSmtp={hostedSmtp} onAdd={() => setOpenRow("add")} />
-          {accountsError !== null ? (
+          {accountState?.discarded ? (
+            <p role="alert" className="text-label text-fail flex flex-wrap items-center gap-2">
+              {t("Account access could not be confirmed.")}{" "}
+              <Button size="sm" onClick={() => { if (accountResource) void accountResource.refresh(); }}>{t("Retry access check")}</Button>
+            </p>
+          ) : accountsError !== null ? (
             <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
               {accountsError}
               <Button size="sm" onClick={() => { if (accountResource) void accountResource.refresh(); }}>{t("Retry")}</Button>
@@ -266,7 +271,7 @@ export default function EmailSending({
 /** SMTP account management never needs the provider directory or broad connection list. */
 export function EmailAccount({ id, viewer, hostedBoard }: { id: string; viewer: Viewer; hostedBoard: boolean }) {
   const t = useTranslate();
-  const resource = viewer.operator === true ? resources.smtpConnections : null;
+  const resource = viewer.operator === true ? resources.smtpConnections(hostedBoard ? "hosted" : "native") : null;
   const state = useMaybeResource(resource);
   const [answered, setAnswered] = useState(false);
   useEffect(() => {
@@ -281,12 +286,23 @@ export function EmailAccount({ id, viewer, hostedBoard }: { id: string; viewer: 
   const row = state?.data?.connections?.find((item) => item.id === id && isSmtpSender(item)) ?? null;
   const unavailable = state?.status === "failed" || state?.status === "stale" || state?.data?.connections_unavailable !== undefined;
   const current = answered && state?.status === "ok" && !state.inFlight && !unavailable;
+  const confirmCurrentAccount = async (): Promise<Connection | null> => {
+    if (!resource || viewer.readOnly) return null;
+    await resource.refresh();
+    const snapshot = resource.get();
+    if (snapshot.inFlight || snapshot.status !== "ok" || snapshot.data?.connections_unavailable !== undefined) return null;
+    return snapshot.data?.connections.find((item) => item.id === id && item.kind === "enrolled" && isSmtpSender(item)) ?? null;
+  };
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0">
       <Link href={EMAIL_CONNECTIONS_HREF} className="lnk text-label">{t("← Email accounts")}</Link>
       {viewer.operator !== true ? (
         <PageState title={viewer.access === "unavailable" ? t("Access could not be confirmed") : viewer.operator === null ? t("Checking access…") : t("Operator access required")}>
           {viewer.access === "unavailable" && viewer.onRetryAccess && <Button size="sm" onClick={viewer.onRetryAccess}>{t("Retry access check")}</Button>}
+        </PageState>
+      ) : state?.discarded ? (
+        <PageState title={t("Account access could not be confirmed.")}>
+          <Button size="sm" onClick={() => { if (resource) void resource.refresh(); }}>{t("Retry access check")}</Button>
         </PageState>
       ) : (
         <>
@@ -295,7 +311,7 @@ export function EmailAccount({ id, viewer, hostedBoard }: { id: string; viewer: 
               <Button size="sm" onClick={() => { if (resource) void resource.refresh(); }}>{t("Retry")}</Button>
             </p>
           )}
-          {row ? <EmailAccountOverview row={row} current={current} canWrite={current && !viewer.readOnly} hostedBoard={hostedBoard} /> :
+          {row ? <EmailAccountOverview row={row} current={current} canWrite={current && !viewer.readOnly} hostedBoard={hostedBoard} confirmCurrentAccount={confirmCurrentAccount} /> :
             current ? <PageState title={t("Email account not found")}>{t("This account may have been disconnected.")}</PageState> :
               !unavailable && <p role="status" className="text-label text-ink-400 mt-4">{t("Loading account…")}</p>}
         </>
@@ -304,11 +320,12 @@ export function EmailAccount({ id, viewer, hostedBoard }: { id: string; viewer: 
   );
 }
 
-function EmailAccountOverview({ row, current, canWrite, hostedBoard }: {
+function EmailAccountOverview({ row, current, canWrite, hostedBoard, confirmCurrentAccount }: {
   row: Connection;
   current: boolean;
   canWrite: boolean;
   hostedBoard: boolean;
+  confirmCurrentAccount: () => Promise<Connection | null>;
 }) {
   const t = useTranslate();
   const entry = useProtectedEntry(!hostedBoard);
@@ -319,6 +336,11 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard }: {
   const [usedBy, setUsedBy] = useState<string[] | null>(null);
   const [usageUnknown, setUsageUnknown] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  const onScreen = useRef(false);
+  useLayoutEffect(() => {
+    onScreen.current = true;
+    return () => { onScreen.current = false; };
+  }, []);
   useEffect(() => {
     let live = true;
     setUsedBy(null);
@@ -338,29 +360,36 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard }: {
       });
       const results = await Promise.all(reads);
       if (!live) return;
-      setUsedBy(results.filter(({ state }) => state.status === "ok" && state.data?.connectionId === row.id).map(({ target }) => target.label));
-      setUsageUnknown(results.some(({ state }) => state.status !== "ok"));
+      setUsedBy(results.filter(({ state }) => state.status === "ok" && state.data?.state === "live" && state.data.connectionId === row.id).map(({ target }) => target.label));
+      setUsageUnknown(results.some(({ state }) => state.status !== "ok" || state.inFlight));
     })();
     return () => { live = false; };
   }, [row.id, attempt]);
   const ready = row.smtp != null && row.status.custody_available && !connectionNeedsAttention(row);
   const label = row.smtp?.sender_name || row.account;
-  const update = () => {
-    if (!canWrite || busy) return;
-    if (hostedBoard || (entry.status === "ready" && !entry.entry.configured)) {
-      setRotating(true);
-      return;
-    }
-    if (entry.status !== "ready") return;
+  const update = async () => {
+    if (!canWrite || busy || (!hostedBoard && entry.status !== "ready")) return;
     setBusy(true);
     setError(null);
-    void api.credentialRequestCreate({
-      provider: row.provider, verb: "rotate", connection_id: row.id,
-      ...(row.revision !== null ? { expected_credential_revision: row.revision } : {}),
-    }).then(({ request }) => {
-      if (!openTrustedEntry(request)) setError(errorCopy("unsupported_deployment"));
-    }).catch((e: unknown) => setError(errorCopy(e instanceof ApiError ? e.code : null)))
-      .finally(() => setBusy(false));
+    try {
+      // The overview may use a warm snapshot. Rotation inherits omitted
+      // settings, so confirm the exact account before offering the form.
+      const account = await confirmCurrentAccount();
+      if (!account || !onScreen.current) return;
+      if (hostedBoard || (entry.status === "ready" && !entry.entry.configured)) {
+        setRotating(true);
+        return;
+      }
+      const { request } = await api.credentialRequestCreate({
+        provider: account.provider, verb: "rotate", connection_id: account.id,
+        ...(account.revision !== null ? { expected_credential_revision: account.revision } : {}),
+      });
+      if (onScreen.current && !openTrustedEntry(request)) setError(errorCopy("unsupported_deployment"));
+    } catch (error) {
+      if (onScreen.current) setError(errorCopy(error instanceof ApiError ? error.code : null));
+    } finally {
+      if (onScreen.current) setBusy(false);
+    }
   };
   return (
     <div className="grid gap-6 mt-4">
@@ -391,7 +420,7 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard }: {
         </SettingsDrawer>
       )}
       <section aria-labelledby="email-used-by">
-        <h2 id="email-used-by" className="text-cardtitle font-medium text-ink-100 mb-2">{t("Used by")}</h2>
+        <h2 id="email-used-by" className="text-cardtitle font-medium text-ink-100 mb-2">{t("Used by apps")}</h2>
         {usedBy === null && <p role="status" className="text-label text-ink-400">{t("Loading app senders…")}</p>}
         {!!usedBy?.length && (
           <div className="settings-rows">
@@ -404,7 +433,12 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard }: {
             </div>
           </div>
         )}
-        {usedBy?.length === 0 && !usageUnknown && <p className="text-label text-ink-400">{t("No app currently uses this account.")}</p>}
+        {usedBy?.length === 0 && !usageUnknown && (
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <p className="text-label text-ink-400">{t("No app currently uses this account.")}</p>
+            <Link href={EMAIL_SENDING_HREF} className="lnk">{t("View app senders")}</Link>
+          </div>
+        )}
         {usageUnknown && (
           <p role="alert" className="text-label text-fail">{t("Some app sender bindings could not be loaded; usage may be incomplete.")}{" "}
             <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
@@ -441,9 +475,24 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard }: {
           </Button>
           {canWrite && disconnecting && (
             <SettingsDrawer title={t("Disconnect account")} onClose={() => setDisconnecting(false)}>
-              {!!usedBy?.length && <p className="text-label text-ink-300 break-words">{t("{apps} will stop sending from this address.").replace("{apps}", () => usedBy.join(", "))}</p>}
-              {(usedBy === null || usageUnknown) && <p className="text-label text-ink-300">{t("App usage could not be fully confirmed. Any app using this account will stop sending from it.")}</p>}
-              <RevokeConfirm row={row} onClose={() => setDisconnecting(false)} onDone={() => { invalidateAccounts(); navigate(EMAIL_CONNECTIONS_HREF); }} />
+              <div className="grid gap-3">
+                {hostedBoard && !!usedBy?.length ? (
+                  <p className="text-label text-ink-300 break-words">
+                    {t("Stop using this account in {apps} before disconnecting.").replace("{apps}", () => usedBy.join(", "))}
+                  </p>
+                ) : (
+                  <>
+                    {!hostedBoard && !!usedBy?.length && <p className="text-label text-ink-300 break-words">{t("{apps} will stop sending from this address.").replace("{apps}", () => usedBy.join(", "))}</p>}
+                    {(usedBy === null || usageUnknown) && <p className="text-label text-ink-300">
+                      {hostedBoard
+                        ? t("App usage could not be fully confirmed. Disconnect is refused while an app still uses this account.")
+                        : t("App usage could not be fully confirmed. Any app using this account will stop sending from it.")}
+                    </p>}
+                    <RevokeConfirm row={row} hostedSmtp={hostedBoard} onClose={() => setDisconnecting(false)} onDone={() => { invalidateAccounts(); navigate(EMAIL_CONNECTIONS_HREF); }} />
+                  </>
+                )}
+                {hostedBoard && <Link className="lnk" href={EMAIL_SENDING_HREF} onClick={() => setDisconnecting(false)}>{t("View app senders")}</Link>}
+              </div>
             </SettingsDrawer>
           )}
         </footer>
@@ -670,9 +719,7 @@ function SenderCard({
       {error && (
         <p className="text-label text-fail break-words" role="alert">
           {error}{" "}
-          {binding === undefined && (
-            <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
-          )}
+          <Button size="sm" disabled={pending} onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
         </p>
       )}
       {note && (

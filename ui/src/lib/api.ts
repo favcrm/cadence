@@ -1528,7 +1528,6 @@ export const api = {
     get<AgentAccess>(`/api/agents/${encodeURIComponent(alias)}/access`),
   /** `GET /api/connections` — every exact provider account (operator-only). */
   connections: () => get<ConnectionsPayload>("/api/connections"),
-  smtpConnections: () => get<ConnectionsPayload>("/api/connections?scope=smtp"),
   /** `GET /api/connections/<id>` — one connection's metadata (operator-only). */
   connection: (id: string) =>
     get<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}`),

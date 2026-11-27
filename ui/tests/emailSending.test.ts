@@ -26,6 +26,8 @@ interface World {
   origin: { unsubscribe_origin: string | null; stored: boolean };
   posts: { path: string; body: any }[];
   failConnectionsOnce?: boolean;
+  denyConnections?: boolean;
+  failBindOnce?: boolean;
   connectionsPartial?: boolean;
   failContextsOnce?: boolean;
   reads?: string[];
@@ -98,6 +100,8 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
         }
         return json({ contexts: world.contexts });
       case "GET /api/connections":
+        if (world.denyConnections) return json({ error: { code: "operator_required", message: "Operator required" } }, 403);
+        if (!fixedUnsubscribeAddress && url.search) return json({ error: "connection query parameters are unsupported" }, 400);
         if (world.failConnectionsOnce) {
           world.failConnectionsOnce = false;
           return json({ error: "connections are unavailable" }, 503);
@@ -122,6 +126,10 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
         // As the daemon does: the receipt names the value, and only a read says `stored`.
         return json({ unsubscribe_origin: body.unsubscribe_origin });
       case "POST /api/crm-smtp/bind": {
+        if (world.failBindOnce) {
+          world.failBindOnce = false;
+          return json({ error: "The sender could not be saved." }, 503);
+        }
         const row = world.connections.find((r) => r.id === body.connection_id);
         const next = bindingFor(row);
         next.context_id = body.context_id;
@@ -167,7 +175,7 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
     Array.from(document.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === label) as HTMLButtonElement | undefined;
   const render = async (focusSenders = false) => {
     const view = accountId
-      ? React.createElement(emailModule.EmailAccount, { id: accountId, viewer, hostedBoard: true })
+      ? React.createElement(emailModule.EmailAccount, { id: accountId, viewer, hostedBoard: fixedUnsubscribeAddress })
       : React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress, focusSenders });
     await React.act(async () => { root.render(accountId ? React.createElement(NavigationProvider, { adapter: hostNavigation, children: view }) : view); });
   };
@@ -447,6 +455,18 @@ async function main() {
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "Retry recovers"));
     await m.unmount();
   }
+  {
+    const world = fresh({ failBindOnce: true });
+    const m = await mount(world);
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.button("Use this sender"), "binding can start"));
+    await m.click(m.button("Use this sender"));
+    await m.settle(() => assert(m.button("Retry"), "a refused write is recoverable in the same drawer"));
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.button("Use this sender"), "retry re-reads the binding and restores the action"));
+    equal(world.posts.filter((post) => post.path.endsWith("/bind")).length, 1, "retry does not replay a write");
+    await m.unmount();
+  }
   // The two Email routes share a mounted page; returning still focuses App senders.
   {
     const m = await mount(fresh());
@@ -477,8 +497,8 @@ async function main() {
     await m.unmount();
   }
   {
-    const world = fresh({ connections: [smtpRow("conn-a"), { ...smtpRow("unrelated"), smtp_sender: false, smtp: null }], reads: [], connectionQueries: [] });
-    const m = await mount(world);
+    const world = fresh({ hostedSmtp: true, connections: [smtpRow("conn-a"), { ...smtpRow("unrelated"), smtp_sender: false, smtp: null }], reads: [], connectionQueries: [] });
+    const m = await mount(world, { operator: true, readOnly: false }, true);
     await m.settle(() => assert(m.host.querySelector('a[href="/settings/connections/email/account/conn-a"]'), "SMTP account renders"));
     assert(!m.host.textContent?.includes("unrelated"), "legacy non-SMTP rows are filtered");
     equal(world.connectionQueries, ["?scope=smtp"], "email requests SMTP scope");
@@ -491,14 +511,15 @@ async function main() {
     const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
     await m.settle(() => assert(m.host.textContent?.includes("usage may be incomplete"), "binding failure is explicit"));
     await m.click(m.button("Disconnect account"));
-    assert(m.host.textContent?.includes("Any app using this account will stop sending"), "disconnect warns when usage is unknown");
+    assert(m.host.textContent?.includes("Disconnect is refused while an app still uses this account"), "disconnect warns when usage is unknown");
     assert(!world.posts.some((post) => post.path.endsWith("/revoke")), "opening confirmation does not disconnect");
     await m.click(m.button("Cancel"));
     await m.click(m.button("Retry"));
     await m.settle(() => assert(m.host.textContent?.includes("CRM · Acme"), "binding retry restores the affected app"));
-    assert(!m.button("Disconnect account")?.disabled, "confirmed usage permits disconnect");
+    assert(!m.button("Disconnect account")?.disabled, "operator can open the disconnect explanation");
     await m.click(m.button("Disconnect account"));
-    assert(m.host.textContent?.includes("CRM · Acme will stop sending"), "confirmation names the affected app");
+    assert(m.host.textContent?.includes("Stop using this account in CRM · Acme before disconnecting"), "hosted confirmation explains the bound-account refusal");
+    assert(!m.button("Disconnect") && m.host.querySelector('a[href="/settings/connections/email/senders"]'), "the drawer links to the remedy instead of offering an impossible write");
     await m.unmount();
   }
   {
@@ -529,6 +550,42 @@ async function main() {
     assert(!m.host.querySelector("input[type=password]"), "account overview displays no password");
     equal(world.connectionQueries, ["?scope=smtp"], "manage requests only SMTP metadata");
     assert(!world.reads?.includes("/api/connection-providers"), "manage never loads the provider directory");
+    await m.unmount();
+  }
+  {
+    const world = fresh({ connectionQueries: [] });
+    const m = await mount(world);
+    await m.settle(() => assert(m.host.querySelector('a[href="/settings/connections/email/account/conn-a"]'), "native Email opens without query parameters"));
+    await m.showAccount("conn-a");
+    await m.settle(() => assert(m.button("Update credentials") && !m.button("Update credentials")?.disabled, "native Manage enables credentials after its ordinary list read"));
+    equal(world.connectionQueries, [""], "native Email and Manage reuse the native-compatible read");
+    await m.unmount();
+  }
+  {
+    const world = fresh({ hostedSmtp: true, denyConnections: true });
+    const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
+    await m.settle(() => assert(m.host.textContent?.includes("Account access could not be confirmed"), "the server's refusal has its own state"));
+    assert(!m.button("Update credentials") && !m.host.textContent?.includes("Email account not found"), "access denial neither exposes actions nor looks like a missing account");
+    await m.unmount();
+  }
+  {
+    const world = fresh({ hostedSmtp: true, connectionQueries: [] });
+    const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
+    await m.settle(() => assert(m.button("Update credentials") && !m.button("Update credentials")?.disabled, "known account displays the update action"));
+    world.failConnectionsOnce = true;
+    await m.click(m.button("Update credentials"));
+    await m.settle(() => assert(m.host.textContent?.includes("could not be fully confirmed"), "rotation needs a successful fresh account read"));
+    assert(!m.host.querySelector("input[type=password]"), "the warm account is not a rotation baseline after a failed read");
+    equal(world.connectionQueries, ["?scope=smtp", "?scope=smtp"], "only the explicit write action obtains a fresh baseline");
+    world.connections = [smtpRow("conn-a", { revision: 2 })];
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.button("Update credentials") && !m.button("Update credentials")?.disabled, "retry restores account controls"));
+    const latest = smtpRow("conn-a", { revision: 3 });
+    latest.smtp.host = "smtp.current.example.test";
+    world.connections = [latest];
+    await m.click(m.button("Update credentials"));
+    await m.settle(() => assert(m.host.querySelector("input[type=password]"), "a fresh account opens the credential drawer"));
+    assert(m.host.querySelector('form input[placeholder="smtp.current.example.test"]'), "the form inherits the newly confirmed settings, not the warm snapshot");
     await m.unmount();
   }
   console.log("email sending checks passed");

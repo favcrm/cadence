@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { routinesApi } from "../agents/routinesApi";
-import { resources } from "../../lib/resources";
+import { cache, resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { EMAIL_CONNECTIONS_HREF, routePath, type ConnectionPage } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
@@ -757,12 +757,12 @@ function ConnectionsIndex({
                 }
                 onChanged={() => {
                   if (listRes) void listRes.invalidate();
-                  resources.smtpConnections.markInvalid();
+                  cache.invalidate("smtp-connections");
                 }}
                 onRevoked={() => {
                   setOpenId(null);
                   if (listRes) void listRes.invalidate();
-                  resources.smtpConnections.markInvalid();
+                  cache.invalidate("smtp-connections");
                 }}
               />
             </SettingsDrawer>
@@ -988,7 +988,7 @@ function ConnectionsAdd({
     // The list is re-read after an enrollment: bypass the freshness
     // window so a just-created row is not reported missing.
     if (listRes) void listRes.invalidate();
-    resources.smtpConnections.markInvalid();
+    cache.invalidate("smtp-connections");
   };
   // The chooser/setup candidates: the reviewed enrollment shapes only.
   // Provider "local" (the built-in outbox) is never offered for setup.
@@ -1218,7 +1218,7 @@ function ConnectionsDetail({
   const providers = providersState?.data ?? [];
   const refresh = () => {
     if (listRes) void listRes.invalidate();
-    resources.smtpConnections.markInvalid();
+    cache.invalidate("smtp-connections");
     if (providersRes) void providersRes.revalidate();
   };
   const row = rows.find((r) => r.id === id) ?? null;
@@ -2794,6 +2794,7 @@ export function RevokeConfirm({
   onDone,
   onClose,
   hostedPlatform = false,
+  hostedSmtp = false,
 }: {
   row: Connection;
   onDone: () => void;
@@ -2801,6 +2802,8 @@ export function RevokeConfirm({
   /** A hosted platform account: revoke disables the provider account and
    *  removes its selected property, not a local SMTP binding. */
   hostedPlatform?: boolean;
+  /** The hosted SMTP store refuses disconnect while there is a live app binding. */
+  hostedSmtp?: boolean;
 }) {
   const t = useTranslate();
   const [armed, setArmed] = useState(false);
@@ -2854,7 +2857,9 @@ export function RevokeConfirm({
             : isAssetPinningProvider(row.provider)
               ? t("Disconnecting disables this provider account and revokes its connection grants. Any pinned ad account is removed. This cannot be undone — connecting the account again creates a new connection.")
               : t("Disconnecting disables this provider account and revokes its connection grants. This cannot be undone — connecting the account again creates a new connection.")
-          : t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}
+          : hostedSmtp
+            ? t("Disconnecting removes this sending account. This cannot be undone.")
+            : t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}
       </p>
       <label className="flex items-start gap-2 text-label text-ink-300">
         <input
@@ -2871,7 +2876,9 @@ export function RevokeConfirm({
               : isAssetPinningProvider(row.provider)
                 ? t("I understand disconnecting {connectionLabel} disables the provider account and removes its pinned account.").replace("{connectionLabel}", () => connectionLabel(row))
                 : t("I understand disconnecting {connectionLabel} disables the provider account and revokes its connection grants.").replace("{connectionLabel}", () => connectionLabel(row))
-            : t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}
+            : hostedSmtp
+              ? t("I understand this sending account will be removed.")
+              : t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}
         </span>
       </label>
       {error && (
