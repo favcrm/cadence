@@ -8,14 +8,14 @@ export const SCREEN_FILE_DOWNLOAD_MAX_BYTES = 16 * 1024 * 1024;
 const SCREEN_FILE_NAME_MAX_CHARS = 120;
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 
-const ALLOWED_DOWNLOAD_MIMES: Readonly<Record<string, string>> = {
-  md: "text/markdown;charset=utf-8",
-  html: "text/html;charset=utf-8",
-  csv: "text/csv;charset=utf-8",
-  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-};
+const ALLOWED_DOWNLOAD_MIMES: ReadonlyMap<string, string> = new Map([
+  ["md", "text/markdown;charset=utf-8"],
+  ["html", "text/html;charset=utf-8"],
+  ["csv", "text/csv;charset=utf-8"],
+  ["xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+  ["pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+  ["docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+]);
 
 export interface ValidatedScreenFileDownload {
   requestId: string;
@@ -39,19 +39,18 @@ function isSafeDownloadFileName(raw: string): boolean {
 }
 
 function extractArrayBuffer(raw: unknown): ArrayBuffer | null {
-  if (raw instanceof ArrayBuffer) {
-    if (raw.byteLength === 0 || raw.byteLength > SCREEN_FILE_DOWNLOAD_MAX_BYTES) return null;
-    const copy = new Uint8Array(raw.byteLength);
-    copy.set(new Uint8Array(raw));
-    return copy.buffer;
+  const view =
+    raw instanceof ArrayBuffer
+      ? new Uint8Array(raw)
+      : raw instanceof Uint8Array
+        ? raw
+        : null;
+  if (!view || view.byteLength === 0 || view.byteLength > SCREEN_FILE_DOWNLOAD_MAX_BYTES) {
+    return null;
   }
-  if (raw instanceof Uint8Array) {
-    if (raw.byteLength === 0 || raw.byteLength > SCREEN_FILE_DOWNLOAD_MAX_BYTES) return null;
-    const copy = new Uint8Array(raw.byteLength);
-    copy.set(raw);
-    return copy.buffer;
-  }
-  return null;
+  const copy = new Uint8Array(view.byteLength);
+  copy.set(view);
+  return copy.buffer;
 }
 
 export function parseScreenFileDownload(data: unknown): ValidatedScreenFileDownload | null {
@@ -63,7 +62,7 @@ export function parseScreenFileDownload(data: unknown): ValidatedScreenFileDownl
   const dot = record.filename.lastIndexOf(".");
   if (dot <= 0 || dot === record.filename.length - 1) return null;
   const ext = record.filename.slice(dot + 1).toLowerCase();
-  const canonicalMime = ALLOWED_DOWNLOAD_MIMES[ext];
+  const canonicalMime = ALLOWED_DOWNLOAD_MIMES.get(ext);
   if (!canonicalMime) return null;
   if (typeof record.mimeType !== "string") return null;
   if (normalizeMimeBase(record.mimeType) !== normalizeMimeBase(canonicalMime)) return null;
