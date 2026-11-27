@@ -115,6 +115,8 @@ async function main() {
     PROJECT_PRESETS,
     createProjectErrorMessage,
     deriveProjectPrefix,
+    projectDisplayName,
+    projectPresetLabel,
     slugifyProjectKey,
   } = require("../src/features/projects/projectCreate") as typeof ProjectCreateModule;
   const ProjectsOverview = (
@@ -140,6 +142,12 @@ async function main() {
     ["general", "client_delivery", "marketing", "software", "operations"],
     "preset allowlist",
   );
+  eq(projectDisplayName({ key: "acme", name: "Acme Corp" }), "Acme Corp", "display name prefers name");
+  eq(projectDisplayName({ key: "acme", name: "   " }), "acme", "display name falls back on blank");
+  eq(projectDisplayName({ key: "acme" }), "acme", "display name falls back when omitted");
+  eq(projectPresetLabel("client_delivery"), "Client Delivery", "preset label resolves known value");
+  eq(projectPresetLabel("unknown"), null, "preset label ignores unknown value");
+  eq(projectPresetLabel(null), null, "preset label handles null");
 
   // 2. Error message mapping across native & hosted error shapes + zh-TW
   eq(
@@ -454,6 +462,104 @@ async function main() {
   });
   eq(dialog(), null, "Escape closes NewProjectModal");
   ok(document.activeElement === hostedNewBtn, "Focus returns to trigger button on close");
+
+  // 5. ProjectsOverview surfaces name, goal, and preset on portfolio cards and detail header, with fallbacks
+  const sampleProjects = [
+    {
+      key: "harbour-q4",
+      name: "Harbour Co Q4 Rollout",
+      prefix: "HAR",
+      goal: "Launch the client billing portal on schedule.",
+      preset: "client_delivery" as const,
+      components: [],
+      repos: [],
+      issues: 3,
+    },
+    {
+      key: "legacy-proj",
+      prefix: "LEG",
+      components: [],
+      repos: [],
+      issues: 1,
+    },
+  ];
+  await act(async () => {
+    root.render(
+      React.createElement(NavigationProvider, {
+        adapter: nav,
+        children: React.createElement(
+          LocaleProvider,
+          null,
+          React.createElement(ProjectsOverview, {
+            project: "all",
+            projects: sampleProjects,
+            issues: emptyIssues,
+            onOpenIssue: () => {},
+            onRetry: () => {},
+          }),
+        ),
+      }),
+    );
+  });
+  const cardText = container.textContent ?? "";
+  ok(cardText.includes("Harbour Co Q4 Rollout"), "Active card shows project name");
+  ok(cardText.includes("Client Delivery"), "Active card shows preset badge");
+  ok(cardText.includes("Launch the client billing portal on schedule."), "Active card shows goal");
+  ok(cardText.includes("legacy-proj"), "Fallback card keeps project key");
+
+  await act(async () => {
+    root.render(
+      React.createElement(NavigationProvider, {
+        adapter: nav,
+        children: React.createElement(
+          LocaleProvider,
+          null,
+          React.createElement(ProjectsOverview, {
+            project: "harbour-q4",
+            projects: sampleProjects,
+            issues: emptyIssues,
+            onOpenIssue: () => {},
+            onRetry: () => {},
+            milestonesEnabled: false,
+            workflowsEnabled: false,
+          }),
+        ),
+      }),
+    );
+  });
+  eq(container.querySelector("h1")?.textContent, "Harbour Co Q4 Rollout", "Overview h1 shows display name");
+  ok(container.textContent?.includes("harbour-q4"), "Overview header shows slug when distinct from name");
+  ok(container.textContent?.includes("Client Delivery"), "Overview header shows preset badge");
+  ok(
+    container.textContent?.includes("Launch the client billing portal on schedule."),
+    "Overview header shows goal subtitle",
+  );
+
+  await act(async () => {
+    root.render(
+      React.createElement(NavigationProvider, {
+        adapter: nav,
+        children: React.createElement(
+          LocaleProvider,
+          null,
+          React.createElement(ProjectsOverview, {
+            project: "legacy-proj",
+            projects: sampleProjects,
+            issues: emptyIssues,
+            onOpenIssue: () => {},
+            onRetry: () => {},
+            milestonesEnabled: false,
+            workflowsEnabled: false,
+          }),
+        ),
+      }),
+    );
+  });
+  eq(container.querySelector("h1")?.textContent, "legacy-proj", "Overview h1 falls back to key");
+  ok(
+    container.textContent?.includes("Current work, active initiatives, and the next things to inspect."),
+    "Overview header falls back to default subtitle",
+  );
 
   await act(async () => {
     root.unmount();

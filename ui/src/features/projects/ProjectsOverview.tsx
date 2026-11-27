@@ -10,6 +10,7 @@ import { HealthBadge, ProgressBar } from "./HealthBadge";
 import { healthView, progressView } from "./work";
 import { projectSummary } from "./overview";
 import NewProjectModal from "./NewProjectModal";
+import { projectDisplayName, projectPresetLabel } from "./projectCreate";
 import ProjectMilestoneSummary from "./ProjectMilestoneSummary";
 import { useLocale } from "../../lib/locale";
 
@@ -66,9 +67,30 @@ export default function ProjectsOverview({
   const summary = projectSummary(cards, project);
   const all = project === "all";
   const selected = projects.find((item) => item.key === project);
+  const selectedName = !all ? projectDisplayName(selected ?? { key: project }) : null;
+  const selectedPreset = !all ? projectPresetLabel(selected?.preset) : null;
+  const selectedGoal = !all ? selected?.goal?.trim() || null : null;
   return <main className="project-overview px-4 lg:px-8 py-6 min-w-0">
     <header className="project-page-heading">
-      <div><div className="slabel">{t(all ? "Your workspace" : "Project overview")}</div><h1>{all ? t("Projects") : project}</h1><p>{t(all ? (archivedTab ? "Archived projects are hidden from active views and keep their work read-only." : "Coordinate people, agents, deliverables and approvals across your workspace.") : "Current work, active initiatives, and the next things to inspect.")}</p></div>
+      <div>
+        <div className="project-overview-kicker">
+          <span className="slabel">{t(all ? "Your workspace" : "Project overview")}</span>
+          {selectedPreset && <span className="project-preset-chip">{t(selectedPreset)}</span>}
+          {!all && selected?.name?.trim() && selected.name.trim() !== selected.key && (
+            <span className="num text-micro text-ink-500">{selected.key}</span>
+          )}
+        </div>
+        <h1>{all ? t("Projects") : selectedName}</h1>
+        <p>
+          {all
+            ? t(
+                archivedTab
+                  ? "Archived projects are hidden from active views and keep their work read-only."
+                  : "Coordinate people, agents, deliverables and approvals across your workspace.",
+              )
+            : selectedGoal ?? t("Current work, active initiatives, and the next things to inspect.")}
+        </p>
+      </div>
       <div className="project-heading-actions">
         {all && !archivedTab && canCreateProject && (
           <button
@@ -151,27 +173,36 @@ export default function ProjectsOverview({
         )}
         {archivedProjects !== null && archivedProjects.length > 0 && (
           <div className="project-grid">
-            {archivedProjects.map((item) => (
-              <article key={item.key} className="project-summary-card">
-                <div className="flex items-center justify-between gap-3">
-                  <Link href={path(item.key)} className="project-name">{item.key} <span aria-hidden>↗</span></Link>
-                  <span className="num text-micro text-ink-500">{item.prefix}</span>
-                </div>
-                <p className="text-label text-ink-400 mt-2">
-                  {formatNumber(item.issues)} {t("items")} · {t("Read-only")}
-                </p>
-                {item.archived_at && (
-                  <p className="text-micro text-ink-500 mt-1">
-                    {t("Archived at")} {item.archived_at}
-                    {item.archived_by ? ` · ${item.archived_by}` : ""}
+            {archivedProjects.map((item) => {
+              const displayName = projectDisplayName(item);
+              const presetLabel = projectPresetLabel(item.preset);
+              const goal = item.goal?.trim();
+              return (
+                <article key={item.key} className="project-summary-card">
+                  <div className="flex items-center justify-between gap-3">
+                    <Link href={path(item.key)} className="project-name">{displayName} <span aria-hidden>↗</span></Link>
+                    <div className="project-card-badges">
+                      {presetLabel && <span className="project-preset-chip">{t(presetLabel)}</span>}
+                      <span className="num text-micro text-ink-500">{item.prefix}</span>
+                    </div>
+                  </div>
+                  {goal && <p className="project-card-goal mt-2">{goal}</p>}
+                  <p className="text-label text-ink-400 mt-2">
+                    {formatNumber(item.issues)} {t("items")} · {t("Read-only")}
                   </p>
-                )}
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <Link href={path(item.key)} className="btn btn-sm">{t("Browse read-only")}</Link>
-                  <Link href={path(item.key, "settings")} className="btn btn-sm btn-ghost">{t("Restore in settings")}</Link>
-                </div>
-              </article>
-            ))}
+                  {item.archived_at && (
+                    <p className="text-micro text-ink-500 mt-1">
+                      {t("Archived at")} {item.archived_at}
+                      {item.archived_by ? ` · ${item.archived_by}` : ""}
+                    </p>
+                  )}
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <Link href={path(item.key)} className="btn btn-sm">{t("Browse read-only")}</Link>
+                    <Link href={path(item.key, "settings")} className="btn btn-sm btn-ghost">{t("Restore in settings")}</Link>
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
         {archivedProjects !== null && archivedProjects.length === 0 && (
@@ -180,6 +211,9 @@ export default function ProjectsOverview({
       </section>
     ) : all ? <section aria-label={t("Projects")}><div className="flex items-center justify-between mb-3"><h2 className="text-section font-semibold text-ink-100">{t("Your projects")}</h2><span className="text-label text-ink-500">{formatNumber(projects.length)} {t("projects")}</span></div>
       <div className="project-grid">{projects.map((item) => {
+        const displayName = projectDisplayName(item);
+        const presetLabel = projectPresetLabel(item.preset);
+        const goal = item.goal?.trim();
         const work = projectSummary(cards, item.key);
         const focus = issues.data ? work.focus[0] : undefined;
         const dotCls = work.blocked > 0
@@ -198,7 +232,7 @@ export default function ProjectsOverview({
           key={item.key}
           role="link"
           tabIndex={0}
-          aria-label={item.key}
+          aria-label={displayName}
           className="project-summary-card project-card-clickable"
           onClick={() => goProject(item.key)}
           onKeyDown={(e) => {
@@ -210,11 +244,15 @@ export default function ProjectsOverview({
         >
           <div className="project-card-eyebrow">
             <div className="project-card-title-row">
-              <span className="project-name">{item.key}</span>
+              <span className="project-name">{displayName}</span>
               <span className="project-card-arrow" aria-hidden="true">↗</span>
             </div>
-            <span className="num text-micro text-ink-500 shrink-0">{item.prefix}</span>
+            <div className="project-card-badges">
+              {presetLabel && <span className="project-preset-chip">{t(presetLabel)}</span>}
+              <span className="num text-micro text-ink-500 shrink-0">{item.prefix}</span>
+            </div>
           </div>
+          {goal && <p className="project-card-goal">{goal}</p>}
           <div className="project-card-attention">
             <span className={`project-attn-dot ${dotCls}`} aria-hidden="true" />
             <span className="project-card-attention-text">{attnText}</span>
