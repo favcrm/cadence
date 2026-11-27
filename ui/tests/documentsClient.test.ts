@@ -183,16 +183,32 @@ async function listChecks(): Promise<void> {
   equal(seen[0]!.method, "GET", "list is a read");
   equal(seen[0]!.cache, "no-store", "list is never served from the HTTP cache");
   assert(active.ok, "a well-formed list is read");
-  equal(active.value, [{ file, document: state }], "rows parsed");
+  const { shared: fileShared, ...fileRest } = file;
+  equal(active.value, [{ file: { ...fileRest, project: null, shared: fileShared }, document: state }], "rows parsed");
   equal(typeof active.value[0]!.document.deliveredAt, "number", "deliveredAt is epoch milliseconds");
 
   const archivedState = { ...state, stage: "archived", archivedAt: 1_794_500_000_000 };
-  reset(reply(200, { documents: [{ file: { ...file, issue: "CAD-1", shared: true, more: 1 }, document: { ...archivedState, more: 2 } }] }));
+  reset(reply(200, { documents: [{ file: { ...file, issue: "CAD-1", project: "acme", shared: true, more: 1 }, document: { ...archivedState, more: 2 } }] }));
   const archived = await documents.list(true);
   equal(seen[0]!.url, "/api/documents?archived=1", "archived list");
   assert(archived.ok, "additive fields are tolerated");
   equal(archived.value[0]!.document.archivedAt, 1_794_500_000_000, "archivedAt is epoch milliseconds");
   equal(archived.value[0]!.file.issue, "CAD-1", "an issue link is kept");
+  equal(archived.value[0]!.file.project, "acme", "a project field is kept");
+
+  reset(reply(200, { documents: [{ file: { ...file, project: null }, document: state }] }));
+  const projectActive = await documents.list(false, "acme");
+  equal(seen[0]!.url, "/api/documents?project=acme&archived=0", "project-scoped active list");
+  assert(projectActive.ok, "project active list parsed");
+  equal(projectActive.value[0]!.file.project, null, "explicit null project is kept");
+
+  reset(reply(200, { documents: [] }));
+  await documents.list(true, "acme/1");
+  equal(seen[0]!.url, "/api/documents?project=acme%2F1&archived=1", "project-scoped archived list encodes project");
+
+  reset(reply(200, { documents: [] }));
+  await documents.list(false, "");
+  equal(seen[0]!.url, "/api/documents?archived=0", "empty project string omits project filter");
 
   reset(reply(200, { documents: [] }));
   const empty = await documents.list(false);
@@ -209,6 +225,7 @@ async function listChecks(): Promise<void> {
     ["a file without an id", { file: { ...file, id: undefined }, document: state }],
     ["a file with a numeric created", { file: { ...file, created: 1 }, document: state }],
     ["a file with shared missing", { file: { ...file, shared: undefined }, document: state }],
+    ["a file with numeric project", { file: { ...file, project: 42 }, document: state }],
     ["no document", { file }],
     ["a row that is not an object", "row"],
   ] as const) {
@@ -374,7 +391,7 @@ async function abortChecks(): Promise<void> {
     const probed = await rejection(() => documents.probe(controller.signal), `probe pre-aborted (${reason})`);
     assert(isAbortError(probed) || probed === reason, `probe pre-aborted (${reason}) rejects with the abort: ${String(probed)}`);
     reset(reply(200, { documents: [] }));
-    const listed = await rejection(() => documents.list(false, controller.signal), `list pre-aborted (${reason})`);
+    const listed = await rejection(() => documents.list(false, null, controller.signal), `list pre-aborted (${reason})`);
     assert(isAbortError(listed) || listed === reason, `list pre-aborted (${reason}) rejects with the abort: ${String(listed)}`);
   }
 
@@ -388,7 +405,7 @@ async function abortChecks(): Promise<void> {
     });
   for (const [name, run] of [
     ["probe", (signal: AbortSignal) => documents.probe(signal)],
-    ["list", (signal: AbortSignal) => documents.list(true, signal)],
+    ["list", (signal: AbortSignal) => documents.list(true, null, signal)],
   ] as const) {
     const controller = new AbortController();
     reset(hang);

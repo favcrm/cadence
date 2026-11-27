@@ -15,6 +15,7 @@ import type { DocumentStage } from "../features/documents/documentsClient";
  *   /projects/:slug/milestones its milestones: progress, worst health
  *   /projects/:slug/context    its context
  *   /projects/:slug/workflows  its stored workflows and new runs (CAD-496)
+ *   /projects/:slug/documents  hosted only: its documents by stage (CAD-2860)
  *   /projects/:slug/issues/:id one issue (CAD-607). `?tab=` picks a section.
  *   /apps[/<project>/<app>]    installed apps, optionally one app's detail (CAD-557)
  *   /apps/<app-key>            one installed app resolved by package key
@@ -44,7 +45,7 @@ import type { DocumentStage } from "../features/documents/documentsClient";
  * routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "overview" | "timeline" | "issues" | "plan" | "epics" | "milestones" | "context" | "workflows" | "settings";
+export type ProjectSection = "overview" | "timeline" | "issues" | "plan" | "epics" | "milestones" | "context" | "workflows" | "documents" | "settings";
 /** `members` is hosted-only (CAD-2115): a native board serves no tenant member
  *  list, so nothing links there. `matchRoute` still parses the URL — dropping
  *  it would turn a stale link into "nothing lives here"; `settingsRedirect`
@@ -79,7 +80,7 @@ export type ConnectionPage =
 
 export type Route =
   | { screen: "home"; privateChat?: true; actionId?: string }
-  | { screen: "projects"; slug: string | null; section: ProjectSection; archived?: boolean }
+  | { screen: "projects"; slug: string | null; section: ProjectSection; archived?: boolean; stage?: DocumentStageFilter }
   | { screen: "issue"; project: string; id: string; tab: IssueTab }
   | { screen: "apps"; project: string | null; name: string | null }
   | { screen: "appsExplore" }
@@ -254,7 +255,7 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "projects", slug: null, section: "overview" };
       const slug = segment(a);
       if (slug && !b) return { screen: "projects", slug, section: "overview" };
-      if (slug && (b === "overview" || b === "timeline" || b === "issues" || b === "plan" || b === "context" || b === "epics" || b === "milestones" || b === "workflows" || b === "settings")) {
+      if (slug && (b === "overview" || b === "timeline" || b === "issues" || b === "plan" || b === "context" || b === "epics" || b === "milestones" || b === "workflows" || b === "documents" || b === "settings")) {
         return { screen: "projects", slug, section: b };
       }
     }
@@ -489,6 +490,17 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   if (route.screen === "projects" && route.slug === null && route.section === "overview" && q.get("archived") === "1") {
     route = { ...route, archived: true };
   }
+  if (route.screen === "projects" && route.slug !== null && route.section === "documents") {
+    const archived = q.get("archived") === "1";
+    const stage = DOCUMENT_STAGE_FILTERS.find((value) => value === q.get("stage"));
+    if (archived || stage) {
+      route = {
+        ...route,
+        ...(archived ? { archived: true } : {}),
+        ...(!archived && stage ? { stage } : {}),
+      };
+    }
+  }
   if (route.screen === "home") {
     const privateChat = q.get("chat") === "assistant";
     const rawAction = q.get("action")?.trim();
@@ -558,6 +570,8 @@ function scopedRoute(route: Route, project: string): Route {
     slug,
     section,
     ...(slug === null && section === "overview" && route.archived ? { archived: true } : {}),
+    ...(slug !== null && section === "documents" && route.archived ? { archived: true } : {}),
+    ...(slug !== null && section === "documents" && !route.archived && route.stage ? { stage: route.stage } : {}),
   };
 }
 
@@ -658,7 +672,9 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
   // Documents for an app route drops them too: there they are still Documents'.
   if (!isAppRoute(route) || from?.screen === "documents" || from?.screen === "projects") {
     q.delete("archived");
-    if (!isAppRoute(route) || from?.screen === "documents") q.delete("stage");
+    if (!isAppRoute(route) || from?.screen === "documents" || (from?.screen === "projects" && from.section === "documents")) {
+      q.delete("stage");
+    }
   }
   if (!isAppRoute(route) || from?.screen === "wiki") q.delete("wiki_scope");
   // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
@@ -693,6 +709,9 @@ export function locationHref(loc: AppLocation, search = "", from: Route | null =
       writeFilters(q, loc.filters);
     } else if (route.slug === null && route.section === "overview" && route.archived) {
       q.set("archived", "1");
+    } else if (route.slug !== null && route.section === "documents") {
+      if (route.archived) q.set("archived", "1");
+      else if (route.stage) q.set("stage", route.stage);
     }
   } else if (projectFilter(route) && loc.project !== "all") {
     q.set("project", loc.project);
@@ -787,6 +806,8 @@ export function goTo(current: AppLocation, route: Route): AppLocation {
         slug,
         section,
         ...(slug === null && section === "overview" && route.archived ? { archived: true } : {}),
+        ...(slug !== null && section === "documents" && route.archived ? { archived: true } : {}),
+        ...(slug !== null && section === "documents" && !route.archived && route.stage ? { stage: route.stage } : {}),
       },
       project: slug ?? "all",
     };

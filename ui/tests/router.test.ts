@@ -48,6 +48,7 @@ const paths: [string, Route][] = [
   ["/projects/cadence/epics", { screen: "projects", slug: "cadence", section: "epics" }],
   ["/projects/cadence/milestones", { screen: "projects", slug: "cadence", section: "milestones" }],
   ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
+  ["/projects/cadence/documents", { screen: "projects", slug: "cadence", section: "documents" }],
   ["/projects/cadence/settings", { screen: "projects", slug: "cadence", section: "settings" }],
   ["/projects/cadence/issues/CAD-607", { screen: "issue", project: "cadence", id: "CAD-607", tab: "overview" }],
   ["/apps", { screen: "apps", project: null, name: null }],
@@ -524,4 +525,24 @@ equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects
     "/apps/crm?keep=1",
     "leaving /projects?archived=1 to an app drops ?archived=1",
   );
+}
+
+// CAD-2860: project-scoped Documents route `/projects/:slug/documents` with `?archived=1` and `?stage=`.
+{
+  const active = readLocation("/projects/acme/documents", "");
+  equal(active.route, { screen: "projects", slug: "acme", section: "documents" }, "/projects/acme/documents matches Active tab");
+  equal(locationHref(active, ""), "/projects/acme/documents", "project Documents Active tab has bare URL");
+
+  const archived = readLocation("/projects/acme/documents", "?archived=1");
+  equal(archived.route, { screen: "projects", slug: "acme", section: "documents", archived: true }, "/projects/acme/documents?archived=1 matches Archived tab");
+  equal(locationHref(archived, "?archived=1"), "/projects/acme/documents?archived=1", "project Documents Archived tab round-trips");
+
+  const staged = readLocation("/projects/acme/documents", "?stage=in_review");
+  equal(staged.route, { screen: "projects", slug: "acme", section: "documents", stage: "in_review" }, "project Documents ?stage=in_review parses");
+  equal(locationHref(staged, "?stage=in_review"), "/projects/acme/documents?stage=in_review", "project Documents ?stage=in_review round-trips");
+
+  equal(readLocation("/projects/acme/documents", "?archived=1&stage=approved").route, { screen: "projects", slug: "acme", section: "documents", archived: true }, "project Documents Archived tab drops stage filter");
+  equal(locationHref(goTo(staged, { screen: "projects", slug: "acme", section: "documents", archived: true }), "?stage=in_review&keep=1", staged.route), "/projects/acme/documents?keep=1&archived=1", "switching to project Documents Archived tab drops stage");
+  equal(locationHref(goTo(staged, { screen: "workspaceAppKey", appKey: "crm" }), "?stage=in_review&keep=1", staged.route), "/apps/crm?keep=1", "leaving project Documents for an app drops stage");
+  equal(locationHref(goTo(archived, { screen: "threads" }), "?archived=1&keep=1", archived.route), "/threads?keep=1", "leaving project Documents for threads drops archived");
 }

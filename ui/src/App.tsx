@@ -1564,6 +1564,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 }),
                 on: route.screen === "projects" && (route.section === "context" || route.section === "workflows"),
               }]),
+              ...(!documentsHosted || documentsProbeState?.data?.kind !== "available" ? [] : [{
+                label: "Documents",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "documents",
+                }),
+                on: route.screen === "projects" && route.section === "documents",
+              }]),
               // CAD-1950: access is a property of the project, so its
               // control lives on the project page rather than in a list.
               {
@@ -1623,6 +1632,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             hosted={hosted}
             onOpenIssue={openIssue}
             browseHref={hrefFor({ screen: "projects", slug: route.slug, section: "issues" })}
+          />
+        )}
+        {route.screen === "projects" && route.slug && route.section === "documents" && (
+          <DocumentsScreen
+            project={route.slug}
+            hosted={documentsHosted}
+            viewer={documentsViewer({ sub: viewerSub, operator: access.operator, readOnly })}
+            archived={route.archived === true}
+            stage={route.stage}
+            hrefFor={hrefFor}
+            onOpenIssue={openIssue}
           />
         )}
         {route.screen === "projects" && route.slug && route.section === "settings" && (
@@ -1915,6 +1935,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             archived={route.archived}
             stage={route.stage}
             hrefFor={hrefFor}
+            onOpenIssue={openIssue}
           />
         )}
         {screen === "setup" && (
