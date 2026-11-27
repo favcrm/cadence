@@ -3102,6 +3102,17 @@ Object.assign(zhTW, {
 // (Operations, Workspace, Kind, Done, Show raw, and Hide raw are defined earlier in zhTW.)
 Object.assign(zhTW, {
   "Marketing": "市場推廣",
+  "Recommended apps": "建議搭配應用",
+  "Read & draft": "讀取及起草",
+  "Read-only": "只讀",
+  "Installed": "已安裝",
+  "Install later": "稍後安裝",
+  "Starter playbook seeded at hire": "聘用時預填初始工作手冊",
+  "Bound apps restrict which workspace apps this specialist can call. Install missing apps anytime in Apps.": "已綁定的應用會限制此專員可呼叫的工作區應用；缺少的應用可隨時於「應用程式」安裝。",
+  "Role skills and connected app skills load on demand in each session.": "角色技能與已連接的應用技能會在每個工作階段按需載入。",
+  "Uses its role instructions and connected app skills on demand.": "按角色指示與已連接的應用技能按需運作。",
+  "Owner approval required before external sends": "對外傳送或發佈前須由擁有者審批",
+  "Disabled tool groups: {groups}": "已停用工具群組：{groups}",
   "Design": "設計",
   "Business": "商務",
   "Engineering": "工程",
