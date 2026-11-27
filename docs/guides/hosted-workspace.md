@@ -1491,11 +1491,12 @@ be omitted when the request is unambiguous. Eligible slots in a stage can run
 together; a later stage waits for every slot in the preceding stage to pass.
 The server starts a board-managed session for each eligible slot.
 
-An enrolled agent claims its job under its own credential; the tenant resolves
-that credential to the agent, requires the agent's profile to be the job's
-nominated profile, and records the claim. Nothing else may claim: a person, an
-MCP assistant, an unenrolled session and a session that names a profile it does
-not hold are all refused, and the client never supplies a review identity.
+An agent holding the job's nominated profile claims it under its own credential;
+the tenant requires the credential's subject to name that profile and records
+the claim. Nothing else may claim: a person, an MCP assistant, or a session
+naming a different profile. There is no per-review enrolment — the project
+policy names the profile for each slot, and the agent's normal profile
+assignment is the identity.
 
 ```sh
 cadence --org acme issue claim <revjob-id>
