@@ -5,6 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::app_runs::worker_completion::AppCompletionProof;
 use super::kickoff::{check_commit_sha, cloud_hold_exit, last_sha_line};
 use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::plans::{Job, Task};
@@ -1129,7 +1130,7 @@ impl Store {
                 &message,
                 status,
                 &result,
-                &super::app_runs::AppCompletionProof::OperatorReconcile,
+                &AppCompletionProof::OperatorReconcile,
             )? && status == "completed"
             {
                 self.task_on_completed(&tx, &message, &result)?;
