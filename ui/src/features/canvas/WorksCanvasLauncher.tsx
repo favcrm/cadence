@@ -1,5 +1,6 @@
 import { useContext, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useTranslate } from "../../lib/locale";
+import "../../ui/controls.css";
 import { installedAppHref } from "../apps/appViewModel";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import {
@@ -10,6 +11,10 @@ import {
 import { openAppViewEditable } from "./canvasStore";
 
 type WorksSection = "docs" | "sheets" | "decks";
+type LauncherEntry = { section: WorksSection | "all"; key: string; label: string };
+
+const MENU_ESTIMATED_WIDTH_PX = 176;
+const VIEWPORT_EDGE_MARGIN_PX = 8;
 
 function findWorksApp(rows: Installation[] | null): Installation | null {
   if (!rows) return null;
@@ -39,6 +44,7 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
     blocked ? null : findWorksApp(readInstallationsSnapshot()),
   );
   const [open, setOpen] = useState(false);
+  const [alignRight, setAlignRight] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
@@ -75,10 +81,11 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
 
   if (blocked || !works) return null;
 
-  const items: { section: WorksSection; label: string }[] = [
-    { section: "docs", label: t("New Doc") },
-    { section: "sheets", label: t("New Sheet") },
-    { section: "decks", label: t("New Deck") },
+  const items: LauncherEntry[] = [
+    { section: "docs", key: "docs", label: t("New Doc") },
+    { section: "sheets", key: "sheets", label: t("New Sheet") },
+    { section: "decks", key: "decks", label: t("New Deck") },
+    { section: "all", key: "import", label: t("Import file…") },
   ];
 
   const onKeyDown = (event: KeyboardEvent) => {
@@ -114,7 +121,7 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
     }
   };
 
-  const launch = (section: WorksSection, label: string) => {
+  const launch = (entry: LauncherEntry) => {
     setOpen(false);
     const baseHref = installedAppHref(works.name);
     if (!baseHref) return;
@@ -123,10 +130,10 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
       installId: works.install_id,
       tag: "works",
       contextId: "default",
-      route: { section, view: "new", record_id: null, segment_id: null },
-      title: label,
+      route: { section: entry.section, view: "new", record_id: null, segment_id: null },
+      title: entry.label,
       appLabel: works.title || "Works",
-      href: `${baseHref}?install=${encodeURIComponent(works.install_id)}&ctx=default&${encodeURIComponent(sectionQuery)}=${section}`,
+      href: `${baseHref}?install=${encodeURIComponent(works.install_id)}&ctx=default&${encodeURIComponent(sectionQuery)}=${entry.section}`,
     });
   };
 
@@ -141,20 +148,37 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
         aria-label={t("New in Works")}
         title={t("New in Works")}
         data-works-canvas-new
-        onClick={() => setOpen((was) => !was)}
+        onClick={() =>
+          setOpen((was) => {
+            if (!was) {
+              const rect = triggerRef.current?.getBoundingClientRect();
+              setAlignRight(
+                Boolean(
+                  rect &&
+                    rect.left + MENU_ESTIMATED_WIDTH_PX >
+                      window.innerWidth - VIEWPORT_EDGE_MARGIN_PX &&
+                    rect.right >= MENU_ESTIMATED_WIDTH_PX,
+                ),
+              );
+            }
+            return !was;
+          })
+        }
       >
         <span aria-hidden="true">+</span> {t("New")}
       </button>
       {open ? (
-        <div className="row-menu-list" role="menu" aria-label={t("New in Works")}>
+        <div
+          className={
+            alignRight
+              ? "row-menu-pop cv-works-new-pop"
+              : "row-menu-pop cv-works-new-pop cv-works-new-pop-start"
+          }
+          role="menu"
+          aria-label={t("New in Works")}
+        >
           {items.map((item) => (
-            <button
-              key={item.section}
-              type="button"
-              role="menuitem"
-              className="row-menu-item"
-              onClick={() => launch(item.section, item.label)}
-            >
+            <button key={item.key} type="button" role="menuitem" onClick={() => launch(item)}>
               <span>{item.label}</span>
             </button>
           ))}
