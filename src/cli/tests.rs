@@ -17,7 +17,6 @@ fn support_commands_parse_hosted_inputs() {
         "-",
         "--request-id",
         "1b39cf20-68c1-463f-87ab-a7c875160b9a",
-        "--include-diagnostics",
     ])
     .is_ok());
     assert!(Cli::try_parse_from(["cadence", "support", "status", "SUP-0123456789ABCDEF"]).is_ok());
