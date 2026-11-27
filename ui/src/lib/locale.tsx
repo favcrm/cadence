@@ -2674,6 +2674,7 @@ Object.assign(zhTW, {
   "New Doc": "新增文件",
   "New Sheet": "新增試算表",
   "New Deck": "新增簡報",
+  "Import file…": "匯入檔案…",
   // CAD-2690: view options in words.
   "as at {date}": "截至 {date}",
   "Prior year": "去年同期",

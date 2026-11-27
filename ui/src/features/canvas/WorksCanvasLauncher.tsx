@@ -10,6 +10,7 @@ import {
 import { openAppViewEditable } from "./canvasStore";
 
 type WorksSection = "docs" | "sheets" | "decks";
+type LauncherEntry = { section: WorksSection | "all"; key: string; label: string };
 
 function findWorksApp(rows: Installation[] | null): Installation | null {
   if (!rows) return null;
@@ -75,10 +76,11 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
 
   if (blocked || !works) return null;
 
-  const items: { section: WorksSection; label: string }[] = [
-    { section: "docs", label: t("New Doc") },
-    { section: "sheets", label: t("New Sheet") },
-    { section: "decks", label: t("New Deck") },
+  const items: LauncherEntry[] = [
+    { section: "docs", key: "docs", label: t("New Doc") },
+    { section: "sheets", key: "sheets", label: t("New Sheet") },
+    { section: "decks", key: "decks", label: t("New Deck") },
+    { section: "all", key: "import", label: t("Import file…") },
   ];
 
   const onKeyDown = (event: KeyboardEvent) => {
@@ -114,7 +116,7 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
     }
   };
 
-  const launch = (section: WorksSection, label: string) => {
+  const launch = (entry: LauncherEntry) => {
     setOpen(false);
     const baseHref = installedAppHref(works.name);
     if (!baseHref) return;
@@ -123,10 +125,10 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
       installId: works.install_id,
       tag: "works",
       contextId: "default",
-      route: { section, view: "new", record_id: null, segment_id: null },
-      title: label,
+      route: { section: entry.section, view: "new", record_id: null, segment_id: null },
+      title: entry.label,
       appLabel: works.title || "Works",
-      href: `${baseHref}?install=${encodeURIComponent(works.install_id)}&ctx=default&${encodeURIComponent(sectionQuery)}=${section}`,
+      href: `${baseHref}?install=${encodeURIComponent(works.install_id)}&ctx=default&${encodeURIComponent(sectionQuery)}=${entry.section}`,
     });
   };
 
@@ -149,11 +151,11 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
         <div className="row-menu-list" role="menu" aria-label={t("New in Works")}>
           {items.map((item) => (
             <button
-              key={item.section}
+              key={item.key}
               type="button"
               role="menuitem"
               className="row-menu-item"
-              onClick={() => launch(item.section, item.label)}
+              onClick={() => launch(item)}
             >
               <span>{item.label}</span>
             </button>

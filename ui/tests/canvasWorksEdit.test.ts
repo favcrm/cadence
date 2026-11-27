@@ -240,9 +240,22 @@ async function main() {
     await click(newBtn);
     const menuItems = Array.from(host.querySelectorAll('[role="menuitem"]')).map((n) => n.textContent);
     assert(
-      menuItems.includes("New Doc") && menuItems.includes("New Sheet") && menuItems.includes("New Deck"),
-      "launcher menu lists New Doc, New Sheet, New Deck",
+      menuItems.includes("New Doc") &&
+        menuItems.includes("New Sheet") &&
+        menuItems.includes("New Deck") &&
+        menuItems.includes("Import file…"),
+      "launcher menu lists New Doc, New Sheet, New Deck, Import file…",
     );
+    await click(Array.from(host.querySelectorAll('[role="menuitem"]')).find((n) => n.textContent === "Import file…") ?? null);
+    assert(
+      store.canvasSnapshot().tabs[0]?.app?.editable === true &&
+        store.canvasSnapshot().tabs[0]?.app?.route.section === "all" &&
+        store.canvasSnapshot().tabs[0]?.app?.route.view === "new",
+      "clicking Import file… opens an editable Works Canvas tab",
+    );
+
+    store.resetCanvas("conv_1", "k", "app");
+    await click(host.querySelector("[data-works-canvas-new]"));
     await click(host.querySelector('[role="menuitem"]'));
     assert(
       store.canvasSnapshot().tabs[0]?.app?.editable === true &&
