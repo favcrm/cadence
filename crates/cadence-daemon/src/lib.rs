@@ -23,8 +23,8 @@ use cadence_agent::{
     continuity, contract_fixture, delivery, doctor, error, fd_fs, gh_guard, home, inbox, issue,
     issuer_transport, lease, managed_section, master, master_perm, memory, model_defaults,
     needs_dismiss, peer, pi_policy, proc, project_policy, protected_runtime, proto, reaper,
-    remote_cli, rollout, runner, sandbox, secret, skill, slots, store, test_seam, thread_search,
-    wiki, worktree, Error, Result,
+    remote_cli, rollout, runner, sandbox, secret, skill, slots, store, task_acceptance, test_seam,
+    thread_search, wiki, worktree, Error, Result,
 };
 #[cfg(all(test, feature = "test-seam"))]
 use cadence_agent::{web_publish, web_sites};
