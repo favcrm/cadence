@@ -1142,6 +1142,11 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             );
         }
     };
+    if matches!(cli.command, Commands::Support { .. }) {
+        return Err(Error::rejected(
+            "support cases require a hosted workspace; native Cadence has no support-case service",
+        ));
+    }
     // CAD-310: a dev Cadence's state dir decides its profile and tracker,
     // not the caller's env. `dev` verbs (alias `sandbox`) resolve their own roots.
     if !matches!(cli.command, Commands::Dev { .. }) {
@@ -1158,6 +1163,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
 
 pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
+        Commands::Support { .. } => Err(Error::rejected(
+            "support cases require a hosted workspace; native Cadence has no support-case service",
+        )),
         Commands::Remote { .. }
         | Commands::Register { .. }
         | Commands::Connect { .. }

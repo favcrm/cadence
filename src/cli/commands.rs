@@ -23,6 +23,11 @@ impl PlacementArg {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Create and inspect hosted support cases (not ordinary issues).
+    Support {
+        #[command(subcommand)]
+        action: SupportAction,
+    },
     /// List PM issues assigned to your signed-in hosted identity.
     MyWork,
     /// Retain, inspect or explicitly send a local result to hosted queued custody.
@@ -1942,6 +1947,47 @@ impl TeamRole {
         match self {
             Self::Owner => "owner",
             Self::Member => "member",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SupportAction {
+    /// Submit a support case; read its description from a file or stdin (-).
+    New {
+        #[arg(long)]
+        subject: String,
+        #[arg(long, value_enum)]
+        impact: SupportImpact,
+        #[arg(long)]
+        file: PathBuf,
+        /// Reuse this UUID to safely repeat the same request after an unknown outcome.
+        #[arg(long)]
+        request_id: Option<uuid::Uuid>,
+    },
+    /// Read one support case by its SUP- id.
+    Status { id: String },
+    /// List support cases, 50 at a time.
+    #[command(visible_alias = "list")]
+    Ls {
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum SupportImpact {
+    Blocked,
+    Degraded,
+    Question,
+}
+
+impl SupportImpact {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Degraded => "degraded",
+            Self::Question => "question",
         }
     }
 }

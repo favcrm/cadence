@@ -4,7 +4,7 @@ import { sessionAdmissible } from "../auth/gate";
 
 export type SettingsIcon =
   | "preferences" | "security" | "connections" | "templates" | "general"
-  | "status" | "daemons" | "agents" | "memory" | "permissions" | "custody" | "account" | "members" | "documents";
+  | "status" | "daemons" | "agents" | "memory" | "permissions" | "custody" | "account" | "members" | "documents" | "support";
 
 export type SettingsNavEntry = { section: SettingsSection; label: string; icon: SettingsIcon };
 export type SettingsNavGroupSpec = { label: string; items: SettingsNavEntry[] };
@@ -13,6 +13,7 @@ const ENTRIES = {
   preferences: { section: "preferences", label: "Preferences", icon: "preferences" },
   /** CAD-2578: hosted only — offered when the board names `security` in its sections. */
   security: { section: "security", label: "Security", icon: "security" },
+  support: { section: "support", label: "Technical support", icon: "support" },
   connections: { section: "connections", label: "Connections", icon: "connections" },
   templates: { section: "templates", label: "Templates", icon: "templates" },
   general: { section: "general", label: "General", icon: "general" },
@@ -71,7 +72,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
   const pick = (...names: (keyof typeof ENTRIES)[]) =>
     names.filter((name) => listed?.includes(name)).map((name) => ENTRIES[name]);
   return [
-    { label: "You", items: pick("preferences", "security") },
+    { label: "You", items: [...pick("preferences", "security"), ...((meta?.hosted === true || meta?.session?.origin === "public") && meta?.signed_in === true ? pick("support") : [])] },
     // CAD-2115: Members leads the workspace pages, as the approved mockup shows.
     // CAD-2286: Documents follows Members; Members stays first, where
     // `settingsRedirect` lands a request for a page this board does not serve.
@@ -85,7 +86,7 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
  * list, no document lifecycle, and no owner daemon directory, so it neither
  * offers nor mounts them.
  */
-const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents", "security", "daemons"];
+const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents", "security", "daemons", "support"];
 
 /**
  * Where a request for `section` should land instead, or null when it is fine.

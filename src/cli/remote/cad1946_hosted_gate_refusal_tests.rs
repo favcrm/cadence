@@ -543,6 +543,24 @@ fn assert_managed_refused_pre_network(err: &Error, label: &str) {
     );
 }
 
+#[test]
+fn support_refuses_managed_caller_before_reading_report() {
+    let target = target_with("https://workspace.example", Some(agent_pin()));
+    let error = run_cmd(
+        target,
+        Commands::Support {
+            action: crate::cli::commands::SupportAction::New {
+                subject: "Synthetic incident".into(),
+                impact: crate::cli::commands::SupportImpact::Blocked,
+                file: tempfile::tempdir().unwrap().path().join("missing.txt"),
+                request_id: None,
+            },
+        },
+    )
+    .unwrap_err();
+    assert_managed_refused_pre_network(&error, "support new");
+}
+
 // ---- Scenario 1: Managed caller pre-network refusal ----
 
 #[test]

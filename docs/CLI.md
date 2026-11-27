@@ -294,6 +294,28 @@ The default `cadence --help` lists nouns. Actions sit under them.
 - `message send` is the canonical enqueue. `cadence send` still parses.
 - Dispatch stays `cadence dispatch <id> --to <alias>`. It starts an issue, so it is not under `agent`.
 
+### Hosted support cases
+
+Support cases are separate from ordinary issues and require a hosted workspace
+and its existing `cadence login`. Native Cadence has no support-case service.
+
+```sh
+cadence --org acme support new --subject "Cannot sign in" --impact blocked --file description.txt
+printf '%s\n' 'What I tried and what happened' | cadence --org acme support new --subject "Question" --impact question --file -
+cadence --org acme support status SUP-0123456789ABCDEF
+cadence --org acme support ls
+cadence --org acme support ls --offset 50
+```
+
+Impact is `blocked`, `degraded`, or `question`. Diagnostic context is available
+only from the Board. Create and status print the case receipt as JSON; list
+prints `cases` and `hasMore`, with 50 cases per
+page. A create prints its generated request UUID to stderr before sending.
+Keep it: if the outcome is unknown, repeat the exact same input with
+`--request-id <UUID>` rather than submitting a new request. No automatic retry
+or ordinary-issue fallback occurs. The hosted server must be deployed first;
+an older server reports that support cases are not implemented.
+
 ### Goal-intake plans
 
 On a native tracker, use `cadence plan propose --project KEY --file PLAN.md`

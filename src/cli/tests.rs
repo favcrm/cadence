@@ -2,6 +2,54 @@
 use super::*;
 
 #[test]
+fn support_commands_parse_hosted_inputs() {
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "--org",
+        "acme",
+        "support",
+        "new",
+        "--subject",
+        "Cannot log in",
+        "--impact",
+        "blocked",
+        "--file",
+        "-",
+        "--request-id",
+        "1b39cf20-68c1-463f-87ab-a7c875160b9a",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from(["cadence", "support", "status", "SUP-0123456789ABCDEF"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "support", "ls", "--offset", "50"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "support",
+        "new",
+        "--subject",
+        "x",
+        "--impact",
+        "urgent",
+        "--file",
+        "-"
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "support",
+        "new",
+        "--subject",
+        "x",
+        "--impact",
+        "question",
+        "--file",
+        "-",
+        "--request-id",
+        "not-a-uuid"
+    ])
+    .is_err());
+}
+
+#[test]
 fn scoped_live_count_uses_only_visible_rows() {
     let rows = json!({"agents": [
         {"alias": "group-a", "state": "busy", "dead": false},

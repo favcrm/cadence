@@ -262,6 +262,11 @@ export default function AccountMenu({
               {t("Security")}
             </Link>
           )}
+          {(meta.hosted === true || meta.session?.origin === "public") && meta.settings_sections?.includes("support") && (
+            <Link href="/settings/support" onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">
+              {t("Technical support")}
+            </Link>
+          )}
           <button type="button" disabled={busy} onClick={signOut} className="block w-full rounded-md px-2.5 py-2 text-left text-secondary text-ink-200 hover:bg-ink-800 disabled:opacity-60">
             {t("Sign out")}
           </button>
