@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type { Route } from "../../lib/router";
 import Button from "../../ui/Button";
 import type { WikiPage } from "./api";
@@ -12,7 +12,7 @@ import { whoLabel } from "./hosted";
 import PageText from "./PageText";
 
 /** The same document toolbar and reader in Wiki and project Context. */
-export default function PagePane({ page, navHref, readOnly, hosted, section, citedPage, viewerSub }: {
+export default function PagePane({ page, navHref, readOnly, hosted, section, citedPage, viewerSub, accessButton, accessPanel }: {
   page: WikiPage;
   navHref: (route: Route) => string;
   readOnly: boolean;
@@ -21,6 +21,8 @@ export default function PagePane({ page, navHref, readOnly, hosted, section, cit
   section?: string;
   citedPage?: number;
   viewerSub?: string | null;
+  accessButton?: ReactNode;
+  accessPanel?: ReactNode;
 }) {
   const t = useTranslate();
   const [downloadError, setDownloadError] = useState<string | null>(null);
@@ -65,7 +67,9 @@ export default function PagePane({ page, navHref, readOnly, hosted, section, cit
           <Button variant="primary" disabled={readOnly}
             title={readOnly ? t("Sign in with editing access to edit") : undefined}
             href={readOnly ? undefined : navHref({ screen: "wiki", mode: "edit", path: page.path, query: null })}>{t("Edit")}</Button>
+          {accessButton}
       </>} />
+      {accessPanel}
       {page.historical && <Note>{t("Pinned revision")} <span className="num">{page.rev}</span>. {t("Open the current revision to read the live page.")}</Note>}
       {section && <p className="wk-meta">{t("Cited section")}: {section}</p>}
       {citedPage !== undefined && <p className="wk-meta">{t("Cited page")}: {citedPage}</p>}

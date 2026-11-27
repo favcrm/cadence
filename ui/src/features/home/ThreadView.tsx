@@ -22,6 +22,7 @@ import { ConnectCard } from "./ConnectCard";
 import { ContextReceiptCard } from "./ContextReceiptCard";
 import { RecordCard } from "./RecordCard";
 import { ViewCard } from "./ViewCard";
+import { AccessRequestCard } from "./AccessRequestCard";
 import { ShareRequestCard } from "./ShareRequestCard";
 import { ACTION_MARK } from "./formModel";
 import { foldable, formReceipt, inlineTokens, lineCount, segments, type Inline } from "./operatorText";
@@ -496,6 +497,8 @@ export function ThreadItemView({
       return <ViewCard entry={item.entry} density={density} />;
     case "share":
       return <ShareRequestCard entry={item.entry} density={density} />;
+    case "access":
+      return <AccessRequestCard entry={item.entry} density={density} />;
     case "context_receipt":
       return <ContextReceiptCard entry={item.entry} />;
     case "answer": {
@@ -1428,6 +1431,8 @@ export function ThreadTurn({
               </div>
             ) : item.type === "share" ? (
               <div key={item.key} data-item-key={item.key}><ShareRequestCard entry={item.entry} density={density} /></div>
+            ) : item.type === "access" ? (
+              <div key={item.key} data-item-key={item.key}><AccessRequestCard entry={item.entry} density={density} /></div>
             ) : item.type === "context_receipt" ? (
               <div key={item.key} data-item-key={item.key}><ContextReceiptCard entry={item.entry} /></div>
             ) : item.type === "artifact" || item.type === "image" || item.type === "video" ? (

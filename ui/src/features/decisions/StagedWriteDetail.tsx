@@ -7,6 +7,7 @@ import { api } from "../../lib/api";
 import { customMcpErrorText } from "../settings/customMcpView";
 import { ageText, approvable, askedBy, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, visible, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
+import AccessRequestDrawer from "./AccessRequestDrawer";
 import ShareRequestDrawer from "./ShareRequestDrawer";
 import "./decisions.css";
 
@@ -76,9 +77,10 @@ export function noticeText(n: DecisionNotice, t: Say): string {
   switch (n.outcome) {
     case "applied":
       if (n.share) return `${t("Shared")} · ${iso(n.title)}`;
+      if (n.access) return `${t("Approved")} · ${iso(n.title)}`;
       return `${t(n.effect === "send" ? "Sent" : n.effect === "draft" ? "Drafted" : "Applied")} · ${iso(n.title)}`;
     case "denied":
-      if (n.share) return `${t("Declined")} · ${iso(n.title)}`;
+      if (n.share || n.access) return `${t("Declined")} · ${iso(n.title)}`;
       return `${t("Denied")} · ${iso(n.title)} · ${t("nothing ran")}`;
     case "failed":
       return t("{title} was approved but did not apply: {reason}. See Feed.")
@@ -730,6 +732,35 @@ export default function StagedWriteDetail({
         total={n}
         onShare={(clicks) => { if (open(clicks)) void run(() => store.decideShare(write.id, "share")); }}
         onDecline={(note, clicks) => { if (open(clicks)) void run(() => store.decideShare(write.id, "decline", note)); }}
+        onCheck={check}
+        onContinue={advance}
+        onSkip={skip}
+        onClose={onClose}
+      />
+    );
+  }
+
+  // AOS-816: project & wiki access requests use AccessRequestDrawer + /api/access-requests/:id/{approve,decline}.
+  if (write.access) {
+    const gone = elsewhere || attempt?.phase === "elsewhere";
+    const open = (clicks: number) => clicks <= 1 && Date.now() >= armedAt.current && block === null && pending && busy === undefined && !lost && !uncertain && !gone;
+    return (
+      <AccessRequestDrawer
+        write={write}
+        attempt={attempt}
+        busy={busy !== undefined}
+        lost={lost}
+        uncertain={uncertain}
+        elsewhere={gone}
+        block={block}
+        at={at}
+        total={n}
+        onApprove={(scope, duration, clicks) => {
+          if (open(clicks)) void run(() => store.decideAccess(write.id, "approve", { scope, duration }));
+        }}
+        onDecline={(note, clicks) => {
+          if (open(clicks)) void run(() => store.decideAccess(write.id, "decline", { note }));
+        }}
         onCheck={check}
         onContinue={advance}
         onSkip={skip}

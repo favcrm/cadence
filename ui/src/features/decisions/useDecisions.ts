@@ -1,6 +1,7 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
 import { requestThreadReload, subscribeMasterChanged } from "../../lib/masterChanged";
+import { decideAccessRequest, type AccessOutcome, type AccessRequestDuration, type AccessRequestScope } from "../home/accessRequest";
 import { decideShareRequest, type ShareOutcome } from "../home/shareRequest";
 import { failureReason, outcomeOf, parseStagedList, type StagedOutcome, type StagedWrite } from "./stagedWrite";
 
@@ -23,10 +24,12 @@ export type Attempt =
   | { phase: "unconfirmed"; verb: Verb }
   /** The server refused the owner (403). */
   | { phase: "access" }
-  /** It was decided, or is gone, by someone else. `winner`: a share request's 409, naming who decided. */
-  | { phase: "elsewhere"; winner?: Extract<ShareOutcome, { kind: "already" }> }
+  /** It was decided, or is gone, by someone else. `winner` / `accessWinner`: a 409 naming who decided. */
+  | { phase: "elsewhere"; winner?: Extract<ShareOutcome, { kind: "already" }>; accessWinner?: Extract<AccessOutcome, { kind: "already" }> }
   /** AOS-711: the report could not be prepared; the request is still pending and Share can be tried again. */
-  | { phase: "snapshot" };
+  | { phase: "snapshot" }
+  /** AOS-816: the access request was refused (e.g. archived project or invalid scope). */
+  | { phase: "refused"; message: string };
 
 export type Verb = "approve" | "deny";
 export type DecideResult = "decided" | "elsewhere" | "access" | "unconfirmed";
@@ -40,6 +43,8 @@ export interface DecisionNotice {
   effect?: "draft" | "send";
   /** AOS-711: a share request, whose outcome reads Shared or Declined. */
   share?: true;
+  /** AOS-816: an access request, whose outcome reads Approved or Declined. */
+  access?: true;
 }
 
 export interface DecisionsState {
@@ -226,7 +231,13 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
 
   function failedOrDone(row: StagedWrite): DecisionNotice {
     const outcome = outcomeOf(row);
-    const effect = row.share ? { share: true as const } : row.connected === null ? {} : { effect: row.connected.effect };
+    const effect = row.share
+      ? { share: true as const }
+      : row.access
+        ? { access: true as const }
+        : row.connected === null
+          ? {}
+          : { effect: row.connected.effect };
     return outcome === "failed" ? { outcome, title: row.title, reason: failureReason(row), ...effect } : { outcome, title: row.title, ...effect };
   }
 
@@ -323,6 +334,50 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     }
   }
 
+  /**
+   * AOS-816: approve or decline a member's project/wiki access request through
+   * `/api/access-requests/:id/{approve,decline}`.
+   */
+  async function decideAccess(
+    id: string,
+    verb: "approve" | "decline",
+    opts?: { scope?: AccessRequestScope; duration?: AccessRequestDuration; note?: string },
+  ): Promise<DecideResult> {
+    const epoch = lifetime;
+    const current = state.rows.find((r) => r.id === id);
+    if (current === undefined || current.status !== "pending" || current.access === undefined) return "elsewhere";
+    for (const attempt of state.attempts.values()) if (attempt.phase === "busy") return "unconfirmed";
+    if (state.attempts.get(id)?.phase === "unconfirmed") return "unconfirmed";
+    const uiVerb: Verb = verb === "approve" ? "approve" : "deny";
+    setAttempt(id, { phase: "busy", verb: uiVerb });
+    const outcome = await decideAccessRequest(current.access.requestId, verb, opts);
+    if (epoch !== lifetime) return "unconfirmed";
+    if (outcome.kind === "done" || outcome.kind === "already") requestThreadReload();
+    switch (outcome.kind) {
+      case "access":
+        setAttempt(id, { phase: "access" });
+        return "access";
+      case "refused":
+        setAttempt(id, { phase: "refused", message: outcome.message });
+        return "unconfirmed";
+      case "already":
+      case "missing":
+        await reloadDecisions();
+        if (epoch !== lifetime) return "unconfirmed";
+        setAttempt(id, outcome.kind === "already" ? { phase: "elsewhere", accessWinner: outcome } : { phase: "elsewhere" });
+        return "elsewhere";
+      case "unknown":
+        setAttempt(id, { phase: "unconfirmed", verb: uiVerb });
+        return "unconfirmed";
+      case "done":
+        if (holders === 0) {
+          setAttempt(id, { phase: "unconfirmed", verb: uiVerb });
+          return "unconfirmed";
+        }
+        return settle(id, uiVerb, epoch);
+    }
+  }
+
   /** After a reply that says it worked, trust the list, not the reply. */
   async function settle(id: string, verb: Verb, epoch: number): Promise<DecideResult> {
     // If this read was superseded, the list that superseded it is as good.
@@ -413,7 +468,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
 
   return {
     conversation,
-    acquire, release, currentDecisions, reloadDecisions, backgroundReload, decide, decideShare, checkDecision,
+    acquire, release, currentDecisions, reloadDecisions, backgroundReload, decide, decideShare, decideAccess, checkDecision,
     clearNotice, markFailedSeen, resetDecisions, requestReview, onReviewRequest,
     subscribe(listener: () => void) {
       listeners.add(listener);
