@@ -63,6 +63,8 @@ mod cad2402_routines_list_guard_acceptance;
 mod cad2487_dedicated_entry_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad2683_works_read_guard_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad2859_project_create_http_acceptance;
 mod cli_route;
 mod cloud_agents;
 #[cfg(all(test, feature = "cli-runtime-test"))]
