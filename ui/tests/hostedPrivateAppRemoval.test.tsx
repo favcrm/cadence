@@ -131,7 +131,7 @@ async function main() {
     await React.act(async () => { button("Remove app…")!.click(); });
     assert(button("Remove Books"), "confirmation names the private installation");
     await React.act(async () => { button("Remove Books")!.click(); });
-    assert(Number(writes.length) === 1 && writes[0] === `${path}/remove`, "confirmation sends exactly one hosted remove request");
+    assert(writes.join() === `${path}/remove`, "confirmation sends exactly one hosted remove request");
     assert(host.textContent?.includes("Removed — its data is retained."), "a validated receipt confirms removal");
     assert(readAppHomeSnapshot("operator")?.[0]?.attention.state === "removed", "confirmed removal updates the retained home before the next read");
     assert(readInstallationsSnapshot()?.[0]?.state === "removed", "confirmed removal updates the retained launcher list before the next read");
@@ -145,7 +145,7 @@ async function main() {
     failRefreshAfterRestore = true;
     assert(button("Restore"), "a private installation within its window can be restored");
     await React.act(async () => { button("Restore")!.click(); });
-    assert(Number(writes.length) === 1 && writes[0] === `${path}/restore`, "restore sends exactly one hosted request");
+    assert(writes.join() === `${path}/restore`, "restore sends exactly one hosted request");
     assert(host.textContent?.includes("Restored — connection grants must be set up again."), "the validated restore receipt is confirmed");
     await Promise.allSettled([readAppHomeFresh(undefined, "operator"), readInstallationsGuarded()]);
     assert(failedRefreshes > 0, "a launcher or home refresh actually failed after confirmation");
@@ -161,7 +161,7 @@ async function main() {
     const readsBeforeExpiry = removedReads;
     assert(button("Restore"), "the pre-write read is still inside the restore window");
     await React.act(async () => { button("Restore")!.click(); });
-    assert(Number(writes.length) === 1 && writes[0] === `${path}/restore`, "server expiry is not retried");
+    assert(writes.join() === `${path}/restore`, "server expiry is not retried");
     assert(removedReads > readsBeforeExpiry, "the server refused after a fresh in-window detail read");
     assert(host.textContent?.includes("The restore window has closed.") && !button("Restore"), "server 409 closes restore without claiming success");
     assert(!host.textContent?.includes("Restored — connection grants"), "expiry does not confirm restore");
