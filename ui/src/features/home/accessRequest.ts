@@ -345,7 +345,14 @@ export type ConfirmAccessOfferOutcome =
   | "access"
   | "unknown";
 
-export async function confirmAccessOffer(offer: AccessOffer): Promise<ConfirmAccessOfferOutcome> {
+export async function confirmAccessOffer(
+  offer: AccessOffer,
+  reason?: string,
+): Promise<ConfirmAccessOfferOutcome> {
+  const body =
+    reason !== undefined
+      ? JSON.stringify({ reason: reason.trim().slice(0, ACCESS_REQUEST_REASON_MAX) })
+      : null;
   try {
     const { status, reply } = await withPrivateOperation(async (operation) => {
       const response = await operation.fetch(
@@ -353,7 +360,11 @@ export async function confirmAccessOffer(offer: AccessOffer): Promise<ConfirmAcc
         {
           method: "POST",
           credentials: "same-origin",
-          headers: { accept: "application/json" },
+          headers: {
+            accept: "application/json",
+            ...(body === null ? {} : { "content-type": "application/json" }),
+          },
+          ...(body === null ? {} : { body }),
         },
       );
       return { status: response.status, reply: (await response.json().catch(() => null)) as unknown };
@@ -378,39 +389,6 @@ export async function confirmAccessOffer(offer: AccessOffer): Promise<ConfirmAcc
     // Request may have reached the server; polling reconciles.
   }
   return "unknown";
-}
-
-export async function createDirectAccessRequest(input: {
-  kind: AccessRequestKind;
-  target: string;
-  scope?: AccessRequestScope;
-  reason?: string;
-}): Promise<
-  | { ok: true; created: boolean; request: AccessCardModel }
-  | { ok: false; message: string }
-> {
-  try {
-    const { ok, reply } = await withPrivateOperation(async (operation) => {
-      const response = await operation.fetch("/api/access-requests", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify(input),
-      });
-      return { ok: response.ok, reply: (await response.json().catch(() => null)) as unknown };
-    });
-    if (ok && isObject(reply) && reply.ok === true) {
-      const parsed = parseAccessRequestPayload(reply.request);
-      if (parsed) return { ok: true, created: reply.created === true, request: parsed };
-    }
-    const err = isObject(reply) && isObject(reply.error) ? reply.error : null;
-    return {
-      ok: false,
-      message: typeof err?.message === "string" && err.message ? err.message : "Could not send access request.",
-    };
-  } catch {
-    return { ok: false, message: "Could not send access request." };
-  }
 }
 
 export async function readAccessRequest(requestId: string): Promise<AccessCardModel | null> {

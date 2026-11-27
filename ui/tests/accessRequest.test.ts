@@ -5,12 +5,14 @@ export {};
  */
 
 declare function require(name: string): any;
+declare const process: { exit(code?: number): never };
 const assert = require("assert");
 
 const {
   accessTargetHref,
   allowedGrantScopes,
   canNarrowAccessScope,
+  confirmAccessOffer,
   parseAccessOfferEntry,
   parseAccessRequestEntry,
 } = require("../src/features/home/accessRequest") as typeof import("../src/features/home/accessRequest");
@@ -149,3 +151,28 @@ const staged = parseStagedList({
 assert(staged !== null && staged.length === 1, "staged access_request parses cleanly");
 assert.equal(staged![0]!.kind, "access_request");
 assert.equal(titleOf(staged![0]!, (s) => s), "Patrick Wun asks for Project · q4-pricing");
+
+// 6. Confirm sends edited reason JSON body
+(async () => {
+  const seen: Array<{ url: string; body: string | undefined }> = [];
+  const origFetch = globalThis.fetch;
+  (globalThis as any).fetch = async (url: unknown, init?: RequestInit) => {
+    seen.push({ url: String(url), body: init?.body as string | undefined });
+    return new Response(JSON.stringify({ ok: true, outcome: "sent" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    const outcome = await confirmAccessOffer(offer!, "Need Q4 figures");
+    assert.equal(outcome, "sent");
+    assert.equal(seen.length, 1);
+    assert(seen[0]!.url.includes(`/api/access-requests/offers/${aroId}/confirm?conversation=`));
+    assert.equal(seen[0]!.body, JSON.stringify({ reason: "Need Q4 figures" }));
+  } finally {
+    (globalThis as any).fetch = origFetch;
+  }
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

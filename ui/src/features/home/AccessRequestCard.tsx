@@ -6,6 +6,7 @@ import Link from "../../ui/Link";
 import { TurnCard, type CardDensity, type CardStatus } from "../../ui/TurnCard";
 import { WriteGate } from "../auth/WriteGate";
 import {
+  ACCESS_REQUEST_REASON_MAX,
   accessTargetHref,
   alreadyAccessText,
   confirmAccessOffer,
@@ -76,10 +77,15 @@ function useLiveAccessRequest(
 function AccessOfferCard({ offer, density }: { offer: AccessOffer; density: CardDensity }) {
   const t = useTranslate();
   const writeBlock = useContext(WriteGate);
+  const [reason, setReason] = useState(offer.reason ?? "");
   const [result, setResult] = useState<ConfirmAccessOfferOutcome | null>(null);
   const [busy, setBusy] = useState(false);
   const [expired, setExpired] = useState(() => Date.parse(offer.expiresAt) <= Date.now());
   const inFlight = useRef(false);
+
+  useEffect(() => {
+    setReason(offer.reason ?? "");
+  }, [offer.id, offer.reason]);
 
   useEffect(() => {
     let timer = 0;
@@ -116,7 +122,7 @@ function AccessOfferCard({ offer, density }: { offer: AccessOffer; density: Card
     }
     inFlight.current = true;
     setBusy(true);
-    const next = await confirmAccessOffer(offer);
+    const next = await confirmAccessOffer(offer, reason);
     setResult(check && next === "unavailable" ? "unknown" : next);
     inFlight.current = false;
     setBusy(false);
@@ -188,9 +194,23 @@ function AccessOfferCard({ offer, density }: { offer: AccessOffer; density: Card
       <p className="text-label text-ink-300 viewcard-place" data-access-scope>
         {scopeShortLabel(offer.requestedScope, t)}
       </p>
-      {offer.reason === undefined ? null : (
+      {state === "offered" && writeBlock === null ? (
+        <label className="grid gap-1 text-micro text-ink-300">
+          <span>{t("Reason (editable before sending)")}</span>
+          <textarea
+            className="field w-full"
+            data-access-reason-input
+            rows={2}
+            maxLength={ACCESS_REQUEST_REASON_MAX}
+            disabled={busy}
+            value={reason}
+            placeholder={t("Why do you need access? (optional)")}
+            onChange={(e) => setReason(e.target.value)}
+          />
+        </label>
+      ) : reason.trim() === "" ? null : (
         <p className="text-label text-ink-300 break-words" data-access-reason>
-          “{offer.reason}”
+          “{reason.trim()}”
         </p>
       )}
       <p className="text-label text-ink-200 break-words" data-access-outcome role="status">
