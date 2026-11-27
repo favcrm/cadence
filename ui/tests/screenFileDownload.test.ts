@@ -8,14 +8,13 @@ import {
   SCREEN_SUBMIT_DOCUMENT_ACK_TYPE,
   SCREEN_SUBMIT_DOCUMENT_MAX_BYTES,
   SCREEN_SUBMIT_DOCUMENT_TYPE,
-  clearWorksImportFile,
+  consumeWorksImportFile,
   handleScreenFileDownloadMessage,
   handleScreenPdfExportMessage,
   handleScreenSubmitDocumentMessage,
   parseScreenFileDownload,
   parseScreenPdfExport,
   parseScreenSubmitDocument,
-  peekWorksImportFile,
   stageWorksImportFile,
 } from "../src/features/workspace-apps/screen/screenFileDownload";
 
@@ -426,17 +425,16 @@ void (async () => {
   await new Promise((r) => setTimeout(r, 0));
   assert((subReplies.length as number) === 1, "wrong source must not receive submit ack");
 
-  // 8. stageWorksImportFile single-use lifecycle
+  // 8. stageWorksImportFile / consumeWorksImportFile single-use lifecycle
   const impId = stageWorksImportFile({
     installId: "inst_works",
     fileName: "報價單.xlsx",
     mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     bytes: pkZip,
   });
-  const peeked = peekWorksImportFile("inst_works");
-  assert(peeked !== null && peeked.id === impId && peeked.fileName === "報價單.xlsx", "staged import readable");
-  clearWorksImportFile(impId);
-  assert(peekWorksImportFile("inst_works") === null, "cleared import gone");
+  const consumed = consumeWorksImportFile("inst_works");
+  assert(consumed !== null && consumed.id === impId && consumed.fileName === "報價單.xlsx", "staged import consumed");
+  assert(consumeWorksImportFile("inst_works") === null, "second consume returns null");
 })();
 
 console.log("screenFileDownload tests passed");

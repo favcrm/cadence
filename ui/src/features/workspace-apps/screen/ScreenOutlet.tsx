@@ -22,14 +22,14 @@ import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { frameRoute, parseRoutePatch, type RoutePatch } from "./screenRoute";
 import {
-  clearWorksImportFile,
+  consumeWorksImportFile,
   handleScreenFileDownloadMessage,
   handleScreenPdfExportMessage,
   handleScreenSubmitDocumentMessage,
-  peekWorksImportFile,
   SCREEN_IMPORT_FILE_ACK_TYPE,
   SCREEN_IMPORT_FILE_TYPE,
   subscribeWorksImportFile,
+  type StagedWorksImportFile,
 } from "./screenFileDownload";
 import { create as createDocument } from "../../documents/documentsClient";
 import { readOnlyReceipt } from "./screenReadOnly";
@@ -972,25 +972,24 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
     const installId = projection.installation.install_id;
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let pendingItem: StagedWorksImportFile | null = null;
     let activeReqId: string | null = null;
-    let activeImportId: string | null = null;
     let retries = 0;
 
     const deliver = () => {
       if (cancelled) return;
       const frame = container.current?.querySelector("iframe");
-      const item = peekWorksImportFile(installId);
-      if (!frame?.contentWindow || !item) return;
+      pendingItem ??= consumeWorksImportFile(installId);
+      if (!frame?.contentWindow || !pendingItem) return;
       clearTimeout(retryTimer);
-      activeImportId = item.id;
-      activeReqId = `${item.id}_${retries}`;
-      const copy = item.bytes.slice(0);
+      activeReqId = `${pendingItem.id}_${retries}`;
+      const copy = pendingItem.bytes.slice(0);
       frame.contentWindow.postMessage(
         {
           type: SCREEN_IMPORT_FILE_TYPE,
           requestId: activeReqId,
-          filename: item.fileName,
-          mimeType: item.mimeType,
+          filename: pendingItem.fileName,
+          mimeType: pendingItem.mimeType,
           bytes: copy,
         },
         "*",
@@ -1003,11 +1002,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
       if (!frame?.contentWindow || event.source !== frame.contentWindow) return;
       const data = event.data as Record<string, unknown> | null;
       if (!data || typeof data !== "object" || data.type !== SCREEN_IMPORT_FILE_ACK_TYPE) return;
-      if (data.requestId !== activeReqId || !activeImportId) return;
+      if (data.requestId !== activeReqId || !pendingItem) return;
       if (data.ok === true) {
-        clearWorksImportFile(activeImportId);
+        pendingItem = null;
         activeReqId = null;
-        activeImportId = null;
         return;
       }
       if (!cancelled && retries < 10) {
@@ -1019,6 +1017,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
     window.addEventListener("message", onImportAck);
     const unsub = subscribeWorksImportFile((changedId) => {
       if (changedId === installId) {
+        const next = consumeWorksImportFile(installId);
+        if (next) pendingItem = next;
         retries = 0;
         deliver();
       }
@@ -1027,6 +1027,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
     return () => {
       cancelled = true;
       clearTimeout(retryTimer);
+      pendingItem = null;
       window.removeEventListener("message", onImportAck);
       unsub();
     };

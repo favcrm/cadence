@@ -51,20 +51,12 @@ export function stageWorksImportFile(input: {
   return id;
 }
 
-export function peekWorksImportFile(installId: string): StagedWorksImportFile | null {
+export function consumeWorksImportFile(installId: string): StagedWorksImportFile | null {
   const item = stagedWorksImports.get(installId) ?? null;
   if (!item) return null;
-  if (Date.now() - item.createdAt > WORKS_IMPORT_TTL_MS) {
-    stagedWorksImports.delete(installId);
-    return null;
-  }
+  stagedWorksImports.delete(installId);
+  if (Date.now() - item.createdAt > WORKS_IMPORT_TTL_MS) return null;
   return item;
-}
-
-export function clearWorksImportFile(id: string): void {
-  for (const [installId, item] of stagedWorksImports) {
-    if (item.id === id) stagedWorksImports.delete(installId);
-  }
 }
 
 export function subscribeWorksImportFile(listener: (installId: string) => void): () => void {
