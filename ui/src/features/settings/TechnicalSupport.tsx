@@ -155,7 +155,7 @@ export default function TechnicalSupport({ search }: { search: string }) {
   return (
     <main className="px-4 lg:px-8 pt-8 pb-9 max-w-5xl">
       <h1 className="text-section font-semibold text-ink-100">{t("Technical support")}</h1>
-      <p className="text-body text-ink-400 mt-2 mb-6">{t("Send a technical support request and track its status here.")}</p>
+      <p className="text-body text-ink-400 mt-2 mb-6">{t("Report a problem with Cadence to Platform Support. It won’t appear on your workspace issue board.")}</p>
       {id ? (
         <section className="card p-5 space-y-3" aria-label={t("Request details")}>
           <Link className="text-accent underline" href="/settings/support">{t("Back to requests")}</Link>
@@ -170,18 +170,31 @@ export default function TechnicalSupport({ search }: { search: string }) {
             {saved && <div role="status" className="bg-ink-800 rounded-md p-3"><strong>{t("Request received")}</strong><p><Link href={`/settings/support?case=${encodeURIComponent(saved.id)}`} className="underline num">{saved.id}</Link> · {status(saved.status)}</p></div>}
             <label className="grid gap-1 text-secondary font-medium">{t("Subject")} <input name="subject" className="field w-full" required maxLength={100} value={subject} disabled={saving} onChange={(e) => change({ subject: e.target.value })} /></label>
             <fieldset><legend className="text-secondary font-medium mb-2">{t("Impact")}</legend><div className="flex flex-wrap gap-3">{(["blocked", "degraded", "question"] as const).map((value) => <label className="flex items-center gap-2 text-secondary" key={value}><input type="radio" name="impact" value={value} checked={impact === value} disabled={saving} onChange={() => change({ impact: value })} />{t(value === "blocked" ? "Blocked" : value === "degraded" ? "Degraded" : "Question")}</label>)}</div></fieldset>
-            <label className="grid gap-1 text-secondary font-medium">{t("What happened?")} <textarea name="description" className="field w-full" rows={5} required maxLength={4000} value={description} disabled={saving} onChange={(e) => change({ description: e.target.value })} /></label>
-            <div><label className="flex items-center gap-2 text-secondary"><input type="checkbox" name="includeDiagnostics" checked={includeDiagnostics} disabled={saving} onChange={(e) => change({ includeDiagnostics: e.target.checked })} />{t("Include screen diagnostics")}</label><p className="text-secondary text-ink-400 mt-2">{t("Opt in to include the screen and Board version. Logs and workspace data are not attached.")}</p></div>
+            <div>
+              <label className="grid gap-1 text-secondary font-medium">{t("What happened?")} <textarea name="description" className="field w-full" rows={5} required maxLength={4000} value={description} disabled={saving} aria-describedby="support-description-hint" onChange={(e) => change({ description: e.target.value })} /></label>
+              <p id="support-description-hint" className="text-secondary text-ink-400 mt-2">{t("Don’t include credentials, customer records or transcripts.")}</p>
+            </div>
+            <div><label className="flex items-center gap-2 text-secondary"><input type="checkbox" name="includeDiagnostics" checked={includeDiagnostics} disabled={saving} aria-describedby="support-diagnostics-hint" onChange={(e) => change({ includeDiagnostics: e.target.checked })} />{t("Include screen diagnostics")}</label><p id="support-diagnostics-hint" className="text-secondary text-ink-400 mt-2">{t("Opt in to include the screen and Board version. Logs and workspace data are not attached.")}</p></div>
             {saveError && <p role="alert" className="text-secondary text-fail">{saveError}</p>}
             <div><button className="btn btn-primary" type="submit" disabled={saving}>{t(saving ? "Sending…" : "Send request")}</button></div>
           </form>
-          <section className="card p-5 grid gap-3" aria-label={t("My requests")}><h2 className="text-body font-semibold">{t("My requests")}</h2>
-            {cases.map((item) => <Link key={item.id} href={`/settings/support?case=${encodeURIComponent(item.id)}`} className="block border-t border-ink-700 pt-3"><span className="block font-medium break-words">{item.subject}</span><span className="text-secondary text-ink-400 num">{item.id}</span><span className="block text-secondary">{status(item.status)}</span></Link>)}
-            {loading && <p role="status" className="text-secondary text-ink-400">{t("Loading requests…")}</p>}
-            {listError && <p role="alert" className="text-secondary">{t("Could not load support requests. Try again.")} <button type="button" className="underline" onClick={() => setRefresh((n) => n + 1)}>{t("Retry")}</button></p>}
-            {!loading && !listError && cases.length === 0 && <p className="text-secondary text-ink-400">{t("No support requests yet.")}</p>}
-            {hasMore && !loading && <button type="button" className="btn btn-sm" onClick={loadMore}>{t("Load more")}</button>}
-          </section>
+          <div className="grid min-w-0 gap-4">
+            <section className="card p-5 grid gap-2" aria-labelledby="support-next">
+              <h2 id="support-next" className="text-body font-semibold">{t("What happens next")}</h2>
+              <ol className="list-decimal space-y-1 ps-5 text-secondary text-ink-400">
+                <li>{t("You get a case ID.")}</li>
+                <li>{t("Platform Support gets an in-app alert and can review the case in their queue.")}</li>
+                <li>{t("Check My requests to see when support starts work or resolves your case.")}</li>
+              </ol>
+            </section>
+            <section className="card p-5 grid gap-3" aria-label={t("My requests")}><h2 className="text-body font-semibold">{t("My requests")}</h2>
+              {cases.map((item) => <Link key={item.id} href={`/settings/support?case=${encodeURIComponent(item.id)}`} className="block border-t border-ink-700 pt-3"><span className="block font-medium break-words">{item.subject}</span><span className="text-secondary text-ink-400 num">{item.id}</span><span className="block text-secondary">{status(item.status)}</span></Link>)}
+              {loading && <p role="status" className="text-secondary text-ink-400">{t("Loading requests…")}</p>}
+              {listError && <p role="alert" className="text-secondary">{t("Could not load support requests. Try again.")} <button type="button" className="underline" onClick={() => setRefresh((n) => n + 1)}>{t("Retry")}</button></p>}
+              {!loading && !listError && cases.length === 0 && <p className="text-secondary text-ink-400">{t("No support requests yet.")}</p>}
+              {hasMore && !loading && <button type="button" className="btn btn-sm" onClick={loadMore}>{t("Load more")}</button>}
+            </section>
+          </div>
         </div>
       )}
     </main>
