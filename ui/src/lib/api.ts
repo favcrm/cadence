@@ -85,6 +85,8 @@ import type {
   OutboxList,
   Overview,
   Project,
+  CreateProjectInput,
+  CreateProjectResponse,
   ProjectContext,
   ProjectLifecycle,
   ArchivedProjectsPayload,
@@ -599,9 +601,9 @@ function unwrapPostJson<T>(status: number, fallbackMessage: string, parsed: unkn
         ? (record.error as Record<string, unknown>)
         : null;
     const nestedCode =
-      typeof record?.code === "string"
+      typeof record?.code === "string" && record.code.length > 0
         ? record.code
-        : typeof nested?.code === "string"
+        : typeof nested?.code === "string" && nested.code.length > 0
           ? nested.code
           : undefined;
     throw new ApiError(
@@ -862,6 +864,8 @@ export const api = {
   myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
   myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
+  createProject: (req: CreateProjectInput) =>
+    post<CreateProjectResponse>("/api/projects", req),
   archivedProjects: () => get<ArchivedProjectsPayload>("/api/projects?archived=1"),
   archivedProjectIssues: (project: string) =>
     get<{ issues: IssueCard[] }>(`/api/issues?project=${encodeURIComponent(project)}&archived=1`),

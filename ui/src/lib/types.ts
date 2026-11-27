@@ -287,7 +287,10 @@ export interface TaskReport {
 
 export interface Project {
   key: string;
+  name?: string | null;
   prefix: string;
+  goal?: string | null;
+  preset?: string | null;
   components: string[];
   /** Declared tag vocabulary — empty accepts any well-formed tag. */
   tags?: string[];
@@ -297,6 +300,29 @@ export interface Project {
   archived?: boolean;
   archived_at?: string | null;
   archived_by?: string | null;
+}
+
+export type ProjectPreset =
+  | "general"
+  | "client_delivery"
+  | "marketing"
+  | "software"
+  | "operations";
+
+export interface CreateProjectInput {
+  name?: string;
+  key?: string;
+  prefix?: string;
+  goal?: string;
+  preset?: ProjectPreset;
+  visibility?: "workspace-visible" | "private";
+  repo?: string;
+}
+
+export interface CreateProjectResponse {
+  project: Omit<Project, "issues"> & { issues?: number };
+  visibility?: "workspace-visible" | "private";
+  duplicate?: boolean;
 }
 
 export interface ProjectLifecycle {

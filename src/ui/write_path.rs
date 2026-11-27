@@ -438,6 +438,261 @@ pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Val
     ))
 }
 
+/// `POST /api/projects`: create a project through the daemon's `project_new`
+/// RPC. The operator gate ran in `admit`; the daemon verifies the operator
+/// connection again before writing `project.yaml`.
+pub(crate) fn post_project(request: &mut Request, state_dir: &Path) -> HttpResp {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProjectCreateReq {
+        name: Option<String>,
+        key: Option<String>,
+        prefix: Option<String>,
+        goal: Option<String>,
+        preset: Option<String>,
+        visibility: Option<String>,
+        repo: Option<String>,
+    }
+
+    const PRESETS: &[&str] = &[
+        "general",
+        "client_delivery",
+        "marketing",
+        "software",
+        "operations",
+    ];
+
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: ProjectCreateReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let name = match req.name {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return coded_response(
+                    400,
+                    "validation_failed",
+                    "project name cannot be blank",
+                    None,
+                );
+            }
+            if trimmed.chars().count() > 120 {
+                return coded_response(
+                    400,
+                    "validation_failed",
+                    "project name exceeds 120 characters",
+                    None,
+                );
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+
+    let key = match req.key {
+        Some(raw) => raw.trim().to_string(),
+        None => match name.as_deref() {
+            Some(n) => slugify_project_key(n),
+            None => {
+                return coded_response(
+                    400,
+                    "validation_failed",
+                    "project name or key is required",
+                    None,
+                );
+            }
+        },
+    };
+    if let Err(err) = crate::issue::project_new::check_key(&key) {
+        return coded_response(400, "validation_failed", &err.to_string(), None);
+    }
+
+    let preset = match req.preset {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if !PRESETS.contains(&trimmed) {
+                return coded_response(
+                    400,
+                    "validation_failed",
+                    &format!(
+                        "'preset' must be one of {} (got '{trimmed}')",
+                        PRESETS.join(", ")
+                    ),
+                    None,
+                );
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+
+    let visibility = match req.visibility {
+        Some(raw) => match crate::issue::cli::PolicyVisibility::from_wire(raw.trim()) {
+            Some(v) => Some(v),
+            None => {
+                return coded_response(
+                    400,
+                    "validation_failed",
+                    "'visibility' must be workspace-visible or private",
+                    None,
+                );
+            }
+        },
+        None => None,
+    };
+
+    let prefix = match req.prefix {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if let Err(err) = cadence_core::issue::check_prefix(trimmed) {
+                return coded_response(400, "validation_failed", &err.to_string(), None);
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+
+    let goal = req
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let repo = req
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let mut params = serde_json::Map::new();
+    params.insert("key".to_string(), json!(key));
+    if let Some(prefix) = &prefix {
+        params.insert("prefix".to_string(), json!(prefix));
+    }
+    if let Some(goal) = &goal {
+        params.insert("goal".to_string(), json!(goal));
+    }
+    if let Some(repo) = &repo {
+        params.insert("repo".to_string(), json!(repo));
+    }
+    if let Some(vis) = visibility {
+        params.insert("visibility".to_string(), json!(vis.wire()));
+    }
+
+    match client::rpc(state_dir, "project_new", Value::Object(params)) {
+        Ok(out) => {
+            let changed = out.get("changed").and_then(Value::as_bool).unwrap_or(false);
+            let out_prefix = out
+                .get("prefix")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or(prefix)
+                .unwrap_or_default();
+            let repos = if let Some(arr) = out.get("repos").and_then(Value::as_array) {
+                Value::Array(arr.clone())
+            } else if let Some(repo_path) = out.get("repo").and_then(Value::as_str) {
+                json!([{
+                    "path": repo_path,
+                    "remote": out.get("remote").and_then(Value::as_str),
+                }])
+            } else {
+                json!([])
+            };
+            let body = json!({
+                "project": {
+                    "key": key,
+                    "name": name.as_deref().unwrap_or(&key),
+                    "prefix": out_prefix,
+                    "goal": goal,
+                    "preset": preset,
+                    "components": [],
+                    "repos": repos,
+                },
+                "visibility": visibility.map(|v| v.wire()).unwrap_or("workspace-visible"),
+                "duplicate": !changed,
+            });
+            let bytes = serde_json::to_vec_pretty(&body).unwrap_or_default();
+            let mut resp = Response::from_data(bytes).with_status_code(StatusCode(if changed {
+                201
+            } else {
+                200
+            }));
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            resp
+        }
+        Err(err) => project_create_rpc_err(&err),
+    }
+}
+
+fn slugify_project_key(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_hyphen = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_hyphen = false;
+        } else if !prev_hyphen {
+            out.push('-');
+            prev_hyphen = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.len() > 32 {
+        out.truncate(32);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    out
+}
+
+fn project_create_rpc_err(err: &Error) -> HttpResp {
+    let text = err.to_string();
+    if text.starts_with("Daemon is not reachable")
+        || text.contains("Unknown method 'project_new'")
+        || busy_response(err).is_some()
+        || matches!(err, Error::Internal(_))
+    {
+        return super::home::rpc_err(err, "project_new");
+    }
+    if err.code() == Some("private_unavailable") {
+        return coded_response(400, "private_unavailable", &text, None);
+    }
+    if text.contains("operator action")
+        || text.contains("not provably the operator")
+        || matches!(
+            err.code(),
+            Some("not_permitted" | "operator_only" | "member_role" | "approver_not_allowed")
+        )
+    {
+        return coded_response(403, "not_permitted", &text, None);
+    }
+    if err.code() == Some("project_exists")
+        || (text.starts_with("Project '")
+            && (text.contains("exists with ") || text.contains("already exists with ")))
+    {
+        return coded_response(409, "project_exists", &text, None);
+    }
+    if err.code() == Some("prefix_conflict")
+        || (text.starts_with("Prefix ") && text.contains("is project "))
+    {
+        return coded_response(409, "prefix_conflict", &text, None);
+    }
+    if matches!(err, Error::Rejected(_)) || err.kind() == "rejected" {
+        return coded_response(400, "validation_failed", &text, None);
+    }
+    super::home::rpc_err(err, "project_new")
+}
+
 /// `POST /api/projects/<key>/policy` (CAD-1950): replace a project's
 /// recorded access policy.
 ///
@@ -1368,6 +1623,7 @@ pub(crate) fn write_route(
             },
             RouteId::AgentRegister => post_agent(&mut request, state_dir),
             RouteId::AgentProfileCreate => post_agent_profile(&mut request, state_dir),
+            RouteId::ProjectCreate => post_project(&mut request, state_dir),
             // CAD-1950: the one writer for a project's access policy — the
             // same `set_project_policy` the CLI calls, so version bumping,
             // grant validation and the commit cannot diverge.

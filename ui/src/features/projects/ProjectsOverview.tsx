@@ -1,6 +1,7 @@
+import { useRef, useState } from "react";
 import type { ResourceState } from "../../lib/cache";
-import { prefetchIssue } from "../../lib/resources";
-import type { IssueCard, Project } from "../../lib/types";
+import { prefetchIssue, resources } from "../../lib/resources";
+import type { CreateProjectResponse, IssueCard, Project } from "../../lib/types";
 import { navigate } from "../../lib/useLocation";
 import { useNavigation } from "../../../screen-ui/src/navigation";
 import Link from "../../ui/Link";
@@ -8,6 +9,7 @@ import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { HealthBadge, ProgressBar } from "./HealthBadge";
 import { healthView, progressView } from "./work";
 import { projectSummary } from "./overview";
+import NewProjectModal from "./NewProjectModal";
 import ProjectMilestoneSummary from "./ProjectMilestoneSummary";
 import { useLocale } from "../../lib/locale";
 
@@ -28,6 +30,9 @@ export default function ProjectsOverview({
   archivedError = null,
   archivedSupported = false,
   onRetryArchived,
+  canCreateProject = false,
+  hosted = false,
+  onProjectCreated,
 }: {
   project: string;
   projects: Project[];
@@ -44,9 +49,14 @@ export default function ProjectsOverview({
   archivedError?: string | null;
   archivedSupported?: boolean;
   onRetryArchived?: () => void;
+  canCreateProject?: boolean;
+  hosted?: boolean;
+  onProjectCreated?: (created: CreateProjectResponse) => void;
 }) {
   const { t, formatNumber } = useLocale();
   const navigation = useNavigation();
+  const [createOpen, setCreateOpen] = useState(false);
+  const newProjectBtnRef = useRef<HTMLButtonElement | null>(null);
   const goProject = (key: string) => {
     const dest = path(key);
     if (navigation) navigation.navigate(dest);
@@ -59,8 +69,34 @@ export default function ProjectsOverview({
   return <main className="project-overview px-4 lg:px-8 py-6 min-w-0">
     <header className="project-page-heading">
       <div><div className="slabel">{t(all ? "Your workspace" : "Project overview")}</div><h1>{all ? t("Projects") : project}</h1><p>{t(all ? (archivedTab ? "Archived projects are hidden from active views and keep their work read-only." : "Coordinate people, agents, deliverables and approvals across your workspace.") : "Current work, active initiatives, and the next things to inspect.")}</p></div>
-      <Link className="project-action" href={path(project, "issues")}>{t(all ? "All work" : "Browse work")} <span aria-hidden>↗</span></Link>
+      <div className="project-heading-actions">
+        {all && !archivedTab && canCreateProject && (
+          <button
+            ref={newProjectBtnRef}
+            type="button"
+            className="btn btn-primary"
+            onClick={() => setCreateOpen(true)}
+          >
+            {t("New project")}
+          </button>
+        )}
+        <Link className="project-action" href={path(project, "issues")}>{t(all ? "All work" : "Browse work")} <span aria-hidden>↗</span></Link>
+      </div>
     </header>
+    {all && !archivedTab && canCreateProject && (
+      <NewProjectModal
+        open={createOpen}
+        hosted={hosted}
+        returnFocusTo={newProjectBtnRef.current}
+        onClose={() => setCreateOpen(false)}
+        onCreated={(created) => {
+          setCreateOpen(false);
+          void resources.projects.refresh();
+          onProjectCreated?.(created);
+          goProject(created.project.key);
+        }}
+      />
+    )}
     {all && archivedSupported && activeHref && archivedHref && (
       <div className="flex flex-wrap items-center gap-2 mb-5" role="tablist" aria-label={t("Project status")}>
         <Link

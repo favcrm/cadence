@@ -75,6 +75,7 @@ pub(super) enum RouteId {
     RequestDismiss,
     ArtifactRead,
     ArtifactVersions,
+    ProjectCreate,
     ProjectPolicy,
     ProjectLifecycle,
     ProjectArchive,
@@ -447,6 +448,7 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     ),
     row!(Locale, "/api/locale", CallerScoped, &[]),
     row!(TimeZone, "/api/time-zone", CallerScoped, &[]),
+    row!(ProjectCreate, "/api/projects", OperatorOnly, &[]),
     row!(
         ProjectPolicy,
         "/api/projects/{key}/policy",
@@ -765,6 +767,21 @@ mod tests {
         // than falling through to a legacy route.
         let bound = resolve_or_path("GET", "/api/projects/cadence/policy").expect("owned");
         assert_eq!(bound.endpoint.method, "POST");
+    }
+
+    #[test]
+    fn the_project_create_row_is_post_operator_only_and_leaves_get_unaffected() {
+        let bound = resolve("POST", "/api/projects").expect("POST /api/projects resolves");
+        assert_eq!(bound.endpoint.id, RouteId::ProjectCreate);
+        assert_eq!(bound.endpoint.class, RouteClass::OperatorOnly);
+        assert!(bound.invalid().is_none());
+
+        assert!(resolve("GET", "/api/projects").is_none());
+        assert!(resolve("HEAD", "/api/projects").is_none());
+
+        let wrong_method = resolve_or_path("PATCH", "/api/projects").expect("owned write path");
+        assert_eq!(wrong_method.endpoint.id, RouteId::ProjectCreate);
+        assert_eq!(wrong_method.endpoint.method, "POST");
     }
 
     #[test]

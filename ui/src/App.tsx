@@ -1614,6 +1614,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             archivedError={archivedProjectsState.error}
             archivedSupported={archivedProjectsState.supported}
             onRetryArchived={() => setLifecycleVersion((v) => v + 1)}
+            canCreateProject={access.operator === true && !readOnly}
+            hosted={meta?.hosted === true}
+            onProjectCreated={(created) => {
+              say("ok", `${t("Created project")} ${created.project.name || created.project.key}`);
+            }}
           />
         )}
         {route.screen === "projects" && route.slug && route.section === "timeline" && hosted !== undefined && (
