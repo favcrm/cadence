@@ -181,4 +181,24 @@ check(readableAnswer("plain text") === "plain text" && readableAnswer(`typed${AC
   check(!shown({ version: "1.0", action: { name: "answer", sourceComponentId: "gone", context: { name: "QA" } } }), "an unknown sending button: no receipt");
 }
 
+// CAD-2873: inline `@mention` highlighting in prose only (skips emails, URLs, and code spans).
+{
+  const mentioned = inlineTokens("Ping @patrick-wun and @research-agent about https://example.com/@user, mail alice@example.com, or run `@ignore-me`.");
+  check(
+    show(mentioned) ===
+      show([
+        { kind: "text", text: "Ping " },
+        { kind: "mention", text: "@patrick-wun", handle: "patrick-wun" },
+        { kind: "text", text: " and " },
+        { kind: "mention", text: "@research-agent", handle: "research-agent" },
+        { kind: "text", text: " about " },
+        { kind: "link", text: "https://example.com/@user", href: "https://example.com/@user" },
+        { kind: "text", text: ", mail alice@example.com, or run " },
+        { kind: "code", text: "@ignore-me" },
+        { kind: "text", text: "." },
+      ]),
+    `mentions preserve emails, links and code: ${show(mentioned)}`,
+  );
+}
+
 console.log("operatorText: ok");

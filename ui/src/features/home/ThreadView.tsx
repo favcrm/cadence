@@ -264,6 +264,12 @@ function InlineToken({ token }: { token: Inline }) {
           {token.text}
         </a>
       );
+    case "mention":
+      return (
+        <span className="op-mention" data-mention={token.handle}>
+          {token.text}
+        </span>
+      );
     default:
       return <>{token.text}</>;
   }

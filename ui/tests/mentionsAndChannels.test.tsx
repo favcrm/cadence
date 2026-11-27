@@ -100,6 +100,7 @@ async function main(): Promise<void> {
     filterMentionCandidates,
     findActiveMention,
     slugifyHandle,
+    splitComposerHighlights,
     startsWithNote,
   } = require<typeof MentionsModule>("../src/features/mentions/mentions");
   const MentionPicker = require<typeof PickerModule>("../src/features/mentions/MentionPicker").default;
@@ -643,6 +644,20 @@ async function main(): Promise<void> {
     );
   });
   await flush();
+  const hlWrap = host.querySelector('.composer-input-wrap[data-has-hl]');
+  const hlTokens = Array.from(host.querySelectorAll('.composer-hl-mirror .composer-hl-tok')).map((el) => ({
+    kind: el.getAttribute('data-kind'),
+    text: el.textContent,
+  }));
+  equal(
+    hlTokens,
+    [
+      { kind: 'mention-human', text: '@bob' },
+      { kind: 'mention-agent', text: '@designer' },
+    ],
+    'AssistantComposer renders highlight mirror spans for @human and @agent mentions',
+  );
+  assert(hlWrap !== null, 'composer wrapper marks active highlights');
   const submitBtn = host.querySelector<HTMLButtonElement>('form[data-composer] button[type="submit"]');
   assert(submitBtn !== null && !submitBtn.disabled, "Home composer submit button is enabled for @teammate and @agent draft");
   await React.act(async () => { submitBtn.click(); });
@@ -651,6 +666,45 @@ async function main(): Promise<void> {
   assert(homeSubmittedCount === 1, "Home composer fires onSubmitted once on direct send");
   assert(host.querySelector("[data-home-handoff-preview]") === null, "Home composer renders no handoff blocker card");
   assert(!(host.textContent ?? "").includes("Colleague mention in private Home"), "Home composer never surfaces handoff consent warning");
+
+  // 5b. CAD-2873 /note command + @mention highlight mirror in Channels (`showSilentToggle`) & Home (`allowNote`) Composers.
+  await React.act(async () => {
+    root.render(
+      React.createElement(LocaleProvider, null,
+        React.createElement(AssistantComposer, {
+          density: "full",
+          storeKey: "home-hl-cmd-test",
+          block: null,
+          seed: { text: "/note @bob ask @designer", n: 1 },
+          showSilentToggle: true,
+          mentionCandidates: [
+            { id: "human-bob", handle: "bob", label: "Bob", kind: "human", subtitle: "Teammate", active: true },
+            { id: "p-designer", handle: "designer", label: "designer", kind: "agent", subtitle: "Designer", active: true },
+          ],
+          onSend: () => undefined,
+          formProps: { "data-composer": "" },
+        }),
+      ),
+    );
+  });
+  await flush();
+  equal(
+    Array.from(host.querySelectorAll('.composer-hl-mirror .composer-hl-tok')).map((el) => ({
+      kind: el.getAttribute('data-kind'),
+      text: el.textContent,
+    })),
+    [
+      { kind: 'command', text: '/note' },
+      { kind: 'mention-human', text: '@bob' },
+      { kind: 'mention-agent', text: '@designer' },
+    ],
+    'AssistantComposer highlights leading /note command alongside @human and @agent mentions',
+  );
+  equal(
+    splitComposerHighlights("/other @bob", { candidates: [{ id: "human-bob", handle: "bob", label: "Bob", kind: "human", active: true }], highlightCommand: "note" }).filter((s) => s.kind !== "text"),
+    [{ kind: "mention-human", text: "@bob" }],
+    'highlightCommand="note" highlights /note without highlighting arbitrary /commands',
+  );
 
   // 6. Human-Turn Brake 3-state branch in HumanContextPanel + NotificationToast CSS stacking
   for (const [chainCount, chainLimit, expectedText, forbiddenText] of [
@@ -773,6 +827,28 @@ async function main(): Promise<void> {
   );
   await React.act(async () => nonOpRoot.unmount());
   nonOpHost.remove();
+
+  // 10. CAD-2873 Inline composer highlighting partitions commands and active agent/human mentions verbatim.
+  const hlCandidates = [
+    { id: "ag-1", handle: "research-agent", label: "research-agent", kind: "agent" as const, active: true },
+    { id: "hu-1", handle: "patrick-wun", label: "Patrick Wun", kind: "human" as const, active: true },
+    { id: "hu-2", handle: "inactive-user", label: "Inactive", kind: "human" as const, active: false },
+  ];
+  const sampleDraft = "/skill:brief @patrick-wun ask @research-agent about @unknown @inactive-user or a@b.com";
+  const spans = splitComposerHighlights(sampleDraft, {
+    candidates: hlCandidates,
+    highlightCommand: true,
+  });
+  assert(spans.map((s) => s.text).join("") === sampleDraft, "highlight spans reproduce draft text verbatim");
+  assert(
+    JSON.stringify(spans.filter((s) => s.kind !== "text")) ===
+      JSON.stringify([
+        { kind: "command", text: "/skill:brief" },
+        { kind: "mention-human", text: "@patrick-wun" },
+        { kind: "mention-agent", text: "@research-agent" },
+      ]),
+    `expected leading command + active human/agent mentions only, got ${JSON.stringify(spans)}`,
+  );
 
   host.remove();
   resetPrivateSession();

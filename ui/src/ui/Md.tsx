@@ -2,6 +2,7 @@ import { createContext, isValidElement, useContext, useState, type ReactNode } f
 import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { citationSpans, isWikiRevisionHref, wikiLinkHref, wikiRevisionHref } from "../features/wiki/citations";
+import { findMentionSpans } from "../features/mentions/mentions";
 import { useTranslate } from "../lib/localeText";
 import Link from "./Link";
 import SafeLink from "./SafeLink";
@@ -18,7 +19,7 @@ interface MdNode {
   value?: string;
   url?: string;
   children?: MdNode[];
-  data?: { hProperties?: Record<string, unknown> };
+  data?: { hName?: string; hProperties?: Record<string, unknown> };
   /** GFM table column alignment. */
   align?: (string | null)[];
 }
@@ -232,6 +233,41 @@ function linkifyCitations(node: MdNode): void {
 }
 
 const remarkWikiCitations = () => (tree: MdNode) => linkifyCitations(tree);
+
+function highlightMentions(node: MdNode): void {
+  const kids = node.children;
+  if (!kids || node.type === "link" || node.type === "linkReference") return;
+  const out: MdNode[] = [];
+  for (const kid of kids) {
+    if (kid.type !== "text" || !kid.value) {
+      highlightMentions(kid);
+      out.push(kid);
+      continue;
+    }
+    const spans = findMentionSpans(kid.value);
+    if (spans.length === 0) {
+      out.push(kid);
+      continue;
+    }
+    let last = 0;
+    for (const span of spans) {
+      if (span.start > last) out.push({ type: "text", value: kid.value.slice(last, span.start) });
+      out.push({
+        type: "mention",
+        data: {
+          hName: "span",
+          hProperties: { className: ["md-mention"], "data-mention": span.handle.toLowerCase() },
+        },
+        children: [{ type: "text", value: span.raw }],
+      });
+      last = span.end;
+    }
+    if (last < kid.value.length) out.push({ type: "text", value: kid.value.slice(last) });
+  }
+  node.children = out;
+}
+
+const remarkMentions = () => (tree: MdNode) => highlightMentions(tree);
 
 // CAD-2363: in an assistant answer, a long hex identifier in running text
 // becomes an inline-code node, which the `code` component paints as a short
@@ -507,7 +543,7 @@ function knownComponents(onOpen: (id: string) => void, known: (id: string) => bo
   return (pair[slot] ??= buildComponents(onOpen, undefined, ids, known));
 }
 
-const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks, remarkSectionLabels, remarkNumericColumns];
+const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkMentions, remarkIssueLinks, remarkSectionLabels, remarkNumericColumns];
 const PAGE_PLUGINS = [...PLUGINS, remarkDropComments];
 const ID_PLUGINS = [...PLUGINS, remarkIdTokens];
 

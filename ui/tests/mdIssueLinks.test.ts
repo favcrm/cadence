@@ -123,4 +123,16 @@ equal(render("[x](//[::1]/a)").includes("<a "), false, "//[::1] is not an anchor
 const bs = render("[x](\\\\[::1]/x)");
 equal(bs, "<p>x</p>", "a single-backslash [::1] target is blanked to plain text");
 
+// CAD-2873: boundary-safe `@mention` pills in Markdown prose; links, URLs, emails, and code stay plain.
+equal(
+  render("Ping @patrick-wun and @research-agent, email alice@example.com, or run `@skip`"),
+  '<p>Ping <span class="md-mention" data-mention="patrick-wun">@patrick-wun</span> and <span class="md-mention" data-mention="research-agent">@research-agent</span>, email <a class="lnk" href="mailto:alice@example.com" target="_blank" rel="noreferrer">alice@example.com</a>, or run <code>@skip</code></p>',
+  "prose @mentions render as md-mention spans while emails and code stay plain",
+);
+equal(
+  render("See [@user](https://example.com/@user) and https://example.com/@other\n\n```\n@code-block\n```").includes('class="md-mention"'),
+  false,
+  "links, URLs, and fenced code blocks do not render mention spans",
+);
+
 console.log("md issue link checks passed");

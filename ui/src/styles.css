@@ -1794,6 +1794,18 @@ textarea.agentform-input { height: auto; width: 100%; }
   background: color-mix(in srgb, var(--color-ink-100) 9%, transparent);
   font: .9em "IBM Plex Mono", monospace;
 }
+.op-mention,
+.md-mention {
+  display: inline-block;
+  padding: 0 .32rem;
+  border-radius: .3rem;
+  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
+  color: var(--color-accent);
+  font-weight: 500;
+}
+[data-chat-message="user"] .op-mention {
+  background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+}
 [data-chat-message="user"] .op-pre {
   margin: .5rem -.25rem 0;
   padding: .55rem .7rem;
@@ -3420,7 +3432,7 @@ button.refchip:hover {
 
 /* A dock whose textarea has grown: the card's own scrollbar stays
    inside the rounded corners. */
-.chatdock textarea {
+.chatdock :is(textarea, .composer-hl-mirror) {
   scrollbar-gutter: stable;
 }
 
@@ -3436,7 +3448,7 @@ button.refchip:hover {
 .home-workspace .issue-reader p { text-wrap: pretty; }
 .home-workspace .master-heading { padding-block: .25rem .75rem; }
 .home-workspace [data-composer][data-blocked] { background: var(--color-ink-875); border-style: solid; }
-.home-workspace [data-composer][data-blocked] textarea { min-height: 2rem; }
+.home-workspace [data-composer][data-blocked] :is(textarea, .composer-hl-mirror) { min-height: 2rem; }
 .activity-tabs { display: flex; gap: 1.25rem; padding: 0 1rem; border-bottom: 1px solid var(--color-ink-700); }
 .activity-tabs button { padding: .8rem 0; font-size: var(--text-label); color: var(--color-ink-500); border-bottom: 2px solid transparent; }
 .activity-tabs button[aria-pressed="true"] { color: var(--color-accent); border-color: var(--color-accent); }
@@ -4057,9 +4069,68 @@ button.refchip:hover {
   border-radius: .75rem;
   padding: .625rem .75rem .5rem;
 }
-[data-composer]:has(> .composer-foot) > textarea {
+.composer-input-wrap {
+  display: grid;
+  position: relative;
+  min-width: 0;
+}
+/* Keep zero specificity here so responsive `.app-chat-textarea` font-size
+   rules apply equally to both `<textarea>` and its `.composer-hl-mirror`. */
+:where(.composer-input-wrap > textarea, .composer-input-wrap > .composer-hl-mirror) {
+  grid-area: 1 / 1;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  font-family: inherit;
+  letter-spacing: inherit;
+  line-height: 1.5;
+}
+[data-composer]:has(> .composer-foot) .composer-input-wrap > :is(textarea, .composer-hl-mirror) {
   display: block; /* no inline baseline gap under the box */
   line-height: 1.5;
+}
+.composer-hl-mirror {
+  pointer-events: none;
+  user-select: none;
+  resize: none;
+  background: transparent;
+  border-color: transparent;
+  color: var(--color-ink-100);
+  scrollbar-color: transparent transparent;
+}
+.composer-hl-mirror::-webkit-scrollbar {
+  background: transparent;
+}
+.composer-hl-mirror::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+.composer-input-wrap[data-has-hl] > textarea {
+  position: relative;
+  z-index: 1;
+  color: transparent;
+  caret-color: var(--color-ink-100);
+}
+.composer-input-wrap[data-has-hl] > textarea::selection {
+  background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+  color: transparent;
+}
+.composer-hl-tok {
+  border-radius: .25rem;
+  font: inherit;
+}
+.composer-hl-tok[data-kind="mention-agent"],
+.composer-hl-tok[data-kind="command"] {
+  background: color-mix(in srgb, var(--color-accent) 16%, transparent);
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--color-accent) 16%, transparent);
+  color: var(--color-accent);
+}
+.composer-hl-tok[data-kind="mention-human"] {
+  background: color-mix(in srgb, var(--color-info) 16%, transparent);
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--color-info) 16%, transparent);
+  color: var(--color-info);
 }
 .composer-foot {
   display: flex;
@@ -4142,16 +4213,19 @@ button.refchip:hover {
     background: color-mix(in srgb, var(--color-ink-850) 92%, transparent);
     backdrop-filter: blur(12px);
   }
-  .home-master [data-composer] > :not(textarea, .composer-foot) { grid-column: 1 / -1; }
+  .home-master [data-composer] > :not(textarea, .composer-input-wrap, .composer-foot) { grid-column: 1 / -1; }
   .home-master .composer-foot { display: contents; }
   .home-master .composer-foot > .composer-hint,
   .home-master .composer-foot > span { display: none; }
   .home-master .composer-foot > .app-chat-attach,
   .home-master .composer-foot > .app-chat-send { width: 2.75rem; height: 2.75rem; }
   .home-master .composer-foot > .app-chat-attach { grid-column: 1; order: 1; }
-  .home-master [data-composer] > textarea {
+  .home-master [data-composer] > .composer-input-wrap {
     grid-column: 2;
     order: 2;
+    min-width: 0;
+  }
+  .home-master [data-composer] .composer-input-wrap > :is(textarea, .composer-hl-mirror) {
     padding: .625rem .25rem;
     max-height: 6.25rem;
     scrollbar-gutter: auto;
@@ -4190,7 +4264,7 @@ button.refchip:hover {
     max-width: min(78%, 34rem);
     border-radius: .875rem;
   }
-  [data-composer]:has(> .composer-foot) > textarea,
+  [data-composer]:has(> .composer-foot) .composer-input-wrap > :is(textarea, .composer-hl-mirror),
   .app-chat-composer .app-chat-box {
     min-height: 2.5rem;
     font-size: .9375rem;
