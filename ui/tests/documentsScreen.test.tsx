@@ -119,7 +119,7 @@ async function main() {
     { file: file("art-brief", "Launch brief", 1), document: doc("in_review", { type: "brief", submittedVersion: 1 }) },
     { file: file("art-approved", "Signed scope", 1), document: doc("approved", { submittedVersion: 1, approvedVersion: 1 }) },
     { file: file("art-delivered", "Delivered deck", 3), document: doc("delivered", { approvedVersion: 3, deliveredVersion: 3, deliveredAt: DELIVERED_AT }) },
-    { file: file("art-draft", "Early draft", 1, "docx"), document: doc("draft") },
+    { file: file("art-draft", "Early draft", 1, "bin"), document: doc("draft") },
   ];
   const ARCHIVED = [
     { file: file("art-old", "Old contract", 1), document: doc("archived", { archivedAt: ARCHIVED_AT, deliveredAt: DELIVERED_AT }) },

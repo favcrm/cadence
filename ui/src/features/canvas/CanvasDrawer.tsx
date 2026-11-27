@@ -59,6 +59,9 @@ const FOOT: Record<string, string[]> = {
   pdf: ["download only"],
   image: ["inline image"],
   csv: ["table · first 2,000 rows · 50 columns"],
+  docx: ["Word document"],
+  xlsx: ["Excel workbook"],
+  pptx: ["PowerPoint deck"],
 };
 
 const HTML_SOURCE_FOOT = ["source", "read-only"];
@@ -424,7 +427,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
           {info?.digest ? ` · sha256:${info.digest.slice(0, 6)}…${info.digest.slice(-3)}` : ""}
         </span>
         {(tab.kind === "html" && htmlView === "source" ? HTML_SOURCE_FOOT : (FOOT[tab.kind] ?? [])).map((f) => (
-          <span key={f}>{f}</span>
+          <span key={f}>{t(f)}</span>
         ))}
       </footer>
       )}

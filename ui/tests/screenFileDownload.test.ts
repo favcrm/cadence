@@ -2,8 +2,13 @@ import {
   SCREEN_FILE_DOWNLOAD_ACK_TYPE,
   SCREEN_FILE_DOWNLOAD_MAX_BYTES,
   SCREEN_FILE_DOWNLOAD_TYPE,
+  SCREEN_PDF_EXPORT_ACK_TYPE,
+  SCREEN_PDF_EXPORT_HTML_MAX_BYTES,
+  SCREEN_PDF_EXPORT_TYPE,
   handleScreenFileDownloadMessage,
+  handleScreenPdfExportMessage,
   parseScreenFileDownload,
+  parseScreenPdfExport,
 } from "../src/features/workspace-apps/screen/screenFileDownload";
 
 export {};
@@ -32,6 +37,11 @@ function assert(value: unknown, message: string): asserts value {
       "spec.docx",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+    [
+      "summary.pdf",
+      "application/pdf",
+      "application/pdf",
     ],
   ];
 
@@ -182,5 +192,125 @@ function assert(value: unknown, message: string): asserts value {
     "expected cadence-file-download-ack",
   );
 }
+
+// 4. PDF export validation, source binding, and async ack replies.
+void (async () => {
+  const validHtml = "<!doctype html><html><body><p>Report</p></body></html>";
+  const parsed = parseScreenPdfExport({
+    type: SCREEN_PDF_EXPORT_TYPE,
+    requestId: "pdf_1",
+    filename: "board-report.pdf",
+    html: validHtml,
+    paper: "a4",
+  });
+  assert(parsed !== null && parsed.fileName === "board-report.pdf" && parsed.paper === "a4", "expected valid pdf export request");
+
+  assert(
+    parseScreenPdfExport({
+      type: SCREEN_PDF_EXPORT_TYPE,
+      requestId: "pdf_bad_ext",
+      filename: "board-report.html",
+      html: validHtml,
+    }) === null,
+    "must require .pdf extension",
+  );
+  assert(
+    parseScreenPdfExport({
+      type: SCREEN_PDF_EXPORT_TYPE,
+      requestId: "pdf_bad_paper",
+      filename: "board-report.pdf",
+      html: validHtml,
+      paper: "a3",
+    }) === null,
+    "must validate paper enum",
+  );
+  assert(
+    parseScreenPdfExport({
+      type: SCREEN_PDF_EXPORT_TYPE,
+      requestId: "pdf_big",
+      filename: "board-report.pdf",
+      html: "x".repeat(SCREEN_PDF_EXPORT_HTML_MAX_BYTES + 1),
+    }) === null,
+    "must enforce html byte limit",
+  );
+
+  const replies: unknown[] = [];
+  const expectedSource = {
+    postMessage(msg: unknown) {
+      replies.push(msg);
+    },
+  };
+  const otherSource = { postMessage() {} };
+  let active = true;
+  let calls = 0;
+
+  assert(
+    handleScreenPdfExportMessage(
+      {
+        source: otherSource as unknown as MessageEventSource,
+        data: { type: SCREEN_PDF_EXPORT_TYPE, requestId: "pdf_spoof", filename: "a.pdf", html: validHtml },
+      },
+      expectedSource,
+      () => active,
+      async () => { calls += 1; },
+    ) === true,
+    "spoofed pdf source must be intercepted",
+  );
+  assert(calls === 0 && replies.length === 0, "spoofed pdf request must not run");
+
+  assert(
+    handleScreenPdfExportMessage(
+      {
+        source: expectedSource as unknown as MessageEventSource,
+        data: { type: SCREEN_PDF_EXPORT_TYPE, requestId: "pdf_ok", filename: "a.pdf", html: validHtml },
+      },
+      expectedSource,
+      () => active,
+      async () => { calls += 1; },
+    ) === true,
+    "valid pdf request must run",
+  );
+  await new Promise((r) => setTimeout(r, 0));
+  assert(
+    (calls as number) === 1 &&
+      (replies.length as number) === 1 &&
+      (replies[0] as { type?: string; requestId?: string; ok?: boolean }).type === SCREEN_PDF_EXPORT_ACK_TYPE &&
+      (replies[0] as { ok?: boolean }).ok === true,
+    "expected cadence-pdf-export-ack ok:true",
+  );
+
+  assert(
+    handleScreenPdfExportMessage(
+      {
+        source: expectedSource as unknown as MessageEventSource,
+        data: { type: SCREEN_PDF_EXPORT_TYPE, requestId: "pdf_err", filename: "a.pdf", html: validHtml },
+      },
+      expectedSource,
+      () => active,
+      async () => { throw new Error("render boom"); },
+    ) === true,
+    "failing pdf request should still be handled",
+  );
+  await new Promise((r) => setTimeout(r, 0));
+  assert(
+    (replies.length as number) === 2 &&
+      (replies[1] as { ok?: boolean; error?: string }).ok === false &&
+      (replies[1] as { error?: string }).error === "render boom",
+    "expected cadence-pdf-export-ack ok:false with error",
+  );
+
+  // Stale frame suppression after unmount
+  handleScreenPdfExportMessage(
+    {
+      source: expectedSource as unknown as MessageEventSource,
+      data: { type: SCREEN_PDF_EXPORT_TYPE, requestId: "pdf_stale", filename: "a.pdf", html: validHtml },
+    },
+    expectedSource,
+    () => active,
+    async () => { active = false; },
+  );
+  await new Promise((r) => setTimeout(r, 0));
+  assert((replies.length as number) === 2, "stale frame must suppress reply");
+})();
 
 console.log("screenFileDownload tests passed");

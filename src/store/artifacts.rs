@@ -49,7 +49,7 @@ pub const ARTIFACT_MAX_BYTES: usize = 10 * 1024 * 1024;
 /// The newest versions kept per id; older ones are pruned.
 pub const ARTIFACT_KEEP_VERSIONS: i64 = 20;
 const TITLE_MAX: usize = 120;
-pub const ARTIFACT_KINDS: &[&str] = &["md", "pdf", "html", "image", "csv"];
+pub const ARTIFACT_KINDS: &[&str] = &["md", "pdf", "html", "image", "csv", "docx", "xlsx", "pptx"];
 
 /// Serializes blob writes against prune deletes, so a prune can never
 /// remove a blob a concurrent put has written but not yet indexed.
@@ -114,12 +114,19 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn is_zip(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04")
+}
+
 fn mime_of(kind: &str, bytes: &[u8]) -> &'static str {
     match kind {
         "md" => "text/markdown; charset=utf-8",
         "csv" => "text/csv; charset=utf-8",
         "html" => "text/html; charset=utf-8",
         "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         _ => image_mime(bytes).unwrap_or("application/octet-stream"),
     }
 }
@@ -130,6 +137,7 @@ fn check_content(kind: &str, bytes: &[u8]) -> Result<()> {
     let ok = match kind {
         "md" | "csv" | "html" => std::str::from_utf8(bytes).is_ok() && !bytes.contains(&0),
         "pdf" => bytes.starts_with(b"%PDF-"),
+        "docx" | "xlsx" | "pptx" => is_zip(bytes),
         "image" => image_mime(bytes).is_some(),
         _ => false,
     };
@@ -519,5 +527,38 @@ mod tests {
             "pruned blobs are removed, refused puts store none"
         );
         assert!(HostedArtifacts.put(req(None, &thread), b"x").is_err());
+    }
+
+    #[test]
+    fn office_artifact_kinds_require_zip_header() {
+        let (dir, s, thread) = fixture();
+        let backend = LocalArtifacts {
+            store: &s,
+            state_dir: dir.path(),
+        };
+        let zip = b"PK\x03\x04dummy-ooxml";
+        for (kind, expected_mime) in [
+            (
+                "docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            (
+                "xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+            (
+                "pptx",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ),
+        ] {
+            let mut r = req(None, &thread);
+            r.kind = kind;
+            let saved = backend.put(r, zip).unwrap();
+            assert_eq!(saved.mime(zip), expected_mime);
+
+            let mut bad = req(None, &thread);
+            bad.kind = kind;
+            assert!(backend.put(bad, b"%PDF-1.4").is_err());
+        }
     }
 }
