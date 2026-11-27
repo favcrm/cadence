@@ -37,9 +37,9 @@ async function flushUi(turns = 10): Promise<void> {
   }
 }
 
-async function testPanelPopupOriginAndDisconnect(): Promise<void> {
+async function testPanelOAuthRedirectAndDisconnect(): Promise<void> {
   const { Window } = require("happy-dom");
-  const win = new Window({ url: "http://localhost/apps/waba" });
+  const win = new Window({ url: "http://localhost/apps/waba?mode=official" });
   const prevDescriptors = new Map<string, PropertyDescriptor | undefined>();
   for (const name of [
     "window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement",
@@ -66,18 +66,23 @@ async function testPanelPopupOriginAndDisconnect(): Promise<void> {
   };
 
   const originalFetch = globalThis.fetch;
-  const originalOpen = win.open;
+  const originalAssign = win.location.assign;
   let getCount = 0;
+  let officialBindingStatus: "none" | "active" | "revoked" = "none";
   let officialConnected = false;
   let settingsChangedCount = 0;
   let disconnectMode: "refused" | "partial" | "ok" = "refused";
-  const openCalls: Array<{ url: string; target?: string; features?: string }> = [];
+  const assignCalls: string[] = [];
+  let lastConnectBody: string | undefined;
 
   try {
-    win.open = (url?: string | URL, target?: string, features?: string) => {
-      openCalls.push({ url: String(url ?? ""), target, features });
-      return null;
-    };
+    Object.defineProperty(win.location, "assign", {
+      configurable: true,
+      writable: true,
+      value: (url: string | URL) => {
+        assignCalls.push(String(url));
+      },
+    });
 
     const currentSnapshot = () => ({
       viewer_role: "owner",
@@ -90,8 +95,8 @@ async function testPanelPopupOriginAndDisconnect(): Promise<void> {
         enabled: true,
         paused: false,
         connected: officialConnected,
-        binding_status: "active",
-        company_name: "Demo Business",
+        binding_status: officialBindingStatus,
+        company_name: officialBindingStatus === "active" ? "Demo Business" : null,
         display_phone_number: officialConnected ? "+852 5555 0148" : null,
         verified_name: officialConnected ? "Demo Business" : null,
         waba_id: officialConnected ? "waba_1" : null,
@@ -101,13 +106,14 @@ async function testPanelPopupOriginAndDisconnect(): Promise<void> {
       },
     });
 
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       if (url.endsWith("/api/apps/install_panel/whatsapp-settings")) {
         getCount += 1;
         return jsonResponse(currentSnapshot());
       }
       if (url.endsWith("/api/apps/install_panel/whatsapp-settings/official/connect")) {
+        lastConnectBody = typeof init?.body === "string" ? init.body : undefined;
         return jsonResponse({ url: "https://portal.favcrm.example.test/wa/connect?token=ok", expires_at: "2026-11-25T13:00:00Z" });
       }
       if (url.endsWith("/api/apps/install_panel/whatsapp-settings/official/disconnect")) {
@@ -156,7 +162,7 @@ async function testPanelPopupOriginAndDisconnect(): Promise<void> {
 
     const container = document.createElement("div");
     document.body.appendChild(container);
-    const root = createRoot(container);
+    let root = createRoot(container);
 
     try {
       await React.act(async () => {
@@ -180,8 +186,9 @@ async function testPanelPopupOriginAndDisconnect(): Promise<void> {
       const buttonWith = (text: string) =>
         [...container.querySelectorAll("button")].find((b) => b.textContent?.includes(text)) as HTMLButtonElement | undefined;
 
-      const connectBtn = buttonWith("Connect via FavCRM");
-      assert(connectBtn, "Connect via FavCRM button renders for linked un-connected workspace");
+      assert(!container.querySelector("input[type='text']"), "no manual FavCRM Company ID input renders");
+      const connectBtn = buttonWith("Connect with FavCRM");
+      assert(connectBtn, "1-click Connect with FavCRM button renders for unlinked workspace");
 
       await React.act(async () => {
         connectBtn.click();
@@ -189,58 +196,44 @@ async function testPanelPopupOriginAndDisconnect(): Promise<void> {
       });
 
       assert(
-        openCalls.length === 1 &&
-          openCalls[0]!.url === "https://portal.favcrm.example.test/wa/connect?token=ok" &&
-          openCalls[0]!.target === "favcrm-waba-connect" &&
-          openCalls[0]!.features === "popup,width=640,height=780" &&
-          !openCalls[0]!.features.includes("noopener"),
-        "popup opens without noopener so window.opener stays available",
+        assignCalls.length === 1 &&
+          assignCalls[0] === "https://portal.favcrm.example.test/wa/connect?token=ok" &&
+          lastConnectBody === JSON.stringify({ return_to: "http://localhost/apps/waba?mode=official" }),
+        "Connect with FavCRM sends return_to and redirects current tab to validated HTTPS URL",
       );
-      assert(container.textContent?.includes("Continue setup in FavCRM"), "auth fallback link renders while popup active");
+      assert(container.textContent?.includes("Continue setup in FavCRM"), "auth fallback link renders after connect");
 
-      const getsBeforeEvil = getCount;
-      await React.act(async () => {
-        win.dispatchEvent(
-          new win.MessageEvent("message", {
-            origin: "https://evil.example.test",
-            data: { type: "favcrm:whatsapp-connected" },
-          }),
-        );
-        win.dispatchEvent(
-          new win.MessageEvent("message", {
-            origin: "https://portal.favcrm.example.test",
-            data: { type: "favcrm:unrelated" },
-          }),
-        );
-        await flushUi();
-      });
-      assert(getCount === getsBeforeEvil, "untrusted origins and unrelated messages are ignored");
-
-      // Focus while still disconnected refreshes snapshot cleanly
-      await React.act(async () => {
-        win.dispatchEvent(new win.FocusEvent("focus"));
-        await flushUi();
-      });
-      assert(getCount === getsBeforeEvil + 1, "window focus triggers silent snapshot re-read");
-
-      // Trusted origin + favcrm:whatsapp-connected flips connected state and clears auth banner
+      // Re-mount simulating OAuth callback return with ?aos_connect=connected
+      officialBindingStatus = "active";
       officialConnected = true;
-      const changedBeforeMsg = settingsChangedCount;
+      win.history.replaceState(null, "", "/apps/waba?mode=official&aos_connect=connected");
+      const changedBeforeMount = settingsChangedCount;
+
+      React.act(() => { root.unmount(); });
+      root = createRoot(container);
       await React.act(async () => {
-        win.dispatchEvent(
-          new win.MessageEvent("message", {
-            origin: "https://portal.favcrm.example.test",
-            data: { type: "favcrm:whatsapp-connected" },
-          }),
+        root.render(
+          React.createElement(
+            LocaleProvider,
+            null,
+            React.createElement(WhatsAppSettingsPanel, {
+              installId: "install_panel",
+              initialMode: "official",
+              onUnsupported: () => {},
+              onSettingsChanged: () => {
+                settingsChangedCount += 1;
+              },
+            }),
+          ),
         );
         await flushUi();
       });
+
       assert(
-        getCount === getsBeforeEvil + 2 &&
-          settingsChangedCount > changedBeforeMsg &&
+        !win.location.search.includes("aos_connect") &&
           container.textContent?.includes("Official WhatsApp connected.") &&
-          !container.textContent?.includes("Continue setup in FavCRM"),
-        "trusted portal postMessage refreshes connected snapshot and clears setup link",
+          settingsChangedCount > changedBeforeMount,
+        "aos_connect=connected shows notice, refreshes settings, and strips query parameter",
       );
 
       // Disconnect with disconnected=false refuses rather than claiming success
@@ -286,7 +279,6 @@ async function testPanelPopupOriginAndDisconnect(): Promise<void> {
       disconnectMode = "ok";
       officialConnected = true;
       await React.act(async () => {
-        // Reload connected state via focus refresh first or direct connected fixture check -> trigger Recheck
         buttonWith("Refresh")?.click();
         await flushUi();
       });
@@ -297,7 +289,7 @@ async function testPanelPopupOriginAndDisconnect(): Promise<void> {
   } finally {
     loader.prototype.require = originalRequire;
     globalThis.fetch = originalFetch;
-    win.open = originalOpen;
+    Object.defineProperty(win.location, "assign", { configurable: true, writable: true, value: originalAssign });
     for (const [name, desc] of prevDescriptors.entries()) {
       if (desc) Object.defineProperty(globalThis, name, desc);
       else delete (globalThis as Record<string, unknown>)[name];
@@ -441,34 +433,6 @@ async function main() {
       if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/connect")) {
         return jsonResponse({ url: "https://portal.favcrm.example.test/wa/connect?token=ok", expires_at: "2026-11-23T12:00:00Z" });
       }
-      if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/inspect")) {
-        return jsonResponse({
-          inspect: {
-            favcrmCompanyId: "cmp_new_1",
-            workspaceName: "Demo Business",
-            organisationName: "Demo Org",
-            role: "owner",
-          },
-        });
-      }
-      if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/link")) {
-        return jsonResponse({
-          official: {
-            available: true,
-            enabled: true,
-            paused: false,
-            connected: false,
-            binding_status: "active",
-            company_name: "Demo Business",
-            display_phone_number: null,
-            verified_name: null,
-            waba_id: null,
-            phone_number_id: null,
-            webhook: null,
-            observed_at: "2026-11-24T00:00:00Z",
-          },
-        });
-      }
       if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/rescope")) {
         return jsonResponse({
           official: {
@@ -564,26 +528,14 @@ async function main() {
     }
     assert(badRoleRejected, "malformed viewer_role fails closed");
 
-    const officialOk = await runOfficialWhatsAppAction("install_waba", "connect");
-    assert(officialOk.connect?.url === "https://portal.favcrm.example.test/wa/connect?token=ok", "valid HTTPS Official connect URL accepted");
-
-    const inspectOk = await runOfficialWhatsAppAction("install_waba", "inspect", { favcrmCompanyId: "cmp_new_1" });
-    const inspectReq = [...seenRequests].reverse().find((r) => r.url.endsWith("/official/inspect"));
+    const officialOk = await runOfficialWhatsAppAction("install_waba", "connect", {
+      returnTo: "https://demo.cadencecloud.app/apps/waba?mode=official",
+    });
+    const connectReq = [...seenRequests].reverse().find((r) => r.url.endsWith("/official/connect"));
     assert(
-      inspectOk.inspect?.workspaceName === "Demo Business" &&
-        inspectOk.inspect.role === "owner" &&
-        inspectReq?.body === JSON.stringify({ favcrm_company_id: "cmp_new_1" }),
-      "Official inspect sends favcrm_company_id and returns workspace preview",
-    );
-
-    const linkOk = await runOfficialWhatsAppAction("install_waba", "link", { favcrmCompanyId: "cmp_new_1" });
-    const linkReq = [...seenRequests].reverse().find((r) => r.url.endsWith("/official/link"));
-    assert(
-      linkOk.official?.available &&
-        linkOk.official.binding_status === "active" &&
-        linkOk.official.company_name === "Demo Business" &&
-        linkReq?.body === JSON.stringify({ favcrm_company_id: "cmp_new_1" }),
-      "Official link sends favcrm_company_id and returns active binding snapshot",
+      officialOk.connect?.url === "https://portal.favcrm.example.test/wa/connect?token=ok" &&
+        connectReq?.body === JSON.stringify({ return_to: "https://demo.cadencecloud.app/apps/waba?mode=official" }),
+      "valid HTTPS Official connect URL accepted and forwards return_to",
     );
 
     const rescopeOk = await runOfficialWhatsAppAction("install_waba", "rescope");
@@ -637,7 +589,7 @@ async function main() {
     globalThis.fetch = originalFetch;
   }
 
-  await testPanelPopupOriginAndDisconnect();
+  await testPanelOAuthRedirectAndDisconnect();
   console.log("whatsappSettings tests passed");
 }
 

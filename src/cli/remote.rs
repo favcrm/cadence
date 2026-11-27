@@ -1653,44 +1653,6 @@ fn verb_for(
                             json!({ "provider": provider.as_str(), "confirm": true }),
                         );
                     }
-                    super::connection::WhatsappAction::Inspect { company_id } => {
-                        if !valid_whatsapp_company_id(company_id) {
-                            return Err(Error::invalid(
-                                "whatsapp_inspect",
-                                "--company-id must be 1-128 characters with no ASCII control characters",
-                            ));
-                        }
-                        args.insert("operation".into(), json!("whatsapp_inspect"));
-                        args.insert(
-                            "body".into(),
-                            json!({ "provider": "official", "favcrm_company_id": company_id }),
-                        );
-                    }
-                    super::connection::WhatsappAction::Link {
-                        company_id,
-                        request,
-                    } => {
-                        if !valid_whatsapp_company_id(company_id) {
-                            return Err(Error::invalid(
-                                "whatsapp_link",
-                                "--company-id must be 1-128 characters with no ASCII control characters",
-                            ));
-                        }
-                        args.insert("operation".into(), json!("whatsapp_link"));
-                        args.insert(
-                            "body".into(),
-                            json!({ "provider": "official", "favcrm_company_id": company_id }),
-                        );
-                        if let Some(req) = request.as_deref() {
-                            if !valid_platform_handle(req) {
-                                return Err(Error::invalid(
-                                    "whatsapp_link",
-                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
-                                ));
-                            }
-                            args.insert("key".into(), json!(req));
-                        }
-                    }
                     super::connection::WhatsappAction::Rescope { request } => {
                         args.insert("operation".into(), json!("whatsapp_rescope"));
                         args.insert("body".into(), json!({ "provider": "official" }));
@@ -2007,12 +1969,6 @@ fn valid_platform_handle(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
-}
-
-fn valid_whatsapp_company_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && !value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
 }
 
 fn whatsapp_connection_stderr_hint(
@@ -3700,8 +3656,6 @@ fn connection_owner_verb(command: &Commands) -> Option<&'static str> {
             super::connection::WhatsappAction::Disconnect { .. } => {
                 "connection whatsapp disconnect"
             }
-            super::connection::WhatsappAction::Inspect { .. } => "connection whatsapp inspect",
-            super::connection::WhatsappAction::Link { .. } => "connection whatsapp link",
             super::connection::WhatsappAction::Rescope { .. } => "connection whatsapp rescope",
         }),
         _ => None,
@@ -7055,29 +7009,6 @@ mod read_contract_tests {
                 "connection whatsapp disconnect",
             ),
             (
-                WhatsappAction::Inspect {
-                    company_id: "comp_42".into(),
-                },
-                json!({"operation": "whatsapp_inspect", "body": {"provider": "official", "favcrm_company_id": "comp_42"}}),
-                "connection whatsapp inspect",
-            ),
-            (
-                WhatsappAction::Link {
-                    company_id: "comp_42".into(),
-                    request: None,
-                },
-                json!({"operation": "whatsapp_link", "body": {"provider": "official", "favcrm_company_id": "comp_42"}}),
-                "connection whatsapp link",
-            ),
-            (
-                WhatsappAction::Link {
-                    company_id: "comp_42".into(),
-                    request: Some("req_link_1".into()),
-                },
-                json!({"operation": "whatsapp_link", "body": {"provider": "official", "favcrm_company_id": "comp_42"}, "key": "req_link_1"}),
-                "connection whatsapp link",
-            ),
-            (
                 WhatsappAction::Rescope { request: None },
                 json!({"operation": "whatsapp_rescope", "body": {"provider": "official"}}),
                 "connection whatsapp rescope",
@@ -7112,16 +7043,6 @@ mod read_contract_tests {
             err.contains("--confirm"),
             "disconnect without --confirm must refuse: {err}"
         );
-
-        let bad_co = outcome(&Commands::Connection {
-            action: ConnectionAction::Whatsapp {
-                action: WhatsappAction::Inspect {
-                    company_id: "bad\nid".into(),
-                },
-            },
-        })
-        .unwrap_err();
-        assert!(bad_co.contains("--company-id"), "{bad_co}");
 
         for payload in [
             json!({"ok": true, "data": {"qr": "secret"}}),
@@ -7188,49 +7109,6 @@ mod read_contract_tests {
                 "verifiedName": "Acme Support",
                 "webhook": {"subscribed": true, "status": "verified"}
             }})
-        );
-
-        let inspect = cadence_agent::remote_cli::project_whatsapp_connection_answer(
-            "whatsapp_inspect",
-            &json!({"ok": true, "data": {
-                "provider": "official",
-                "inspect": {
-                    "favcrmCompanyId": "comp_42",
-                    "workspaceName": "Acme",
-                    "organisationName": "Acme Ltd",
-                    "role": "owner",
-                    "internalGrant": "strip-me"
-                },
-                "extraField": "strip-me"
-            }}),
-        )
-        .unwrap();
-        assert_eq!(
-            inspect,
-            json!({"ok": true, "data": {
-                "provider": "official",
-                "inspect": {
-                    "favcrmCompanyId": "comp_42",
-                    "workspaceName": "Acme",
-                    "organisationName": "Acme Ltd",
-                    "role": "owner"
-                }
-            }})
-        );
-        assert!(
-            cadence_agent::remote_cli::project_whatsapp_connection_answer(
-                "whatsapp_inspect",
-                &json!({"ok": true, "data": {
-                    "provider": "official",
-                    "inspect": {
-                        "favcrmCompanyId": "comp_42",
-                        "workspaceName": "Acme",
-                        "organisationName": "Acme Ltd",
-                        "role": "guest"
-                    }
-                }})
-            )
-            .is_none()
         );
 
         let connect_ok = cadence_agent::remote_cli::project_whatsapp_connection_answer(

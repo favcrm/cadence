@@ -79,19 +79,10 @@ export type OfficialConnectResult = {
   expires_at: string | null;
 };
 
-export type OfficialInspectResult = {
-  favcrmCompanyId: string;
-  workspaceName: string;
-  organisationName: string | null;
-  role: string;
-};
-
 export type OfficialWhatsAppActionName =
   | "connect"
   | "start"
   | "stop"
-  | "inspect"
-  | "link"
   | "rescope"
   | "disconnect";
 
@@ -360,17 +351,16 @@ export async function runLinkedWhatsAppAction(
 export async function runOfficialWhatsAppAction(
   installId: string,
   action: OfficialWhatsAppActionName,
-  opts?: { timeoutMs?: number; favcrmCompanyId?: string },
+  opts?: { timeoutMs?: number; returnTo?: string },
 ): Promise<{
   connect?: OfficialConnectResult;
   official?: OfficialWhatsAppSnapshot;
-  inspect?: OfficialInspectResult;
   disconnected?: boolean;
   favcrm_revoked?: boolean;
 }> {
   const safeId = assertSafeInstallId(installId);
   const payload: Record<string, string> = {};
-  if (opts?.favcrmCompanyId) payload.favcrm_company_id = opts.favcrmCompanyId;
+  if (action === "connect" && opts?.returnTo) payload.return_to = opts.returnTo;
   return postJsonMutation(
     `/api/apps/${safeId}/whatsapp-settings/official/${action}`,
     "POST",
@@ -386,26 +376,6 @@ export async function runOfficialWhatsAppAction(
           connect: {
             url: safeUrl,
             expires_at: typeof body.expires_at === "string" ? body.expires_at : null,
-          },
-        };
-      }
-      if (action === "inspect") {
-        const raw = body.inspect;
-        if (
-          !isRecord(raw) ||
-          typeof raw.favcrmCompanyId !== "string" ||
-          typeof raw.workspaceName !== "string" ||
-          typeof raw.role !== "string"
-        ) {
-          throw new Error("Invalid Official WhatsApp inspect response.");
-        }
-        return {
-          inspect: {
-            favcrmCompanyId: raw.favcrmCompanyId,
-            workspaceName: raw.workspaceName,
-            organisationName:
-              typeof raw.organisationName === "string" ? raw.organisationName : null,
-            role: raw.role,
           },
         };
       }

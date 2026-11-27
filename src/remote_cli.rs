@@ -643,8 +643,7 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                     | "artifact"
                     | "connection_providers"
                     | "connection_list"
-                    | "whatsapp_status"
-                    | "whatsapp_inspect",
+                    | "whatsapp_status",
                 ) => Effect::Read,
                 // CAD-2226: starting an owner enrollment mints a one-time provider
                 // link, so its lost or unusable answer is a possible mutation; the
@@ -655,7 +654,6 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                     | "whatsapp_start"
                     | "whatsapp_stop"
                     | "whatsapp_disconnect"
-                    | "whatsapp_link"
                     | "whatsapp_rescope",
                 ) => mutation(RECONCILE_WHATSAPP_STATUS),
                 Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
@@ -1070,39 +1068,10 @@ pub fn project_whatsapp_connection_answer(operation: &str, answer: &Value) -> Op
                 }
             }
         }
-        "whatsapp_inspect" => {
-            if provider != "official" {
-                return None;
-            }
-            let inspect = data.get("inspect")?.as_object()?;
-            let company_id = inspect.get("favcrmCompanyId").and_then(Value::as_str)?;
-            let workspace_name = inspect.get("workspaceName").and_then(Value::as_str)?;
-            let org_name = inspect.get("organisationName").and_then(Value::as_str)?;
-            let role = inspect.get("role").and_then(Value::as_str)?;
-            if !matches!(role, "owner" | "admin") {
-                return None;
-            }
-            let mut out = Map::new();
-            out.insert(
-                "favcrmCompanyId".into(),
-                Value::String(company_id.to_owned()),
-            );
-            out.insert(
-                "workspaceName".into(),
-                Value::String(workspace_name.to_owned()),
-            );
-            out.insert(
-                "organisationName".into(),
-                Value::String(org_name.to_owned()),
-            );
-            out.insert("role".into(), Value::String(role.to_owned()));
-            projected.insert("inspect".into(), Value::Object(out));
-        }
         "whatsapp_connect"
         | "whatsapp_start"
         | "whatsapp_stop"
         | "whatsapp_disconnect"
-        | "whatsapp_link"
         | "whatsapp_rescope" => {
             let expected_action = operation.strip_prefix("whatsapp_")?;
             if data.get("action").and_then(Value::as_str) != Some(expected_action) {
@@ -7919,7 +7888,6 @@ fn call_verb_until_retry(
                         | "whatsapp_start"
                         | "whatsapp_stop"
                         | "whatsapp_disconnect"
-                        | "whatsapp_link"
                         | "whatsapp_rescope"
                 )
             )
@@ -8179,12 +8147,10 @@ fn call_verb_until_retry(
             platform_operation,
             Some(
                 "whatsapp_status"
-                    | "whatsapp_inspect"
                     | "whatsapp_connect"
                     | "whatsapp_start"
                     | "whatsapp_stop"
                     | "whatsapp_disconnect"
-                    | "whatsapp_link"
                     | "whatsapp_rescope"
             )
         ) && (status == 501

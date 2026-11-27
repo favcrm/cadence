@@ -57,18 +57,6 @@ pub(crate) enum WhatsappAction {
         #[arg(long)]
         confirm: bool,
     },
-    /// Inspect an Official API FavCRM company binding candidate.
-    Inspect {
-        #[arg(long = "company-id")]
-        company_id: String,
-    },
-    /// Link an Official API FavCRM company binding for this hosted workspace.
-    Link {
-        #[arg(long = "company-id")]
-        company_id: String,
-        #[arg(long)]
-        request: Option<String>,
-    },
     /// Request an Official API FavCRM OAuth rescope URL for this hosted workspace.
     Rescope {
         #[arg(long)]
@@ -912,24 +900,6 @@ mod tests {
                 "disconnect",
                 "--provider",
                 "official",
-            ],
-            vec![
-                "cadence",
-                "connection",
-                "whatsapp",
-                "inspect",
-                "--company-id",
-                "co_123",
-            ],
-            vec![
-                "cadence",
-                "connection",
-                "whatsapp",
-                "link",
-                "--company-id",
-                "co_123",
-                "--request",
-                "req_1",
             ],
             vec!["cadence", "connection", "whatsapp", "rescope"],
             vec![
