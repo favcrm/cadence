@@ -21,7 +21,17 @@ import { recordServices, object, exact, type HostCommand } from "./screenService
 import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./screenDisplayCache";
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { frameRoute, parseRoutePatch, type RoutePatch } from "./screenRoute";
-import { handleScreenFileDownloadMessage, handleScreenPdfExportMessage } from "./screenFileDownload";
+import {
+  consumeWorksImportFile,
+  handleScreenFileDownloadMessage,
+  handleScreenPdfExportMessage,
+  handleScreenSubmitDocumentMessage,
+  SCREEN_IMPORT_FILE_ACK_TYPE,
+  SCREEN_IMPORT_FILE_TYPE,
+  subscribeWorksImportFile,
+  type StagedWorksImportFile,
+} from "./screenFileDownload";
+import { create as createDocument } from "../../documents/documentsClient";
 import { readOnlyReceipt } from "./screenReadOnly";
 import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize, type WhatsAppComposeProvider, type WhatsAppReplyBounds } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
@@ -70,6 +80,15 @@ function triggerFileSave(bytes: ArrayBuffer, mimeType: string, fileName: string)
   } finally {
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const chunk = 0x4000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }
 
 export default function ScreenOutlet({ projection, fallback, renderFailure, onRefreshScope, loadAsset, actions, onMounted, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit, suppressLoadingOverlay = false, onStateChange }: {
@@ -452,6 +471,63 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
           }
           if (!isCurrent()) return;
           triggerFileSave(bytes, "application/pdf", parsed.fileName);
+        })
+      ) {
+        return;
+      }
+      if (
+        handleScreenSubmitDocumentMessage(event, activeFrameWindow, isCurrent, async (parsed) => {
+          if (readOnly) {
+            throw new Error("Document submission is unavailable in read-only mode.");
+          }
+          let contentBase64: string;
+          if (parsed.kind === "pdf") {
+            const response = await privateFetch(
+              "/api/screen-pdf",
+              {
+                method: "POST",
+                credentials: "same-origin",
+                cache: "no-store",
+                signal: controller.signal,
+                headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+                body: JSON.stringify({
+                  html: parsed.html,
+                  ...(parsed.paper ? { paper: parsed.paper } : {}),
+                }),
+              },
+              session,
+            );
+            if (!response.ok) {
+              const payload = (await response.json().catch(() => null)) as { error?: { message?: string } | string; message?: string } | null;
+              const detail =
+                (typeof payload?.error === "object" ? payload.error?.message : payload?.error) ??
+                payload?.message ??
+                `HTTP ${response.status}`;
+              throw new Error(`PDF export failed: ${detail}`);
+            }
+            const ct = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+            if (ct !== "application/pdf") {
+              throw new Error("Unexpected PDF response type.");
+            }
+            const bytes = await response.arrayBuffer();
+            if (bytes.byteLength === 0) {
+              throw new Error("Received empty PDF response.");
+            }
+            contentBase64 = bytesToBase64(new Uint8Array(bytes));
+          } else {
+            contentBase64 = bytesToBase64(new Uint8Array(parsed.bytes));
+          }
+          const created = await createDocument({
+            title: parsed.title,
+            label: parsed.label,
+            kind: parsed.kind,
+            contentBase64,
+            submit: parsed.submit,
+          });
+          if (!created.ok) {
+            throw new Error(created.failure.message || "Could not create document.");
+          }
+          return { id: created.value.file.id, stage: created.value.document.stage };
         })
       ) {
         return;
@@ -891,6 +967,71 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
     const nextUrl = currentUrl.pathname + (currentUrl.searchParams.size ? `?${currentUrl.searchParams}` : "") + currentUrl.hash;
     window.history.replaceState(window.history.state, "", nextUrl);
   }, [primary, readOnly, projection.installation.name, state, href]);
+  useEffect(() => {
+    if (readOnly || projection.installation.name !== "works" || state !== "ready") return;
+    const installId = projection.installation.install_id;
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let pendingItem: StagedWorksImportFile | null = null;
+    let activeReqId: string | null = null;
+    let retries = 0;
+
+    const deliver = () => {
+      if (cancelled) return;
+      const frame = container.current?.querySelector("iframe");
+      pendingItem ??= consumeWorksImportFile(installId);
+      if (!frame?.contentWindow || !pendingItem) return;
+      clearTimeout(retryTimer);
+      activeReqId = `${pendingItem.id}_${retries}`;
+      const copy = pendingItem.bytes.slice(0);
+      frame.contentWindow.postMessage(
+        {
+          type: SCREEN_IMPORT_FILE_TYPE,
+          requestId: activeReqId,
+          filename: pendingItem.fileName,
+          mimeType: pendingItem.mimeType,
+          bytes: copy,
+        },
+        "*",
+        [copy],
+      );
+    };
+
+    const onImportAck = (event: MessageEvent) => {
+      const frame = container.current?.querySelector("iframe");
+      if (!frame?.contentWindow || event.source !== frame.contentWindow) return;
+      const data = event.data as Record<string, unknown> | null;
+      if (!data || typeof data !== "object" || data.type !== SCREEN_IMPORT_FILE_ACK_TYPE) return;
+      if (data.requestId !== activeReqId || !pendingItem) return;
+      if (data.ok === true) {
+        pendingItem = null;
+        activeReqId = null;
+        return;
+      }
+      if (!cancelled && retries < 10) {
+        retries += 1;
+        retryTimer = setTimeout(deliver, 150);
+      }
+    };
+
+    window.addEventListener("message", onImportAck);
+    const unsub = subscribeWorksImportFile((changedId) => {
+      if (changedId === installId) {
+        const next = consumeWorksImportFile(installId);
+        if (next) pendingItem = next;
+        retries = 0;
+        deliver();
+      }
+    });
+    deliver();
+    return () => {
+      cancelled = true;
+      clearTimeout(retryTimer);
+      pendingItem = null;
+      window.removeEventListener("message", onImportAck);
+      unsub();
+    };
+  }, [readOnly, projection.installation.install_id, projection.installation.name, state]);
   // The child portal exists only for a live primary with a real private
   // token; the token goes into the mount POST and nowhere else.
   const drawerToken = primary ? actionTokenRef.current : null;

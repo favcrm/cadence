@@ -5,10 +5,17 @@ import {
   SCREEN_PDF_EXPORT_ACK_TYPE,
   SCREEN_PDF_EXPORT_HTML_MAX_BYTES,
   SCREEN_PDF_EXPORT_TYPE,
+  SCREEN_SUBMIT_DOCUMENT_ACK_TYPE,
+  SCREEN_SUBMIT_DOCUMENT_MAX_BYTES,
+  SCREEN_SUBMIT_DOCUMENT_TYPE,
+  consumeWorksImportFile,
   handleScreenFileDownloadMessage,
   handleScreenPdfExportMessage,
+  handleScreenSubmitDocumentMessage,
   parseScreenFileDownload,
   parseScreenPdfExport,
+  parseScreenSubmitDocument,
+  stageWorksImportFile,
 } from "../src/features/workspace-apps/screen/screenFileDownload";
 
 export {};
@@ -311,6 +318,123 @@ void (async () => {
   );
   await new Promise((r) => setTimeout(r, 0));
   assert((replies.length as number) === 2, "stale frame must suppress reply");
+
+  // 7. parseScreenSubmitDocument & handleScreenSubmitDocumentMessage
+  const validPdfSubmit = parseScreenSubmitDocument({
+    type: SCREEN_SUBMIT_DOCUMENT_TYPE,
+    requestId: "sub_pdf_1",
+    title: "Q4 Report",
+    label: "report",
+    kind: "pdf",
+    html: validHtml,
+    paper: "a4",
+    submit: true,
+  });
+  assert(validPdfSubmit !== null && validPdfSubmit.kind === "pdf" && validPdfSubmit.submit === true, "valid pdf submit parses");
+
+  const pkZip = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]).buffer;
+  const validDocxSubmit = parseScreenSubmitDocument({
+    type: SCREEN_SUBMIT_DOCUMENT_TYPE,
+    requestId: "sub_docx_1",
+    title: "合約草案",
+    label: "proposal",
+    kind: "docx",
+    bytes: pkZip,
+    submit: false,
+  });
+  assert(validDocxSubmit !== null && validDocxSubmit.kind === "docx" && validDocxSubmit.submit === false, "valid docx submit parses");
+
+  assert(
+    parseScreenSubmitDocument({
+      type: SCREEN_SUBMIT_DOCUMENT_TYPE,
+      requestId: "sub_bad_magic",
+      title: "Fake",
+      label: "report",
+      kind: "xlsx",
+      bytes: new Uint8Array([1, 2, 3, 4]).buffer,
+      submit: true,
+    }) === null,
+    "reject non-ZIP Office bytes",
+  );
+  assert(
+    parseScreenSubmitDocument({
+      type: SCREEN_SUBMIT_DOCUMENT_TYPE,
+      requestId: "sub_bad_label",
+      title: "Bad Label",
+      label: "a/b",
+      kind: "pdf",
+      html: validHtml,
+      submit: false,
+    }) === null,
+    "reject slash in label",
+  );
+  assert(
+    parseScreenSubmitDocument({
+      type: SCREEN_SUBMIT_DOCUMENT_TYPE,
+      requestId: "sub_too_big",
+      title: "Big",
+      label: "report",
+      kind: "pptx",
+      bytes: new Uint8Array(SCREEN_SUBMIT_DOCUMENT_MAX_BYTES + 1).buffer,
+      submit: true,
+    }) === null,
+    "reject >10 MiB Office payload",
+  );
+
+  const subReplies: unknown[] = [];
+  const subSource = { postMessage(msg: unknown) { subReplies.push(msg); } };
+  assert(
+    handleScreenSubmitDocumentMessage(
+      {
+        source: subSource as unknown as MessageEventSource,
+        data: {
+          type: SCREEN_SUBMIT_DOCUMENT_TYPE,
+          requestId: "sub_ok",
+          title: "Deck",
+          label: "proposal",
+          kind: "pptx",
+          bytes: pkZip,
+          submit: true,
+        },
+      },
+      subSource,
+      () => true,
+      async () => ({ id: "doc_123", stage: "in_review" }),
+    ) === true,
+    "handled valid submit document message",
+  );
+  await new Promise((r) => setTimeout(r, 0));
+  assert(
+    (subReplies.length as number) === 1 &&
+      (subReplies[0] as { type?: string; ok?: boolean; id?: string; stage?: string }).type === SCREEN_SUBMIT_DOCUMENT_ACK_TYPE &&
+      (subReplies[0] as { ok?: boolean }).ok === true &&
+      (subReplies[0] as { id?: string }).id === "doc_123",
+    "expected cadence-submit-document-ack ok:true",
+  );
+
+  // Wrong source must be ignored without replying
+  handleScreenSubmitDocumentMessage(
+    {
+      source: {} as MessageEventSource,
+      data: { type: SCREEN_SUBMIT_DOCUMENT_TYPE, requestId: "sub_evil", title: "X", label: "report", kind: "pptx", bytes: pkZip, submit: true },
+    },
+    subSource,
+    () => true,
+    async () => { throw new Error("must not run"); },
+  );
+  await new Promise((r) => setTimeout(r, 0));
+  assert((subReplies.length as number) === 1, "wrong source must not receive submit ack");
+
+  // 8. stageWorksImportFile / consumeWorksImportFile single-use lifecycle
+  const impId = stageWorksImportFile({
+    installId: "inst_works",
+    fileName: "報價單.xlsx",
+    mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    bytes: pkZip,
+  });
+  const consumed = consumeWorksImportFile("inst_works");
+  assert(consumed !== null && consumed.id === impId && consumed.fileName === "報價單.xlsx", "staged import consumed");
+  assert(consumeWorksImportFile("inst_works") === null, "second consume returns null");
 })();
 
 console.log("screenFileDownload tests passed");
