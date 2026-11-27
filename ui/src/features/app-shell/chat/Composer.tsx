@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -22,6 +23,7 @@ import {
   applyMention,
   filterMentionCandidates,
   findActiveMention,
+  splitComposerHighlights,
   startsWithNote,
   type MentionCandidate,
 } from "../../mentions/mentions";
@@ -529,6 +531,7 @@ export default function Composer({
   const [mentionHi, setMentionHi] = useState<number>(0);
   const [mentionOffFor, setMentionOffFor] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
+  const highlightMirror = useRef<HTMLDivElement>(null);
   const revealRef = useRef(onReveal);
   revealRef.current = onReveal;
   useLayoutEffect(() => {
@@ -560,6 +563,11 @@ export default function Composer({
     if (!el || el.clientWidth === 0) return;
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
+    if (highlightMirror.current) {
+      highlightMirror.current.style.height = el.style.height;
+      highlightMirror.current.scrollTop = el.scrollTop;
+      highlightMirror.current.scrollLeft = el.scrollLeft;
+    }
   }, []);
   useEffect(() => {
     resizeBox();
@@ -890,6 +898,30 @@ export default function Composer({
       />
     ) : null;
 
+  const textareaClass = compact
+    ? "app-chat-box app-chat-textarea"
+    : "app-chat-textarea w-full resize-none bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem] max-h-40 overflow-y-auto";
+
+  const highlightSpans = useMemo(
+    () =>
+      splitComposerHighlights(draft, {
+        candidates: mentionCandidates,
+        highlightCommand: Boolean((commands && commands.length > 0) || allowNote),
+      }),
+    [draft, mentionCandidates, commands, allowNote],
+  );
+  const hasHighlights = !block && highlightSpans.some((s) => s.kind !== "text");
+
+  const syncHighlightScroll = useCallback(() => {
+    if (!highlightMirror.current || !box.current) return;
+    highlightMirror.current.scrollTop = box.current.scrollTop;
+    highlightMirror.current.scrollLeft = box.current.scrollLeft;
+  }, []);
+
+  useLayoutEffect(() => {
+    syncHighlightScroll();
+  }, [draft, hasHighlights, syncHighlightScroll]);
+
   const boxEl = (
     <>
     {libraryImage ? (
@@ -905,44 +937,61 @@ export default function Composer({
         </button>
       </div>
     ) : null}
-    <textarea
-      ref={box}
-      id={textareaId}
-      value={draft}
-      onChange={(e) => {
-        setSkillsFor(null);
-        setMentionOffFor(null);
-        setCaret(e.target.selectionStart ?? e.target.value.length);
-        setDraft(e.target.value);
-      }}
-      onClick={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
-      onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
-      onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
-      onKeyDown={onKey}
-      onPaste={(e) => {
-        if (block || !attachEnabled || !e.clipboardData) return;
-        const files =
-          e.clipboardData.files.length > 0
-            ? Array.from(e.clipboardData.files)
-            : Array.from(e.clipboardData.items ?? [])
-                .filter((item) => item.kind === "file")
-                .map((item) => item.getAsFile())
-                .filter((file): file is File => file !== null);
-        if (files.length === 0) return;
-        e.preventDefault();
-        addSelected(normalizePastedFiles(files));
-      }}
-      rows={1}
-      disabled={!!block}
-      placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
-      aria-label={t(ariaLabel ?? "Message to Assistant")}
-      aria-expanded={matches.length > 0 || mentionMatches.length > 0 || undefined}
-      className={
-        compact
-          ? "app-chat-box app-chat-textarea"
-          : "app-chat-textarea w-full resize-none bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem] max-h-40 overflow-y-auto"
-      }
-    />
+    <div className="composer-input-wrap" data-has-hl={hasHighlights ? "" : undefined}>
+      {hasHighlights && (
+        <div
+          ref={highlightMirror}
+          className={`${textareaClass} composer-hl-mirror`}
+          aria-hidden="true"
+        >
+          {highlightSpans.map((span, idx) =>
+            span.kind === "text" ? (
+              span.text
+            ) : (
+              <span key={idx} className="composer-hl-tok" data-kind={span.kind}>
+                {span.text}
+              </span>
+            ),
+          )}
+          {draft.endsWith("\n") ? "\u200b" : null}
+        </div>
+      )}
+      <textarea
+        ref={box}
+        id={textareaId}
+        value={draft}
+        onChange={(e) => {
+          setSkillsFor(null);
+          setMentionOffFor(null);
+          setCaret(e.target.selectionStart ?? e.target.value.length);
+          setDraft(e.target.value);
+        }}
+        onClick={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+        onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+        onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+        onScroll={syncHighlightScroll}
+        onKeyDown={onKey}
+        onPaste={(e) => {
+          if (block || !attachEnabled || !e.clipboardData) return;
+          const files =
+            e.clipboardData.files.length > 0
+              ? Array.from(e.clipboardData.files)
+              : Array.from(e.clipboardData.items ?? [])
+                  .filter((item) => item.kind === "file")
+                  .map((item) => item.getAsFile())
+                  .filter((file): file is File => file !== null);
+          if (files.length === 0) return;
+          e.preventDefault();
+          addSelected(normalizePastedFiles(files));
+        }}
+        rows={1}
+        disabled={!!block}
+        placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
+        aria-label={t(ariaLabel ?? "Message to Assistant")}
+        aria-expanded={matches.length > 0 || mentionMatches.length > 0 || undefined}
+        className={textareaClass}
+      />
+    </div>
     </>
   );
 

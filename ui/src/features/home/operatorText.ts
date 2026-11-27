@@ -9,6 +9,7 @@
  * Block syntax (headings, lists, tables, images, raw HTML) is not parsed, so
  * a leading `#` or `-` keeps its place in the message.
  */
+import { findMentionSpans } from "../mentions/mentions";
 import { ACTION_MARK } from "./formModel";
 
 export type Inline =
@@ -16,7 +17,8 @@ export type Inline =
   | { kind: "code"; text: string }
   | { kind: "strong"; text: string }
   | { kind: "em"; text: string }
-  | { kind: "link"; text: string; href: string };
+  | { kind: "link"; text: string; href: string }
+  | { kind: "mention"; text: string; handle: string };
 
 /** A code span: one pair of backticks on one line, nothing parsed inside. */
 const CODE = /`([^`\n]+)`/g;
@@ -38,17 +40,33 @@ function push(out: Inline[], token: Inline): void {
   else if (token.kind !== "text" || token.text !== "") out.push(token);
 }
 
+function pushTextWithMentions(out: Inline[], text: string): void {
+  if (!text) return;
+  const mentions = findMentionSpans(text);
+  if (mentions.length === 0) {
+    push(out, { kind: "text", text });
+    return;
+  }
+  let at = 0;
+  for (const mention of mentions) {
+    if (mention.start > at) push(out, { kind: "text", text: text.slice(at, mention.start) });
+    push(out, { kind: "mention", text: mention.raw, handle: mention.handle.toLowerCase() });
+    at = mention.end;
+  }
+  if (at < text.length) push(out, { kind: "text", text: text.slice(at) });
+}
+
 function rich(text: string, out: Inline[]): void {
   let at = 0;
   for (const m of text.matchAll(RICH)) {
-    push(out, { kind: "text", text: text.slice(at, m.index) });
+    pushTextWithMentions(out, text.slice(at, m.index));
     if (m[1] !== undefined) push(out, { kind: "link", text: m[1], href: m[2] });
     else if (m[3] !== undefined) push(out, { kind: "link", text: m[3], href: m[3] });
     else if (m[4] !== undefined) push(out, { kind: "strong", text: m[4] });
     else push(out, { kind: "em", text: m[5] ?? m[6] });
     at = m.index + m[0].length;
   }
-  push(out, { kind: "text", text: text.slice(at) });
+  pushTextWithMentions(out, text.slice(at));
 }
 
 /** The operator's text as inline tokens. Concatenating every token's

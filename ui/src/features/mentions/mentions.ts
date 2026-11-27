@@ -66,6 +66,97 @@ function isHandleChar(ch: string): boolean {
   return /[A-Za-z0-9_-]/.test(ch);
 }
 
+const MENTION_TOKEN = /@([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?![A-Za-z0-9_-])/g;
+const LEADING_COMMAND_TOKEN = /^(?:\/skill:[a-z0-9][a-z0-9-]{0,31}|\/[a-z][a-z0-9-]{0,31})(?=\s|$)/;
+
+export interface MentionSpan {
+  start: number;
+  end: number;
+  raw: string;
+  handle: string;
+}
+
+/**
+ * Find boundary-safe `@handle` spans inside prose, skipping email-style
+ * `name@domain` occurrences where `@` immediately follows a word char or `.`.
+ */
+export function findMentionSpans(text: string): MentionSpan[] {
+  const out: MentionSpan[] = [];
+  for (const m of text.matchAll(MENTION_TOKEN)) {
+    const start = m.index ?? 0;
+    const prev = start > 0 ? text[start - 1] : undefined;
+    if (!isBoundaryBeforeAt(prev)) continue;
+    const handle = m[1] ?? "";
+    if (!handle) continue;
+    out.push({
+      start,
+      end: start + m[0].length,
+      raw: m[0],
+      handle,
+    });
+  }
+  return out;
+}
+
+export type ComposerHighlightKind = "text" | "command" | "mention-agent" | "mention-human";
+
+export interface ComposerHighlightSpan {
+  kind: ComposerHighlightKind;
+  text: string;
+}
+
+/**
+ * Partition composer draft text into highlight spans for inline backdrop
+ * rendering. Concatenating every span's `text` always reproduces `text` verbatim.
+ */
+export function splitComposerHighlights(
+  text: string,
+  options?: {
+    candidates?: readonly MentionCandidate[];
+    highlightCommand?: boolean;
+  },
+): ComposerHighlightSpan[] {
+  if (!text) return [];
+  const candidateKindByHandle = new Map<string, "agent" | "human">();
+  for (const candidate of options?.candidates ?? []) {
+    if (!candidate.active) continue;
+    const key = candidate.handle.trim().toLowerCase();
+    if (key && !candidateKindByHandle.has(key)) candidateKindByHandle.set(key, candidate.kind);
+  }
+
+  const out: ComposerHighlightSpan[] = [];
+  let cursor = 0;
+
+  if (options?.highlightCommand) {
+    const cmd = LEADING_COMMAND_TOKEN.exec(text);
+    if (cmd?.[0]) {
+      out.push({ kind: "command", text: cmd[0] });
+      cursor = cmd[0].length;
+    }
+  }
+
+  if (candidateKindByHandle.size > 0) {
+    for (const span of findMentionSpans(text)) {
+      if (span.start < cursor) continue;
+      const targetKind = candidateKindByHandle.get(span.handle.toLowerCase());
+      if (!targetKind) continue;
+      if (span.start > cursor) {
+        out.push({ kind: "text", text: text.slice(cursor, span.start) });
+      }
+      out.push({
+        kind: targetKind === "agent" ? "mention-agent" : "mention-human",
+        text: span.raw,
+      });
+      cursor = span.end;
+    }
+  }
+
+  if (cursor < text.length) {
+    out.push({ kind: "text", text: text.slice(cursor) });
+  }
+  return out;
+}
+
 /**
  * Find an active `@handle` token ending at `caret`, ignoring email-style
  * `name@domain` addresses where `@` follows a letter, digit, `_`, or `.`.
