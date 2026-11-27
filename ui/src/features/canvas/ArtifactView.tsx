@@ -43,7 +43,7 @@ const OFFICE_KIND_LABEL: Record<"docx" | "xlsx" | "pptx", string> = {
 export function downloadName(title: string, kind: ArtifactKind, mime: string): string {
   const base = title.replace(/[^\w.\- ]+/g, "_").trim().slice(0, 80) || "artifact";
   const ext = kind === "image" ? (mime.split("/")[1]?.split("+")[0] ?? "png") : EXT[kind];
-  return `${base}.${ext}`;
+  return base.toLowerCase().endsWith(`.${ext.toLowerCase()}`) ? base : `${base}.${ext}`;
 }
 
 /** Hand bytes to the browser as a file. */

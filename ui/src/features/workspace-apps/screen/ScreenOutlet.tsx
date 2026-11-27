@@ -447,7 +447,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
             throw new Error("Unexpected PDF response type.");
           }
           const bytes = await response.arrayBuffer();
-          if (bytes.byteLength === 0 || !isCurrent()) return;
+          if (bytes.byteLength === 0) {
+            throw new Error("Received empty PDF response.");
+          }
+          if (!isCurrent()) return;
           triggerFileSave(bytes, "application/pdf", parsed.fileName);
         })
       ) {

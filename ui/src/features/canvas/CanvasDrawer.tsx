@@ -427,7 +427,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
           {info?.digest ? ` · sha256:${info.digest.slice(0, 6)}…${info.digest.slice(-3)}` : ""}
         </span>
         {(tab.kind === "html" && htmlView === "source" ? HTML_SOURCE_FOOT : (FOOT[tab.kind] ?? [])).map((f) => (
-          <span key={f}>{f}</span>
+          <span key={f}>{t(f)}</span>
         ))}
       </footer>
       )}
