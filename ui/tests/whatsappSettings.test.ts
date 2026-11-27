@@ -203,6 +203,159 @@ async function testPanelOAuthRedirectAndDisconnect(): Promise<void> {
       );
       assert(container.textContent?.includes("Continue setup in FavCRM"), "auth fallback link renders after connect");
 
+      // Retained fallback popup message/focus handlers reject untrusted origins and refresh on focus
+      const getsBeforeEvil = getCount;
+      await React.act(async () => {
+        win.dispatchEvent(
+          new win.MessageEvent("message", {
+            origin: "https://evil.example.test",
+            data: { type: "favcrm:whatsapp-connected" },
+          }),
+        );
+        win.dispatchEvent(
+          new win.MessageEvent("message", {
+            origin: "https://portal.favcrm.example.test",
+            data: { type: "favcrm:unrelated" },
+          }),
+        );
+        await flushUi();
+      });
+      assert(getCount === getsBeforeEvil, "untrusted origins and unrelated messages are ignored");
+
+      await React.act(async () => {
+        win.dispatchEvent(new win.FocusEvent("focus"));
+        await flushUi();
+      });
+      assert(getCount === getsBeforeEvil + 1, "window focus triggers silent snapshot re-read");
+
+      officialBindingStatus = "active";
+      officialConnected = true;
+      const changedBeforeMessage = settingsChangedCount;
+      await React.act(async () => {
+        win.dispatchEvent(
+          new win.MessageEvent("message", {
+            origin: "https://portal.favcrm.example.test",
+            data: { type: "favcrm:whatsapp-connected" },
+          }),
+        );
+        await flushUi();
+      });
+      assert(
+        container.textContent?.includes("Official WhatsApp connected.") &&
+          !container.textContent?.includes("Continue setup in FavCRM") &&
+          settingsChangedCount > changedBeforeMessage,
+        "trusted favcrm:whatsapp-connected message flips connected state and clears auth banner",
+      );
+
+      // Re-mount simulating ?aos_connect=linked_needs_number + owner Linked · Needs number state
+      officialBindingStatus = "active";
+      officialConnected = false;
+      win.history.replaceState(null, "", "/apps/waba?mode=official&aos_connect=linked_needs_number");
+      const changedBeforeNeedsNum = settingsChangedCount;
+
+      React.act(() => { root.unmount(); });
+      root = createRoot(container);
+      await React.act(async () => {
+        root.render(
+          React.createElement(
+            LocaleProvider,
+            null,
+            React.createElement(WhatsAppSettingsPanel, {
+              installId: "install_panel",
+              initialMode: "official",
+              onUnsupported: () => {},
+              onSettingsChanged: () => {
+                settingsChangedCount += 1;
+              },
+            }),
+          ),
+        );
+        await flushUi();
+      });
+      assert(
+        !win.location.search.includes("aos_connect") &&
+          container.textContent?.includes("FavCRM workspace linked. Finish setting up your WhatsApp number in FavCRM.") &&
+          settingsChangedCount > changedBeforeNeedsNum &&
+          container.textContent?.includes("Set up your WhatsApp number"),
+        "aos_connect=linked_needs_number shows notice, strips query, refreshes settings, and renders Needs number card",
+      );
+      const setupNumberBtn = buttonWith("Set up WhatsApp number in FavCRM");
+      const needsNumRescopeBtn = buttonWith("Rescope");
+      const needsNumDisconnectBtn = buttonWith("Disconnect");
+      assert(
+        setupNumberBtn && needsNumRescopeBtn && needsNumDisconnectBtn,
+        "owner Linked · Needs number state renders setup link CTA, Rescope, and Disconnect",
+      );
+      await React.act(async () => {
+        setupNumberBtn.click();
+        await flushUi();
+      });
+      assert(
+        assignCalls.at(1) === "https://portal.favcrm.example.test/wa/connect?token=ok" &&
+          lastConnectBody === JSON.stringify({ return_to: "http://localhost/apps/waba?mode=official" }),
+        "Set up WhatsApp number in FavCRM initiates OAuth redirect with return_to",
+      );
+
+      // Re-mount simulating ?aos_connect=cancelled
+      officialBindingStatus = "none";
+      officialConnected = false;
+      win.history.replaceState(null, "", "/apps/waba?mode=official&aos_connect=cancelled");
+      const changedBeforeCancelled = settingsChangedCount;
+      React.act(() => { root.unmount(); });
+      root = createRoot(container);
+      await React.act(async () => {
+        root.render(
+          React.createElement(
+            LocaleProvider,
+            null,
+            React.createElement(WhatsAppSettingsPanel, {
+              installId: "install_panel",
+              initialMode: "official",
+              onUnsupported: () => {},
+              onSettingsChanged: () => {
+                settingsChangedCount += 1;
+              },
+            }),
+          ),
+        );
+        await flushUi();
+      });
+      assert(
+        !win.location.search.includes("aos_connect") &&
+          container.textContent?.includes("FavCRM connection was cancelled.") &&
+          settingsChangedCount === changedBeforeCancelled,
+        "aos_connect=cancelled shows cancellation notice and strips query parameter",
+      );
+
+      // Re-mount simulating ?aos_connect=failed
+      win.history.replaceState(null, "", "/apps/waba?mode=official&aos_connect=failed");
+      const changedBeforeFailed = settingsChangedCount;
+      React.act(() => { root.unmount(); });
+      root = createRoot(container);
+      await React.act(async () => {
+        root.render(
+          React.createElement(
+            LocaleProvider,
+            null,
+            React.createElement(WhatsAppSettingsPanel, {
+              installId: "install_panel",
+              initialMode: "official",
+              onUnsupported: () => {},
+              onSettingsChanged: () => {
+                settingsChangedCount += 1;
+              },
+            }),
+          ),
+        );
+        await flushUi();
+      });
+      assert(
+        !win.location.search.includes("aos_connect") &&
+          container.textContent?.includes("Could not complete FavCRM connection. Please try again.") &&
+          settingsChangedCount === changedBeforeFailed,
+        "aos_connect=failed shows error notice and strips query parameter",
+      );
+
       // Re-mount simulating OAuth callback return with ?aos_connect=connected
       officialBindingStatus = "active";
       officialConnected = true;
