@@ -16,12 +16,16 @@ function parse(value: unknown): WikiManagedFile {
   return row;
 }
 
+export class ManagedFileError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
 async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   return withPrivateOperation(async (operation) => {
     const response = await operation.fetch(path, { headers: sessionHeaders(), cache: "no-store" });
-    const body: unknown = await response.json();
+    const body: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
-    if (!response.ok) throw new Error(errorMessage(body, `The board answered ${response.status}.`));
+    if (!response.ok) throw new ManagedFileError(response.status, errorMessage(body, `The board answered ${response.status}.`));
     return body;
   }, signal);
 }

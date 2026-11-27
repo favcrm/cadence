@@ -5448,6 +5448,11 @@ const PROFILE_WRITE_NOT_PERMITTED: &str = "defining or editing a profile is a li
 /// unchanged.
 fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Error) -> Error {
     let action: Option<(&'static str, &'static str)> = match (verb, code) {
+        ("issue_new" | "issue_set" | "issue_attach", Some("artifact_share_required")) => Some((
+            "artifact_share_required",
+            "this ticket would give the file new readers; use Copy private link or \
+             Share this version with ticket readers in Wiki. No change was saved",
+        )),
         ("message_send", Some("recipient_class_unsupported")) => Some((
             "recipient_class_unsupported",
             "remote send reaches `master` (human workspace owner only) or an active \

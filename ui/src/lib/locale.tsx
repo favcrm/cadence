@@ -5027,3 +5027,36 @@ const CAD2872_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2872_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2876_ZHTW: Record<string, string> = {
+  "Copy private link": "複製私人連結",
+  "Private link copied. It does not grant access.": "已複製私人連結。連結不會授予存取權。",
+  "Could not copy the private link.": "無法複製私人連結。",
+  "Ticket ID": "工單編號",
+  "Review ticket audience": "檢視工單讀者範圍",
+  "Share this version with ticket readers?": "與工單讀者分享此版本？",
+  "Share this version with ticket readers": "與工單讀者分享此版本",
+  "Audience revision": "讀者範圍修訂版本",
+  "This version was shared with ticket readers.": "此版本已與工單讀者分享。",
+  "The audience changed. Reload and confirm again.": "讀者範圍已變更。請重新載入並再次確認。",
+  "Could not share this version. Try again.": "無法分享此版本。請再試。",
+  "This file version is unavailable.": "此檔案版本無法使用。",
+  "Request access": "要求存取權",
+  "Access request status": "存取要求狀態",
+  "Could not request access. Try again.": "無法要求存取權。請再試。",
+  "Pending": "待處理",
+  "Granted": "已授權",
+  "Declined": "已拒絕",
+  "Revoked": "已撤銷",
+  "Available": "可使用",
+  "File access requests": "檔案存取要求",
+  "No file access requests.": "沒有檔案存取要求。",
+  "Could not load access requests.": "無法載入存取要求。",
+  "Could not update access. Requests have been reloaded.": "無法更新存取權。要求已重新載入。",
+  "Grant access": "授予存取權",
+  "Decline": "拒絕",
+  "Revoke access": "撤銷存取權",
+};
+for (const [key, value] of Object.entries(CAD2876_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

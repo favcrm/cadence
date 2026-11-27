@@ -1,0 +1,48 @@
+{
+  "description": "CAD-2876 hosted managed-file privacy HTTP response examples; synthetic data.",
+  "version": "hosted-wiki-file-access.v1",
+  "requests": {
+    "requests": [
+      {
+        "id": "art-example",
+        "version": 2,
+        "requester": "member-example",
+        "requested_at": "2026-11-27T12:00:00.000Z",
+        "status": "pending",
+        "title": "Project brief"
+      },
+      {
+        "id": "art-other",
+        "version": 1,
+        "requester": "member-other",
+        "requested_at": "2026-11-27T12:01:00.000Z",
+        "status": "granted"
+      }
+    ]
+  },
+  "empty_requests": { "requests": [] },
+  "request_pending": { "status": "pending" },
+  "request_granted": { "status": "granted" },
+  "request_declined": { "status": "declined" },
+  "request_revoked": { "status": "revoked" },
+  "request_available": { "status": "available" },
+  "share_preview": {
+    "status": "preview",
+    "ticket": "ALPHA-1",
+    "audience": { "project": "ALPHA", "visibility": "private", "revision": "audience-1" }
+  },
+  "share_confirmed": {
+    "status": "shared",
+    "ticket": "ALPHA-1",
+    "audience": { "project": "ALPHA", "visibility": "private", "revision": "audience-1" }
+  },
+  "share_workspace_preview": {
+    "status": "preview",
+    "ticket": "BETA-1",
+    "audience": { "project": "BETA", "visibility": "workspace", "revision": null }
+  },
+  "decision_granted": { "status": "granted" },
+  "decision_declined": { "status": "declined" },
+  "decision_revoked": { "status": "revoked" },
+  "refused": { "error": { "code": "forbidden", "message": "Access denied." } }
+}

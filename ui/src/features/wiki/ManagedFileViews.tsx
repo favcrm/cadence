@@ -8,7 +8,8 @@ import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import ArtifactView, { downloadName, saveBytes, useArtifactBytes } from "../canvas/ArtifactView";
 import { ARTIFACT_KINDS, type ArtifactKind } from "../canvas/canvasStore";
 import { approve, archive, restore } from "../documents/documentsClient";
-import { getManagedFile, listManagedFiles, type WikiManagedFile } from "./managedFiles";
+import { getManagedFile, listManagedFiles, ManagedFileError, type WikiManagedFile } from "./managedFiles";
+import { AccessRequestButton, FileSharing, useFileAccessSupport } from "./FileAccessViews";
 
 export function managedRoute(row: WikiManagedFile): Route {
   return { screen: "wiki", mode: "browse", path: null, query: null, file: row.file.id, version: row.file.version };
@@ -95,21 +96,23 @@ function FileContent({ row, readOnly, choose }: { row: WikiManagedFile; readOnly
   );
 }
 
-export function ManagedFilePane({ id, version, readOnly, navHref, onChange }: { id: string; version: number; readOnly: boolean; navHref: (route: Route) => string; onChange?: () => void }) {
+export function ManagedFilePane({ id, version, readOnly, navHref, canonicalHref, onChange }: { id: string; version: number; readOnly: boolean; navHref: (route: Route) => string; canonicalHref: (route: Route) => string; onChange?: () => void }) {
   const t = useTranslate();
+  const supported = useFileAccessSupport();
   const [row, setRow] = useState<WikiManagedFile | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; status?: number } | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const [shareConflict, setShareConflict] = useState(false);
   const [action, setAction] = useState<FileAction | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     const controller = new AbortController();
     setRow(null); setError(null);
-    void getManagedFile(id, version, controller.signal).then(setRow).catch((e) => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e)); });
+    void getManagedFile(id, version, controller.signal).then(setRow).catch((e) => { if (!controller.signal.aborted) setError({ message: e instanceof ManagedFileError && e.status === 404 ? t("This file version is unavailable.") : e instanceof Error ? e.message : String(e), status: e instanceof ManagedFileError ? e.status : undefined }); });
     return () => controller.abort();
   }, [id, version, attempt]);
-  useEffect(() => onPrivateReadsPaused(() => { setRow(null); setError(null); setAction(null); }), []);
+  useEffect(() => onPrivateReadsPaused(() => { setRow(null); setError(null); setAction(null); setShareConflict(false); }), []);
   const run = async () => {
     if (!action || !row || readOnly || busy) return;
     setBusy(true);
@@ -135,11 +138,14 @@ export function ManagedFilePane({ id, version, readOnly, navHref, onChange }: { 
       <Link className="text-accent hover:underline" href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>← {t("Files")}</Link>
       {error && (
         <p role="alert" className="text-fail">
-          {error} <button className="lnk" type="button" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</button>
+          {error.message} <button className="lnk" type="button" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</button>
         </p>
       )}
+      {error?.status === 404 && supported && <AccessRequestButton id={id} version={version} />}
+      {shareConflict && <p role="alert" className="text-fail">{t("The audience changed. Reload and confirm again.")}</p>}
       {!row && !error && <p role="status">{t("Loading file…")}</p>}
       {row && <FileContent row={row} readOnly={readOnly} choose={(next) => { setActionError(null); setAction(next); }} />}
+      {row && supported && <FileSharing id={id} version={version} readOnly={readOnly} href={canonicalHref({ screen: "wiki", mode: "browse", path: null, query: null, file: id, version })} onConflict={() => { setShareConflict(true); setAttempt((n) => n + 1); }} />}
       {action && row && <ConfirmDialog
         title={t(action === "approve" ? "Approve document?" : action === "archive" ? "Archive document?" : "Restore document?")}
         body={<p>{action === "approve"
