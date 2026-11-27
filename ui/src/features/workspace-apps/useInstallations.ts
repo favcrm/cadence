@@ -29,10 +29,9 @@ export interface InstallationsState {
  * backoff before the error is shown. `refreshKey` re-reads on change.
  */
 /** CAD-1537: a member's apps come from the member-readable `/api/app-home`
- *  rows. Only the fields route resolution reads are carried — `install_id`,
- *  `name` (the key), `title`, `removed` and `project_link`; nothing else of
- *  the operator's `Installation` is present, so these rows serve app-key
- *  resolution and the menu only. */
+ *  rows. Only app identity, display and lifecycle fields needed by the
+ *  launcher are projected; none of the operator's bundle details are read.
+ */
 async function memberRows(signal: AbortSignal, shared: boolean): Promise<Installation[]> {
   const home = await appExplorer.home(signal, shared ? "member" : undefined);
   if (!Array.isArray(home?.installations)) throw new Error("The server returned an invalid app list.");
@@ -41,7 +40,8 @@ async function memberRows(signal: AbortSignal, shared: boolean): Promise<Install
     name: row.name,
     title: row.title,
     removed: row.attention?.state === "removed" ? 1 : null,
-    state: row.attention?.state === "removed" ? "removed" : undefined,
+    state: row.attention?.state === "removed" ? "removed"
+      : row.attention?.state === "off" ? "disabled" : undefined,
     project_link: row.project ?? "",
     navigation: row.navigation ?? null,
     i18n: row.i18n ?? null,

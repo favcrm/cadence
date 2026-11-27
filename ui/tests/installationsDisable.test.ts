@@ -32,8 +32,8 @@ async function main() {
   };
 
   let seen: ReturnType<typeof useInstallations> | undefined;
-  function Probe({ enabled, paused = false }: { enabled: boolean; paused?: boolean }) {
-    seen = useInstallations(enabled, "k", "list", true, paused);
+  function Probe({ enabled, paused = false, source = "list" }: { enabled: boolean; paused?: boolean; source?: "list" | "home" }) {
+    seen = useInstallations(enabled, "k", source, true, paused);
     return null;
   }
   const root = createRoot(win.document.createElement("div"));
@@ -88,6 +88,26 @@ async function main() {
   }
   equal(refused, true, "mid-flight pause refuses installations result with 401");
   equal(readInstallationsSnapshot(), null, "refused mid-flight read never caches under current session");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input), win.location.href);
+    if (url.pathname !== "/api/app-home") throw new Error(`Unexpected member read: ${url.pathname}`);
+    const installations = ["ok", "off", "removed"].map((state) => ({
+      install_id: `install_${state}`, name: state, title: state,
+      attention: { state, message: null, action: null, count: 0 },
+    }));
+    return new Response(JSON.stringify({ installations }), { headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    await act(async () => { root.render(React.createElement(Probe, { enabled: true, source: "home" })); });
+    await settle();
+    const { canOpenInstall } = require("../src/features/explorer/installAccess") as typeof import("../src/features/explorer/installAccess");
+    const launchable = seen?.list?.filter((row) => canOpenInstall(row.state, row.removed)).map((row) => row.install_id);
+    equal(launchable, ["install_ok"], "member launch links exclude disabled and removed installs from app home");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 
   await act(async () => { root.unmount(); });
   win.close?.();
