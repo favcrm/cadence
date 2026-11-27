@@ -517,7 +517,7 @@
              2) [ ] \"tab\\there\"."
         );
         assert!(!crate::adapter::pty::has_control_chars(&body), "{body}");
-        let (items, rest) = crate::issue::dispatch::parse_acceptance_listing(
+        let (items, rest) = crate::task_acceptance::parse_acceptance_listing(
             body.split_once("Outstanding criteria: ").unwrap().1,
         )
         .unwrap();

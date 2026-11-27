@@ -43,6 +43,7 @@ use crate::error::{Error, Result};
 use crate::issue::{self, task_report, Pm};
 use crate::master;
 use crate::store;
+use crate::task_acceptance;
 
 /// Longest decline reason.
 const REASON_MAX: usize = 2_000;
@@ -1357,7 +1358,7 @@ impl Shared {
             .ok_or_else(|| Error::internal("reviewer vanished"))?;
         let ticket = issue::board::find_issue(&pm.dir, &rec.issue)?;
         let items = issue::parse::acceptance_items(&ticket.body);
-        let listing = issue::dispatch::acceptance_listing(&items);
+        let listing = task_acceptance::acceptance_listing(&items);
         let round = rec.rounds + 1;
         let risk_note = if unattended {
             "\n\nUnattended grant: include `risk: auto` in the verdict frontmatter only if this exact head needs no sensitive/operator-only treatment. The path list is a floor: declare human/unknown risk for auth, identity, secrets or other consequential uncertainty; never label those auto."

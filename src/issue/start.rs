@@ -1152,7 +1152,7 @@ fn build_and_finalize_start(
         let task_acceptance = if pre.initial_intake.is_some() {
             None
         } else {
-            crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(params.body))
+            crate::task_acceptance::acceptance_listing(&parse::acceptance_items(params.body))
         };
         let created_job = if let Some(job) = req.verified_job {
             json!({"job": {"id": job["id"]}})

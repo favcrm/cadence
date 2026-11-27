@@ -7,15 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use super::{
-    content_digest, context_guard, parse_acceptance_listing, GatedIssue, JobContext,
-    PreparedContext,
-};
+use super::{content_digest, context_guard, GatedIssue, JobContext, PreparedContext};
 use crate::error::{Error, Result};
 use crate::issue::app_catalog::fs::Root;
 use crate::issue::parse::AcceptanceItem;
 use crate::issue::{context, parse, start, write, Pm};
 use crate::store;
+use crate::task_acceptance::parse_acceptance_listing;
 
 /// Does `lane`'s directory name belong to issue `id` under the layout
 /// (`<id-lower>-<slug>`)? A layout lane named for another issue is a foreign

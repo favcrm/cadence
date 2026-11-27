@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::issue::model::Front;
 use crate::issue::parse::AcceptanceItem;
 use crate::issue::{board, claim, parse, start, write, Pm};
+use crate::task_acceptance::acceptance_listing;
 
 mod context;
 mod early_kickoff;
@@ -41,15 +42,11 @@ pub use self::job_spec::{
     canonical_issue_spec_digest, capture_intake_cloud_spec, dispatch_lane, intake_spec_matches,
     intake_spec_pin, job_context,
 };
-pub use self::kickoff::parse_acceptance_listing;
-#[doc(hidden)]
-pub use self::kickoff::{
-    acceptance_listing, inline_listing, intake_acceptance, outstanding_items,
-    with_independent_acceptance,
-};
 use self::kickoff::{
     acceptance_warning, check_body, check_job_kickoff, job_prototype, plain_body, plain_kickoff,
 };
+#[doc(hidden)]
+pub use self::kickoff::{intake_acceptance, with_independent_acceptance};
 #[cfg(test)]
 use self::kickoff::{kickoff_body, with_acceptance};
 
@@ -1834,6 +1831,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_acceptance::parse_acceptance_listing;
 
     fn kickoff() -> String {
         kickoff_body(
@@ -2096,34 +2094,5 @@ mod tests {
         job_check(&items(60), "cloud").unwrap();
         let err = job_check(&items(600), "cloud").unwrap_err().to_string();
         assert!(err.contains("48000-char"), "{err}");
-    }
-
-    /// CAD-160: the outstanding criteria of a stored task acceptance.
-    #[test]
-    fn outstanding_items_keep_only_unchecked_criteria() {
-        let items = vec![
-            AcceptanceItem {
-                text: "a; 2) [ ] \"b\"".into(),
-                checked: false,
-            },
-            AcceptanceItem {
-                text: "done".into(),
-                checked: true,
-            },
-        ];
-        let listing = inline_listing(&items);
-        assert_eq!(outstanding_items(Some(&listing)), items[..1].to_vec());
-        // Free-form text, or a listing with trailing prose, is one item.
-        for text in ["green tests", &format!("{listing} and more")] {
-            assert_eq!(
-                outstanding_items(Some(text)),
-                vec![AcceptanceItem {
-                    text: text.to_string(),
-                    checked: false
-                }]
-            );
-        }
-        assert!(outstanding_items(None).is_empty());
-        assert!(outstanding_items(Some("  ")).is_empty());
     }
 }

@@ -268,6 +268,8 @@ pub mod skill;
 pub mod slots;
 pub mod store;
 pub mod tailnet_proof;
+#[doc(hidden)]
+pub mod task_acceptance;
 #[cfg(test)]
 pub(crate) mod test_ports;
 pub mod test_seam;

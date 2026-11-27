@@ -3,6 +3,7 @@
 use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::proto::identifier;
+use crate::task_acceptance;
 use rusqlite::params;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -432,12 +433,8 @@ impl Store {
         }
         let job = self.job(&task.job_id)?;
         let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
-        let outstanding = crate::issue::dispatch::outstanding_items(task.acceptance.as_deref());
-        let criteria = if outstanding.is_empty() {
-            "none".to_string()
-        } else {
-            crate::issue::dispatch::inline_listing(&outstanding)
-        };
+        let criteria = task_acceptance::outstanding_listing(task.acceptance.as_deref());
+        let criteria = criteria.as_deref().unwrap_or("none");
         // The approved intake scope belongs to this exact kickoff, not to
         // the independently maintained task criteria or a later dispatch.
         let intake_scope = if let Some(message) = task.dispatch_message.as_deref() {

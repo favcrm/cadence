@@ -1278,7 +1278,7 @@ so text such as `a; [x] b` stays one unchecked item —
 quoting escapes `"` and `\`, writes tab as `\t` and every other control
 character and U+2028/U+2029 as `\uXXXX`, so the kickoff stays one
 control-free line and the text is recoverable exactly
-(`dispatch::parse_acceptance_listing` reads it back). Criteria are
+(`task_acceptance::parse_acceptance_listing` reads it back). Criteria are
 never truncated, dropped or replaced by a pointer (CAD-160): when the
 plain kickoff would pass the 4000-char pty ceiling, the title (or
 `--summary`) is shortened and ends in `…`; when the items cannot fit
