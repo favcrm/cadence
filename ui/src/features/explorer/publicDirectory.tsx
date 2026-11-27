@@ -337,7 +337,7 @@ function useBoardInstalls(viewer: Viewer): {
       .map((row) => ({
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
-        removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
+        state: row.state, removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
         i18n: row.i18n, listing: row.listing,
       }));
     const fromHome = (home: HomeInstallation[]): InstallRef[] => home
@@ -345,6 +345,7 @@ function useBoardInstalls(viewer: Viewer): {
       .map((row) => ({
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         project_link: row.project ?? "", removed: null, catalogue: row.catalogue ?? null, project: row.project,
+        state: row.attention?.state === "off" ? "disabled" : undefined,
         i18n: row.i18n, listing: row.listing,
       }));
     const once = () => operator
@@ -389,7 +390,7 @@ function useBoardInstalls(viewer: Viewer): {
     const confirmed: InstallRef = {
       install_id: row.install_id, name: row.name, title: row.title, version: row.version,
       digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
-      removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
+      state: row.state, removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
       i18n: row.i18n, listing: row.listing,
     };
     setRows((current) => [...(current ?? []).filter((item) => item.install_id !== row.install_id), confirmed]);

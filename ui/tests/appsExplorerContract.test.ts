@@ -1,4 +1,4 @@
-export {};
+import type * as PublicDirectory from "../src/features/explorer/publicDirectory";
 /**
  * Apps favorites persistence and public-directory navigation against the
  * daemon favorites/home shapes and the public catalogue wire contract.
@@ -32,6 +32,10 @@ const ExplorerComponent = (require("../src/features/explorer/Explorer") as typeo
 const Explorer = (props: React.ComponentProps<typeof ExplorerComponent>) =>
   React.createElement(LocaleProvider, null,
     React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(ExplorerComponent, props) }));
+const { PublicAppDetail } = require("../src/features/explorer/publicDirectory") as typeof PublicDirectory;
+const CatalogDetail = (props: React.ComponentProps<typeof PublicAppDetail>) =>
+  React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(PublicAppDetail, props) }));
 
 const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": "application/json" } });
 // Legacy installation/favorites response shapes from the daemon.
@@ -44,6 +48,7 @@ const home = {
   ],
 };
 let favorites: unknown = { owner: "operator", is_default: false, favorites: [{ install_id: "inst-a", position: 0, opened_at: null }] };
+let socialState: "active" | "disabled" = "active";
 const catalog = { catalog: [{
   id: "crm", source_kind: "builtin", retired: true,
   retired_reason: "This embedded catalogue entry is retired.",
@@ -76,12 +81,16 @@ globalThis.fetch = async (input: any, init?: any) => {
     }
     return json({});
   }
-  if (path === "/api/app-home") return json(home);
+  if (path === "/api/app-home") return json({
+    installations: home.installations.map((row) => row.install_id === "inst-b"
+      ? { ...row, version: "0.9.6", attention: { ...row.attention, state: socialState === "disabled" ? "off" : "ok" } }
+      : row),
+  });
   if (path === "/api/apps") return json({ apps: [] });
   if (path === "/api/overview") return json({ needs_me: [] });
   if (path === "/api/app-installations") return json([
     { install_id: "inst-a", name: "crm", title: "CRM", removed: null },
-    { install_id: "inst-b", name: "social-content", title: "Social Content", removed: null },
+    { install_id: "inst-b", name: "social-content", title: "Social Content", version: "0.9.6", removed: null, state: socialState },
   ]);
   if (path === "/api/app-favorites") return json(favorites);
   if (path === "/api/app-catalog") return json(catalog);
@@ -188,6 +197,31 @@ async function main() {
     assert(location.pathname === "/apps/catalog/social-content", "following the card stays on the board's native detail route");
     assert(!writes.some((write) => write.path === "/api/app-installations/upload" || write.path.endsWith("/upgrade")),
       "opening a card never applies an installation");
+  });
+  await check("disabled installations cannot update or open from the catalog", async () => {
+    const detail = { id: publishedApp.id, viewer: operator };
+    const directoryRegion = "section[aria-label='Public apps']";
+    const openLink = 'a[href="/apps/social-content"]';
+    await React.act(() => root.render(React.createElement(Explorer, { viewer: operator })));
+    await flush();
+    assert(host.querySelector(directoryRegion)?.textContent?.includes("Update available"),
+      "an active installation with a newer release shows the update hint");
+    await React.act(() => root.render(React.createElement(CatalogDetail, detail)));
+    await flush();
+    assert(host.querySelector(openLink), "an active installation can open from its detail");
+
+    socialState = "disabled";
+    for (const viewer of [operator, { readOnly: false, operator: false }]) {
+      await React.act(() => root.render(React.createElement(Explorer, { viewer })));
+      await flush();
+      const listing = host.querySelector(directoryRegion)?.textContent ?? "";
+      assert(listing.includes("Installed") && !listing.includes("Update available"),
+        "the disabled installation stays discoverable without an update hint");
+      await React.act(() => root.render(React.createElement(CatalogDetail, { ...detail, viewer })));
+      await flush();
+      assert(host.querySelector("h1") && !host.querySelector(openLink),
+        "disabled detail renders without offering a broken Open link");
+    }
   });
   if (failures.length) throw new Error(failures.join("\n"));
 }
