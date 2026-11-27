@@ -814,7 +814,7 @@ mod tests {
         let template = parse_template(text).unwrap();
         assert_eq!(template.capability_slots, vec!["image"]);
         assert_eq!(template.required_asset_slot.as_deref(), Some("image"));
-        let workflow = crate::store::app_runs::LocalWorkflow::parse(
+        let workflow = crate::app_run_workflow::LocalWorkflow::parse(
             text,
             &BTreeMap::from([
                 ("subject".into(), "Customer follow-up".into()),

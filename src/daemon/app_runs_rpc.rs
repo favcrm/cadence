@@ -1,7 +1,8 @@
 //! Operator-owned local app lifecycle and turn-bound dependency artifacts.
 use super::*;
+use crate::app_run_workflow::LocalWorkflow;
 use crate::issue::app_catalog::workspace;
-use crate::store::app_runs::{self, LocalRunProvenance, LocalRunRequest, LocalWorkflow};
+use crate::store::app_runs::{self, LocalRunProvenance, LocalRunRequest};
 use std::collections::BTreeMap;
 
 /// Release live dispatch ownership on every exit, including provider failure.
