@@ -42,7 +42,7 @@
 .cv-grip:focus-visible { outline: none; }
 
 /* Tabs (only with more than one view open): the mark and the short title, the open one underlined in the accent. */
-.cv-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; container: cv-main / inline-size; }
+.cv-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; container: cv-main / inline-size; }
 .cv-tabrow { display: flex; flex-wrap: wrap; align-items: center; min-width: 0; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-875); }
 .cv-tabs { display: flex; flex: 1 1 12rem; min-width: 0; overflow-x: auto; gap: 4px; padding: 0 8px; scrollbar-width: thin; }
 .cv-tab { display: inline-flex; flex-shrink: 0; align-items: center; max-width: 14rem; border-bottom: 2px solid transparent; color: var(--color-ink-400); }
@@ -460,3 +460,34 @@ button.cv-saved:hover { color: var(--color-ink-100); border-color: var(--color-i
 .cv-pptx-slide-title { font-size: 1rem; font-weight: 600; color: var(--color-ink-100); margin: 0; }
 .cv-pptx-slide-lines { margin: 0; padding-left: 18px; display: grid; gap: 4px; color: var(--color-ink-200); font-size: var(--text-label); }
 @media (prefers-reduced-motion: reduce) { .cv-divider::after { transition: none; } }
+
+/* ---- CAD-2883: inline PDF viewer and wide/full-canvas PDF overlay drawer ---- */
+.canvas-pdf { display: flex; flex: 1; flex-direction: column; gap: 10px; min-height: 0; }
+.cv-pdf-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--color-ink-800); border-radius: 8px; background: var(--color-ink-850); }
+.cv-pdf-zoom { display: inline-flex; align-items: center; gap: 4px; }
+.cv-pdf-zoom-val { min-width: 3rem; text-align: center; color: var(--color-ink-200); }
+.cv-pdf-overlay-btn { margin-left: auto; }
+.cv-pdf-pages { display: grid; justify-items: center; gap: 14px; overflow: auto; flex: 1; min-height: 0; padding: 8px 4px; }
+.cv-pdf-page { border-radius: 6px; overflow: hidden; border: 1px solid var(--color-ink-700); background: #fff; box-shadow: 0 4px 18px rgb(0 0 0 / 24%); max-width: 100%; }
+.cv-pdf-page canvas { display: block; max-width: 100%; height: auto !important; }
+.cv-pdf-fallback { display: grid; gap: 6px; align-content: start; padding: 8px 2px; }
+
+.cv-pdf-overlay { position: absolute; inset: 0; z-index: 25; display: flex; justify-content: flex-end; min-width: 0; min-height: 0; }
+.cv-pdf-backdrop { position: absolute; inset: 0; background: rgb(10 12 16 / 48%); backdrop-filter: blur(2px); }
+.cv-pdf-drawer { position: relative; z-index: 1; display: flex; flex-direction: column; width: min(82%, 720px); max-width: 100%; height: 100%; background: var(--color-ink-900); border-left: 1px solid var(--color-ink-700); box-shadow: -16px 0 40px rgb(0 0 0 / 38%); animation: cv-pdf-in 0.18s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.cv-pdf-drawer[data-full="true"] { width: 100%; border-left: 0; }
+@keyframes cv-pdf-in { from { transform: translateX(20px); opacity: 0; } }
+@media (max-width: 560px) {
+  .cv-pdf-drawer { width: 100%; border-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cv-pdf-drawer { animation: none; }
+}
+.cv-pdf-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-850); min-width: 0; }
+.cv-pdf-badge { width: 34px; height: 34px; }
+.cv-pdf-title { flex: 1 1 10rem; min-width: 0; }
+.cv-pdf-title h2 { margin: 0; color: var(--color-ink-100); font-size: var(--text-label); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-pdf-title p { margin: 0; }
+.cv-pdf-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
+.cv-pdf-width-btn { display: inline-flex; align-items: center; gap: 5px; }
+.cv-pdf-body { flex: 1; min-height: 0; overflow: auto; padding: 12px; display: flex; flex-direction: column; }

@@ -59,6 +59,7 @@ export type ChildToHost =
   | { v: 2; op: "whatsapp-reply-inset-ready"; nomination: number; seq: number; px: number }
   | { v: 2; op: "whatsapp-thread-unread"; conversation_id: string; provider: WhatsAppComposeProvider; unread: boolean }
   | WhatsAppMediaRequest
+  | { v: 2; op: "whatsapp-pdf-preview"; conversation_id: string; message_id: string; provider?: WhatsAppComposeProvider }
   | AudioRequest
   | AudioSessionRequest
   | CallRequest
@@ -248,6 +249,8 @@ const LINKED_WHATSAPP_CHAT = /^[A-Za-z0-9._:-]{1,128}@(s\.whatsapp\.net|lid|g\.u
 const OFFICIAL_WHATSAPP_CHAT = /^[A-Za-z0-9._:@-]{1,128}$/;
 /** Bounded inbound WhatsApp media download bridge (`screen-whatsapp-media.v1`). */
 export const SCREEN_WHATSAPP_MEDIA_V1 = "screen-whatsapp-media.v1";
+/** Host-rendered wide/full-canvas PDF overlay trigger (`screen-whatsapp-pdf-preview.v1`). */
+export const SCREEN_WHATSAPP_PDF_PREVIEW_V1 = "screen-whatsapp-pdf-preview.v1";
 export const LINKED_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
 export const LINKED_MEDIA_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export type WhatsAppMediaDisposition = "inline" | "download";
@@ -585,7 +588,8 @@ export const SCREEN_ROUTE_PARAMS_V1 = "screen-route-params.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2 | typeof SCREEN_WHATSAPP_MEDIA_V1 | typeof SCREEN_WHATSAPP_UX_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2 | typeof SCREEN_WHATSAPP_MEDIA_V1 | typeof SCREEN_WHATSAPP_PDF_PREVIEW_V1 | typeof SCREEN_WHATSAPP_UX_V1;
+export const SCREEN_ACCEPTS_MAX = 16;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -993,11 +997,11 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
-    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 8 &&
+    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= SCREEN_ACCEPTS_MAX &&
     new Set(d.accepts).size === d.accepts.length &&
     !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
     !(d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1) && d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2)) &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2 || a === SCREEN_WHATSAPP_MEDIA_V1 || a === SCREEN_WHATSAPP_UX_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2 || a === SCREEN_WHATSAPP_MEDIA_V1 || a === SCREEN_WHATSAPP_PDF_PREVIEW_V1 || a === SCREEN_WHATSAPP_UX_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -1143,6 +1147,22 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       conversation_id: d.conversation_id,
       provider: d.provider,
       unread: d.unread,
+    };
+  }
+  if (
+    d.v === 2 &&
+    d.op === "whatsapp-pdf-preview" &&
+    Object.keys(d).every((k) => k === "v" || k === "op" || k === "conversation_id" || k === "message_id" || k === "provider") &&
+    validLinkedMediaId(d.conversation_id) &&
+    validLinkedMediaId(d.message_id) &&
+    (d.provider === undefined || d.provider === "linked" || d.provider === "official")
+  ) {
+    return {
+      v: 2,
+      op: "whatsapp-pdf-preview",
+      conversation_id: d.conversation_id,
+      message_id: d.message_id,
+      ...(d.provider !== undefined ? { provider: d.provider as WhatsAppComposeProvider } : {}),
     };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&

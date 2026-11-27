@@ -37,6 +37,8 @@ import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type Recor
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
 import AppLoadingSurface from "../AppLoadingSurface";
+import PdfOverlayDrawer from "../../canvas/PdfOverlayDrawer";
+import { canvasSnapshot, closePdfOverlay, openPdfOverlay } from "../../canvas/canvasStore";
 import {
   getActiveWhatsAppView,
   markWhatsAppThreadUnread,
@@ -195,6 +197,16 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
     resolve: (result: ActionResult) => void;
   } | null>(null);
   const audioKeyRef = useRef(0);
+  const [screenPdfOverlay, setScreenPdfOverlay] = useState<{
+    title: string;
+    bytes: ArrayBuffer | null;
+    mime: string;
+    fileName?: string;
+    loading: boolean;
+    error: string | null;
+  } | null>(null);
+  const pdfPreviewAbortRef = useRef<AbortController | null>(null);
+  const pdfPreviewSeqRef = useRef(0);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
   const stateChangeRef = useRef(onStateChange);
   stateChangeRef.current = onStateChange;
@@ -398,6 +410,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
       stopHandshakeWait();
       clearLeaveGuard();
       inlineAudio?.dispose();
+      pdfPreviewAbortRef.current?.abort();
+      pdfPreviewAbortRef.current = null;
+      setScreenPdfOverlay(null);
+      if (navigationCallbacks.current.route !== undefined) closePdfOverlay();
       if (!isCurrent()) return;
       setFailure(why);
       services?.retire();
@@ -694,7 +710,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
           mountQuery.set("wa_compose_layout", "1");
           mountQuery.set("wa_compose_inset_ack", "1");
         }
-        if (mediaDownloadServices) mountQuery.set("wa_media_download", "1");
+        if (mediaDownloadServices) {
+          mountQuery.set("wa_media_download", "1");
+          mountQuery.set("wa_pdf_preview", "1");
+        }
         if (whatsappUxEnabled) mountQuery.set("wa_ux", "1");
         frame.src = `${receipt.mount}${mountQuery.size ? `?${mountQuery}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
         // The URL carries the pick at mount time; a change during the load can
@@ -781,6 +800,72 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
               ) =>
                 mediaDownloadServices.downloadWhatsAppMedia(conversationId, messageId, signal, provider),
               onWhatsAppMediaSave: triggerFileSave,
+              onWhatsAppPdfPreview: (
+                conversationId: string,
+                messageId: string,
+                provider: WhatsAppComposeProvider = "linked",
+              ) => {
+                if (!isCurrent()) return;
+                pdfPreviewAbortRef.current?.abort();
+                const abort = new AbortController();
+                pdfPreviewAbortRef.current = abort;
+                const inCanvas = navigationCallbacks.current.route !== undefined;
+                if (inCanvas) {
+                  openPdfOverlay({ title: "PDF", bytes: null, mime: "application/pdf", loading: true, error: null });
+                } else {
+                  setScreenPdfOverlay({ title: "PDF", bytes: null, mime: "application/pdf", loading: true, error: null });
+                }
+                const seq = ++pdfPreviewSeqRef.current;
+                void mediaDownloadServices
+                  .downloadWhatsAppMedia(conversationId, messageId, abort.signal, provider)
+                  .then((result) => {
+                    if (!isCurrent() || abort.signal.aborted || seq !== pdfPreviewSeqRef.current) return;
+                    if (!result.ok) {
+                      const err = result.refusal.text || t("Could not load this PDF attachment.");
+                      if (inCanvas) {
+                        if (canvasSnapshot().pdfOverlay?.loading) {
+                          openPdfOverlay({ title: "PDF", bytes: null, mime: "application/pdf", loading: false, error: err });
+                        }
+                      } else {
+                        setScreenPdfOverlay((cur) => (cur?.loading ? { ...cur, loading: false, error: err } : cur));
+                      }
+                      return;
+                    }
+                    const mime = result.mimeType.split(";")[0].toLowerCase();
+                    if (mime !== "application/pdf") {
+                      const err = t("This file is not a PDF document.");
+                      if (inCanvas) {
+                        if (canvasSnapshot().pdfOverlay?.loading) {
+                          openPdfOverlay({ title: result.fileName ?? "Document", bytes: null, mime: result.mimeType, loading: false, error: err });
+                        }
+                      } else {
+                        setScreenPdfOverlay((cur) => (cur?.loading ? { ...cur, loading: false, error: err } : cur));
+                      }
+                      return;
+                    }
+                    const fileName = result.fileName ?? "whatsapp-document.pdf";
+                    if (inCanvas) {
+                      if (canvasSnapshot().pdfOverlay?.loading) {
+                        openPdfOverlay({ title: fileName, bytes: result.bytes, mime: "application/pdf", fileName, loading: false, error: null });
+                      }
+                    } else {
+                      setScreenPdfOverlay((cur) =>
+                        cur?.loading ? { title: fileName, bytes: result.bytes, mime: "application/pdf", fileName, loading: false, error: null } : cur,
+                      );
+                    }
+                  })
+                  .catch(() => {
+                    if (!isCurrent() || abort.signal.aborted || seq !== pdfPreviewSeqRef.current) return;
+                    const err = t("Could not load this PDF attachment.");
+                    if (inCanvas) {
+                      if (canvasSnapshot().pdfOverlay?.loading) {
+                        openPdfOverlay({ title: "PDF", bytes: null, mime: "application/pdf", loading: false, error: err });
+                      }
+                    } else {
+                      setScreenPdfOverlay((cur) => (cur?.loading ? { ...cur, loading: false, error: err } : cur));
+                    }
+                  });
+              },
             } : {}),
             ...(whatsappUxEnabled ? {
               onWhatsAppThreadUnread: (conversationId: string, provider: WhatsAppComposeProvider, unread: boolean) => {
@@ -900,6 +985,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
       session.dispose();
       clearLeaveGuard();
       inlineAudio?.dispose();
+      pdfPreviewAbortRef.current?.abort();
+      pdfPreviewAbortRef.current = null;
+      setScreenPdfOverlay(null);
+      if (navigationCallbacks.current.route !== undefined) closePdfOverlay();
       services?.retire();
       mounted.current = null;
       navigationCallbacks.current.onMounted?.(null);
@@ -1066,6 +1155,22 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
         onTap={(token, trusted, at, input) => { channel.current?.tapSlot(token, trusted, at, input); }}
         onCancel={token => channel.current?.cancelSlot(token)} />
+      {screenPdfOverlay ? (
+        <PdfOverlayDrawer
+          title={screenPdfOverlay.title}
+          bytes={screenPdfOverlay.bytes}
+          mime={screenPdfOverlay.mime}
+          fileName={screenPdfOverlay.fileName}
+          loading={screenPdfOverlay.loading}
+          error={screenPdfOverlay.error}
+          scope="screen"
+          onClose={() => {
+            pdfPreviewAbortRef.current?.abort();
+            pdfPreviewAbortRef.current = null;
+            setScreenPdfOverlay(null);
+          }}
+        />
+      ) : null}
     </div>
     {audioModal && typeof document !== "undefined" && createPortal(
       <ScreenAudioModal

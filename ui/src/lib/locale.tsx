@@ -5043,3 +5043,21 @@ const CAD2880_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2880_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2883_ZHTW: Record<string, string> = {
+  "inline PDF": "內嵌 PDF",
+  "Open in overlay": "在浮動視窗開啟",
+  "Full width": "展開至全寬",
+  "Default width": "預設寬度",
+  "Zoom": "縮放",
+  "Zoom in": "放大",
+  "Zoom out": "縮小",
+  "Reset zoom": "重設縮放",
+  "Pages": "頁",
+  "Loading PDF preview…": "正在載入 PDF 預覽…",
+  "Could not load this PDF attachment.": "無法載入此 PDF 附件。",
+  "This file is not a PDF document.": "此檔案並非 PDF 文件。",
+};
+for (const [key, value] of Object.entries(CAD2883_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}
