@@ -165,10 +165,6 @@ export interface ComposerProps {
   mentionCandidates?: MentionCandidate[];
   /** Allow leading `/note` without invoking the slash-command dispatcher. */
   allowNote?: boolean;
-  /** Observe draft text changes (e.g. for private Home mention previews). */
-  onDraftChange?: (draft: string) => void;
-  /** Optional pre-send gate; returning `false` holds the draft in place. */
-  beforeSend?: (body: string) => boolean;
   /** Optional `/note` silent-post toggle (Channels). */
   showSilentToggle?: boolean;
   silent?: boolean;
@@ -476,8 +472,6 @@ export default function Composer({
   onArrowUpEmpty,
   mentionCandidates,
   allowNote = false,
-  onDraftChange,
-  beforeSend,
   showSilentToggle = false,
   silent = false,
   onSilentChange,
@@ -499,11 +493,6 @@ export default function Composer({
   const hasArtifactRef = citesArtifact(refs);
   const libraryImage = cell.libraryImage;
   const libraryPin = libraryImage?.state === "ready" ? libraryImage.pin : null;
-  const onDraftChangeRef = useRef(onDraftChange);
-  onDraftChangeRef.current = onDraftChange;
-  useEffect(() => {
-    onDraftChangeRef.current?.(draft);
-  }, [draft]);
   const setDraft = (next: string) => setComposerDraft(key, next);
   const setRefs = (next: ThreadRef[]) => setComposerRefs(key, next);
   // The queue lives in the store, keyed like the draft: a remount
@@ -761,7 +750,6 @@ export default function Composer({
       if (onCommand?.(cmd.name, cmd.arg) !== false) finishCommand();
       else keepRefused(cmd.arg);
     } else {
-      if (beforeSend && beforeSend(outgoing) === false) return;
       // Pin before a pending row paints, so a follow effect scrolls into view.
       onSubmitted?.();
       // Capture the ready rows by key+generation, not by file id: two

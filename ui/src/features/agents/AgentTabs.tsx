@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { fmtTime } from "../../lib/fmt";
+import { resources } from "../../lib/resources";
 import { navigate } from "../../lib/useLocation";
 import { setComposerDraft } from "../app-shell/chat/composerStore";
 import { useTranslate } from "../../lib/locale";
@@ -23,8 +24,9 @@ import { AgentActivity, AgentQueue, AssignedTaskList, WorkBlock, agentThreadHref
 import Link from "../../ui/Link";
 import { ProfileBlock } from "./AgentProfile";
 import { MASTER } from "../home/master";
+import { agentHandleProblem } from "./agentRoles";
 import InstructionsEditor from "./InstructionsEditor";
-import { contextOf, isOwnKind, nativeChange } from "./instructionsDoc";
+import { contextOf, isOwnKind, nativeChange, profileBody } from "./instructionsDoc";
 import type { InstructionsDoc } from "./useInstructionsDoc";
 import {
   BUNDLED_SKILLS,
@@ -70,6 +72,10 @@ export interface TabContext {
   onOpenIssue: (id: string) => void;
   /** Set when this page is a profile with no runtime: nothing to read but itself. */
   hired: HiredProfile | undefined;
+  /** Other existing profile aliases used to check handle collisions on rename. */
+  otherAliases?: readonly string[];
+  /** Called with the committed alias after an owner renames a hosted profile. */
+  onRenamed?: (nextAlias: string) => void;
   /** The viewer is the operator. A member's events carry no actor, so "not recorded" is only said to the operator. */
   operator: boolean;
   /** This viewer may save, and the board can take the write now. */
@@ -1423,11 +1429,105 @@ function KnowledgeSection({ c }: { c: TabContext }) {
   );
 }
 
+function HandleSection({ c }: { c: TabContext }) {
+  const t = useTranslate();
+  const [draft, setDraft] = useState(c.alias);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setDraft(c.alias);
+    setError(null);
+  }, [c.alias]);
+  if (!c.hired || !c.hostedBoard) return null;
+  if (!c.writable) {
+    return (
+      <Panel title="Mention handle">
+        <Facts items={[["Handle", `@${c.alias}`]]} />
+      </Panel>
+    );
+  }
+  const next = draft.trim();
+  const dirty = next !== c.alias;
+  const problem = dirty ? agentHandleProblem(next, c.otherAliases ?? []) : null;
+
+  async function saveHandle() {
+    if (!c.hired || !c.writable || saving || !dirty || problem !== null) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const { profile: stored } = await api.agentProfile(c.hired.id);
+      const { profile: saved } = await api.saveAgentProfile(c.hired.id, {
+        ...profileBody(stored, stored.responsibilities, stored.revision),
+        name: next,
+      });
+      await resources.agents.refresh();
+      c.toast("ok", t("Handle updated"));
+      c.onRenamed?.(saved.name);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409 && e.code === "alias_taken") {
+        setError(t("An agent with this name already exists."));
+      } else if (e instanceof ApiError && e.status === 409) {
+        setError(t("Someone else changed this agent, so nothing was saved. Reload to see the current handle."));
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Panel title="Mention handle">
+      <form
+        className="rc-fld"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void saveHandle();
+        }}
+      >
+        <label className="rc-fld">
+          <span className="lab">{t("Handle")}</span>
+          <input
+            className="field num"
+            value={draft}
+            aria-invalid={problem !== null}
+            disabled={saving}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setError(null);
+            }}
+          />
+        </label>
+        {problem ? (
+          <span className="bad" role="alert">
+            {t(problem)}
+          </span>
+        ) : (
+          <span className="hint">
+            {t("How you will mention it: @{name}").replace("{name}", () => next || c.alias)}
+          </span>
+        )}
+        {error && (
+          <span className="bad" role="alert">
+            {error}
+          </span>
+        )}
+        <div className="flex items-center gap-2 pt-1">
+          <Button type="submit" variant="secondary" size="sm" disabled={saving || !dirty || problem !== null}>
+            {saving ? t("Saving…") : t("Save handle")}
+          </Button>
+        </div>
+      </form>
+    </Panel>
+  );
+}
+
 /** The gear: everything about the agent that isn't one of its sections. */
 export function AgentSettingsDrawer({ c, onClose }: { c: TabContext; onClose: () => void }) {
   const t = useTranslate();
   const body = (
     <div className="ap-body">
+      <HandleSection c={c} />
       <ModelSection c={c} />
       {c.stats.some(([, value]) => value !== "—") && (
         <Panel title="Figures">

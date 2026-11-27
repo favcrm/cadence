@@ -34,8 +34,6 @@ export default function Composer({
   onArrowUpEmpty,
   mentionCandidates,
   allowNote,
-  onDraftChange,
-  beforeSend,
   modelPicker,
   modelControls,
 }: {
@@ -54,8 +52,6 @@ export default function Composer({
   onArrowUpEmpty?: () => boolean;
   mentionCandidates?: MentionCandidate[];
   allowNote?: boolean;
-  onDraftChange?: (draft: string) => void;
-  beforeSend?: (body: string) => boolean;
   modelPicker?: AssistantModelPickerProps | null;
   modelControls?: ReactNode;
 }) {
@@ -78,8 +74,6 @@ export default function Composer({
       onArrowUpEmpty={onArrowUpEmpty}
       mentionCandidates={mentionCandidates}
       allowNote={allowNote}
-      onDraftChange={onDraftChange}
-      beforeSend={beforeSend}
       modelPicker={modelPicker}
       modelControls={modelControls}
       attach={{

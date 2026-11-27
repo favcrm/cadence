@@ -52,6 +52,20 @@ export function aliasProblem(alias: string, taken: Iterable<string>): string | n
   return null;
 }
 
+/** Validation for an agent's `@handle` (`alias`), including reserved names and case-insensitive uniqueness. */
+export function agentHandleProblem(alias: string, taken: Iterable<string>): string | null {
+  const name = alias.trim();
+  const base = aliasProblem(name, []);
+  if (base) return base;
+  if (name === "master" || name === "reviewer" || name.startsWith("assist-")) {
+    return "This name is reserved.";
+  }
+  for (const other of taken) {
+    if (other.trim().toLowerCase() === name) return "An agent with this name already exists.";
+  }
+  return null;
+}
+
 /** Known app ids → the roles that work in them. */
 const APP_ROLE_HINTS: { match: RegExp; label: string; roles: string[] }[] = [
   { match: /crm/i, label: "CRM", roles: ["quotation", "support"] },

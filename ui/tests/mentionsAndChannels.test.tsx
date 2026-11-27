@@ -10,7 +10,8 @@ import type * as PickerModule from "../src/features/mentions/MentionPicker";
 import type * as HumanThreadsModule from "../src/features/threads/HumanThreads";
 import type * as NewConvModule from "../src/features/threads/NewHumanConversation";
 import type * as NotificationToastModule from "../src/features/threads/NotificationToast";
-import type * as HandoffModule from "../src/features/mentions/HomeMentionHandoff";
+import type * as PeopleModule from "../src/features/mentions/useWorkspacePeople";
+import type * as RolesModule from "../src/features/agents/agentRoles";
 import type * as PartsModule from "../src/features/threads/ThreadChatParts";
 import type * as ClientModule from "../src/features/threads/humanThreadsClient";
 import type * as LocaleModule from "../src/lib/locale";
@@ -101,11 +102,12 @@ async function main(): Promise<void> {
     startsWithNote,
   } = require<typeof MentionsModule>("../src/features/mentions/mentions");
   const MentionPicker = require<typeof PickerModule>("../src/features/mentions/MentionPicker").default;
-  const { isShareableAgent } = require<typeof CandidatesModule>("../src/features/mentions/candidates");
+  const { buildMentionCandidates, isShareableAgent, isShareableProfile } = require<typeof CandidatesModule>("../src/features/mentions/candidates");
+  const { filterSelfTeammates, teammateMentionCandidates } = require<typeof PeopleModule>("../src/features/mentions/useWorkspacePeople");
+  const { agentHandleProblem } = require<typeof RolesModule>("../src/features/agents/agentRoles");
   const { HumanContextPanel, HumanRoomTimeline } = require<typeof HumanThreadsModule>("../src/features/threads/HumanThreads");
   const NewHumanConversation = require<typeof NewConvModule>("../src/features/threads/NewHumanConversation").default;
   const { NotificationToastProvider } = require<typeof NotificationToastModule>("../src/features/threads/NotificationToast");
-  const { HomeMentionHandoffCard, findMentionedTeammates } = require<typeof HandoffModule>("../src/features/mentions/HomeMentionHandoff");
   const { ThreadComposerFrame } = require<typeof PartsModule>("../src/features/threads/ThreadChatParts");
   const { LocaleProvider, translateUiText } = require<typeof LocaleModule>("../src/lib/locale");
   const { allowPrivateReads, resetPrivateSession } = require<typeof SessionModule>("../src/lib/privateSession");
@@ -553,35 +555,66 @@ async function main(): Promise<void> {
     "NewHumanConversation submits new channel creation",
   );
 
-  // 5. Private Home colleague mention detection and consent-gated HomeMentionHandoffCard
-  const homeCandidates: MentionsModule.MentionCandidate[] = [
-    { id: "human-bob", handle: "bob", label: "Bob", kind: "human", active: true },
-  ];
-  equal(findMentionedTeammates("ping @bob on release", homeCandidates).map((c) => c.handle), ["bob"], "finds non-silent @teammate in Home draft");
-  equal(findMentionedTeammates("email bob@example.com", homeCandidates), [], "ignores email addresses in Home draft");
-  equal(findMentionedTeammates("/note private @bob", homeCandidates), [], "ignores /note silent drafts in Home");
+  // 5. Hosted profile @mention merging, teammate self-exclusion/disambiguation, and agent @handle validation
+  assert(!isShareableProfile({ alias: "master", role: "coder", team_role: "coder" }), "master profile is not shareable");
+  assert(!isShareableProfile({ alias: "assist-alice", role: "coder", team_role: "coder" }), "assist-* profile is not shareable");
+  assert(isShareableProfile({ alias: "coder", role: "coder", team_role: "coder" }), "ordinary hired profile is shareable");
 
-  let handoffClicks = 0;
-  let keepPrivateClicks = 0;
-  await React.act(async () => {
-    root.render(
-      React.createElement(LocaleProvider, null,
-        React.createElement(HomeMentionHandoffCard, {
-          teammates: homeCandidates,
-          sendBlockedForConsent: true,
-          onOpenChannels: () => { handoffClicks += 1; },
-          onKeepPrivate: () => { keepPrivateClicks += 1; },
-        }),
-      ),
-    );
-  });
-  await flush();
-  const handoffCard = host.querySelector<HTMLElement>("[data-home-handoff-preview]");
-  assert(handoffCard?.getAttribute("role") === "alert", "held teammate mention in Home surfaces role=alert consent banner");
-  const openChannelsBtn = Array.from(host.querySelectorAll<HTMLButtonElement>("[data-home-handoff-preview] button")).find((b) => b.textContent?.includes("Open in Channels"));
-  const keepPrivateBtn = Array.from(host.querySelectorAll<HTMLButtonElement>("[data-home-handoff-preview] button")).find((b) => b.textContent?.includes("Keep private in Home"));
-  await React.act(async () => { openChannelsBtn?.click(); keepPrivateBtn?.click(); });
-  assert(handoffClicks === 1 && keepPrivateClicks === 1, "HomeMentionHandoffCard wires Open in Channels and Keep private in Home actions");
+  const mergedCandidates = buildMentionCandidates(
+    [
+      { alias: "master", role: "master", provider: "codex", inbox: false, dead: false },
+      { alias: "builder", role: "coder", provider: "codex", inbox: false, dead: false },
+    ],
+    [],
+    "",
+    null,
+    [
+      { id: "p-1", alias: "builder", role: "coder", team_role: "coder" },
+      { id: "p-2", alias: "designer", role: "designer", team_role: "designer" },
+      { id: "p-3", alias: "master", role: "master", team_role: "master" },
+    ],
+  );
+  equal(
+    mergedCandidates.map((c) => c.handle),
+    ["builder", "designer"],
+    "buildMentionCandidates merges shareable hosted profiles when agents omits them and deduplicates aliases",
+  );
+
+  const rawPeople = [
+    { id: "person-self-by-id", subject: "sub-other", name: "Alex" },
+    { id: "person-self-by-sub", subject: "sub-viewer", name: "Viewer" },
+    { id: "person-a", subject: "sub-111111aaaaaa", name: "Sam" },
+    { id: "person-b", subject: "sub-222222bbbbbb", name: "Sam" },
+  ];
+  const filteredPeople = filterSelfTeammates(rawPeople, "person-self-by-id", "sub-viewer");
+  equal(
+    filteredPeople.map((p) => p.id),
+    ["person-a", "person-b"],
+    "filterSelfTeammates excludes both actor id and viewerSub",
+  );
+  equal(
+    teammateMentionCandidates(filteredPeople, "Teammate").map((c) => [c.handle, c.subtitle]),
+    [
+      ["sam", "Teammate · aaaaaa"],
+      ["sam", "Teammate · bbbbbb"],
+    ],
+    "teammateMentionCandidates disambiguates colliding handles via subtitle suffix",
+  );
+  equal(
+    teammateMentionCandidates(
+      [{ id: "person-explicit", subject: "sub-explicit", name: "Sam Lee", handle: "sam-lee" } as unknown as Parameters<typeof teammateMentionCandidates>[0][number]],
+      "Teammate",
+    ).map((c) => c.handle),
+    ["sam-lee"],
+    "teammateMentionCandidates prefers explicit teammate handle when provided",
+  );
+
+  equal(agentHandleProblem("coder-2", ["master", "designer"]), null, "accepts valid lowercase hyphenated handle");
+  assert(agentHandleProblem("Bad_Handle", []) !== null, "rejects uppercase/underscore agent handle");
+  assert(agentHandleProblem("master", []) !== null, "rejects reserved master handle");
+  assert(agentHandleProblem("reviewer", []) !== null, "rejects reserved reviewer handle");
+  assert(agentHandleProblem("assist-bob", []) !== null, "rejects reserved assist-* handle");
+  assert(agentHandleProblem("Designer", ["designer"]) !== null, "rejects duplicate handle case-insensitively");
 
   // 6. Human-Turn Brake 3-state branch in HumanContextPanel + NotificationToast CSS stacking
   for (const [chainCount, chainLimit, expectedText, forbiddenText] of [
