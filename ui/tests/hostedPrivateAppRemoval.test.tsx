@@ -64,6 +64,7 @@ globalThis.fetch = async (input, init) => {
       if (changedBundleDuringRestore) {
         removed = false;
         replacementDigest = `sha256:${"b".repeat(64)}`;
+        refreshUnavailable = true;
         return json({}, 503);
       }
       if (failRefreshAfterRestore) refreshUnavailable = true;
@@ -170,14 +171,20 @@ async function main() {
     expireOnRestore = false;
 
     const replaced = await scenario({ capability: true, kind: "private" });
+    assert(readInstallationsSnapshot()?.[0]?.digest === base.digest, "the warm launcher has the original package before restore");
     changedBundleDuringRestore = true;
     await React.act(async () => { button("Restore")!.click(); });
     assert(Number(writes.length) === 1, "an uncertain restore of a replaced bundle is not replayed");
     assert(host.textContent?.includes("The requested change was not confirmed."), "active readback at another digest does not confirm the requested restore");
     assert(!host.textContent?.includes("Restored — connection grants"), "a different installed digest is not a restore success");
+    await Promise.allSettled([readInstallationsGuarded()]);
+    const launcher = readInstallationsSnapshot();
+    assert(launcher && !launcher.some((row) => row.install_id === base.install_id),
+      "a failed refresh never revives stale launcher metadata after a changed-digest readback");
     await React.act(async () => { replaced.unmount(); });
     changedBundleDuringRestore = false;
     replacementDigest = undefined;
+    refreshUnavailable = false;
     removed = false;
 
     const uncertain = await scenario({ capability: true, kind: "private" });

@@ -655,19 +655,26 @@ export const workspaceApps = {
  * re-reads at once instead of waiting for the next navigation. */
 export const APPS_CHANGED_EVENT = "cadence:apps-changed";
 
-function replaceHostedRow<T extends { install_id: string }>(rows: T[] | null, change: Installation, project: (row: T) => T): T[] | null {
+function replaceHostedRow<T extends { install_id: string }>(rows: T[] | null, change: Installation, project: (row: T) => T | null): T[] | null {
   const index = rows?.findIndex((row) => row.install_id === change.install_id) ?? -1;
   if (!rows || index < 0) return rows;
   const next = rows.slice();
-  next[index] = project(next[index]);
+  const row = project(next[index]);
+  if (row === null) next.splice(index, 1);
+  else next[index] = row;
   return next;
 }
 
 /** Apply only the verified lifecycle fields to a previously observed row. */
 export function applyHostedLifecycleToList(rows: Installation[] | null, change: Installation): Installation[] | null {
-  return replaceHostedRow(rows, change, (row) => ({
-    ...row, state: change.state, executable: change.executable, removed_at: change.removed_at, restore_until: change.restore_until,
-  }));
+  return replaceHostedRow(rows, change, (row) => {
+    // A concurrent replacement is not a restore of the retained package.
+    // Drop its stale launch metadata until the normal list read verifies it.
+    if (typeof change.digest === "string" && change.digest !== row.digest) return null;
+    return {
+      ...row, state: change.state, executable: change.executable, removed_at: change.removed_at, restore_until: change.restore_until,
+    };
+  });
 }
 
 export function applyHostedLifecycleToHome(rows: HomeInstallation[] | null, change: Installation): HomeInstallation[] | null {
