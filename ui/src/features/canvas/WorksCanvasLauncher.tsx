@@ -4,6 +4,7 @@ import "../../ui/controls.css";
 import { installedAppHref } from "../apps/appViewModel";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import {
+  APPS_CHANGED_EVENT,
   readInstallationsGuarded,
   readInstallationsSnapshot,
   type Installation,
@@ -53,17 +54,31 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
       setWorks(null);
       return;
     }
-    const controller = new AbortController();
+    let controller: AbortController;
+    const refresh = () => {
+      controller?.abort();
+      controller = new AbortController();
+      const request = controller;
+      readInstallationsGuarded(request.signal)
+        .then((rows) => {
+          if (!request.signal.aborted) setWorks(findWorksApp(rows));
+        })
+        .catch(() => {
+          // Fail closed silently if installations cannot be loaded.
+        });
+    };
+    const onAppsChanged = () => {
+      setWorks(null);
+      refresh();
+    };
+    window.addEventListener(APPS_CHANGED_EVENT, onAppsChanged);
     const cached = findWorksApp(readInstallationsSnapshot());
     if (cached) setWorks(cached);
-    readInstallationsGuarded(controller.signal)
-      .then((rows) => {
-        if (!controller.signal.aborted) setWorks(findWorksApp(rows));
-      })
-      .catch(() => {
-        // Fail closed silently if installations cannot be loaded.
-      });
-    return () => controller.abort();
+    refresh();
+    return () => {
+      window.removeEventListener(APPS_CHANGED_EVENT, onAppsChanged);
+      controller.abort();
+    };
   }, [blocked]);
 
   useEffect(() => {

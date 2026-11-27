@@ -48,11 +48,18 @@ const home = {
   ],
 };
 let favorites: unknown = { owner: "operator", is_default: false, favorites: [{ install_id: "inst-a", position: 0, opened_at: null }] };
-let socialState: "active" | "disabled" = "active";
+let socialState: "active" | "disabled" | "removed" | "absent" = "active";
+let directoryFails = false;
 const catalog = { catalog: [{
   id: "crm", source_kind: "builtin", retired: true,
   retired_reason: "This embedded catalogue entry is retired.",
   name: "crm", title: "CRM", trust: "cadence", featured: false, state: "available", request_count: 0,
+}, {
+  id: "social-content", source_kind: "builtin", retired: true,
+  name: "social-content", title: "Social Content", trust: "cadence", state: "available",
+}, {
+  id: "live-only", source_kind: "builtin", retired: false,
+  name: "live-only", title: "Live Only", trust: "cadence", state: "available",
 }] };
 // Current public catalogue producer contract, separate from retired tombstones.
 const publishedApp = {
@@ -72,6 +79,14 @@ globalThis.fetch = async (input: any, init?: any) => {
   if (init?.method === "POST") {
     const body: unknown = JSON.parse(String(init.body));
     writes.push({ path, body });
+    if (path === "/api/app-installations/upload/check") return json({
+      schema: 1, committed: false, name: publishedApp.app, version: publishedApp.version, digest: publishedApp.digest,
+      catalogue: { id: publishedApp.id, version: publishedApp.version, digest: publishedApp.digest },
+      files: [], notes: [], secret_warnings: [],
+      access_diff: { connections: { added: [], removed: [] }, capabilities: {} },
+      compatibility: { schema: 1, declared: true, ok: true, compatible: true, checks: [] },
+    });
+    if (path === "/api/app-installations/upload") return new Response(JSON.stringify({ error: "busy", code: "resource_busy" }), { status: 503, headers: { "Content-Type": "application/json" } });
     if (path === "/api/app-favorites") {
       const ids = (body as { install_ids?: unknown }).install_ids;
       if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string"))
@@ -82,20 +97,20 @@ globalThis.fetch = async (input: any, init?: any) => {
     return json({});
   }
   if (path === "/api/app-home") return json({
-    installations: home.installations.map((row) => row.install_id === "inst-b"
-      ? { ...row, version: "0.9.6", attention: { ...row.attention, state: socialState === "disabled" ? "off" : "ok" } }
+    installations: home.installations.filter((row) => row.install_id !== "inst-b" || socialState !== "absent").map((row) => row.install_id === "inst-b"
+      ? { ...row, version: "0.9.6", attention: { ...row.attention, state: socialState === "removed" ? "removed" : socialState === "disabled" ? "off" : "ok" } }
       : row),
   });
   if (path === "/api/apps") return json({ apps: [] });
   if (path === "/api/overview") return json({ needs_me: [] });
   if (path === "/api/app-installations") return json([
     { install_id: "inst-a", name: "crm", title: "CRM", removed: null },
-    { install_id: "inst-b", name: "social-content", title: "Social Content", version: "0.9.6", removed: null, state: socialState },
+    ...(socialState === "absent" ? [] : [{ install_id: "inst-b", name: "social-content", title: "Social Content", version: "0.9.6", removed: null, state: socialState, catalogue: { id: publishedApp.id, version: "0.9.6", digest: publishedApp.digest } }]),
   ]);
   if (path === "/api/app-favorites") return json(favorites);
   if (path === "/api/app-catalog") return json(catalog);
   if (path === "/api/app-requests") return json({ requests: [] });
-  if (path === "/api/public-apps") return json({ ok: true, data: { apps: [publishedApp] } });
+  if (path === "/api/public-apps") return directoryFails ? new Response("unavailable", { status: 503 }) : json({ ok: true, data: { apps: [publishedApp] } });
   if (path === "/api/public-apps/social-content") return json({ ok: true, data: { app: publishedApp } });
   if (path === "/api/public-apps/social-content/versions") return json({
     app_id: publishedApp.id, app: publishedApp.app, recommended_version: publishedApp.version,
@@ -222,6 +237,74 @@ async function main() {
       assert(host.querySelector("h1") && !host.querySelector(openLink),
         "disabled detail renders without offering a broken Open link");
     }
+  });
+  await check("only explicitly retired catalogue entries appear as retired", async () => {
+    socialState = "active";
+    directoryFails = false;
+    await React.act(() => root.render(React.createElement(Explorer, { viewer: operator })));
+    await flush();
+    const retired = host.querySelector(".pubdir-retired");
+    assert(retired?.textContent?.includes("CRM") && !retired.textContent.includes("Social Content") && !retired.textContent.includes("Live Only"),
+      "retired entries are deduplicated against published listings and live catalogue rows are excluded");
+    directoryFails = true;
+    await React.act(() => root.render(React.createElement("div")));
+    await React.act(() => root.render(React.createElement(Explorer, { viewer: operator })));
+    await flush();
+    const fallback = host.querySelector(".pubdir-retired");
+    assert(fallback?.textContent?.includes("CRM") && fallback.textContent.includes("Social Content") && !fallback.textContent.includes("Live Only"),
+      "a failed public read retains explicit tombstones without labelling live rows retired");
+    directoryFails = false;
+    await React.act(() => root.render(React.createElement("div")));
+  });
+  await check("removed installs remain in detail without becoming fresh installs", async () => {
+    socialState = "removed";
+    for (const viewer of [operator, { readOnly: false, operator: false }]) {
+      await React.act(() => root.render(React.createElement(Explorer, { viewer })));
+      await flush();
+      assert(host.querySelector("section[aria-label='Public apps']")?.textContent?.includes("Not installed"),
+        "removed rows retain the existing browse availability semantics");
+      for (const query of ["", "?installation=inst-b"]) {
+        history.replaceState(null, "", `/apps/catalog/social-content${query}`);
+        await React.act(() => root.render(React.createElement(CatalogDetail, { id: publishedApp.id, viewer })));
+        await flush();
+        const panel = host.querySelector("aside[aria-label='Your workspace']");
+        assert(panel && panel.textContent?.includes("Removed") && !panel.textContent.includes("not in this workspace"),
+          "the retained row is identified even through its canonical link");
+        assert(!panel.querySelector('a[href="/apps/social-content"]') &&
+          !Array.from(panel.querySelectorAll("button")).some((button) => /install|update|restore/i.test(button.textContent ?? "")),
+          "the removed record cannot be opened, installed, updated, or restored from detail");
+        await React.act(() => root.render(React.createElement("div")));
+      }
+    }
+  });
+  await check("busy fresh install retains the checked review for an explicit retry", async () => {
+    socialState = "absent";
+    history.replaceState(null, "", "/apps/catalog/social-content");
+    writes.length = 0;
+    await React.act(() => root.render(React.createElement(CatalogDetail, { id: publishedApp.id, viewer: operator })));
+    await flush();
+    const review = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.includes("Review & install"));
+    assert(review && !review.disabled, "fresh install review is available");
+    await React.act(() => review.click());
+    await flush();
+    let dialog = host.querySelector("dialog[open]");
+    assert(dialog, "checked review opens");
+    let install = Array.from(dialog.querySelectorAll("button")).find((button) => button.textContent?.includes("Install 0.9.7"));
+    assert(install, "checked review offers the pinned install");
+    await React.act(() => install!.click());
+    await flush();
+    dialog = host.querySelector("dialog[open]");
+    assert(dialog && dialog.textContent?.includes("did not start"), "busy admission leaves the review and refusal visible");
+    assert(writes.filter((write) => write.path === "/api/app-installations/upload").length === 1, "no automatic mutation retry");
+    install = Array.from(dialog.querySelectorAll("button")).find((button) => button.textContent?.includes("Install 0.9.7"));
+    assert(install, "the same checked receipt can be explicitly retried");
+    await React.act(() => install!.click());
+    await flush();
+    assert(writes.filter((write) => write.path === "/api/app-installations/upload").length === 2 &&
+      writes.filter((write) => write.path === "/api/app-installations/upload/check").length === 1,
+      "explicit retry applies the retained review without another preflight");
+    const attempts = writes.filter((write) => write.path === "/api/app-installations/upload");
+    assert(JSON.stringify(attempts[0].body) === JSON.stringify(attempts[1].body), "retry preserves the exact pinned request");
   });
   if (failures.length) throw new Error(failures.join("\n"));
 }

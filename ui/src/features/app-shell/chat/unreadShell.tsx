@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { useQuery } from "../../../lib/useResource";
 import { useNotificationToast } from "../../threads/NotificationToast";
 import { conversationLabel, conversationList } from "../conversationClient";
@@ -86,7 +86,10 @@ function UnreadProbe({ installId }: { installId: string }) {
 
 /** Observe every installed app by default; callers may defer offscreen probes during initial paint. */
 export function AssistantUnreadProbes({ apps, observed }: { apps: { installId: string }[] | null; observed?: ReadonlySet<string> }) {
-  useEffect(() => {
+  // Retire the shell's targets before other subscribers can observe a new
+  // session. Do not clear them on ordinary app/observed-list updates.
+  useLayoutEffect(() => () => setKnownInstalls([]), []);
+  useLayoutEffect(() => {
     const ids = apps === null ? [] : apps.map((app) => app.installId);
     setKnownInstalls(ids, observed === undefined ? ids : ids.filter((id) => observed.has(id)));
   }, [apps, observed]);

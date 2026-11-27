@@ -333,7 +333,6 @@ function useBoardInstalls(viewer: Viewer): {
 
   const read = useCallback((signal: AbortSignal, shared: boolean): Promise<InstallRef[]> => {
     const fromOperator = (list: Installation[]): InstallRef[] => list
-      .filter((row) => row.removed == null && row.state !== "removed")
       .map((row) => ({
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
@@ -341,11 +340,10 @@ function useBoardInstalls(viewer: Viewer): {
         i18n: row.i18n, listing: row.listing,
       }));
     const fromHome = (home: HomeInstallation[]): InstallRef[] => home
-      .filter((row) => row.attention?.state !== "removed")
       .map((row) => ({
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         project_link: row.project ?? "", removed: null, catalogue: row.catalogue ?? null, project: row.project,
-        state: row.attention?.state === "off" ? "disabled" : undefined,
+        state: row.attention?.state === "removed" ? "removed" : row.attention?.state === "off" ? "disabled" : undefined,
         i18n: row.i18n, listing: row.listing,
       }));
     const once = () => operator
@@ -444,6 +442,7 @@ export function PublicDirectory({ viewer, afterListings }: {
   const installsByName = useMemo(() => {
     const map = new Map<string, InstallRef[]>();
     for (const row of installs.rows ?? []) {
+      if (row.state === "removed" || row.removed != null) continue;
       const list = map.get(row.name) ?? [];
       list.push(row);
       map.set(row.name, list);
@@ -611,6 +610,8 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   // A claimant without a readable install_id stays a fact row — no Open,
   // Manage or chooser link can name it.
   const addressable = install !== null && typeof install.install_id === "string" ? install : null;
+  const removed = addressable !== null && (addressable.state === "removed" ||
+    (addressable.removed != null && addressable.removed !== 0));
   // A disabled or removed install has no openable route: offering Open there
   // sends the reader to "Unknown installation".
   const openable = addressable !== null && canOpenInstall(addressable.state, addressable.removed);
@@ -663,13 +664,17 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
                   <dd>{addressable.version ?? "—"}</dd>
                 </div>
               </dl>
-              <div className="pub-actions">
-                <InstalledActions install={addressable} openHref={openHref} operator={operator} />
-              </div>
+              {removed ? (
+                <p className="pub-note" role="status">{t("This installation was removed and cannot be opened or changed here.")}</p>
+              ) : (
+                <div className="pub-actions">
+                  <InstalledActions install={addressable} openHref={openHref} operator={operator} />
+                </div>
+              )}
             </>
           )}
           <p className="pub-caption">
-            {t("The installed copy stays usable. Published versions and update checks return when the catalogue answers.")}
+            {t(removed ? "This removed installation is retained in the workspace." : "The installed copy stays usable. Published versions and update checks return when the catalogue answers.")}
           </p>
         </aside>
       )}

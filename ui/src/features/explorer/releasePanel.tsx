@@ -439,6 +439,8 @@ export default function ReleasePanel({
 
   const selected = release?.version ?? null;
   const installKey = install?.install_id ?? null;
+  const removed = install !== null && (install.state === "removed" ||
+    (install.removed != null && install.removed !== 0));
 
   // A different selection or a different install clears the check that
   // named the old one; an uncertain lock survives — it is only lifted by
@@ -457,7 +459,7 @@ export default function ReleasePanel({
         ? current
         : null,
     );
-  }, [app.id, selected, release?.digest, release?.installable, installKey, install?.version, operator]);
+  }, [app.id, selected, release?.digest, release?.installable, installKey, install?.version, install?.state, install?.removed, operator]);
 
   // Readback follows the app/session, not the selection or the rows it replaces.
   useEffect(() => {
@@ -494,6 +496,7 @@ export default function ReleasePanel({
   }, []);
 
   const relation = ():
+    | "removed"
     | "missing"
     | "unavailable"
     | "downgrade"
@@ -502,6 +505,7 @@ export default function ReleasePanel({
     | "unversioned"
     | "unordered"
     | "install" => {
+    if (removed) return "removed";
     if (!release) return "missing";
     if (!release.installable) return "unavailable";
     if (install) {
@@ -589,6 +593,7 @@ export default function ReleasePanel({
       };
     if (chooser || installParamMissing)
       return { key: "", text: t("Not checked") };
+    if (removed) return { key: "statusBlocked", text: t("Removed") };
     if (!install) return { key: "", text: t("Not installed") };
     if (
       mode === "downgrade" ||
@@ -611,6 +616,7 @@ export default function ReleasePanel({
   const showInstallReview = reviewingInstall && mode === "install" && !!release;
   const ReviewSurface = showInstallReview ? "dialog" : "section";
   const cancelInstallReview = () => {
+    if (applying) return;
     installDialog.current?.close();
     installOpener.current?.focus();
     serial.current += 1;
@@ -809,7 +815,6 @@ export default function ReleasePanel({
       target: { version: release.version, digest: release.digest },
     };
     publishOutcome(app.id, pending);
-    setReviewingInstall(false);
     setConfirming(false);
     setNote(null);
     const fail = (text: string) => {
@@ -824,6 +829,7 @@ export default function ReleasePanel({
       if (currentSession()) notifyAppsChanged();
       if (!live()) return;
       setFlow({ kind: "none" });
+      setReviewingInstall(false);
       setNote({
         tone: "status",
         observed: {
@@ -852,6 +858,7 @@ export default function ReleasePanel({
             (STALE.test(cause.message) && cause.status < 500));
         settleOutcome(app.id, pending, !(busy || withdrawn || stale));
         if (!live()) return;
+        if (!busy) setReviewingInstall(false);
         if (busy) {
           // Admission refused before staging; the checked proposal stays.
           setNote({
@@ -1008,6 +1015,11 @@ export default function ReleasePanel({
           </div>
         )}
       </dl>
+      {removed && (
+        <p className="pub-note" role="status">
+          {t("This installation was removed and cannot be opened or changed here.")}
+        </p>
+      )}
 
       {installParamMissing && (
         <p className="pub-note" role="status">
@@ -1117,7 +1129,7 @@ export default function ReleasePanel({
           )}
         </p>
       )}
-      {!operator && signedIn && !chooser && (
+      {!operator && signedIn && !chooser && !removed && (
         <p className="pub-note">
           {t(
             install
@@ -1243,7 +1255,7 @@ export default function ReleasePanel({
           )}
           {reviewingInstall && (
             <div className="pub-actions">
-              <Button onClick={cancelInstallReview}>
+              <Button onClick={cancelInstallReview} disabled={applying}>
                 {t("Cancel")}
               </Button>
               {!checking && !proposalMatches && (
@@ -1293,7 +1305,7 @@ export default function ReleasePanel({
                 : t("Check installation")}
             </Button>
           )}
-          {install && (
+          {install && !removed && (
             <InstalledActions
               install={install}
               openHref={openHref}

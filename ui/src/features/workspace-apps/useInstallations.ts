@@ -46,12 +46,12 @@ async function memberRows(signal: AbortSignal, shared: boolean): Promise<Install
   }) as unknown as Installation);
 }
 
-export function useInstallations(enabled: boolean, refreshKey: unknown, source: "list" | "home" = "list", shareOperatorRead = true): InstallationsState {
+export function useInstallations(enabled: boolean, refreshKey: unknown, source: "list" | "home" = "list", shareOperatorRead = true, paused = false): InstallationsState {
   const authority = source === "home" ? "member" : shareOperatorRead ? "operator" : "viewer";
   const [loaded, setLoaded] = useState<{ authority: string; list: Installation[] | null }>(() => ({
-    authority, list: enabled && authority === "operator" ? readInstallationsSnapshot() : null,
+    authority, list: enabled && !paused && authority === "operator" ? readInstallationsSnapshot() : null,
   }));
-  const list = loaded.authority === authority ? loaded.list : null;
+  const list = enabled && !paused && loaded.authority === authority ? loaded.list : null;
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -60,6 +60,12 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
     if (!enabled) {
       // Not the operator (any more): drop the last operator list and state.
       dropInstallationsSnapshot();
+      setLoaded({ authority, list: null }); setError(null); setRetrying(false); setLoading(false);
+      return;
+    }
+    if (paused) {
+      // This consumer does not need a read, but still has authority. Do not
+      // evict the snapshot used by other operator surfaces.
       setLoaded({ authority, list: null }); setError(null); setRetrying(false); setLoading(false);
       return;
     }
@@ -85,7 +91,7 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
       },
     );
     return () => controller.abort();
-  }, [enabled, refreshKey, manual, source, shareOperatorRead, authority]);
+  }, [enabled, paused, refreshKey, manual, source, shareOperatorRead, authority]);
   const retry = useCallback(() => setManual((n) => n + 1), []);
-  return { list, error, retrying, loading, retry };
+  return { list, error: enabled && !paused ? error : null, retrying: enabled && !paused && retrying, loading: enabled && !paused && loading, retry };
 }

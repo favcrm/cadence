@@ -37,7 +37,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   const error = catalogLoad.error === null ? null : appLoadErrorCopy(catalogLoad.error, "The catalog didn't load.");
 
   const retiredListings = (publishedIds: ReadonlySet<string>) => {
-    const cards = catalog?.filter((card) => !publishedIds.has(card.id)) ?? [];
+    const cards = catalog?.filter((card) => card.retired === true && !publishedIds.has(card.id)) ?? [];
     return cards.length > 0 && <details className="pubdir-retired">
       <summary>{t("From the retired catalog")}</summary>
       <div className="apps-grid">

@@ -36,7 +36,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   // CAD-1438: Open spells the canonical `/apps/<key>` route — for the
   // operator resolved against the verified install list, for a member
   // the key route itself proves the mapping before rendering anything.
-  const installs = useInstallations(publicHit === "no" && viewer.operator === true, id).list;
+  const installs = useInstallations(viewer.operator === true, id, "list", true, publicHit !== "no").list;
   const installed = card?.state === "installed" || card?.state === "off";
   const removed = card?.removed === true;
   const retired = card?.retired === true;
