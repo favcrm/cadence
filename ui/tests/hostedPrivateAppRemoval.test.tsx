@@ -1,0 +1,117 @@
+/** CAD-2826: independent mounted consumer checks. The HTTP responses below are
+ * synthetic; receipt fields come from the shared, shipped host contract. */
+import type * as HappyDom from "happy-dom";
+import type * as ReactTypes from "react";
+import type * as ReactDomClient from "react-dom/client";
+import type * as Locale from "../src/lib/locale";
+import type * as Manage from "../src/features/explorer/ManageApp";
+import type * as Navigation from "../screen-ui/src/navigation";
+import type * as HostNavigation from "../src/ui/hostNavigation";
+
+declare function require(name: string): unknown;
+const { Window } = require("happy-dom") as typeof HappyDom;
+const win = new Window({ url: "https://tenant.example.test/apps/manage/install_books" });
+for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "SVGElement", "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage", "localStorage"] as const)
+  Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
+for (const name of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"] as const)
+  Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
+Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+const loader = require("module") as { prototype: { require: (this: unknown, id: string) => unknown } };
+const originalRequire = loader.prototype.require;
+loader.prototype.require = function (this: unknown, id: string) {
+  if (id.endsWith(".css")) return {};
+  if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
+  if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
+  return originalRequire.call(this, id);
+};
+const React = require("react") as typeof ReactTypes;
+const { createRoot } = require("react-dom/client") as typeof ReactDomClient;
+const { LocaleProvider } = require("../src/lib/locale") as typeof Locale;
+const ManageApp = (require("../src/features/explorer/ManageApp") as typeof Manage).default;
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof Navigation;
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof HostNavigation;
+const fixture = JSON.parse((require("node:fs") as { readFileSync(path: string, encoding: string): string }).readFileSync("tests/fixtures/hosted-private-app-removal.json", "utf8")) as {
+  remove_receipt: Record<string, unknown>; restore_receipt: Record<string, unknown>;
+};
+const path = "/api/app-installations/install_books";
+const base = { install_id: "install_books", name: "books", title: "Books", version: "1.0.0", summary: "", state: "active", executable: true, removed_at: null, restore_until: null, approved: true, digest: `sha256:${"a".repeat(64)}`, catalog_generation: "a", files: [], connection_slots: [], capabilities: null, storage_kind: "workspace", source_kind: "private", removed: null };
+let source: string | undefined = "private";
+let writes: string[] = [];
+let replyLost = false;
+let readUnavailable = false;
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+globalThis.fetch = async (input, init) => {
+  const url = new URL(String(input), win.location.href).pathname;
+  if (init?.method === "POST") {
+    writes.push(url);
+    if (replyLost) {
+      readUnavailable = true;
+      return json({}, 503);
+    }
+    return json(url.endsWith("/restore") ? fixture.restore_receipt : fixture.remove_receipt);
+  }
+  const install = { ...base, source_kind: source };
+  if (url === path) return readUnavailable ? json({}, 503) : json(install);
+  if (url === "/api/app-installations") return json([install]);
+  if (url === "/api/app-home") return json({ installations: [{ ...install, attention: { state: "ok", message: null, action: null, count: 0 } }] });
+  return json({}, 404);
+};
+function assert(value: unknown, why: string): asserts value { if (!value) throw new Error(`hosted private removal: ${why}`); }
+const host = document.createElement("div"); document.body.append(host);
+const button = (text: string) => [...host.querySelectorAll("button")].find(el => el.textContent?.trim() === text);
+async function scenario(options: { capability?: boolean; operator?: boolean; readOnly?: boolean; kind?: string }) {
+  source = options.kind; writes = [];
+  const root = createRoot(host);
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null,
+      React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(ManageApp, {
+        installId: "install_books", viewer: { operator: options.operator ?? true, readOnly: options.readOnly ?? false },
+        automaticUpdatesEnabled: false, appAgentSession: null, hosted: true, hostedRemovalEnabled: options.capability,
+      }) })));
+  });
+  return root;
+}
+async function main() {
+  try {
+    for (const options of [
+      { capability: false, kind: "private" },
+      { capability: true, kind: "public" },
+      { capability: true, kind: undefined },
+      { kind: "private" },
+      { capability: true, kind: "private", operator: false },
+      { capability: true, kind: "private", readOnly: true },
+    ]) {
+      const root = await scenario(options);
+      assert(!button("Remove app…"), `no removal control for ${JSON.stringify(options)}`);
+      assert(writes.length === 0, "denied rendering must not mutate");
+      await React.act(async () => { root.unmount(); });
+    }
+    const root = await scenario({ capability: true, kind: "private" });
+    assert(button("Remove app…"), "an eligible owner can open removal");
+    await React.act(async () => { button("Remove app…")!.click(); });
+    assert(writes.length === 0, "opening confirmation does not mutate");
+    assert(button("Cancel"), "confirmation offers cancel");
+    await React.act(async () => { button("Cancel")!.click(); });
+    assert(writes.length === 0, "cancel does not mutate");
+    await React.act(async () => { button("Remove app…")!.click(); });
+    assert(button("Remove Books"), "confirmation names the private installation");
+    await React.act(async () => { button("Remove Books")!.click(); });
+    assert(Number(writes.length) === 1 && writes[0] === `${path}/remove`, "confirmation sends exactly one hosted remove request");
+    assert(host.textContent?.includes("Removed — its data is retained."), "a validated receipt confirms removal");
+    await React.act(async () => { root.unmount(); });
+
+    const uncertain = await scenario({ capability: true, kind: "private" });
+    replyLost = true;
+    await React.act(async () => { button("Remove app…")!.click(); });
+    await React.act(async () => { button("Remove Books")!.click(); });
+    assert(button("Check again") && !button("Remove app…"), "an unconfirmed result offers a read, not a repeated write");
+    assert(!host.textContent?.includes("Off — the app is removed."), "a missing receipt does not report removal");
+    readUnavailable = false;
+    await React.act(async () => { button("Check again")!.click(); });
+    assert(Number(writes.length) === 1 && !!button("Remove app…"), "authoritative active readback unlocks without replaying remove");
+    assert(!host.textContent?.includes("Restored — connection grants"), "unchanged state is not a restore success");
+    await React.act(async () => { uncertain.unmount(); });
+  } finally { await win.happyDOM.close(); }
+  console.log("Hosted private app removal guard checks passed");
+}
+void main();

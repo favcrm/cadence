@@ -563,3 +563,10 @@
 .apps-detail .ma-orphans .ma-lead {
   margin-bottom: 10px;
 }
+
+dialog.hosted-remove-dialog:modal { overscroll-behavior: contain; }
+dialog.hosted-remove-dialog::backdrop {
+  background: rgb(0 0 0 / 50%);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}

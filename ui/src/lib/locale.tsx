@@ -9,6 +9,19 @@ type Scope = "user" | "organization";
 type Preferences = { organization_locale: Locale | null; user_locale: Locale | null };
 
 const zhTW: Record<string, string> = {
+  "Remove {title}?": "移除 {title}？",
+  "Installation: {id}": "安裝項目：{id}",
+  "Removing this private app ends access. Its data is retained and it can be restored for 30 days.": "移除此私人應用程式會終止存取。其資料會保留，並可在 30 天內還原。",
+  "Connection grants are revoked and are not restored.": "連線授權會被撤銷，還原時不會重新授權。",
+  "Removed private apps retain their data. Connection grants are not restored.": "已移除的私人應用程式會保留資料。連線授權不會隨還原恢復。",
+  "The result could not be confirmed. Check again before making another change.": "無法確認結果。作出其他變更前請再次檢查。",
+  "The app's current state could not be verified.": "無法確認應用程式目前的狀態。",
+  "The app change was not allowed or could not be verified.": "應用程式變更不獲允許或無法確認。",
+  "The app change was denied. Check your workspace access.": "應用程式變更遭拒。請檢查你的工作區存取權限。",
+  "The restore deadline could not be verified.": "無法確認還原期限。",
+  "Removed — its data is retained.": "已移除，資料仍會保留。",
+  "The requested change was not confirmed. The app's current state is shown below.": "未能確認所要求的變更。應用程式目前的狀態顯示如下。",
+  "Restored — connection grants must be set up again.": "已還原，必須重新設定連線授權。",
   "Technical support": "技術支援",
   "Report a problem with Cadence to Platform Support. It won’t appear on your workspace issue board.": "向平台支援回報 Cadence 問題。這不會顯示在工作區的議題看板上。",
   "New request": "新增請求",

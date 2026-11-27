@@ -346,6 +346,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const humanThreadsOn = boardSupports(meta, "human_threads");
   const credentialRequestsOn = boardSupports(meta, "credential_requests");
   const automaticUpdatesOn = boardSupports(meta, "app_automatic_updates");
+  const hostedRemovalEnabled = hostedBoard && meta.signed_in === true && boardSupports({ ...meta, hosted: hostedBoard }, "app_private_removal");
   // CAD-2286: the document lifecycle is hosted only. Only a hosted board is
   // probed; the nav shows Documents once the probe answers `available`.
   const documentsHosted = meta?.hosted === true;
@@ -1835,7 +1836,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "apps" && !route.project && (
-          <Apps key={`${viewer.operator}:${viewer.readOnly}`} viewer={viewer} installationsList={installations.list} />
+          <Apps key={`${viewer.operator}:${viewer.readOnly}`} viewer={viewer} installationsList={installations.list} hosted={hostedBoard} hostedRemovalEnabled={hostedRemovalEnabled} />
         )}
         {route.screen === "appsExplore" && (
           <Explorer viewer={viewer} />
@@ -1844,7 +1845,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <CatalogDetail key={route.id} id={route.id} viewer={viewer} />
         )}
         {route.screen === "appsManage" && (
-          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} appAgentSession={appAgentSession} hosted={hostedBoard} />
+          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} appAgentSession={appAgentSession} hosted={hostedBoard} hostedRemovalEnabled={hostedRemovalEnabled} />
         )}
         {(route.screen === "workspaceApp" || route.screen === "workspaceAppKey") && (
           <WorkspaceAppEntry

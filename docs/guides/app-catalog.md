@@ -88,6 +88,15 @@ pins, and checked review; changed input conflicts. Installation grants no
 send/deploy, worker registration, or run approval.
 Native install/run/business records remain native-owned; this is not their migration.
 
+## Hosted private-app removal
+
+On a hosted workspace that advertises private-app removal, a current owner can
+remove a private installation from Manage and restore it there or under Recently
+removed on Apps before its server-provided 30-day deadline. Removal prevents
+access and execution but retains the installation, package and app data; expiry
+does not purge them. Connection grants are revoked and are not restored. If a
+result cannot be confirmed, use Check again rather than repeating the write.
+
 ## Offline byte validation: `cadence app check`
 
 `cadence app check <dir>` validates package bytes with no

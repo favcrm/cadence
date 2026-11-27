@@ -8,7 +8,8 @@ export type BoardCapability =
   | "work_conversations"
   | "human_threads"
   | "credential_requests"
-  | "app_automatic_updates";
+  | "app_automatic_updates"
+  | "app_private_removal";
 
 /**
  * Whether this board serves an optional surface. Local/native boards serve all
@@ -19,6 +20,7 @@ export function boardSupports(
   meta: Pick<Meta, "hosted" | BoardCapability> | null | undefined,
   capability: BoardCapability,
 ): boolean {
+  if (capability === "app_private_removal") return meta?.hosted === true && meta[capability] === true;
   if (meta?.hosted !== true) return true;
   return meta[capability] === true;
 }

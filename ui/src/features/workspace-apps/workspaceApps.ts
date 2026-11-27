@@ -57,6 +57,8 @@ export interface Installation {
   state?: "active" | "disabled" | "removed";
   disabled_at?: number | null;
   removed_at?: number | null;
+  /** Hosted lifecycle deadline, in Unix milliseconds. */
+  restore_until?: number | null;
   /**
    * CAD-1171: `execution: "host"` runs the workflow's capability step
    * in-process for the operator's own click — no worker, no owner PM and
@@ -332,16 +334,16 @@ function appResponseError(response: Response, value: unknown): ApiError {
   return new ApiError(message, response.status, code ? { code } : undefined);
 }
 
-async function request<T>(path: string, signal?: AbortSignal, body?: object): Promise<T> {
+async function request<T>(path: string, signal?: AbortSignal, body?: object, postEmpty = false): Promise<T> {
   return withPrivateOperation(async (operation) => {
-    const read = body === undefined;
+    const read = body === undefined && !postEmpty;
     const response = await privateFetch(path, {
       method: read ? "GET" : "POST",
       credentials: "same-origin", cache: "no-store",
       headers: read ? sessionHeaders() : {
         "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders(),
       },
-      ...(read ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }, operation);
     operation.assertCurrent();
     const value = await response.json().catch(() => null);
@@ -789,6 +791,8 @@ export interface HomeInstallation {
    *  installed version, the bundle's own listing copy and the recorded
    *  catalogue locator (null/absent on a path or Git install). */
   version?: string; listing?: Listing | null; catalogue?: CatalogueLocator | null;
+  source_kind?: "private" | null;
+  restore_until?: number | null;
   attention: {
     state: "ok" | "setup" | "update" | "off" | "attention" | "removed";
     message: string | null; action: string | null; count: number;
@@ -920,6 +924,8 @@ export const appExplorer = {
   removePreview: (installId: string) => request<RemovePreview>(`/api/app-installations/${part(installId)}/remove-preview`, undefined, {}),
   remove: (installId: string, body: { expected_generation: string; expected_digest: string; request_id: string }) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, body),
   restore: (installId: string) => request<{ restored: boolean; digest: string }>(`/api/app-installations/${part(installId)}/restore`, undefined, {}),
+  hostedRemove: (installId: string) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, undefined, true),
+  hostedRestore: (installId: string) => request<unknown>(`/api/app-installations/${part(installId)}/restore`, undefined, undefined, true),
   /** CAD-2215: exact-conversation member access. The read is validated
    * before it reaches a screen, so a malformed answer is an error, not an
    * empty grant list. `members` is the daemon-verified live roster (or

@@ -1,9 +1,12 @@
 import { canOpenInstall } from "../explorer/installAccess";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { resources } from "../../lib/resources";
 import { navigate, useHref } from "../../lib/useLocation";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused, onPrivateSessionReset } from "../../lib/privateSession";
+import { privateSessionGeneration } from "../../lib/privateSession";
+import { ApiError } from "../../lib/api";
+import { changeHostedLifecycle, checkHostedLifecycle, hostedRestoreAvailable, pendingHostedLifecycle } from "../workspace-apps/hostedPrivateLifecycle";
 import { localizedAppCategory, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
 import {
   appExplorer,
@@ -71,10 +74,14 @@ type FilterKey = "all" | "pinned" | "updates" | "attention" | `cat:${string}`;
 export default function Apps({
   viewer,
   installationsList,
+  hosted = false,
+  hostedRemovalEnabled = false,
 }: {
   viewer: Viewer;
   /** Optional parent-supplied `/api/app-installations` list to avoid a duplicate read. */
   installationsList?: Installation[] | null;
+  hosted?: boolean;
+  hostedRemovalEnabled?: boolean;
 }) {
   const { locale, t } = useLocale();
   const [revision, setRevision] = useState(0);
@@ -85,6 +92,11 @@ export default function Apps({
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [privateOpen, setPrivateOpen] = useState(false);
+  const [unresolved, setUnresolved] = useState<string | null>(null);
+  const [confirmedActive, setConfirmedActive] = useState<Set<string>>(() => new Set());
+  const hostedLock = useRef(false);
+  const [hostedExpired, setHostedExpired] = useState<Set<string>>(() => new Set());
+  const [, setDeadlineTick] = useState(0);
   const href = useHref();
   const reviewId = new URLSearchParams(href.split("?")[1] ?? "").get("review");
   const closeReview = () => {
@@ -100,12 +112,17 @@ export default function Apps({
     const bump = () => setRevision((r) => r + 1);
     window.addEventListener(APPS_CHANGED_EVENT, bump);
     const clearCatalog = () => setCatalogCards(null);
+    const clearLifecycle = () => { setUnresolved(null); setConfirmedActive(new Set()); setHostedExpired(new Set()); };
+    const stopLifecyclePause = onPrivateReadsPaused(clearLifecycle);
+    const stopLifecycleReset = onPrivateSessionReset(clearLifecycle);
     const stopPause = onPrivateReadsPaused(clearCatalog);
     const stopReset = onPrivateSessionReset(clearCatalog);
     return () => {
       window.removeEventListener(APPS_CHANGED_EVENT, bump);
       stopPause();
       stopReset();
+      stopLifecyclePause();
+      stopLifecycleReset();
     };
   }, []);
 
@@ -116,6 +133,23 @@ export default function Apps({
   const homeLoad = useBackoffLoad((signal) => readAppHomeFresh(signal, authority), revision, undefined, authority ? readAppHomeSnapshot(authority) : null);
   const favLoad = useBackoffLoad((signal) => readAppFavoritesFresh(signal), revision, undefined, readAppFavoritesSnapshot());
   const home = homeLoad.data;
+  const pendingRow = hosted ? home?.find((row) => pendingHostedLifecycle(row.install_id) !== null) : undefined;
+  useEffect(() => {
+    if (!hosted || !home) return;
+    const deadlines = home.map((row) => row.restore_until).filter((value): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= Date.now());
+    if (!deadlines.length) return;
+    const delay = Math.min(...deadlines) - Date.now() + 1;
+    const timer = window.setTimeout(() => setDeadlineTick((n) => n + 1), Math.min(Math.max(delay, 1), 2147483647));
+    return () => window.clearTimeout(timer);
+  });
+  useEffect(() => {
+    if (!homeLoad.data) return;
+    setConfirmedActive((old) => {
+      const next = new Set(old);
+      for (const row of homeLoad.data ?? []) if (row.attention.state !== "removed") next.delete(row.install_id);
+      return next.size === old.size ? old : next;
+    });
+  }, [homeLoad.data]);
   const [pinned, setPinned] = useState<FavoritesPayload | null>(null);
   useEffect(() => setPinned(null), [favLoad.data]);
   const favs = pinned ?? favLoad.data;
@@ -155,8 +189,8 @@ export default function Apps({
     return map;
   }, [home]);
 
-  const live = useMemo(() => (home ?? []).filter((h) => h.attention.state !== "removed"), [home]);
-  const removedList = useMemo(() => (home ?? []).filter((h) => h.attention.state === "removed"), [home]);
+  const live = useMemo(() => (home ?? []).filter((h) => h.attention.state !== "removed" && !(hosted && installs?.find((row) => row.install_id === h.install_id)?.state === "removed")), [home, hosted, installs]);
+  const removedList = useMemo(() => (home ?? []).filter((h) => h.attention.state === "removed" && !confirmedActive.has(h.install_id)), [home, confirmedActive]);
 
   // Operator-only background catalog check (5-min tab cache) so returning from
   // apps does not re-fetch /api/app-catalog while still surfacing updates on /apps.
@@ -292,7 +326,43 @@ export default function Apps({
       });
   };
   const opened = (id: string) => { void appExplorer.opened(id).catch(() => {}); };
-  const restore = (id: string) => {
+  const restore = (id: string, checkOnly = false) => {
+    if (hosted) {
+      const row = home?.find((item) => item.install_id === id);
+      if (!isOp || !hostedRemovalEnabled || !row || row.source_kind !== "private" || hostedLock.current || (unresolved !== null && !checkOnly)) return;
+      if (!checkOnly && !hostedRestoreAvailable(row.restore_until)) {
+        setActionError(t("The restore window has closed."));
+        return;
+      }
+      hostedLock.current = true;
+      const generation = privateSessionGeneration();
+      const action = checkOnly ? pendingHostedLifecycle(id) ?? "restore" : "restore";
+      setBusy(id); setActionError(null);
+      void (checkOnly ? checkHostedLifecycle(id, generation) : changeHostedLifecycle(id, "restore", generation))
+        .then((result) => {
+          if (privateSessionGeneration() !== generation) return;
+          if (result.kind === "uncertain") {
+            setUnresolved(id);
+          } else if (result.kind === "denied") {
+            setUnresolved(null);
+            if (result.error instanceof ApiError && result.error.code === "restore_window") {
+              setHostedExpired((old) => new Set(old).add(id));
+              setActionError(t("The restore window has closed."));
+            } else if (result.error instanceof ApiError && (result.error.status === 401 || result.error.status === 403)) {
+              setActionError(t("The app change was denied. Check your workspace access."));
+            } else setActionError(t("The app change was not allowed or could not be verified."));
+          } else {
+            setUnresolved(null);
+            if (result.installation.state === "active") setConfirmedActive((old) => new Set(old).add(id));
+            if (result.installation.state !== (action === "remove" ? "removed" : "active")) {
+              setActionError(t("The requested change was not confirmed. The app's current state is shown below."));
+            }
+            notifyAppsChanged();
+          }
+        })
+        .finally(() => { hostedLock.current = false; if (privateSessionGeneration() === generation) setBusy(null); });
+      return;
+    }
     setBusy(id);
     void appExplorer.restore(id)
       .then(notifyAppsChanged)
@@ -390,6 +460,15 @@ export default function Apps({
           </header>
 
           {actionError && <div className="alert fail mb-4" role="alert">{actionError}</div>}
+          {isOp && hostedRemovalEnabled && (unresolved ?? pendingRow?.install_id) && (
+            <div className="alert warn mb-4" role="status">
+              <p>{t("The result could not be confirmed. Check again before making another change.")}</p>
+              <Button className="btn-sm mt-2" disabled={busy !== null} onClick={() => {
+                const id = unresolved ?? pendingRow?.install_id;
+                if (id) restore(id, true);
+              }}>{t("Check again")}</Button>
+            </div>
+          )}
           {loadError !== null && (
             <div className="apps-state card mb-4" role="alert">
               {loadError === UNVERIFIED_APPS_COPY ? (
@@ -644,7 +723,7 @@ export default function Apps({
                     <h2 className="apps-kicker">{t("Recently removed")}</h2>
                     <span className="apps-count-pill num">{removedList.length}</span>
                   </div>
-                  <p className="hint mb-2">{t("Removed apps restore for 30 days, then they're deleted for good.")}</p>
+                  <p className="hint mb-2">{t(hosted ? "Removed private apps retain their data. Connection grants are not restored." : "Removed apps restore for 30 days, then they're deleted for good.")}</p>
                   <div className="card p-0 divide-y divide-ink-800">
                     {removedList.map((h) => {
                       const title = localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t);
@@ -654,11 +733,11 @@ export default function Apps({
                           <div className="grow">
                             <b>{title}</b>
                             <small className="block text-ink-500">
-                              {t(h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}
+                              {t(hosted ? (!Number.isSafeInteger(h.restore_until) ? "The restore deadline could not be verified." : !hostedExpired.has(h.install_id) && hostedRestoreAvailable(h.restore_until) ? "Removed" : "Removed · restore window closed") : h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}
                             </small>
                           </div>
-                          {h.attention.action === "restore" && (
-                            <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
+                          {(hosted ? hostedRemovalEnabled && h.source_kind === "private" && !pendingHostedLifecycle(h.install_id) && !hostedExpired.has(h.install_id) && hostedRestoreAvailable(h.restore_until) : h.attention.action === "restore") && (
+                            <Button className="btn-sm" disabled={busy !== null || unresolved !== null} onClick={() => restore(h.install_id)}>
                               {t(busy === h.install_id ? "Restoring…" : "Restore")}
                             </Button>
                           )}

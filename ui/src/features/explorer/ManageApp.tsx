@@ -18,6 +18,9 @@ import {
   type UpgradeProposal,
   notifyAppsChanged,
 } from "../workspace-apps/workspaceApps";
+import { changeHostedLifecycle, checkHostedLifecycle, hostedRestoreAvailable, pendingHostedLifecycle, type HostedLifecycleAction, type HostedLifecycleResult } from "../workspace-apps/hostedPrivateLifecycle";
+import { privateSessionGeneration } from "../../lib/privateSession";
+import { ApiError } from "../../lib/api";
 import { onPrivateReadsPaused, onPrivateSessionReset } from "../../lib/privateSession";
 import type { Viewer } from "../projects/work";
 import { useInstallations } from "../workspace-apps/useInstallations";
@@ -55,12 +58,14 @@ export default function ManageApp({
   automaticUpdatesEnabled = true,
   appAgentSession,
   hosted = false,
+  hostedRemovalEnabled = false,
 }: {
   installId: string;
   viewer: Viewer;
   automaticUpdatesEnabled?: boolean;
   appAgentSession: string | null;
   hosted?: boolean;
+  hostedRemovalEnabled?: boolean;
 }) {
   const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
@@ -71,6 +76,11 @@ export default function ManageApp({
   const [removing, setRemoving] = useState(false);
   const [privateOpen, setPrivateOpen] = useState(false);
   const [restoring, setRestoring] = useState(false);
+  const [hostedPending, setHostedPending] = useState<HostedLifecycleAction | null>(() => pendingHostedLifecycle(installId));
+  const hostedLock = useRef(false);
+  const lifecycleEpoch = useRef(0);
+  const [, setDeadlineTick] = useState(0);
+  const [hostedExpired, setHostedExpired] = useState(false);
   const [checking, setChecking] = useState(false);
   const [applying, setApplying] = useState(false);
   const [upgradeSource, setUpgradeSource] = useState("");
@@ -115,14 +125,26 @@ export default function ManageApp({
   // keys get no link instead of the retired ID route.
   const installs = useInstallations(viewer.operator === true, reread).list;
   useEffect(() => {
+    if (!hosted || typeof inst?.restore_until !== "number") return;
+    const delay = inst.restore_until - Date.now() + 1;
+    if (delay <= 0) return;
+    const timer = window.setTimeout(() => setDeadlineTick((n) => n + 1), Math.min(delay, 2147483647));
+    return () => window.clearTimeout(timer);
+  });
+  useEffect(() => {
     const clearCatalog = () => setCatalogCards(null);
+    const clearLifecycle = () => { lifecycleEpoch.current += 1; setHostedPending(pendingHostedLifecycle(installId)); setHostedExpired(false); setInst(null); setHome(null); setRemoveOpen(false); };
+    const stopLifecyclePause = onPrivateReadsPaused(clearLifecycle);
+    const stopLifecycleReset = onPrivateSessionReset(clearLifecycle);
     const stopPause = onPrivateReadsPaused(clearCatalog);
     const stopReset = onPrivateSessionReset(clearCatalog);
     return () => {
       stopPause();
       stopReset();
+      stopLifecyclePause();
+      stopLifecycleReset();
     };
-  }, []);
+  }, [installId]);
   useEffect(() => {
     if (!isOp) {
       setCatalogCards(null);
@@ -132,12 +154,13 @@ export default function ManageApp({
     setError(null);
     setHome(null);
     setHomeUnavailable(false);
+    const readEpoch = lifecycleEpoch.current;
     void workspaceApps.detail(installId, controller.signal)
-      .then((d) => { if (!controller.signal.aborted) setInst(d); })
+      .then((d) => { if (!controller.signal.aborted && readEpoch === lifecycleEpoch.current) setInst(d); })
       .catch((e: unknown) => { if (!controller.signal.aborted) setError(appLoadErrorCopy(e, "Could not load the app. Try again in a moment.")); });
     void appExplorer.home(controller.signal)
       .then((h) => {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || readEpoch !== lifecycleEpoch.current) return;
         const row = Array.isArray(h.installations)
           ? h.installations.find((i) => i.install_id === installId)
           : undefined;
@@ -282,9 +305,9 @@ export default function ManageApp({
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9"><p className="text-label text-ink-400" role="status">{t("Loading…")}</p></main>;
   }
 
-  // The record's own mark is authoritative; the home row only agrees with it.
-  const removed = inst.removed != null || home?.attention.state === "removed";
-  const restorable = inst.restore_after == null || Date.now() / 1000 <= inst.restore_after;
+  const removed = hosted ? inst.state === "removed" : inst.removed != null || home?.attention.state === "removed";
+  const restorable = hosted ? !hostedExpired && inst.state === "removed" && hostedRestoreAvailable(inst.restore_until) : inst.restore_after == null || Date.now() / 1000 <= inst.restore_after;
+  const hostedAllowed = hosted && hostedRemovalEnabled && isOp && inst.install_id === installId && inst.source_kind === "private" && (inst.state === "active" || inst.state === "disabled" || inst.state === "removed");
   const off = !removed && (home?.attention.state === "off" || inst.approved === false);
   const catalogUpdate = !removed ? pendingCatalogUpdates(catalogCards, [inst]).get(installId) ?? null : null;
   const updateReady = home?.attention.state === "update" || catalogUpdate !== null;
@@ -318,14 +341,60 @@ export default function ManageApp({
     }
   };
 
+  const finishHosted = (result: HostedLifecycleResult, action: HostedLifecycleAction) => {
+    if (result.kind === "uncertain") {
+      setRemoveOpen(false);
+      setHostedPending(action);
+      setNotice("The result could not be confirmed. Check again before making another change.");
+      return;
+    }
+    setHostedPending(null);
+    setRemoveOpen(false);
+    if (result.kind === "denied") {
+      if (result.error instanceof ApiError && result.error.code === "restore_window") {
+        setHostedExpired(true);
+        setNotice("The restore window has closed.");
+      } else if (result.error instanceof ApiError && (result.error.status === 401 || result.error.status === 403)) {
+        setNotice("The app change was denied. Check your workspace access.");
+      } else {
+        setNotice("The app change was not allowed or could not be verified.");
+      }
+      return;
+    }
+    lifecycleEpoch.current += 1;
+    setHostedExpired(false);
+    setInst((old) => old ? { ...old, ...result.installation } : result.installation);
+    setHome(null);
+    setNotice(action === "remove" && result.installation.state === "removed" ? "Removed — its data is retained."
+      : action === "restore" && result.installation.state === "active" ? "Restored — connection grants must be set up again."
+      : "The requested change was not confirmed. The app's current state is shown below.");
+    notifyAppsChanged();
+  };
+  const hostedChange = (action: HostedLifecycleAction, checkOnly = false) => {
+    if (!hostedAllowed || hostedLock.current || (!checkOnly && hostedPending !== null)) return;
+    if (!checkOnly && action === "restore" && !hostedRestoreAvailable(inst.restore_until)) {
+      setNotice("The restore window has closed.");
+      return;
+    }
+    hostedLock.current = true;
+    const generation = privateSessionGeneration();
+    setRemoving(action === "remove"); setRestoring(action === "restore"); setNotice(null);
+    void (checkOnly ? checkHostedLifecycle(installId, generation) : changeHostedLifecycle(installId, action, generation))
+      .then((result) => {
+        if (currentInstallId.current === installId && privateSessionGeneration() === generation) finishHosted(result, action);
+      })
+      .finally(() => { hostedLock.current = false; if (privateSessionGeneration() === generation) { setRemoving(false); setRestoring(false); } });
+  };
+
   const openRemove = () => {
-    if (hosted) return;
+    if (hosted) { if (hostedAllowed && !hostedPending) setRemoveOpen(true); return; }
     void appExplorer.removePreview(installId)
       .then(setPreview)
       .catch((e: unknown) => setNotice(appErrorCopy(e, "Couldn't work out what removing would take. Try again in a moment.")));
     setRemoveOpen(true);
   };
   const doRemove = () => {
+    if (hosted) { hostedChange("remove"); return; }
     if (!preview) return;
     setRemoving(true); setNotice(null);
     void appExplorer.remove(installId, {
@@ -345,6 +414,7 @@ export default function ManageApp({
       .finally(() => setRemoving(false));
   };
   const restore = () => {
+    if (hosted) { hostedChange("restore"); return; }
     setRestoring(true); setNotice(null);
     void appExplorer.restore(installId)
       .then(() => {
@@ -486,7 +556,11 @@ export default function ManageApp({
       </div>
 
       {notice && <div className="alert info mt-4" role="status">{t(notice)}</div>}
-      {removed && <div className="alert warn mt-4" role="status">{restorable ? t("Removed. Restore brings it back within its 30-day window.") : t("Removed. The 30-day restore window has closed, so it stays removed.")}</div>}
+      {removed && !hostedPending && <div className="alert warn mt-4" role="status">{restorable ? t("Removed. Restore brings it back within its 30-day window.") : hosted && !Number.isSafeInteger(inst.restore_until) ? t("The restore deadline could not be verified.") : t("Removed. The 30-day restore window has closed, so it stays removed.")}</div>}
+      {hostedAllowed && hostedPending && <div className="mt-3">
+        {!notice && <p role="status">{t("The result could not be confirmed. Check again before making another change.")}</p>}
+        <Button className="btn-sm" disabled={removing || restoring} onClick={() => hostedChange(hostedPending, true)}>{t("Check again")}</Button>
+      </div>}
 
       {/* CAD-2215: exact-conversation member access, above the rest of
           Manage. It re-reads the daemon's list itself and refuses every
@@ -649,8 +723,8 @@ export default function ManageApp({
           {removed ? (
             <>
               <h3>{t("Restore {title}").replace("{title}", () => inst.title)}</h3>
-              <p>{restorable ? t("Removed apps restore within 30 days, with the same data.") : t("The restore window has closed.")}</p>
-              {restorable && (
+              <p>{hosted && hostedPending ? t("The app's current state could not be verified.") : restorable ? t("Removed apps restore within 30 days, with the same data.") : hosted && !Number.isSafeInteger(inst.restore_until) ? t("The restore deadline could not be verified.") : t("The restore window has closed.")}</p>
+              {restorable && !hostedPending && (!hosted || hostedAllowed) && (
                 <div className="mt-3">
                   <Button className="btn-primary btn-sm" disabled={restoring} onClick={restore}>{restoring ? t("Restoring…") : t("Restore")}</Button>
                 </div>
@@ -661,10 +735,10 @@ export default function ManageApp({
               <h3 className={hosted ? undefined : "text-fail"}>{t("Remove {title}").replace("{title}", () => inst.title)}</h3>
               <p>
                 {hosted
-                  ? t("Removing installed apps from a hosted workspace is not available yet. You can revoke tool access above.")
+                  ? t("Removing this private app ends access. Its data is retained and it can be restored for 30 days.")
                   : t("Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.")}
               </p>
-              {!hosted && (
+              {(!hosted || (hostedAllowed && !hostedPending)) && (
                 <div className="mt-3">
                   <Button className="btn-danger btn-sm" onClick={openRemove}>{t("Remove app…")}</Button>
                 </div>
@@ -676,6 +750,9 @@ export default function ManageApp({
 
       {!hosted && removeOpen && preview && (
         <RemoveDialog preview={preview} removing={removing} onCancel={() => setRemoveOpen(false)} onConfirm={doRemove} />
+      )}
+      {hosted && removeOpen && hostedAllowed && (
+        <HostedRemoveDialog inst={inst} removing={removing} onCancel={() => setRemoveOpen(false)} onConfirm={doRemove} />
       )}
     </main>
   );
@@ -738,4 +815,23 @@ function RemoveDialog({ preview, removing, onCancel, onConfirm }: {
       </div>
     </div>
   );
+}
+
+function HostedRemoveDialog({ inst, removing, onCancel, onConfirm }: {
+  inst: Installation; removing: boolean; onCancel: () => void; onConfirm: () => void;
+}) {
+  const t = useTranslate();
+  const ref = useRef<HTMLDialogElement>(null);
+  useEffect(() => { ref.current?.showModal(); }, []);
+  const cancel = () => { ref.current?.close(); onCancel(); };
+  return <dialog ref={ref} className="hosted-remove-dialog modal card p-5 max-w-lg w-full" aria-labelledby="hosted-rmh" onCancel={(event) => { event.preventDefault(); if (!removing) cancel(); }}>
+    <h1 id="hosted-rmh" className="text-cardtitle font-medium text-ink-100 mb-3">{t("Remove {title}?").replace("{title}", () => inst.title)}</h1>
+    <p className="text-label text-ink-400 mb-2">{t("Installation: {id}").replace("{id}", () => inst.install_id)}</p>
+    <p className="text-label text-ink-400 mb-2">{t("Removing this private app ends access. Its data is retained and it can be restored for 30 days.")}</p>
+    <p className="text-label text-ink-400 mb-4">{t("Connection grants are revoked and are not restored.")}</p>
+    <div className="flex gap-2 justify-end">
+      <button type="button" className="btn" disabled={removing} onClick={cancel}>{t("Cancel")}</button>
+      <Button className="btn-danger-solid" disabled={removing} onClick={onConfirm}>{removing ? t("Removing…") : t("Remove {title}").replace("{title}", () => inst.title)}</Button>
+    </div>
+  </dialog>;
 }
