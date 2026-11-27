@@ -26,7 +26,7 @@ export const DOCUMENT_CAPABILITY = "cad2286.document-lifecycle.v1";
 export const DOCUMENT_STAGES = ["draft", "in_review", "approved", "delivered", "archived"] as const;
 export type DocumentStage = (typeof DOCUMENT_STAGES)[number];
 
-export const DOCUMENT_KINDS = ["md", "html", "csv", "pdf", "image"] as const;
+export const DOCUMENT_KINDS = ["md", "html", "csv", "pdf", "image", "docx", "xlsx", "pptx"] as const;
 export type DocumentKind = (typeof DOCUMENT_KINDS)[number];
 export const DOCUMENT_MAX_BYTES = 10 * 1024 * 1024;
 

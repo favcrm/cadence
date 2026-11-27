@@ -42,6 +42,9 @@ const EXTENSION_KIND: Record<string, DocumentKind> = {
   ".jpeg": "image",
   ".webp": "image",
   ".gif": "image",
+  ".docx": "docx",
+  ".xlsx": "xlsx",
+  ".pptx": "pptx",
 };
 
 const MIME_KIND: Record<string, DocumentKind> = {
@@ -54,6 +57,9 @@ const MIME_KIND: Record<string, DocumentKind> = {
   "image/jpeg": "image",
   "image/webp": "image",
   "image/gif": "image",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
 };
 
 /** Map a local file name and browser MIME type onto a board `ArtifactKind`, or `null` when unsupported. */
@@ -111,6 +117,9 @@ const KIND_BADGE: Record<DocumentKind, string> = {
   csv: "CSV",
   pdf: "PDF",
   image: "IMAGE",
+  docx: "DOCX",
+  xlsx: "XLSX",
+  pptx: "PPTX",
 };
 
 interface SelectedFile {
@@ -512,7 +521,7 @@ export default function NewDocumentModal({
                 ref={fileInputRef}
                 type="file"
                 className="sr-only"
-                accept=".md,.markdown,.html,.htm,.csv,.pdf,.png,.jpg,.jpeg,.webp,.gif,text/markdown,text/html,text/csv,application/pdf,image/png,image/jpeg,image/webp,image/gif"
+                accept=".md,.markdown,.html,.htm,.csv,.pdf,.png,.jpg,.jpeg,.webp,.gif,.docx,.xlsx,.pptx,text/markdown,text/html,text/csv,application/pdf,image/png,image/jpeg,image/webp,image/gif,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 onChange={(event) => {
                   const picked = event.target.files?.[0] ?? null;
                   void handleFile(picked);

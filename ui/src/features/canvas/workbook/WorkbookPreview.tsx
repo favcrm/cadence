@@ -62,7 +62,7 @@ function cellStyle(cell: SheetCell | undefined, style: SheetCellStyle | undefine
   };
 }
 
-export default function WorkbookPreview({ href, title }: { href: string; title: string }) {
+export default function WorkbookPreview({ href, bytes: directBytes, title }: { href?: string; bytes?: ArrayBuffer; title: string }) {
   const zh = useLocaleTag() === "zh-TW";
   const id = useId();
   const [state, setState] = useState<State>({ status: "loading" });
@@ -79,7 +79,8 @@ export default function WorkbookPreview({ href, title }: { href: string; title: 
         const pending = beginPrivateOperation();
         operation = pending;
         pending.signal.addEventListener("abort", () => worker?.terminate(), { once: true });
-        const bytes = await readBytes(href, pending);
+        const bytes = directBytes ? directBytes.slice(0) : href ? await readBytes(href, pending) : null;
+        if (!bytes) throw new Error("Unavailable workbook");
         // This Vite-only module exists in the browser, not in the CommonJS test harness.
         const { default: workerUrl } = await import("./workbook.worker?worker&url");
         pending.assertCurrent();
@@ -99,7 +100,7 @@ export default function WorkbookPreview({ href, title }: { href: string; title: 
       }
     })();
     return () => { active = false; operation?.dispose(); };
-  }, [href]);
+  }, [href, directBytes]);
 
   if (state.status === "loading") return <div className="workbook-status" role="status">{zh ? "正在載入試算表…" : "Loading workbook…"}</div>;
   if (state.status === "error") return <div className="workbook-status" role="alert">{zh ? "無法預覽此試算表。檔案可能無法使用、格式不支援或超過大小限制。" : "This workbook cannot be previewed. It may be unavailable, unsupported, or too large."}</div>;

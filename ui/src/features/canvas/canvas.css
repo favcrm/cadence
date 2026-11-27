@@ -443,4 +443,20 @@ button.cv-saved:hover { color: var(--color-ink-100); border-color: var(--color-i
 .cv-works-new-pop-start { left: 0; right: auto; }
 .cv-works-new-btn { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 9px; border: 1px solid var(--color-ink-700); border-radius: 6px; font-size: var(--text-micro); font-weight: 500; color: var(--color-ink-200); white-space: nowrap; }
 .cv-works-new-compact { margin-left: 4px; }
+.cv-office-preview { display: flex; flex-direction: column; min-height: 0; gap: 10px; }
+.cv-office-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border: 1px solid var(--color-ink-800); border-radius: 8px; background: var(--color-ink-900); }
+.cv-office-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.cv-docx-sheet { display: grid; gap: 10px; padding: 16px 20px; border: 1px solid var(--color-ink-800); border-radius: 8px; background: var(--color-ink-900); color: var(--color-ink-100); font-size: var(--text-body); line-height: 1.55; max-width: 100%; overflow-wrap: anywhere; }
+.cv-docx-sheet h1 { font-size: 1.25rem; font-weight: 600; color: var(--color-ink-100); margin: 4px 0 2px; }
+.cv-docx-sheet h2 { font-size: 1.05rem; font-weight: 600; color: var(--color-ink-100); margin: 4px 0 2px; }
+.cv-docx-sheet h3 { font-size: 0.95rem; font-weight: 600; color: var(--color-ink-200); margin: 2px 0; }
+.cv-docx-sheet p { margin: 0; white-space: pre-wrap; color: var(--color-ink-200); }
+.cv-docx-li { display: flex; gap: 8px; color: var(--color-ink-200); padding-left: 6px; }
+.cv-docx-table { width: 100%; border-collapse: collapse; font-size: var(--text-label); }
+.cv-docx-table th, .cv-docx-table td { border: 1px solid var(--color-ink-700); padding: 6px 8px; text-align: left; vertical-align: top; }
+.cv-docx-table th { background: var(--color-ink-800); font-weight: 600; }
+.cv-pptx-deck { display: grid; gap: 10px; }
+.cv-pptx-slide { display: grid; gap: 6px; padding: 14px 18px; border: 1px solid var(--color-ink-800); border-radius: 8px; background: var(--color-ink-900); }
+.cv-pptx-slide-title { font-size: 1rem; font-weight: 600; color: var(--color-ink-100); margin: 0; }
+.cv-pptx-slide-lines { margin: 0; padding-left: 18px; display: grid; gap: 4px; color: var(--color-ink-200); font-size: var(--text-label); }
 @media (prefers-reduced-motion: reduce) { .cv-divider::after { transition: none; } }

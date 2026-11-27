@@ -20,8 +20,11 @@ import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
 import AppViewBody from "./AppViewBody";
 import RecordViewBody from "./RecordViewBody";
-import WorksCanvasLauncher from "./WorksCanvasLauncher";
+import WorksCanvasLauncher, { findWorksApp } from "./WorksCanvasLauncher";
 import WorkbookPreview from "./workbook/WorkbookPreview";
+import { installedAppHref } from "../apps/appViewModel";
+import { readInstallationsGuarded, readInstallationsSnapshot, type Installation } from "../workspace-apps/workspaceApps";
+import { stageWorksImportFile } from "../workspace-apps/screen/screenFileDownload";
 import { attachmentHref } from "../home/AttachmentMedia";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
 import { canvasChrome, setCanvasFull, setChatPeek, useCanvasChrome } from "./canvasChrome";
@@ -40,6 +43,7 @@ import {
   readWidth,
   selectVersion,
   setLayoutMode,
+  openAppViewEditable,
   unpane,
   useCanvas,
   writeWidth,
@@ -152,6 +156,54 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
   const [tplSaved, setTplSaved] = useState<{ name: string; version: number; sha256: string; html: string; specJson: string; sampleHtml?: string } | null>(null);
   const saveLifecycle = useRef(0);
   const patchForm = (patch: Partial<typeof tplForm>) => setTplForm((f) => ({ ...f, ...patch }));
+  const isOffice = tab.kind === "docx" || tab.kind === "xlsx" || tab.kind === "pptx";
+  const [worksApp, setWorksApp] = useState<Installation | null>(() =>
+    hosted && isOffice && writeGate === null ? findWorksApp(readInstallationsSnapshot()) : null,
+  );
+
+  useEffect(() => {
+    if (!hosted || !isOffice || writeGate !== null) {
+      setWorksApp(null);
+      return;
+    }
+    const cached = findWorksApp(readInstallationsSnapshot());
+    if (cached) { setWorksApp(cached); return; }
+    const controller = new AbortController();
+    readInstallationsGuarded(controller.signal)
+      .then((rows) => { if (!controller.signal.aborted) setWorksApp(findWorksApp(rows)); })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [hosted, isOffice, writeGate]);
+
+  const openInWorks = hosted && worksApp && isOffice && state.status === "ready"
+    ? () => {
+        const baseHref = installedAppHref(worksApp.name);
+        if (!baseHref) return;
+        const officeKind = tab.kind as "docx" | "xlsx" | "pptx";
+        const section = officeKind === "xlsx" ? "sheets" : officeKind === "pptx" ? "decks" : "docs";
+        const sectionQuery = worksApp.navigation?.section_query || "works";
+        stageWorksImportFile({
+          installId: worksApp.install_id,
+          fileName: downloadName(tab.title, officeKind, state.data.mime),
+          mimeType: state.data.mime,
+          bytes: state.data.bytes,
+        });
+        openAppViewEditable({
+          installId: worksApp.install_id,
+          tag: "works",
+          contextId: "default",
+          appLabel: worksApp.title || "Works",
+          title: tab.title,
+          route: {
+            section,
+            view: "list",
+            record_id: null,
+            segment_id: null,
+          },
+          href: `${baseHref}?install=${encodeURIComponent(worksApp.install_id)}&ctx=default&${encodeURIComponent(sectionQuery)}=${section}`,
+        });
+      }
+    : undefined;
 
   useEffect(() => {
     const reset = () => { saveLifecycle.current += 1; setSaveOpen(false); setTplBusy(false); setTplError(null); setTplSaved(null); };
@@ -417,7 +469,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
         {state.status === "loading" ? <p className="text-label text-ink-500 p-3">{t("Loading…")}</p> : null}
         {state.status === "failed" ? <p className="text-label text-fail p-3" role="alert">{state.error}</p> : null}
         {state.status === "ready" ? (
-          <ArtifactView kind={tab.kind} title={tab.title} data={state.data} contentRef={contentRef} htmlView={htmlView} aspect={tab.aspect} />
+          <ArtifactView kind={tab.kind} title={tab.title} data={state.data} contentRef={contentRef} htmlView={htmlView} aspect={tab.aspect} onOpenInWorks={openInWorks} />
         ) : null}
       </div>
       {image ? null : (

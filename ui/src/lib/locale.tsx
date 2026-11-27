@@ -5027,3 +5027,19 @@ const CAD2872_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2872_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2880_ZHTW: Record<string, string> = {
+  "Open in Works": "在 Works 開啟",
+  "Loading preview…": "正在載入預覽…",
+  "Read-only preview": "唯讀預覽",
+  "Word document (.docx)": "Word 文件 (.docx)",
+  "Excel workbook (.xlsx)": "Excel 活頁簿 (.xlsx)",
+  "PowerPoint deck (.pptx)": "PowerPoint 簡報 (.pptx)",
+  "Slide {n}": "投影片 {n}",
+  "This file has no previewable text yet.": "這份檔案目前沒有可預覽的文字。",
+  "Preview truncated.": "預覽內容已截斷。",
+  "Could not preview this file. Use Download to open locally.": "無法預覽此檔案，請使用「下載」在本機開啟。",
+};
+for (const [key, value] of Object.entries(CAD2880_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

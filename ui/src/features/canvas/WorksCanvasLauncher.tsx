@@ -16,7 +16,7 @@ type LauncherEntry = { section: WorksSection | "all"; key: string; label: string
 const MENU_ESTIMATED_WIDTH_PX = 176;
 const VIEWPORT_EDGE_MARGIN_PX = 8;
 
-function findWorksApp(rows: Installation[] | null): Installation | null {
+export function findWorksApp(rows: Installation[] | null): Installation | null {
   if (!rows) return null;
   return (
     rows.find(

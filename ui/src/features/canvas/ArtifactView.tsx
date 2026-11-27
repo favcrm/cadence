@@ -5,6 +5,8 @@ import { artifactBytes } from "./artifactClient";
 import { CSV_MAX_COLS, CSV_MAX_ROWS, parseCsv } from "./csv";
 import type { ArtifactKind } from "./canvasStore";
 import ImageOverlay from "./ImageOverlay";
+import { parseDocxPreview, parsePptxPreview, type DocxPreview, type PptxPreview } from "./officePreview";
+import WorkbookPreview from "./workbook/WorkbookPreview";
 
 export interface Loaded {
   bytes: ArrayBuffer;
@@ -41,7 +43,15 @@ const OFFICE_KIND_LABEL: Record<"docx" | "xlsx" | "pptx", string> = {
 };
 
 export function downloadName(title: string, kind: ArtifactKind, mime: string): string {
-  const base = title.replace(/[^\w.\- ]+/g, "_").trim().slice(0, 80) || "artifact";
+  const cleaned = title
+    .replace(/[\u0000-\u001f\u007f/\\:*?"<>|]+/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^\.+/, "")
+    .slice(0, 80)
+    .trim()
+    .replace(/\.+$/, "");
+  const base = cleaned || "artifact";
   const ext = kind === "image" ? (mime.split("/")[1]?.split("+")[0] ?? "png") : EXT[kind];
   return base.toLowerCase().endsWith(`.${ext.toLowerCase()}`) ? base : `${base}.${ext}`;
 }
@@ -174,6 +184,7 @@ export default function ArtifactView({
   htmlView = "rendered",
   focusablePreview = false,
   aspect,
+  onOpenInWorks,
 }: {
   kind: ArtifactKind;
   title: string;
@@ -184,6 +195,8 @@ export default function ArtifactView({
   focusablePreview?: boolean;
   /** A generated image's shape, for its overlay. */
   aspect?: string;
+  /** Open this Office file directly in an editable Works tab. */
+  onOpenInWorks?: () => void;
 }) {
   const t = useTranslate();
   switch (kind) {
@@ -253,24 +266,267 @@ export default function ArtifactView({
           </div>
         </div>
       );
-    case "docx":
     case "xlsx":
-    case "pptx":
       return (
-        <div className="canvas-doc canvas-pdf" data-artifact-view={kind}>
-          <p className="text-body text-ink-100">{title}</p>
-          <p className="num text-micro text-ink-500">{t(OFFICE_KIND_LABEL[kind])} · {sizeLabel(data.bytes.byteLength)}</p>
-          <p className="text-micro text-ink-400">{t("Office file — use Download to open locally.")}</p>
-          <div className="flex flex-wrap items-center gap-3 pt-1">
-            <button
-              type="button"
-              className="btn"
-              onClick={() => saveBytes(data.bytes, data.mime, downloadName(title, kind, data.mime))}
-            >
-              {t("Download")}
-            </button>
-          </div>
+        <div className="canvas-doc cv-office-preview" data-artifact-view="xlsx">
+          <OfficePreviewBar
+            title={title}
+            kind="xlsx"
+            data={data}
+            onOpenInWorks={onOpenInWorks}
+          />
+          <WorkbookPreview bytes={data.bytes} title={title} />
         </div>
       );
+    case "docx":
+      return (
+        <DocxInlineView
+          title={title}
+          data={data}
+          contentRef={contentRef}
+          onOpenInWorks={onOpenInWorks}
+        />
+      );
+    case "pptx":
+      return (
+        <PptxInlineView
+          title={title}
+          data={data}
+          contentRef={contentRef}
+          onOpenInWorks={onOpenInWorks}
+        />
+      );
   }
+}
+
+function OfficePreviewBar({
+  title,
+  kind,
+  data,
+  onOpenInWorks,
+}: {
+  title: string;
+  kind: "docx" | "xlsx" | "pptx";
+  data: Loaded;
+  onOpenInWorks?: () => void;
+}) {
+  const t = useTranslate();
+  return (
+    <div className="cv-office-bar">
+      <div>
+        <p className="text-body text-ink-100">{title}</p>
+        <p className="num text-micro text-ink-500">
+          {t(OFFICE_KIND_LABEL[kind])} · {sizeLabel(data.bytes.byteLength)} · {t("Read-only preview")}
+        </p>
+      </div>
+      <div className="cv-office-actions">
+        {onOpenInWorks ? (
+          <button type="button" className="btn" onClick={onOpenInWorks}>
+            {t("Open in Works")}
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => saveBytes(data.bytes, data.mime, downloadName(title, kind, data.mime))}
+        >
+          {t("Download")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function OfficeFallbackCard({
+  title,
+  kind,
+  data,
+  message,
+  onOpenInWorks,
+}: {
+  title: string;
+  kind: "docx" | "pptx";
+  data: Loaded;
+  message: string;
+  onOpenInWorks?: () => void;
+}) {
+  const t = useTranslate();
+  return (
+    <div className="canvas-doc canvas-pdf" data-artifact-view={kind}>
+      <p className="text-body text-ink-100">{title}</p>
+      <p className="num text-micro text-ink-500">{t(OFFICE_KIND_LABEL[kind])} · {sizeLabel(data.bytes.byteLength)}</p>
+      <p className="text-micro text-ink-400">{message}</p>
+      <div className="flex flex-wrap items-center gap-3 pt-1">
+        {onOpenInWorks ? (
+          <button type="button" className="btn" onClick={onOpenInWorks}>
+            {t("Open in Works")}
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="btn"
+          onClick={() => saveBytes(data.bytes, data.mime, downloadName(title, kind, data.mime))}
+        >
+          {t("Download")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DocxInlineView({
+  title,
+  data,
+  contentRef,
+  onOpenInWorks,
+}: {
+  title: string;
+  data: Loaded;
+  contentRef: React.RefObject<HTMLDivElement | null>;
+  onOpenInWorks?: () => void;
+}) {
+  const t = useTranslate();
+  const [state, setState] = useState<
+    { status: "loading" } | { status: "ready"; preview: DocxPreview } | { status: "error" }
+  >({ status: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    setState({ status: "loading" });
+    void parseDocxPreview(data.bytes).then(
+      (preview) => { if (active) setState({ status: "ready", preview }); },
+      () => { if (active) setState({ status: "error" }); },
+    );
+    return () => { active = false; };
+  }, [data.bytes]);
+
+  if (state.status === "loading") {
+    return (
+      <div className="canvas-doc cv-office-preview" data-artifact-view="docx">
+        <OfficePreviewBar title={title} kind="docx" data={data} onOpenInWorks={onOpenInWorks} />
+        <p className="text-micro text-ink-400 p-2" role="status">{t("Loading preview…")}</p>
+      </div>
+    );
+  }
+  if (state.status === "error") {
+    return (
+      <OfficeFallbackCard
+        title={title}
+        kind="docx"
+        data={data}
+        message={t("Could not preview this file. Use Download to open locally.")}
+        onOpenInWorks={onOpenInWorks}
+      />
+    );
+  }
+  return (
+    <div ref={contentRef} className="canvas-doc cv-office-preview" data-artifact-view="docx">
+      <OfficePreviewBar title={title} kind="docx" data={data} onOpenInWorks={onOpenInWorks} />
+      {state.preview.blocks.length === 0 ? (
+        <p className="text-micro text-ink-400 p-2">{t("This file has no previewable text yet.")}</p>
+      ) : (
+        <div className="cv-docx-sheet">
+          {state.preview.blocks.map((block, idx) => {
+            if (block.kind === "heading") {
+              if (block.level === 1) return <h1 key={idx}>{block.text}</h1>;
+              if (block.level === 2) return <h2 key={idx}>{block.text}</h2>;
+              return <h3 key={idx}>{block.text}</h3>;
+            }
+            if (block.kind === "list_item") {
+              return <div key={idx} className="cv-docx-li"><span aria-hidden>•</span><span>{block.text}</span></div>;
+            }
+            if (block.kind === "table") {
+              return (
+                <div key={idx} className="overflow-x-auto">
+                  <table className="cv-docx-table">
+                    <tbody>
+                      {block.rows.map((row, r) => (
+                        <tr key={r}>
+                          {row.map((cell, c) => r === 0 ? <th key={c}>{cell}</th> : <td key={c}>{cell}</td>)}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            }
+            return <p key={idx}>{block.text}</p>;
+          })}
+          {state.preview.truncated ? (
+            <p className="text-micro text-ink-500">{t("Preview truncated.")}</p>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PptxInlineView({
+  title,
+  data,
+  contentRef,
+  onOpenInWorks,
+}: {
+  title: string;
+  data: Loaded;
+  contentRef: React.RefObject<HTMLDivElement | null>;
+  onOpenInWorks?: () => void;
+}) {
+  const t = useTranslate();
+  const [state, setState] = useState<
+    { status: "loading" } | { status: "ready"; preview: PptxPreview } | { status: "error" }
+  >({ status: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    setState({ status: "loading" });
+    void parsePptxPreview(data.bytes).then(
+      (preview) => { if (active) setState({ status: "ready", preview }); },
+      () => { if (active) setState({ status: "error" }); },
+    );
+    return () => { active = false; };
+  }, [data.bytes]);
+
+  if (state.status === "loading") {
+    return (
+      <div className="canvas-doc cv-office-preview" data-artifact-view="pptx">
+        <OfficePreviewBar title={title} kind="pptx" data={data} onOpenInWorks={onOpenInWorks} />
+        <p className="text-micro text-ink-400 p-2" role="status">{t("Loading preview…")}</p>
+      </div>
+    );
+  }
+  if (state.status === "error") {
+    return (
+      <OfficeFallbackCard
+        title={title}
+        kind="pptx"
+        data={data}
+        message={t("Could not preview this file. Use Download to open locally.")}
+        onOpenInWorks={onOpenInWorks}
+      />
+    );
+  }
+  return (
+    <div ref={contentRef} className="canvas-doc cv-office-preview" data-artifact-view="pptx">
+      <OfficePreviewBar title={title} kind="pptx" data={data} onOpenInWorks={onOpenInWorks} />
+      <div className="cv-pptx-deck">
+        {state.preview.slides.map((slide) => (
+          <section key={slide.index} className="cv-pptx-slide" aria-label={t("Slide {n}").replace("{n}", String(slide.index))}>
+            <span className="num text-micro text-ink-500">{t("Slide {n}").replace("{n}", String(slide.index))}</span>
+            {slide.title ? <h3 className="cv-pptx-slide-title">{slide.title}</h3> : null}
+            {slide.lines.length > 0 ? (
+              <ul className="cv-pptx-slide-lines">
+                {slide.lines.map((line, i) => <li key={i}>{line}</li>)}
+              </ul>
+            ) : !slide.title ? (
+              <p className="text-micro text-ink-500">{t("This file has no previewable text yet.")}</p>
+            ) : null}
+          </section>
+        ))}
+        {state.preview.truncated ? (
+          <p className="text-micro text-ink-500">{t("Preview truncated.")}</p>
+        ) : null}
+      </div>
+    </div>
+  );
 }
