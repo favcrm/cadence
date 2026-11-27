@@ -7,6 +7,7 @@ import {
   catalogUpdateHref,
   isSafeCatalogId,
   pendingCatalogUpdates,
+  publishHostedLifecycle,
   readAppCatalogCached,
   readAppCatalogSnapshot,
   workspaceApps,
@@ -104,6 +105,15 @@ export default function ManageApp({
   const checkRequest = useRef(0);
   const applyRequest = useRef(0);
   const [notice, setNotice] = useState<string | null>(null);
+  const hostedResult = useRef<HTMLDivElement>(null);
+  const focusHostedResult = useRef(false);
+  const [grantsRevision, setGrantsRevision] = useState(0);
+  useEffect(() => {
+    if (!removeOpen && notice && focusHostedResult.current) {
+      focusHostedResult.current = false;
+      hostedResult.current?.focus();
+    }
+  }, [notice, removeOpen]);
   const [error, setError] = useState<string | null>(null);
   const [catalogBindings, setCatalogBindings] = useState<AppBinding[] | null>(null);
   const [catalogError, setCatalogError] = useState(false);
@@ -188,7 +198,7 @@ export default function ManageApp({
 
   useEffect(() => {
     setWabaSummary(null);
-    if (!hosted || !isOp || !inst || inst.install_id !== installId || inst.name !== "waba" || inst.removed != null) {
+    if (!hosted || !isOp || !inst || inst.install_id !== installId || inst.name !== "waba" || inst.state === "removed" || inst.removed != null) {
       return;
     }
     const controller = new AbortController();
@@ -200,10 +210,10 @@ export default function ManageApp({
         // Older boards without host WhatsApp settings routes degrade cleanly.
       });
     return () => controller.abort();
-  }, [hosted, installId, inst?.install_id, inst?.name, inst?.removed, isOp, reread]);
+  }, [hosted, installId, inst?.install_id, inst?.name, inst?.state, inst?.removed, isOp, reread, grantsRevision]);
 
   useEffect(() => {
-    if (!isOp || !inst || inst.install_id !== installId || !hasCatalogSlots || inst.removed != null) return;
+    if (!isOp || !inst || inst.install_id !== installId || !hasCatalogSlots || inst.state === "removed" || inst.removed != null) return;
     const slots = new Set(declaredSlots(inst).filter(isCatalogSlot).map((slot) => slot.slot));
     const controller = new AbortController();
     setCatalogBindings(null);
@@ -225,7 +235,7 @@ export default function ManageApp({
       })
       .catch(() => { if (!controller.signal.aborted) setCatalogError(true); });
     return () => controller.abort();
-  }, [installId, inst?.digest, inst?.removed, hasCatalogSlots, isOp, reread]);
+  }, [installId, inst?.digest, inst?.state, inst?.removed, hasCatalogSlots, isOp, reread, grantsRevision]);
 
   useEffect(() => {
     if (!automaticUpdatesEnabled || !isOp) return;
@@ -362,13 +372,16 @@ export default function ManageApp({
       return;
     }
     lifecycleEpoch.current += 1;
+    setCatalogBindings(null);
+    setWabaSummary(null);
+    setGrantsRevision((n) => n + 1);
     setHostedExpired(false);
     setInst((old) => old ? { ...old, ...result.installation } : result.installation);
     setHome(null);
     setNotice(action === "remove" && result.installation.state === "removed" ? "Removed — its data is retained."
       : action === "restore" && result.installation.state === "active" ? "Restored — connection grants must be set up again."
       : "The requested change was not confirmed. The app's current state is shown below.");
-    notifyAppsChanged();
+    publishHostedLifecycle(result.installation);
   };
   const hostedChange = (action: HostedLifecycleAction, checkOnly = false) => {
     if (!hostedAllowed || hostedLock.current || (!checkOnly && hostedPending !== null)) return;
@@ -377,6 +390,7 @@ export default function ManageApp({
       return;
     }
     hostedLock.current = true;
+    focusHostedResult.current = true;
     const generation = privateSessionGeneration();
     setRemoving(action === "remove"); setRestoring(action === "restore"); setNotice(null);
     void (checkOnly ? checkHostedLifecycle(installId, generation) : changeHostedLifecycle(installId, action, generation))
@@ -555,8 +569,8 @@ export default function ManageApp({
         </div>
       </div>
 
-      {notice && <div className="alert info mt-4" role="status">{t(notice)}</div>}
-      {removed && !hostedPending && <div className="alert warn mt-4" role="status">{restorable ? t("Removed. Restore brings it back within its 30-day window.") : hosted && !Number.isSafeInteger(inst.restore_until) ? t("The restore deadline could not be verified.") : t("Removed. The 30-day restore window has closed, so it stays removed.")}</div>}
+      {notice && <div ref={hosted ? hostedResult : undefined} tabIndex={hosted ? -1 : undefined} className="alert info mt-4" role="status">{t(notice)}</div>}
+      {removed && !hostedPending && <div className="alert warn mt-4" role="status">{hosted && !hostedAllowed ? t("Removed") : restorable ? t("Removed. Restore brings it back within its 30-day window.") : hosted && !Number.isSafeInteger(inst.restore_until) ? t("The restore deadline could not be verified.") : t("Removed. The 30-day restore window has closed, so it stays removed.")}</div>}
       {hostedAllowed && hostedPending && <div className="mt-3">
         {!notice && <p role="status">{t("The result could not be confirmed. Check again before making another change.")}</p>}
         <Button className="btn-sm" disabled={removing || restoring} onClick={() => hostedChange(hostedPending, true)}>{t("Check again")}</Button>
@@ -719,8 +733,13 @@ export default function ManageApp({
           </div>
         </div>
 
-        <div className="card mcard">
-          {removed ? (
+        {(!hosted || inst.source_kind === "private") && <div className="card mcard">
+          {hosted && !hostedAllowed ? (
+            <>
+              <h3>{t("Remove {title}").replace("{title}", () => inst.title)}</h3>
+              <p>{t("Private-app removal and restore are not available in this workspace.")}</p>
+            </>
+          ) : removed ? (
             <>
               <h3>{t("Restore {title}").replace("{title}", () => inst.title)}</h3>
               <p>{hosted && hostedPending ? t("The app's current state could not be verified.") : restorable ? t("Removed apps restore within 30 days, with the same data.") : hosted && !Number.isSafeInteger(inst.restore_until) ? t("The restore deadline could not be verified.") : t("The restore window has closed.")}</p>
@@ -745,7 +764,7 @@ export default function ManageApp({
               )}
             </>
           )}
-        </div>
+        </div>}
       </div>
 
       {!hosted && removeOpen && preview && (
@@ -824,14 +843,14 @@ function HostedRemoveDialog({ inst, removing, onCancel, onConfirm }: {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => { ref.current?.showModal(); }, []);
   const cancel = () => { ref.current?.close(); onCancel(); };
-  return <dialog ref={ref} className="hosted-remove-dialog modal card p-5 max-w-lg w-full" aria-labelledby="hosted-rmh" onCancel={(event) => { event.preventDefault(); if (!removing) cancel(); }}>
+  return <dialog ref={ref} className="hosted-remove-dialog p-5" aria-labelledby="hosted-rmh" onCancel={(event) => { event.preventDefault(); if (!removing) cancel(); }}>
     <h1 id="hosted-rmh" className="text-cardtitle font-medium text-ink-100 mb-3">{t("Remove {title}?").replace("{title}", () => inst.title)}</h1>
     <p className="text-label text-ink-400 mb-2">{t("Installation: {id}").replace("{id}", () => inst.install_id)}</p>
     <p className="text-label text-ink-400 mb-2">{t("Removing this private app ends access. Its data is retained and it can be restored for 30 days.")}</p>
     <p className="text-label text-ink-400 mb-4">{t("Connection grants are revoked and are not restored.")}</p>
     <div className="flex gap-2 justify-end">
       <button type="button" className="btn" disabled={removing} onClick={cancel}>{t("Cancel")}</button>
-      <Button className="btn-danger-solid" disabled={removing} onClick={onConfirm}>{removing ? t("Removing…") : t("Remove {title}").replace("{title}", () => inst.title)}</Button>
+      <Button variant="danger" disabled={removing} onClick={onConfirm}>{removing ? t("Removing…") : t("Remove {title}").replace("{title}", () => inst.title)}</Button>
     </div>
   </dialog>;
 }

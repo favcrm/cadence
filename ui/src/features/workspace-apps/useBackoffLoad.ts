@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { loadFailureMessage, loadWithBackoff } from "./installationsLoad";
 
 export interface BackoffLoad<T> {
   /** The last good answer; `null` until one arrives. Kept across failed refreshes. */
   data: T | null;
+  setData: Dispatch<SetStateAction<T | null>>;
   /** The newest refresh failed (after any automatic busy retries). */
   error: string | null;
   /** A busy daemon is being retried automatically. */
@@ -54,5 +55,5 @@ export function useBackoffLoad<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, refreshKey, manual]);
   const retry = useCallback(() => setManual((n) => n + 1), []);
-  return { data, error, retrying, loading, retry };
+  return { data, setData, error, retrying, loading, retry };
 }

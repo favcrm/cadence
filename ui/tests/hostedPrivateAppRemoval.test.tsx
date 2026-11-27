@@ -7,6 +7,7 @@ import type * as Locale from "../src/lib/locale";
 import type * as Manage from "../src/features/explorer/ManageApp";
 import type * as Navigation from "../screen-ui/src/navigation";
 import type * as HostNavigation from "../src/ui/hostNavigation";
+import type * as WorkspaceApps from "../src/features/workspace-apps/workspaceApps";
 
 declare function require(name: string): unknown;
 const { Window } = require("happy-dom") as typeof HappyDom;
@@ -30,6 +31,7 @@ const { LocaleProvider } = require("../src/lib/locale") as typeof Locale;
 const ManageApp = (require("../src/features/explorer/ManageApp") as typeof Manage).default;
 const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof Navigation;
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof HostNavigation;
+const { readAppHomeFresh, readAppHomeSnapshot, readInstallationsSnapshot } = require("../src/features/workspace-apps/workspaceApps") as typeof WorkspaceApps;
 const fixture = JSON.parse((require("node:fs") as { readFileSync(path: string, encoding: string): string }).readFileSync("tests/fixtures/hosted-private-app-removal.json", "utf8")) as {
   remove_receipt: Record<string, unknown>; restore_receipt: Record<string, unknown>;
 };
@@ -87,6 +89,8 @@ async function main() {
       await React.act(async () => { root.unmount(); });
     }
     const root = await scenario({ capability: true, kind: "private" });
+    await readAppHomeFresh(undefined, "operator");
+    assert(readAppHomeSnapshot("operator")?.[0]?.attention.state === "ok", "warm home starts with the installation live");
     assert(button("Remove app…"), "an eligible owner can open removal");
     await React.act(async () => { button("Remove app…")!.click(); });
     assert(writes.length === 0, "opening confirmation does not mutate");
@@ -98,6 +102,8 @@ async function main() {
     await React.act(async () => { button("Remove Books")!.click(); });
     assert(Number(writes.length) === 1 && writes[0] === `${path}/remove`, "confirmation sends exactly one hosted remove request");
     assert(host.textContent?.includes("Removed — its data is retained."), "a validated receipt confirms removal");
+    assert(readAppHomeSnapshot("operator")?.[0]?.attention.state === "removed", "confirmed removal updates the retained home before the next read");
+    assert(readInstallationsSnapshot()?.[0]?.state === "removed", "confirmed removal updates the retained launcher list before the next read");
     await React.act(async () => { root.unmount(); });
 
     const uncertain = await scenario({ capability: true, kind: "private" });

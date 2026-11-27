@@ -9,11 +9,14 @@ import { ApiError } from "../../lib/api";
 import { changeHostedLifecycle, checkHostedLifecycle, hostedRestoreAvailable, pendingHostedLifecycle } from "../workspace-apps/hostedPrivateLifecycle";
 import { localizedAppCategory, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
 import {
+  applyHostedLifecycleToHome,
   appExplorer,
   catalogUpdateHref,
+  hostedLifecycleFromEvent,
   notifyAppsChanged,
   pendingCatalogUpdates,
   prefetchAppScope,
+  publishHostedLifecycle,
   readAppCatalogCached,
   readAppCatalogSnapshot,
   readAppFavoritesFresh,
@@ -93,7 +96,6 @@ export default function Apps({
   const [actionError, setActionError] = useState<string | null>(null);
   const [privateOpen, setPrivateOpen] = useState(false);
   const [unresolved, setUnresolved] = useState<string | null>(null);
-  const [confirmedActive, setConfirmedActive] = useState<Set<string>>(() => new Set());
   const hostedLock = useRef(false);
   const [hostedExpired, setHostedExpired] = useState<Set<string>>(() => new Set());
   const [, setDeadlineTick] = useState(0);
@@ -109,16 +111,13 @@ export default function Apps({
   const [catalogCards, setCatalogCards] = useState<CatalogCard[] | null>(() => (isOp ? readAppCatalogSnapshot() : null));
 
   useEffect(() => {
-    const bump = () => setRevision((r) => r + 1);
-    window.addEventListener(APPS_CHANGED_EVENT, bump);
     const clearCatalog = () => setCatalogCards(null);
-    const clearLifecycle = () => { setUnresolved(null); setConfirmedActive(new Set()); setHostedExpired(new Set()); };
+    const clearLifecycle = () => { setUnresolved(null); setHostedExpired(new Set()); };
     const stopLifecyclePause = onPrivateReadsPaused(clearLifecycle);
     const stopLifecycleReset = onPrivateSessionReset(clearLifecycle);
     const stopPause = onPrivateReadsPaused(clearCatalog);
     const stopReset = onPrivateSessionReset(clearCatalog);
     return () => {
-      window.removeEventListener(APPS_CHANGED_EVENT, bump);
       stopPause();
       stopReset();
       stopLifecyclePause();
@@ -133,6 +132,16 @@ export default function Apps({
   const homeLoad = useBackoffLoad((signal) => readAppHomeFresh(signal, authority), revision, undefined, authority ? readAppHomeSnapshot(authority) : null);
   const favLoad = useBackoffLoad((signal) => readAppFavoritesFresh(signal), revision, undefined, readAppFavoritesSnapshot());
   const home = homeLoad.data;
+  const setHome = homeLoad.setData;
+  useEffect(() => {
+    const bump = (event: Event) => {
+      const change = hostedLifecycleFromEvent(event);
+      if (change && isOp && hosted) setHome((rows) => applyHostedLifecycleToHome(rows, change));
+      setRevision((r) => r + 1);
+    };
+    window.addEventListener(APPS_CHANGED_EVENT, bump);
+    return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
+  }, [hosted, isOp, setHome]);
   const pendingRow = hosted ? home?.find((row) => pendingHostedLifecycle(row.install_id) !== null) : undefined;
   useEffect(() => {
     if (!hosted || !home) return;
@@ -142,14 +151,6 @@ export default function Apps({
     const timer = window.setTimeout(() => setDeadlineTick((n) => n + 1), Math.min(Math.max(delay, 1), 2147483647));
     return () => window.clearTimeout(timer);
   });
-  useEffect(() => {
-    if (!homeLoad.data) return;
-    setConfirmedActive((old) => {
-      const next = new Set(old);
-      for (const row of homeLoad.data ?? []) if (row.attention.state !== "removed") next.delete(row.install_id);
-      return next.size === old.size ? old : next;
-    });
-  }, [homeLoad.data]);
   const [pinned, setPinned] = useState<FavoritesPayload | null>(null);
   useEffect(() => setPinned(null), [favLoad.data]);
   const favs = pinned ?? favLoad.data;
@@ -189,8 +190,8 @@ export default function Apps({
     return map;
   }, [home]);
 
-  const live = useMemo(() => (home ?? []).filter((h) => h.attention.state !== "removed" && !(hosted && installs?.find((row) => row.install_id === h.install_id)?.state === "removed")), [home, hosted, installs]);
-  const removedList = useMemo(() => (home ?? []).filter((h) => h.attention.state === "removed" && !confirmedActive.has(h.install_id)), [home, confirmedActive]);
+  const live = useMemo(() => (home ?? []).filter((h) => h.attention.state !== "removed"), [home]);
+  const removedList = useMemo(() => (home ?? []).filter((h) => h.attention.state === "removed"), [home]);
 
   // Operator-only background catalog check (5-min tab cache) so returning from
   // apps does not re-fetch /api/app-catalog while still surfacing updates on /apps.
@@ -353,11 +354,10 @@ export default function Apps({
             } else setActionError(t("The app change was not allowed or could not be verified."));
           } else {
             setUnresolved(null);
-            if (result.installation.state === "active") setConfirmedActive((old) => new Set(old).add(id));
             if (result.installation.state !== (action === "remove" ? "removed" : "active")) {
               setActionError(t("The requested change was not confirmed. The app's current state is shown below."));
             }
-            notifyAppsChanged();
+            publishHostedLifecycle(result.installation);
           }
         })
         .finally(() => { hostedLock.current = false; if (privateSessionGeneration() === generation) setBusy(null); });

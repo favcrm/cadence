@@ -654,14 +654,60 @@ export const workspaceApps = {
 /** Fired after an install, remove or restore so the sidebar's app list
  * re-reads at once instead of waiting for the next navigation. */
 export const APPS_CHANGED_EVENT = "cadence:apps-changed";
+
+/** Apply only the verified lifecycle fields to a previously observed row. */
+export function applyHostedLifecycleToList(rows: Installation[] | null, change: Installation): Installation[] | null {
+  const index = rows?.findIndex((row) => row.install_id === change.install_id) ?? -1;
+  if (!rows || index < 0) return rows;
+  const next = rows.slice();
+  next[index] = { ...next[index], state: change.state, executable: change.executable, removed_at: change.removed_at, restore_until: change.restore_until };
+  return next;
+}
+
+export function applyHostedLifecycleToHome(rows: HomeInstallation[] | null, change: Installation): HomeInstallation[] | null {
+  const index = rows?.findIndex((row) => row.install_id === change.install_id) ?? -1;
+  if (!rows || index < 0) return rows;
+  const next = rows.slice();
+  const attention = change.state === "removed"
+    ? { state: "removed" as const, message: "Removed", action: "restore", count: 0 }
+    : change.state === "disabled"
+      ? { state: "off" as const, message: "Disabled", action: "restore", count: 0 }
+      : { state: "ok" as const, message: null, action: null, count: 0 };
+  next[index] = { ...next[index], restore_until: change.restore_until, attention };
+  return next;
+}
+
+export function hostedLifecycleFromEvent(event: Event): Installation | undefined {
+  return (event as CustomEvent<Installation | undefined>).detail;
+}
+
+export function publishHostedLifecycle(change: Installation): void {
+  if (!privateReadsAllowed()) return;
+  appsChanged(change);
+}
+
 export function notifyAppsChanged(): void {
+  appsChanged();
+}
+
+function appsChanged(change?: Installation): void {
   dropAppCatalogSnapshot();
   installationsEpoch += 1;
   abortFlights(installationListReads);
   abortFlights(homeReads);
   abortFlights(appHomeReads);
-  dropInstallationsSnapshot();
-  try { window.dispatchEvent(new Event(APPS_CHANGED_EVENT)); } catch { /* no window in a test */ }
+  if (change) {
+    const session = sessionKey();
+    if (installationsSnapshot?.session === session) {
+      installationsSnapshot.rows = applyHostedLifecycleToList(installationsSnapshot.rows, change)!;
+    }
+    if (appHomeSnapshot?.session === session && appHomeSnapshot.authority === "operator") {
+      appHomeSnapshot.rows = applyHostedLifecycleToHome(appHomeSnapshot.rows, change)!;
+    }
+  } else dropInstallationsSnapshot();
+  try {
+    window.dispatchEvent(change ? new window.CustomEvent(APPS_CHANGED_EVENT, { detail: change }) : new Event(APPS_CHANGED_EVENT));
+  } catch { /* no window in a test */ }
 }
 
 const CANONICAL_SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;

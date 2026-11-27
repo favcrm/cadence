@@ -18,6 +18,7 @@ const zhTW: Record<string, string> = {
   "The app's current state could not be verified.": "無法確認應用程式目前的狀態。",
   "The app change was not allowed or could not be verified.": "應用程式變更不獲允許或無法確認。",
   "The app change was denied. Check your workspace access.": "應用程式變更遭拒。請檢查你的工作區存取權限。",
+  "Private-app removal and restore are not available in this workspace.": "此工作區不支援移除或還原私人應用程式。",
   "The restore deadline could not be verified.": "無法確認還原期限。",
   "Removed — its data is retained.": "已移除，資料仍會保留。",
   "The requested change was not confirmed. The app's current state is shown below.": "未能確認所要求的變更。應用程式目前的狀態顯示如下。",

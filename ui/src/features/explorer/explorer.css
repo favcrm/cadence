@@ -564,9 +564,15 @@
   margin-bottom: 10px;
 }
 
-dialog.hosted-remove-dialog:modal { overscroll-behavior: contain; }
-dialog.hosted-remove-dialog::backdrop {
-  background: rgb(0 0 0 / 50%);
-  overflow: hidden;
+dialog.hosted-remove-dialog {
+  width: min(32rem, calc(100% - 2rem));
+  max-height: calc(100% - 2rem);
+  margin: auto;
+  border: 1px solid var(--color-edge);
+  border-radius: 0.625rem;
+  color: var(--color-ink-100);
+  background: var(--color-ink-850);
   overscroll-behavior: contain;
+  overflow-wrap: anywhere;
 }
+dialog.hosted-remove-dialog::backdrop { background: var(--color-scrim); }

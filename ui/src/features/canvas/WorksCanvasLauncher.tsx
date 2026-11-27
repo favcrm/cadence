@@ -68,7 +68,7 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
         });
     };
     const onAppsChanged = () => {
-      setWorks(null);
+      setWorks(findWorksApp(readInstallationsSnapshot()));
       refresh();
     };
     window.addEventListener(APPS_CHANGED_EVENT, onAppsChanged);

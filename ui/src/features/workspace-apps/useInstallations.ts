@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { loadFailureMessage, loadWithBackoff } from "./installationsLoad";
 import {
+  APPS_CHANGED_EVENT,
+  applyHostedLifecycleToList,
   appExplorer,
   dropInstallationsSnapshot,
+  hostedLifecycleFromEvent,
   readInstallationsGuarded,
   readInstallationsSnapshot,
   type Installation,
@@ -72,6 +75,12 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
     if (authority === "operator") {
       setLoaded((prev) => ({ authority, list: prev.authority === authority ? prev.list ?? readInstallationsSnapshot() : readInstallationsSnapshot() }));
     }
+    const onAppsChanged = (event: Event) => {
+      const change = hostedLifecycleFromEvent(event);
+      if (change) setLoaded((prev) => prev.authority === authority
+        ? { authority, list: applyHostedLifecycleToList(prev.list, change) } : prev);
+    };
+    if (authority === "operator") window.addEventListener(APPS_CHANGED_EVENT, onAppsChanged);
     const controller = new AbortController();
     setLoading(true);
     setRetrying(false);
@@ -90,7 +99,10 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
         setError(loadFailureMessage(cause)); setRetrying(false); setLoading(false);
       },
     );
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (authority === "operator") window.removeEventListener(APPS_CHANGED_EVENT, onAppsChanged);
+    };
   }, [enabled, paused, refreshKey, manual, source, shareOperatorRead, authority]);
   const retry = useCallback(() => setManual((n) => n + 1), []);
   return { list, error: enabled && !paused ? error : null, retrying: enabled && !paused && retrying, loading: enabled && !paused && loading, retry };
