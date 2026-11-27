@@ -15,6 +15,7 @@ const line = (icon: typeof Mail01Icon) => <HugeiconsIcon icon={icon} size={16} s
 const ICONS: Record<SettingsIcon, ReactNode> = {
   preferences: line(SlidersHorizontalIcon),
   security: line(SquareLock01Icon),
+  support: line(Mail01Icon),
   connections: <IconConnection size={16} />,
   templates: line(File01Icon),
   general: line(GlobalIcon),

@@ -2962,6 +2962,145 @@ fn print_issue_artifact(command: &Commands, body: &Value) -> Result<bool> {
     Ok(true)
 }
 
+fn support_receipt(value: &Value) -> bool {
+    let id = value.get("id").and_then(Value::as_str).unwrap_or("");
+    id.len() == 20
+        && id.starts_with("SUP-")
+        && id[4..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+        && value.get("subject").and_then(Value::as_str).is_some()
+        && matches!(
+            value.get("impact").and_then(Value::as_str),
+            Some("blocked" | "degraded" | "question")
+        )
+        && matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("open" | "in_progress" | "resolved")
+        )
+        && matches!(
+            value.get("source").and_then(Value::as_str),
+            Some("board" | "cli" | "mcp")
+        )
+        && value.get("createdAt").and_then(Value::as_i64).is_some()
+        && value.get("updatedAt").and_then(Value::as_i64).is_some()
+}
+
+fn support(
+    target: RemoteTarget,
+    action: &super::commands::SupportAction,
+    timeout: u64,
+) -> Result<i32> {
+    use super::commands::SupportAction;
+    use std::io::Read;
+    let (method, suffix, body) = match action {
+        SupportAction::New {
+            subject,
+            impact,
+            file,
+            request_id,
+        } => {
+            let reader: Box<dyn Read> = if file.as_os_str() == "-" {
+                Box::new(std::io::stdin())
+            } else {
+                Box::new(
+                    std::fs::File::open(file)
+                        .map_err(|_| Error::rejected("cannot open support description file"))?,
+                )
+            };
+            let mut bytes = Vec::new();
+            reader
+                .take(16_001)
+                .read_to_end(&mut bytes)
+                .map_err(|_| Error::rejected("cannot read support description"))?;
+            if bytes.len() > 16_000 {
+                return Err(Error::rejected("support description is too long"));
+            }
+            let description = String::from_utf8(bytes)
+                .map_err(|_| Error::rejected("support description must be UTF-8"))?;
+            let request_id = request_id.unwrap_or_else(uuid::Uuid::new_v4);
+            eprintln!("support request id: {request_id} (retain for --request-id if the outcome is unknown)");
+            (
+                "POST",
+                String::new(),
+                Some(json!({
+                    "requestId": request_id.to_string(),
+                    "subject": subject.trim(),
+                    "impact": impact.as_str(),
+                    "description": description,
+                })),
+            )
+        }
+        SupportAction::Status { id } => {
+            if id.len() != 20
+                || !id.starts_with("SUP-")
+                || !id[4..]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+            {
+                return Err(Error::rejected(
+                    "support case id must be SUP- followed by 16 uppercase hex digits",
+                ));
+            }
+            ("GET", format!("/{id}"), None)
+        }
+        SupportAction::Ls { offset } => ("GET", format!("?offset={offset}"), None),
+    };
+    let answer = cadence_agent::remote_cli::support_request(
+        &target,
+        method,
+        &suffix,
+        body.as_ref(),
+        timeout,
+    )?;
+    let valid = match action {
+        SupportAction::New {
+            subject, impact, ..
+        } => {
+            support_receipt(&answer)
+                && answer["subject"] == subject.trim()
+                && answer["impact"] == impact.as_str()
+        }
+        SupportAction::Status { id } => support_receipt(&answer) && answer["id"] == *id,
+        SupportAction::Ls { .. } => {
+            answer.get("hasMore").and_then(Value::as_bool).is_some()
+                && answer
+                    .get("cases")
+                    .and_then(Value::as_array)
+                    .is_some_and(|cases| cases.iter().all(support_receipt))
+        }
+    };
+    if !valid {
+        return Err(if method == "POST" {
+            Error::unknown("support response was invalid; the case may have been saved; repeat only with the same --request-id and input")
+        } else {
+            Error::rejected("support response was invalid")
+        });
+    }
+    print_json(&answer);
+    Ok(0)
+}
+
+#[cfg(test)]
+mod support_tests {
+    use super::*;
+
+    #[test]
+    fn support_receipt_requires_complete_public_case() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/agenticos/hosted-technical-support.json"
+        ))
+        .unwrap();
+        let mut receipt = fixture["receipt"].clone();
+        assert!(support_receipt(&receipt));
+        receipt["id"] = json!("SUP-0123456789abcdef");
+        assert!(!support_receipt(&receipt));
+        receipt["id"] = json!("SUP-0123456789ABCDEF");
+        receipt.as_object_mut().unwrap().remove("updatedAt");
+        assert!(!support_receipt(&receipt));
+    }
+}
+
 /// Entry point for a `Remote` resolution (called by `action_dispatch`
 /// instead of the local `dispatch`). `Org` stays local — it edits the
 /// registry, not a daemon — so `org switch local` still gets you home.
@@ -3002,6 +3141,9 @@ where
 {
     if let Commands::Org { action } = command {
         return org::run(action);
+    }
+    if let Commands::Support { action } = &command {
+        return support(target, action, wake_timeout);
     }
     // CAD-1586: remote settings authority is the stored LOGIN credential —
     // the gateway mints an envelope from it, and a `user`+`owner` envelope

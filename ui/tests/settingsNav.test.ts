@@ -132,3 +132,13 @@ equal(settingsRedirect("daemons", OWNER_DAEMONS), null, "a listed daemons sectio
 equal(settingsRedirect("daemons", MEMBER), "members", "a member link to daemons redirects away");
 equal(settingsRedirect("daemons", {}), "models", "a native board redirects away from daemons");
 equal(settingsLabel("daemons"), "Daemons", "the crumb names Daemons");
+
+// CAD-2865: support is offered only to signed-in hosted sessions that advertise it.
+const SUPPORT = { hosted: true, signed_in: true, settings_sections: ["preferences", "support"] };
+equal(flat(SUPPORT).includes("Technical support"), true, "advertised hosted support appears");
+equal(settingsRedirect("support", SUPPORT), null, "advertised support remains reachable");
+equal(flat({ ...SUPPORT, signed_in: false }).includes("Technical support"), false, "signed-out support is hidden");
+equal(flat({ ...SUPPORT, hosted: false }).includes("Technical support"), false, "native boards do not offer support");
+equal(flat({ ...SUPPORT, settings_sections: ["preferences"] }).includes("Technical support"), false, "older boards do not offer support");
+equal(settingsRedirect("support", {}), "models", "native direct support links redirect");
+equal(settingsLabel("support"), "Technical support", "the crumb names support");

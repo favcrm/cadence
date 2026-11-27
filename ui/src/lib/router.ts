@@ -50,7 +50,7 @@ export type ProjectSection = "overview" | "timeline" | "issues" | "plan" | "epic
  *  list, so nothing links there. `matchRoute` still parses the URL — dropping
  *  it would turn a stale link into "nothing lives here"; `settingsRedirect`
  *  moves it off a board whose `/api/meta` does not name it. */
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "security" | "general" | "custody" | "members" | "documents" | "daemons";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "security" | "general" | "custody" | "members" | "documents" | "daemons" | "support";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). `trash`
  *  is the operator's deleted-landing browser (CAD-2018); its selector is a
  *  server-issued `.trash/…` value, never a logical wiki path. */
@@ -322,6 +322,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "account") return { screen: "settings", section: "account" };
       if (a === "preferences") return { screen: "settings", section: "preferences" };
       if (a === "security") return { screen: "settings", section: "security" };
+      if (a === "support") return { screen: "settings", section: "support" };
       if (a === "permissions") return { screen: "settings", section: "permissions" };
       if (a === "email") return { screen: "settings", section: "connections", page: { kind: "email", focusSenders: true } };
       if (a === "general") return { screen: "settings", section: "general" };
@@ -432,6 +433,7 @@ export function routePath(route: Route): string {
       if (route.section === "account") return "/settings/account";
       if (route.section === "preferences") return "/settings/preferences";
       if (route.section === "security") return "/settings/security";
+      if (route.section === "support") return "/settings/support";
       if (route.section === "memory") return "/settings/memory";
       if (route.section === "update") return "/settings/update";
       if (route.section === "permissions") return "/settings/permissions";

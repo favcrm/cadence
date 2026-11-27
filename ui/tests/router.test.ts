@@ -71,6 +71,7 @@ const paths: [string, Route][] = [
   ["/settings/connections/email/senders", { screen: "settings", section: "connections", page: { kind: "email", focusSenders: true } }],
   ["/settings/connections/email/account/c-1", { screen: "settings", section: "connections", page: { kind: "emailAccount", id: "c-1" } }],
   ["/settings/security", { screen: "settings", section: "security" }],
+  ["/settings/support", { screen: "settings", section: "support" }],
   ["/outbox", { screen: "outbox" }],
   ["/login", { screen: "login" }],
 ];

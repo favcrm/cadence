@@ -8716,6 +8716,86 @@ fn endpoint_request_once(
     Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
 }
 
+/// A support request goes directly to the selected hosted workspace using its
+/// saved login. It is never sent through the issue relay or retried implicitly.
+pub fn support_request(
+    target: &RemoteTarget,
+    method: &str,
+    suffix: &str,
+    body: Option<&Value>,
+    timeout_secs: u64,
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    support_request_in(&dir, target, method, suffix, body, timeout_secs)
+}
+
+fn support_request_in(
+    dir: &Path,
+    target: &RemoteTarget,
+    method: &str,
+    suffix: &str,
+    body: Option<&Value>,
+    timeout_secs: u64,
+) -> Result<Value> {
+    if !matches!(method, "GET" | "POST")
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-?=&_".contains(&b))
+    {
+        return Err(reject("invalid support request"));
+    }
+    let org = target
+        .org_id
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect::<String>();
+    let path = format!("/__platform/hosted-cadence/{org}/support-cases{suffix}");
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    let cred = renewed_credential(dir, target, deadline)?;
+    if !valid_token(&cred.access_token, "hct_") {
+        return Err(reject("invalid remote credential"));
+    }
+    let (status, _, answer) = endpoint_request_once(target, &cred, method, &path, body, deadline)?;
+    if status == 501 {
+        return Err(reject("this workspace's server does not support support cases yet; update the server first (nothing was saved)"));
+    }
+    if (method == "POST" && status == 201) || (method == "GET" && status == 200) {
+        return answer.filter(Value::is_object).ok_or_else(|| {
+            Error::unknown("support response was invalid; the request may have been saved")
+        });
+    }
+    if method == "POST" && (status >= 500 || (200..300).contains(&status)) {
+        return Err(Error::unknown(
+            "support request outcome is unknown; repeat only with the same --request-id and input",
+        ));
+    }
+    let code = answer
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.get("code"))
+        .and_then(Value::as_str)
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 80
+                && s.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+        .unwrap_or("request_failed");
+    Err(reject(format!(
+        "support request refused (HTTP {status}, {code})"
+    )))
+}
+
 /// CAD-2094: owner-only `/api/endpoints/*` request to a hosted tenant board
 /// using the renewed `hct_` bearer token (never cookies or cross-origin headers).
 pub fn endpoint_request(

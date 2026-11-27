@@ -1,0 +1,18 @@
+{
+  "request": {
+    "requestId": "b67c764f-ee30-4860-9581-c655ef3833a0",
+    "subject": "Issue list won’t load",
+    "impact": "blocked",
+    "description": "After opening Work, the list remains blank.",
+    "includeDiagnostics": true
+  },
+  "receipt": {
+    "id": "SUP-0123456789ABCDEF",
+    "subject": "Issue list won’t load",
+    "impact": "blocked",
+    "status": "open",
+    "source": "board",
+    "createdAt": 1700000000000,
+    "updatedAt": 1700000000000
+  }
+}

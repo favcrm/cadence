@@ -58,6 +58,7 @@ import AdvancedCustody from "./features/settings/AdvancedCustody";
 import { settingsLabel, settingsNavGroups, settingsRedirect } from "./features/settings/settingsNav";
 import Preferences from "./features/settings/Preferences";
 import Security from "./features/settings/Security";
+import TechnicalSupport from "./features/settings/TechnicalSupport";
 import Templates from "./features/templates/Templates";
 import { useHostedTemplatePendingCount } from "./features/templates/HostedTemplateReview";
 import Update from "./features/settings/Update";
@@ -1990,6 +1991,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
             {route.section === "security" && meta?.settings_sections?.includes("security") && (
               <Security onSessionInvalidated={refresh} />
+            )}
+            {route.section === "support" && hostedBoard && meta.signed_in === true && meta.settings_sections?.includes("support") && (
+              <TechnicalSupport search={search} />
             )}
             {route.section === "general" && <General documentPolicy={
               managedFiles && viewer.operator === true && !readOnly && viewerSub && !viewerSub.startsWith("operator-token:")

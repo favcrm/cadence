@@ -43,6 +43,82 @@ fn store_credential(dir: &Path, endpoint: &str) {
 }
 
 #[test]
+fn support_transport_uses_hosted_bearer_and_never_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote = target(&listener);
+    store_credential(dir.path(), &remote.endpoint);
+    let handle = thread::spawn(move || {
+        let mut captured = Vec::new();
+        for (status, body) in [
+            ("201 Created", r#"{"id":"SUP-0123456789ABCDEF"}"#),
+            ("200 OK", r#"{"cases":[],"hasMore":false}"#),
+            (
+                "501 Not Implemented",
+                r#"{"ok":false,"error":{"code":"not_implemented","message":"not available"}}"#,
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.to_ascii_lowercase().starts_with("content-length:") {
+                    length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+                }
+                headers.push_str(&line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let mut payload = vec![0; length];
+            std::io::Read::read_exact(&mut reader, &mut payload).unwrap();
+            captured.push((headers, payload));
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+        captured
+    });
+    let payload = json!({"requestId":"1b39cf20-68c1-463f-87ab-a7c875160b9a", "subject":"Help", "impact":"question", "description":"Private text"});
+    assert_eq!(
+        support_request_in(dir.path(), &remote, "POST", "", Some(&payload), 5).unwrap()["id"],
+        "SUP-0123456789ABCDEF"
+    );
+    assert_eq!(
+        support_request_in(dir.path(), &remote, "GET", "?offset=50", None, 5).unwrap()["hasMore"],
+        false
+    );
+    let err = support_request_in(dir.path(), &remote, "POST", "", Some(&payload), 5).unwrap_err();
+    assert!(err.to_string().contains("server first"));
+    let captured = handle.join().unwrap();
+    assert!(captured[0]
+        .0
+        .starts_with("POST /__platform/hosted-cadence/ws_real/support-cases HTTP/1.1"));
+    assert!(captured[1]
+        .0
+        .starts_with("GET /__platform/hosted-cadence/ws_real/support-cases?offset=50 HTTP/1.1"));
+    for (headers, _) in &captured {
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.contains(&format!(
+            "authorization: bearer {}",
+            BRIDGE.to_ascii_lowercase()
+        )));
+        assert!(!headers.contains("\ncookie:"));
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&captured[0].1).unwrap(),
+        payload
+    );
+}
+
+#[test]
 fn audit_verdict_is_a_registered_mutating_write() {
     use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
 
