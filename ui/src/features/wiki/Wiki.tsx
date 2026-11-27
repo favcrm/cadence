@@ -44,6 +44,7 @@ import SearchPane from "./SearchPane";
 import HistoryPane from "./HistoryPane";
 import TrashPane from "./TrashPane";
 import { ManagedFilePane, ManagedList } from "./ManagedFileViews";
+import { AccessInbox } from "./FileAccessViews";
 import "./wiki.css";
 
 /**
@@ -322,10 +323,10 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
         <div className="wk-pane" data-mode={route.mode}>
           {managedFiles && route.file !== undefined ? (
             route.file && route.version
-              ? <ManagedFilePane key={`${route.file}:${route.version}`} id={route.file} version={route.version} readOnly={readOnly} navHref={fileHref} onChange={onManagedChange} />
+              ? <ManagedFilePane key={`${route.file}:${route.version}`} id={route.file} version={route.version} readOnly={readOnly} navHref={fileHref} canonicalHref={navHref} onChange={onManagedChange} />
               : <PageState title={t("This file version is unavailable")}>{t("A valid file and version are required.")}</PageState>
           ) : restricted || (managedFiles && route.archived) ? (
-            <ManagedLibraryPane key={`${restricted}:${!!route.archived}`} root={root} restricted={restricted} archived={!!route.archived} navHref={navHref} fileHref={fileHref} />
+            <ManagedLibraryPane key={`${restricted}:${!!route.archived}`} root={root} restricted={restricted} archived={!!route.archived} readOnly={readOnly} navHref={navHref} fileHref={fileHref} />
           ) : route.mode === "trash" ? (
             <TrashPane
               operator={operator}
@@ -395,10 +396,11 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
   );
 }
 
-function ManagedLibraryPane({ root, restricted, archived, navHref, fileHref }: {
+function ManagedLibraryPane({ root, restricted, archived, readOnly, navHref, fileHref }: {
   root: string;
   restricted: boolean;
   archived: boolean;
+  readOnly: boolean;
   navHref: (route: Route) => string;
   fileHref: (route: Route) => string;
 }) {
@@ -424,6 +426,7 @@ function ManagedLibraryPane({ root, restricted, archived, navHref, fileHref }: {
           <Button type="submit">{t("Search")}</Button>
         </form>
       )}
+      {restricted && <AccessInbox readOnly={readOnly} />}
       <ManagedList
         key={query}
         path={root}

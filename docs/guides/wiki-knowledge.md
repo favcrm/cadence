@@ -61,6 +61,17 @@ with its own search and Archived filter. Shared folders and search do not
 include those files. Personal review reminders live in **Home → To do**, not
 in Wiki.
 
+On a hosted board with private-file sharing enabled, **Copy private link**
+points to one file version and does not grant access. A signed-in member who
+cannot open it can choose **Request access** without seeing a preview or title.
+Stewards can grant, decline, or revoke version-only access in **Restricted
+files**, including revoking existing grants while the feature is paused.
+**Link to ticket** attaches the version in one step when all ticket readers
+already have access. To add readers, confirm the displayed audience with
+**Share this version with ticket readers**. Preview again if the audience
+changes. Revoking access cannot recall copies already downloaded.
+Existing ticket links and direct uploads are not reclassified.
+
 An empty project Context offers to create its wiki folder. Search filters use
 the available file type, and a hosted result that matched only some search
 terms says so. Hosted attachment filenames remain searchable even when their
