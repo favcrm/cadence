@@ -18,6 +18,7 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
             ("setup", "Set up Cadence on this machine"),
             ("login", "Sign in to an existing hosted workspace"),
             ("register", "Create a hosted workspace in the browser"),
+            ("support", "File or track a private hosted support case"),
         ],
     ),
     (
@@ -638,6 +639,8 @@ mod tests {
             &["cadence", "plan", "list"][..],
             &["cadence", "issue", "epic", "list"][..],
             &["cadence", "job", "ls"][..],
+            &["cadence", "support", "ls"][..],
+            &["cadence", "support", "list"][..],
         ] {
             assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
         }

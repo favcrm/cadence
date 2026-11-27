@@ -1968,6 +1968,7 @@ pub(crate) enum SupportAction {
     /// Read one support case by its SUP- id.
     Status { id: String },
     /// List support cases, 50 at a time.
+    #[command(visible_alias = "list")]
     Ls {
         #[arg(long, default_value_t = 0)]
         offset: u64,
