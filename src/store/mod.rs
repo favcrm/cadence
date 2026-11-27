@@ -99,7 +99,8 @@ mod inbox;
 mod kickoff;
 #[doc(hidden)]
 pub use kickoff::captured_cloud_kickoff;
-pub(crate) use kickoff::last_sha_line;
+#[doc(hidden)]
+pub use kickoff::last_sha_line;
 pub mod routines;
 pub mod workspace_settings;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};

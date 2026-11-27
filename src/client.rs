@@ -680,7 +680,8 @@ pub(crate) fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixSt
 /// Any other outcome — a connection, a full backlog, a permission or
 /// path error — is not proof, so a daemon that might be alive is never
 /// read as stopped. A nonblocking connect never waits.
-pub(crate) fn socket_has_no_listener(socket: &Path) -> bool {
+#[doc(hidden)]
+pub fn socket_has_no_listener(socket: &Path) -> bool {
     let Ok((addr, len)) = unix_addr(socket) else {
         return false;
     };

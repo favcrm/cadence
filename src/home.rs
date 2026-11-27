@@ -807,7 +807,11 @@ fn real_home() -> Option<PathBuf> {
 
 /// One lock for every CAD-1922 test that rewrites process environment, in
 /// this module and in `sandbox`: they share `HOME` and `CADENCE_*`.
-#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
+#[cfg(any(
+    test,
+    feature = "ops-test-support",
+    all(debug_assertions, feature = "test-seam")
+))]
 #[cfg_attr(not(test), doc(hidden))]
 pub static CAD1922_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

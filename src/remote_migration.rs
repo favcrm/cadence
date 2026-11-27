@@ -4,7 +4,7 @@
 //!
 //! Transport is the fixed issuer-origin path family
 //! `/v1/hosted-cadence/portable-migrations` under
-//! [`crate::remote_enrollment::migration_issuer_request`]: the renewed `hct_`
+//! [`crate::remote_enrollment::portable_migration_request`]: the renewed `hct_`
 //! bearer, the registered workspace id in `X-Cadence-Workspace`, the pinned
 //! issuer from the stored login, and the same Access-ingress discipline as
 //! every issuer call. Nothing here follows a redirect, accepts a server-
@@ -46,10 +46,9 @@ use std::time::{Duration, Instant};
 use crate::backup::portable::{self, VerifiedPackage};
 use crate::error::{Error, Result};
 use crate::remote_cli::{self, RemoteTarget};
-use crate::remote_enrollment::{
-    migration_issuer_request, MigrationBody, MigrationRequest, MigrationTimeout,
-};
+use crate::remote_enrollment::{portable_migration_request, PortableMigrationRequest};
 
+#[path = "remote_migration/pack.rs"]
 mod pack;
 
 use pack::{
@@ -59,7 +58,6 @@ use pack::{
 #[cfg(test)]
 use pack::{js_string, InventoryMember, Pack};
 
-const BASE: &str = "/v1/hosted-cadence/portable-migrations";
 const RECEIPT_FORMAT: &str = "cadence.portable-migration/1";
 /// packed-v1: greedy whole-member packs target this many bytes (immutable ABI).
 pub(super) const PACK_BYTES: u64 = 1_048_576;
@@ -116,15 +114,12 @@ pub fn run(target: &RemoteTarget, command: MigrationCommand, note: impl Fn(&str)
                 &dir,
                 target,
                 "remote preflight",
-                "POST",
-                &format!("{BASE}/preflight"),
-                MigrationBody::Json(&json!({
-                    "packageManifestSha256": package.manifest_sha256,
-                    "schemaVersion": package.manifest.schema_version,
-                    "memberCount": package.manifest.members.len(),
-                    "manifestBytes": package.manifest_bytes.len(),
-                })),
-                MigrationTimeout::Json,
+                PortableMigrationRequest::Preflight {
+                    digest: &package.manifest_sha256,
+                    schema_version: package.manifest.schema_version,
+                    member_count: package.manifest.members.len(),
+                    manifest_bytes: package.manifest_bytes.len(),
+                },
             )?;
             preflight_data(&data, target, &package)
         }
@@ -137,7 +132,6 @@ pub fn run(target: &RemoteTarget, command: MigrationCommand, note: impl Fn(&str)
             None,
             None,
             "inactive",
-            "confirm-inactive-restore",
             &note,
         ),
         MigrationCommand::Replace {
@@ -155,7 +149,6 @@ pub fn run(target: &RemoteTarget, command: MigrationCommand, note: impl Fn(&str)
             Some(&expected_destination_digest),
             Some(&expected_generation),
             "replace",
-            "confirm-replace-retain-rollback",
             &note,
         ),
         MigrationCommand::Status {
@@ -163,7 +156,7 @@ pub fn run(target: &RemoteTarget, command: MigrationCommand, note: impl Fn(&str)
             request_id,
         } => {
             let request_lookup = operation_id.strip_prefix("request:");
-            let path = if let Some(id) = request_lookup {
+            let operation = if let Some(id) = request_lookup {
                 if !request_id_valid(id)
                     || request_id.as_deref().is_some_and(|expected| expected != id)
                 {
@@ -171,19 +164,14 @@ pub fn run(target: &RemoteTarget, command: MigrationCommand, note: impl Fn(&str)
                         "status request selector does not match --request-id",
                     ));
                 }
-                format!("{BASE}/by-request/{id}")
+                PortableMigrationRequest::StatusByRequest { request_id: id }
             } else {
-                operation_path(&operation_id, "")?
+                validate_operation_id(&operation_id)?;
+                PortableMigrationRequest::Status {
+                    operation_id: &operation_id,
+                }
             };
-            let data = call(
-                &dir,
-                target,
-                "remote migration status",
-                "GET",
-                &path,
-                MigrationBody::None,
-                MigrationTimeout::Json,
-            )?;
+            let data = call(&dir, target, "remote migration status", operation)?;
             let resolved_id = if request_lookup.is_some() {
                 data.get("operationId")
                     .and_then(Value::as_str)
@@ -209,15 +197,12 @@ pub fn run(target: &RemoteTarget, command: MigrationCommand, note: impl Fn(&str)
                 &dir,
                 target,
                 &format!("remote migration rollback for {operation_id}; reconcile with restore --portable --status {operation_id}"),
-                "POST",
-                &operation_path(&operation_id, "/rollback")?,
-                MigrationBody::Json(&json!({
-                    "requestId": request_id,
-                    "expectedDestinationDigest": expected_destination_digest,
-                    "expectedGeneration": expected_generation,
-                    "consent": "confirm-rollback-retained-root",
-                })),
-                MigrationTimeout::Json,
+                PortableMigrationRequest::Rollback {
+                    operation_id: validate_operation_id(&operation_id)?,
+                    request_id: &request_id,
+                    destination_digest: &expected_destination_digest,
+                    generation: &expected_generation,
+                },
             )?;
             status_data(&data, target, &operation_id, Some(&request_id))
         }
@@ -238,7 +223,6 @@ fn transfer(
     expected_destination_digest: Option<&str>,
     expected_generation: Option<&str>,
     mode: &'static str,
-    consent: &'static str,
     note: &dyn Fn(&str),
 ) -> Result<Value> {
     if !request_id_valid(request_id) {
@@ -256,30 +240,17 @@ fn transfer(
             )));
         }
     }
-    let mut body = Map::new();
-    body.insert("requestId".into(), json!(request_id));
-    body.insert(
-        "packageManifestSha256".into(),
-        json!(package.manifest_sha256),
-    );
-    body.insert(
-        "expectedDestinationDigest".into(),
-        expected_destination_digest.map_or(Value::Null, |v| json!(v)),
-    );
-    body.insert(
-        "expectedGeneration".into(),
-        expected_generation.map_or(Value::Null, |v| json!(v)),
-    );
-    body.insert("mode".into(), json!(mode));
-    body.insert("consent".into(), json!(consent));
     let data = call(
         dir,
         target,
         &format!("remote migration begin for request {request_id}; reconcile with restore --portable --status request:{request_id}"),
-        "POST",
-        BASE,
-        MigrationBody::Json(&Value::Object(body)),
-        MigrationTimeout::Json,
+        PortableMigrationRequest::Begin {
+            request_id,
+            digest: &package.manifest_sha256,
+            destination_digest: expected_destination_digest,
+            generation: expected_generation,
+            replace: mode == "replace",
+        },
     )?;
     let operation_id = begin_data(
         &data,
@@ -311,10 +282,9 @@ fn transfer(
         dir,
         target,
         "remote migration replay status",
-        "GET",
-        &operation_path(&operation_id, "")?,
-        MigrationBody::None,
-        MigrationTimeout::Json,
+        PortableMigrationRequest::Status {
+            operation_id: validate_operation_id(&operation_id)?,
+        },
     )
     .map_err(reconcile)?;
     let status =
@@ -336,10 +306,9 @@ fn transfer(
         dir,
         target,
         "remote migration input reconciliation",
-        "GET",
-        &operation_path(&operation_id, "/inputs")?,
-        MigrationBody::None,
-        MigrationTimeout::Json,
+        PortableMigrationRequest::Inputs {
+            operation_id: validate_operation_id(&operation_id)?,
+        },
     )
     .map_err(reconcile)?;
     let (descriptor, completed_packs, part_bytes) =
@@ -389,10 +358,11 @@ fn transfer(
                 dir,
                 target,
                 "remote migration pack",
-                "PUT",
-                &operation_path(&operation_id, &format!("/input-packs/{}", pack.index))?,
-                MigrationBody::Stream(&mut reader),
-                MigrationTimeout::Pack,
+                PortableMigrationRequest::Pack {
+                    operation_id: validate_operation_id(&operation_id)?,
+                    index: pack.index,
+                    reader: &mut reader,
+                },
             )
             .map_err(reconcile)?;
             pack_data(
@@ -413,13 +383,12 @@ fn transfer(
                     dir,
                     target,
                     "remote migration pack part",
-                    "PUT",
-                    &operation_path(
-                        &operation_id,
-                        &format!("/input-packs/{}/parts/{part}", pack.index),
-                    )?,
-                    MigrationBody::Stream(&mut body),
-                    MigrationTimeout::Pack,
+                    PortableMigrationRequest::Part {
+                        operation_id: validate_operation_id(&operation_id)?,
+                        index: pack.index,
+                        part,
+                        reader: &mut body,
+                    },
                 )
                 .map_err(reconcile)?;
                 body.finish_part()?;
@@ -442,13 +411,10 @@ fn transfer(
                 dir,
                 target,
                 "remote migration pack finalize",
-                "POST",
-                &operation_path(
-                    &operation_id,
-                    &format!("/input-packs/{}/finalize", pack.index),
-                )?,
-                MigrationBody::Empty,
-                MigrationTimeout::Pack,
+                PortableMigrationRequest::Finalize {
+                    operation_id: validate_operation_id(&operation_id)?,
+                    index: pack.index,
+                },
             )
             .map_err(reconcile)?;
             pack_data(
@@ -468,10 +434,10 @@ fn transfer(
         dir,
         target,
         "remote migration commit",
-        "POST",
-        &operation_path(&operation_id, "/commit")?,
-        MigrationBody::Json(&json!({"requestId": request_id})),
-        MigrationTimeout::Commit,
+        PortableMigrationRequest::Commit {
+            operation_id: validate_operation_id(&operation_id)?,
+            request_id,
+        },
     )
     .map_err(reconcile)?;
     let receipt = status_data(&data, target, &operation_id, Some(request_id)).map_err(reconcile)?;
@@ -710,10 +676,10 @@ fn upload_manifest(
         dir,
         target,
         "remote migration manifest",
-        "POST",
-        &operation_path(operation_id, "/manifest")?,
-        MigrationBody::Bytes(package.manifest_bytes.as_slice()),
-        MigrationTimeout::Manifest,
+        PortableMigrationRequest::Manifest {
+            operation_id: validate_operation_id(operation_id)?,
+            bytes: package.manifest_bytes.as_slice(),
+        },
     )?;
     manifest_data(&data, target, operation_id, package, plan)
 }
@@ -962,32 +928,22 @@ fn verify_source(source: &Path) -> Result<VerifiedPackage> {
 /// header, single attempt. A send failure is outcome-unknown (the bytes may
 /// have landed) and carries the step name for reconciliation — nothing is
 /// silently re-issued.
-#[allow(clippy::too_many_arguments)]
 fn call(
     dir: &Path,
     target: &RemoteTarget,
     step: &str,
-    method: &str,
-    path: &str,
-    body: MigrationBody<'_>,
-    timeout: MigrationTimeout,
+    operation: PortableMigrationRequest<'_>,
 ) -> Result<Value> {
     let material = remote_cli::cli_material_until(dir, target, Instant::now() + RENEWAL_BUDGET)?;
     let issuer = material.issuer.as_deref().ok_or_else(|| {
         Error::rejected("the stored login has no pinned issuer — run `cadence login` again")
     })?;
-    let outcome = migration_issuer_request(
+    let outcome = portable_migration_request(
         dir,
         issuer,
-        MigrationRequest {
-            method,
-            path,
-            workspace: &target.org_id,
-            bearer: &material.access_token,
-            timeout,
-            body,
-        },
-        Instant::now() + timeout.cap() + Duration::from_secs(5),
+        &target.org_id,
+        &material.access_token,
+        operation,
     );
     let (status, body) = match outcome {
         Ok(pair) => pair,
@@ -1106,15 +1062,14 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Build the `/:operationId<suffix>` path; a malformed id is refused before
-/// it can reach a URL.
-fn operation_path(operation_id: &str, suffix: &str) -> Result<String> {
+/// Refuse malformed operation ids before renewing the credential.
+fn validate_operation_id(operation_id: &str) -> Result<&str> {
     if !id_valid(operation_id) {
         return Err(Error::rejected(
             "remote migration operation id is not valid",
         ));
     }
-    Ok(format!("{BASE}/{operation_id}{suffix}"))
+    Ok(operation_id)
 }
 
 #[cfg(test)]

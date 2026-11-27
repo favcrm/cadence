@@ -300,7 +300,7 @@ fn looks_secret(tok: &str) -> bool {
     t.len() >= 12
         || (t.len() >= 6 && t.bytes().any(|b| b.is_ascii_digit()))
         || t.ends_with('=')
-        || doctor::host::has_secret_prefix(t)
+        || crate::secret::shared_has_secret_prefix(t)
         || (t.starts_with("eyJ") && t.contains('.'))
 }
 

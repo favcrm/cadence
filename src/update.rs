@@ -754,7 +754,7 @@ fn version_of(layout: &Layout, sha: &str) -> Option<String> {
     (std::fs::canonicalize(&binary).ok()? == me).then(|| {
         format!(
             "{}+{}",
-            env!("CARGO_PKG_VERSION"),
+            cadence_agent::HOST_VERSION,
             crate::overview::BUILD_COMMIT
         )
     })
@@ -2008,7 +2008,7 @@ mod tests {
     /// for a commit whose binary reports 0.3.11.
     #[test]
     fn a_target_version_is_never_borrowed_from_the_running_build() {
-        let borrowed = format!("{}+{NEW}", env!("CARGO_PKG_VERSION"));
+        let borrowed = format!("{}+{NEW}", cadence_agent::HOST_VERSION);
         let retained = |manifest: Option<&str>| {
             let host = Host::new(src(NEW, "behind", 33), 33);
             let dir = host.layout.release_dir(NEW);

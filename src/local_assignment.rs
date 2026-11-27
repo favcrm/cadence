@@ -19,20 +19,27 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::remote_cli::{self, CliMaterial, RemoteTarget};
 use crate::worktree::{self, layout};
 
+#[path = "local_assignment/contract.rs"]
 mod contract;
+#[path = "local_assignment/delivery.rs"]
 pub mod delivery;
+#[path = "local_assignment/events.rs"]
 pub mod events;
+#[path = "local_assignment/finish_guidance.rs"]
 pub mod finish_guidance;
+#[path = "local_assignment/http.rs"]
 pub mod http;
+#[path = "local_assignment/notifications.rs"]
 pub mod notifications;
+#[path = "local_assignment/reporting.rs"]
 pub mod reporting;
+#[path = "local_assignment/wire.rs"]
 mod wire;
 
 use self::contract::{
@@ -43,14 +50,17 @@ use self::contract::{
 
 // Independently authored CAD-2290 acceptance; implementers must not weaken it.
 #[cfg(test)]
+#[path = "local_assignment/cad2290_hosted_finish_acceptance.rs"]
 mod cad2290_hosted_finish_acceptance;
 
 // Independently authored CAD-2337 refusal acceptance; implementers must not weaken it.
 #[cfg(test)]
+#[path = "local_assignment/cad2337_stale_socket_finish_refusal.rs"]
 mod cad2337_stale_socket_finish_refusal;
 
 // Independently authored CAD-2584 acceptance; implementers must not weaken it.
 #[cfg(test)]
+#[path = "local_assignment/cad2584_private_app_acceptance.rs"]
 mod cad2584_private_app_acceptance;
 
 pub const VERSION: &str = "hosted-cadence-local-assignment.v1";
@@ -760,9 +770,9 @@ impl<H: CoordHttp> Coordinator<H> {
                 ));
             }
         }
-        let _lock = remote_cli::private_lock(
+        let _lock = remote_cli::assignment_coordination_lock(
             &ledger,
-            "local-assign",
+            remote_cli::AssignmentCoordinationLock::Ledger,
             Instant::now() + Duration::from_secs(5),
         )?;
         Ok(Self {
@@ -781,9 +791,9 @@ impl<H: CoordHttp> Coordinator<H> {
     }
 
     fn with_ledger<T>(&self, body: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
-        let _lock = remote_cli::private_lock(
+        let _lock = remote_cli::assignment_coordination_lock(
             &self.ledger,
-            "local-assign",
+            remote_cli::AssignmentCoordinationLock::Ledger,
             Instant::now() + Duration::from_secs(5),
         )?;
         let mut ledger = Ledger::load(&self.ledger, &self.org_id)?;
@@ -791,14 +801,13 @@ impl<H: CoordHttp> Coordinator<H> {
         ledger.save(&self.ledger, &self.org_id)?;
         Ok(out)
     }
-    fn assignment_lock(&self, assignment: &str) -> Result<File> {
-        let mut lock_key = Sha256::new();
-        lock_key.update((self.org_id.len() as u64).to_be_bytes());
-        lock_key.update(self.org_id.as_bytes());
-        lock_key.update(assignment.as_bytes());
-        remote_cli::private_lock(
+    fn assignment_lock(&self, assignment: &str) -> Result<remote_cli::AssignmentCoordinationGuard> {
+        remote_cli::assignment_coordination_lock(
             &self.ledger,
-            &format!("local-reassign-{:x}", lock_key.finalize()),
+            remote_cli::AssignmentCoordinationLock::Assignment {
+                organization: &self.org_id,
+                assignment,
+            },
             Instant::now() + Duration::from_secs(5),
         )
     }

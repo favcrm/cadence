@@ -1,5 +1,11 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_FINAL_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Why a hosted lane was not released when no release was attempted: the
 /// observation is guidance only and never authorizes cleanup.
 pub fn refusal<H: CoordHttp>(
@@ -69,9 +75,9 @@ pub fn release_cancelled<H: CoordHttp>(
     assignment: &str,
     state_dir: &Path,
 ) -> Result<Value> {
-    let lock = remote_cli::private_lock(
+    let lock = remote_cli::assignment_coordination_lock(
         &coordinator.ledger,
-        "local-assign",
+        remote_cli::AssignmentCoordinationLock::Ledger,
         Instant::now() + Duration::from_secs(5),
     )?;
     let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;
@@ -169,9 +175,15 @@ fn release_bound<H: CoordHttp>(
         .map(|id| coordinator.assignment_lock(id))
         .collect::<Result<Vec<_>>>()?;
     let lock_and_validate = || {
-        let lock = remote_cli::private_lock(
+        #[cfg(test)]
+        BEFORE_FINAL_LOCK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let lock = remote_cli::assignment_coordination_lock(
             &coordinator.ledger,
-            "local-assign",
+            remote_cli::AssignmentCoordinationLock::Ledger,
             Instant::now() + Duration::from_secs(5),
         )?;
         let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;
@@ -417,9 +429,9 @@ fn bound_lane<H: CoordHttp>(
     selected: Option<&Path>,
     assignment: Option<&str>,
 ) -> Result<Option<BoundLane>> {
-    let lock = remote_cli::private_lock(
+    let lock = remote_cli::assignment_coordination_lock(
         &coordinator.ledger,
-        "local-assign",
+        remote_cli::AssignmentCoordinationLock::Ledger,
         Instant::now() + Duration::from_secs(5),
     )?;
     let ledger = Ledger::load(&coordinator.ledger, &coordinator.org_id)?;
@@ -2363,7 +2375,7 @@ mod tests {
         let coord = fx.cancel();
         let protected = fx.lane.join(".env");
         let created = protected.clone();
-        crate::issue::finish::BEFORE_FINAL_LOCK.with(|hook| {
+        BEFORE_FINAL_LOCK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 fs::write(created, "operator secret\n").unwrap();
             }));

@@ -55,7 +55,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             json,
         } => match action {
             Some(ReviewAction::Flakes { test }) => {
-                cadence_agent::review::print_flakes(state_dir, test).map(|()| 0)
+                cadence_ops::review::print_flakes(state_dir, test).map(|()| 0)
             }
             None => review::run(
                 state_dir,

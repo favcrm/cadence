@@ -89,7 +89,7 @@ pub(super) fn run(state_dir: PathBuf, action: SessionAction) -> Result<i32> {
             json,
             fix,
             host_report,
-        } => cadence_agent::session::run_start(&cadence_agent::session::StartOptions {
+        } => cadence_ops::session::run_start(&cadence_ops::session::StartOptions {
             project,
             all,
             json,
@@ -105,7 +105,7 @@ pub(super) fn run(state_dir: PathBuf, action: SessionAction) -> Result<i32> {
             force_finish,
             idle_secs,
             host_report,
-        } => cadence_agent::session::run_end(&cadence_agent::session::EndOptions {
+        } => cadence_ops::session::run_end(&cadence_ops::session::EndOptions {
             project,
             json,
             dry_run,
@@ -121,7 +121,7 @@ pub(super) fn run(state_dir: PathBuf, action: SessionAction) -> Result<i32> {
             expires,
             list,
             json,
-        } => cadence_agent::session::run_ack(&cadence_agent::session::AckOptions {
+        } => cadence_ops::session::run_ack(&cadence_ops::session::AckOptions {
             key,
             reason,
             expires,

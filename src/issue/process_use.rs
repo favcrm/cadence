@@ -835,7 +835,8 @@ fn validate_proc_mountinfo(
 /// cannot be fully inspected leaves the scan incomplete; cleanup never infers
 /// that a process lacks an inherited or transferred checkout descriptor from
 /// its UID or path permissions.
-pub(crate) struct ProcessUse {
+#[doc(hidden)]
+pub struct ProcessUse {
     pub cwd: Vec<u32>,
     pub fd: Vec<u32>,
     pub enumeration_error: Option<String>,
@@ -1168,7 +1169,8 @@ fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse, cal
     finish_pid_scan(view, pid, use_, pending);
 }
 
-pub(crate) fn process_use_under(dir: &Path) -> Result<ProcessUse> {
+#[doc(hidden)]
+pub fn process_use_under(dir: &Path) -> Result<ProcessUse> {
     process_use_under_from_proc_root(dir, &process_proc_root())
 }
 

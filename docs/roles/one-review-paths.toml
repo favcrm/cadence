@@ -76,6 +76,7 @@ one_review_exclude = [
   "src/peer.rs",
   "src/daemon.rs",
   "crates/cadence-daemon/**",
+  "crates/cadence-ops/**",
   "src/daemon/identity.rs",
   "src/daemon/caller_rule.rs",
   "src/daemon/slots_rpc.rs",

@@ -3,5 +3,5 @@
 use super::*;
 
 pub(super) fn run(_state_dir: PathBuf, timeout_secs: Option<u64>) -> Result<i32> {
-    cadence_agent::mcp::run(timeout_secs)
+    cadence_ops::mcp::run(timeout_secs)
 }

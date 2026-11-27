@@ -16,7 +16,9 @@ use crate::daemon::monitor_scope::MONITOR_READER_SCOPE_ACK;
 
 use super::{now_epoch, PROBE_TIMEOUT};
 
+#[path = "monitoring/validate.rs"]
 mod validate;
+#[path = "monitoring/view.rs"]
 mod view;
 
 pub use validate::validate_scoped_monitor_alert_response;

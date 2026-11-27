@@ -1743,7 +1743,7 @@ pub(crate) enum Commands {
         /// GitHub repository whose CI built and attested the binary.
         /// An operator input: it decides which repository's builds are
         /// trusted.
-        #[arg(long, default_value = cadence_agent::upgrade::DEFAULT_REPO)]
+        #[arg(long, default_value = cadence_ops::upgrade::DEFAULT_REPO)]
         repo: String,
         /// Symlink that puts cadence on PATH [default: ~/.local/bin/cadence].
         /// An operator input: it decides what gets replaced.
@@ -1823,7 +1823,7 @@ pub(crate) enum Commands {
         #[arg(long, conflicts_with_all = ["check", "rollback"])]
         now: bool,
         /// Previous releases kept under the releases dir [default: 3].
-        #[arg(long, default_value_t = cadence_agent::update::DEFAULT_KEEP as u64,
+        #[arg(long, default_value_t = cadence_ops::update::DEFAULT_KEEP as u64,
               value_parser = clap::value_parser!(u64).range(0..))]
         keep: u64,
         /// Where the pre-update backup goes [default:

@@ -4,6 +4,7 @@ use crate::private_app_update::{
     valid_generation, valid_install_id, valid_package_ref, valid_sha256_prefixed,
     valid_zip_file_name,
 };
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;

@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
+#[path = "test_queue/env.rs"]
 mod env;
 
 use env::{

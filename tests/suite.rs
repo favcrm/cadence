@@ -18521,7 +18521,8 @@ mod cad2286_document_acceptance {
 
 // CAD-2019 acceptance: HTML5 sanitizer/renderer, store/daemon lifecycle, and hosted CLI relay.
 mod cad2019_html_templates_acceptance {
-    use cadence_agent::{business_export::export_html, business_templates as bt, store::Store};
+    use cadence_agent::{business_templates as bt, store::Store};
+    use cadence_ops::business_export::export_html;
     use serde_json::{json, Value};
 
     const HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>@page{size:A4}</style></head><body><svg viewBox=\"0 0 80 20\"><defs><linearGradient id=\"grad\"><stop offset=\"0%\" stop-color=\"#111111\"/></linearGradient></defs><rect width=\"10\" height=\"10\" fill=\"url(#grad)\"/></svg>{{ customer }}{% for item in items %}{{ item.description }}:{{ item.line_total }}{% endfor %}{{ total }}</body></html>";

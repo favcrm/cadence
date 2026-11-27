@@ -37,6 +37,7 @@ const TAIL_LINES: usize = 40;
 // Config — schema, defaults and validation live in `review::config`.
 // ---------------------------------------------------------------------------
 
+#[path = "review/config.rs"]
 mod config;
 
 use config::{backend_label, result_format_label, safe_rel_path, CONFIG_KEYS};
@@ -49,6 +50,7 @@ pub use config::{
 // Pure diff/output analysis — public names remain available from review.
 // ---------------------------------------------------------------------------
 
+#[path = "review/analysis.rs"]
 mod analysis;
 pub use analysis::{
     extract_failed_tests, glob_match, parse_new_tests, schema_migration_hit, suite_modules,
@@ -59,6 +61,7 @@ pub use analysis::{
 // Flake ledger and host load
 // ---------------------------------------------------------------------------
 
+#[path = "review/flakes.rs"]
 mod flakes;
 
 #[cfg(test)]
@@ -440,6 +443,7 @@ fn tail(text: &str, n: usize) -> Vec<String> {
         .collect()
 }
 
+#[path = "review/junit.rs"]
 mod junit;
 
 #[cfg(test)]
@@ -919,6 +923,7 @@ fn unknown_full_suite_row(step: &Step) -> Value {
 // Review-owned checkout lifecycle
 // ---------------------------------------------------------------------------
 
+#[path = "review/workspace.rs"]
 mod workspace;
 use workspace::{MergeResultState, ReviewTree};
 

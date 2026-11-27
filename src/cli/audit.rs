@@ -412,7 +412,7 @@ pub(super) fn run(
                      approvals name no project. Nothing was read"
                 )));
             }
-            let (v, code) = cadence_agent::audit::scope_check(&state_dir, issue.trim());
+            let (v, code) = cadence_ops::audit::scope_check(&state_dir, issue.trim());
             print_json(&v);
             Ok(code)
         }
@@ -441,7 +441,7 @@ pub(super) fn run(
             let head = full_head(&head)?;
             let repo = match repo {
                 Some(r) => r,
-                None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
+                None => cadence_ops::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
                     || {
                         Error::rejected(
                             "no github.com origin remote in the cwd — pass --repo owner/name",
@@ -449,7 +449,7 @@ pub(super) fn run(
                     },
                 )?,
             };
-            let (v, code) = cadence_agent::audit::approval_check(&state_dir, &repo, pr, &head);
+            let (v, code) = cadence_ops::audit::approval_check(&state_dir, &repo, pr, &head);
             print_json(&v);
             Ok(code)
         }
@@ -492,7 +492,7 @@ pub(super) fn run(
             run_audit_evidence(&state_dir, action)
         }
         Some(action) => run_audit_evidence(&state_dir, action),
-        None => cadence_agent::audit::run(&cadence_agent::audit::AuditOptions {
+        None => cadence_ops::audit::run(&cadence_ops::audit::AuditOptions {
             since,
             class,
             project,
@@ -542,7 +542,7 @@ pub(super) fn verdicts(
         )));
     }
     let head = full_head(head)?;
-    print_json(&cadence_agent::audit::verdicts_check(
+    print_json(&cadence_ops::audit::verdicts_check(
         notes_dir,
         issue.trim(),
         pr,

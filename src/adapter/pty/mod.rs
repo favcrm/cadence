@@ -638,7 +638,8 @@ pub fn pane_clients(state_dir: &Path, alias: &str, env: &ProviderEnv) -> Option<
     )
 }
 
-pub(crate) fn resolve_on_path(bin: &str) -> Result<String> {
+#[doc(hidden)]
+pub fn resolve_on_path(bin: &str) -> Result<String> {
     let path = std::env::var("PATH").unwrap_or_default();
     for dir in path.split(':') {
         let candidate = Path::new(dir).join(bin);

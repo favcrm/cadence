@@ -230,17 +230,17 @@ fn atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn config_lock(state: &Path) -> Result<impl Sized> {
-    remote_cli::private_lock(
+    remote_cli::assignment_coordination_lock(
         state,
-        "hosted-event-config",
+        remote_cli::AssignmentCoordinationLock::EventConfig,
         Instant::now() + Duration::from_secs(5),
     )
 }
 
 fn inbox_lock(state: &Path) -> Result<impl Sized> {
-    remote_cli::private_lock(
+    remote_cli::assignment_coordination_lock(
         state,
-        "hosted-event-inbox",
+        remote_cli::AssignmentCoordinationLock::EventInbox,
         Instant::now() + Duration::from_secs(5),
     )
 }
@@ -922,14 +922,17 @@ pub fn run(
         .collect();
     let runtime = Arc::new(runtime);
     // A replacement configuration cannot overlap the old workspace socket.
-    let name = format!("hosted-workspace-{}", binding.organization_id);
     let _owner = loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        if let Ok(lock) =
-            remote_cli::private_lock(&state, &name, Instant::now() + Duration::from_millis(250))
-        {
+        if let Ok(lock) = remote_cli::assignment_coordination_lock(
+            &state,
+            remote_cli::AssignmentCoordinationLock::WorkspaceOwner {
+                organization: &binding.organization_id,
+            },
+            Instant::now() + Duration::from_millis(250),
+        ) {
             break lock;
         }
     };

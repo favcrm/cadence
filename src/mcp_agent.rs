@@ -51,7 +51,7 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                 "protocolVersion":request.pointer("/params/protocolVersion")
                     .and_then(Value::as_str).unwrap_or("2025-11-25"),
                 "capabilities":{"tools":{}},
-                "serverInfo":{"name":"cadence-agent","version":env!("CARGO_PKG_VERSION")}
+                "serverInfo":{"name":"cadence-agent","version":cadence_agent::HOST_VERSION}
             }}),
             Some("tools/list") => {
                 let list = discovered.get_or_insert_with(|| platform_tools(state_dir));
@@ -278,39 +278,11 @@ const THREAD_SEARCH_DESCRIPTION: &str = "Search your own earlier conversation in
     with around set to it to read the entries just before and after. Only your own \
     conversation is searched, and only messages that reached you.";
 
-const STATIC_TOOL_NAMES: [&str; 16] = [
-    "self",
-    "wiki_search",
-    "wiki_read",
-    "issue_show",
-    "memory_match",
-    "memory_propose",
-    "thread_search",
-    "app_run_artifact",
-    "private_app_prepare",
-    "private_app_status",
-    "private_app_apply",
-    "private_app_reconcile",
-    "app_describe",
-    "app_skill",
-    "app_call",
-    "board_pending_actions",
-];
-
-/// MCP tool names allow only `[A-Za-z0-9_-]`; a platform slug such as
-/// `smtp` and a tool slug such as `email.send` must survive the join.
-fn mcp_name_part(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
+pub(crate) use cadence_agent::mcp_agent::generated_tool_names;
+#[cfg(test)]
+pub(crate) use cadence_agent::mcp_agent::static_tool_names;
+#[cfg(test)]
+use cadence_agent::mcp_agent::{mcp_name_part, STATIC_TOOL_NAMES};
 
 fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
     // Bounded end to end: `rpc_deadline` puts connect, the write and the
@@ -374,65 +346,6 @@ fn platform_tools_from(listing: &Value) -> Vec<PlatformTool> {
         });
     }
     out
-}
-
-pub(crate) fn static_tool_names() -> &'static [&'static str] {
-    &STATIC_TOOL_NAMES
-}
-
-/// Generated MCP names for one reviewed inventory, in one deterministic
-/// order for every consumer. A name that collides with a static tool or an
-/// earlier generated name gets a stable digest suffix instead of silently
-/// overwriting another tool.
-pub(crate) fn generated_tool_names<'a>(
-    entries: impl Iterator<Item = (&'a str, &'a str, bool)>,
-) -> Vec<(String, String, String)> {
-    let mut used: std::collections::HashSet<String> = STATIC_TOOL_NAMES
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect();
-    let mut out = Vec::new();
-    for (platform, tool, direct) in entries {
-        if !direct {
-            continue;
-        }
-        let name = platform_tool_name(platform, tool, &mut used);
-        out.push((name, platform.to_string(), tool.to_string()));
-    }
-    out
-}
-
-fn platform_tool_name(
-    platform: &str,
-    tool: &str,
-    used: &mut std::collections::HashSet<String>,
-) -> String {
-    let base = format!("{}_{}", mcp_name_part(platform), mcp_name_part(tool));
-    if used.insert(base.clone()) {
-        return base;
-    }
-    let mut digest = Sha256::new();
-    digest.update(platform.as_bytes());
-    digest.update(b"\0");
-    digest.update(tool.as_bytes());
-    let hex = format!("{:x}", digest.finalize());
-    // Deterministic and unique: an earlier base may already occupy the
-    // first suffixed spelling, so keep appending an attempt counter (and
-    // stay within the MCP 64-character name bound).
-    let mut attempt = 0u32;
-    loop {
-        let suffix = match attempt {
-            0 => format!("_{}", &hex[..6]),
-            attempt => format!("_{}_{attempt}", &hex[..6]),
-        };
-        let room = 64usize.saturating_sub(suffix.len());
-        let stem: String = base.chars().take(room).collect();
-        let candidate = format!("{stem}{suffix}");
-        if used.insert(candidate.clone()) {
-            return candidate;
-        }
-        attempt = attempt.saturating_add(1);
-    }
 }
 
 fn fields<'a>(

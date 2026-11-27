@@ -18,6 +18,7 @@ use crate::proc::{self, BoundedError};
 
 /// CAD-1416: hosted intake and export, selected by the daemon's real lease.
 #[doc(hidden)]
+#[path = "business_export/hosted.rs"]
 pub mod hosted;
 
 /// Wall-clock bound for one export, above the runner's own 105 s limit.
@@ -126,7 +127,7 @@ fn runner_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CADENCE_BUSINESS_SCRIPTS") {
         return Ok(PathBuf::from(dir));
     }
-    let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/business-documents/scripts");
+    let built = Path::new(crate::WORKSPACE_MANIFEST_DIR).join("skills/business-documents/scripts");
     if built.join("run_isolated.py").is_file() {
         return Ok(built);
     }

@@ -15,7 +15,7 @@ pub(crate) struct UpdateTargetArgs {
     #[arg(long = "as")]
     pub(super) as_identity: Option<String>,
     /// GitHub repository whose CI built and attested the binary.
-    #[arg(long, default_value = cadence_agent::upgrade::DEFAULT_REPO)]
+    #[arg(long, default_value = cadence_ops::upgrade::DEFAULT_REPO)]
     pub(super) repo: String,
     /// Symlink that puts cadence on PATH [default: ~/.local/bin/cadence].
     #[arg(long)]
@@ -81,7 +81,7 @@ pub(crate) struct UpdateArgs {
     pub(super) release_source: Option<String>,
 }
 
-/// The production [`cadence_agent::update::UpdateHost`]: the daemon for
+/// The production [`cadence_ops::update::UpdateHost`]: the daemon for
 /// the drain, the waiters and the health answers; the filesystem for
 /// the releases and the marker.
 /// The update's release source: the owned HTTPS catalogue (the
@@ -90,8 +90,8 @@ pub(crate) struct UpdateArgs {
 /// repository. Both implement `ReleaseSource`; the field type
 /// dispatches between them.
 pub(crate) enum UpdateSource {
-    Gh(cadence_agent::upgrade::Gh),
-    Http(Box<cadence_agent::releases::HttpGh>),
+    Gh(cadence_ops::upgrade::Gh),
+    Http(Box<cadence_ops::releases::HttpGh>),
 }
 
 impl UpdateSource {
@@ -107,29 +107,29 @@ impl UpdateSource {
     /// authorities.
     pub(super) fn new(release_source: Option<&str>, repo: &str) -> Result<Self> {
         let repo = repo.trim();
-        let default_repo = repo.is_empty() || repo == cadence_agent::upgrade::DEFAULT_REPO;
+        let default_repo = repo.is_empty() || repo == cadence_ops::upgrade::DEFAULT_REPO;
         match (release_source, default_repo) {
-            (Some(base), true) => Ok(Self::Http(Box::new(cadence_agent::releases::HttpGh::new(
+            (Some(base), true) => Ok(Self::Http(Box::new(cadence_ops::releases::HttpGh::new(
                 base,
             )?))),
             (Some(_), false) => Err(Error::rejected(format!(
                 "--repo {repo} cannot combine with --release-source: the owned catalogue's \
                  signed evidence binds {} only — pass one trust authority",
-                cadence_agent::upgrade::DEFAULT_REPO
+                cadence_ops::upgrade::DEFAULT_REPO
             ))),
             (None, true) => {
-                let base = cadence_agent::releases::resolve_base(None)?;
-                Ok(Self::Http(Box::new(cadence_agent::releases::source_for(
+                let base = cadence_ops::releases::resolve_base(None)?;
+                Ok(Self::Http(Box::new(cadence_ops::releases::source_for(
                     &base,
-                    cadence_agent::releases::PROFILE_OPERATOR_HOST,
+                    cadence_ops::releases::PROFILE_OPERATOR_HOST,
                 )?)))
             }
-            (None, false) => Ok(Self::Gh(cadence_agent::upgrade::Gh::new(repo))),
+            (None, false) => Ok(Self::Gh(cadence_ops::upgrade::Gh::new(repo))),
         }
     }
 }
 
-impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
+impl cadence_ops::upgrade::ReleaseSource for UpdateSource {
     fn repo(&self) -> &str {
         match self {
             Self::Gh(s) => s.repo(),
@@ -142,7 +142,7 @@ impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
             Self::Http(s) => s.check_auth(),
         }
     }
-    fn latest_green_main(&self) -> Result<Option<cadence_agent::upgrade::Run>> {
+    fn latest_green_main(&self) -> Result<Option<cadence_ops::upgrade::Run>> {
         match self {
             Self::Gh(s) => s.latest_green_main(),
             Self::Http(s) => s.latest_green_main(),
@@ -154,7 +154,7 @@ impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
             Self::Http(s) => s.published_source(),
         }
     }
-    fn on_main(&self, sha: &str) -> Result<cadence_agent::upgrade::OnMain> {
+    fn on_main(&self, sha: &str) -> Result<cadence_ops::upgrade::OnMain> {
         match self {
             Self::Gh(s) => s.on_main(sha),
             Self::Http(s) => s.on_main(sha),
@@ -166,25 +166,25 @@ impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
             Self::Http(s) => s.compare(base, head),
         }
     }
-    fn main_runs(&self, sha: &str) -> Result<Vec<cadence_agent::upgrade::Run>> {
+    fn main_runs(&self, sha: &str) -> Result<Vec<cadence_ops::upgrade::Run>> {
         match self {
             Self::Gh(s) => s.main_runs(sha),
             Self::Http(s) => s.main_runs(sha),
         }
     }
-    fn merge_group_runs(&self, sha: &str) -> Result<Vec<cadence_agent::upgrade::Run>> {
+    fn merge_group_runs(&self, sha: &str) -> Result<Vec<cadence_ops::upgrade::Run>> {
         match self {
             Self::Gh(s) => s.merge_group_runs(sha),
             Self::Http(s) => s.merge_group_runs(sha),
         }
     }
-    fn jobs(&self, run_id: u64) -> Result<Vec<cadence_agent::upgrade::Job>> {
+    fn jobs(&self, run_id: u64) -> Result<Vec<cadence_ops::upgrade::Job>> {
         match self {
             Self::Gh(s) => s.jobs(run_id),
             Self::Http(s) => s.jobs(run_id),
         }
     }
-    fn artifact(&self, run_id: u64, name: &str) -> Result<cadence_agent::upgrade::ArtifactState> {
+    fn artifact(&self, run_id: u64, name: &str) -> Result<cadence_ops::upgrade::ArtifactState> {
         match self {
             Self::Gh(s) => s.artifact(run_id, name),
             Self::Http(s) => s.artifact(run_id, name),
@@ -202,7 +202,7 @@ impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
             Self::Http(s) => s.verify_attestation(binary, sha),
         }
     }
-    fn verify_retained(&self, dir: &Path) -> Result<cadence_agent::upgrade::RetainedProof> {
+    fn verify_retained(&self, dir: &Path) -> Result<cadence_ops::upgrade::RetainedProof> {
         match self {
             Self::Gh(s) => s.verify_retained(dir),
             Self::Http(s) => s.verify_retained(dir),
@@ -214,7 +214,7 @@ impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
             Self::Http(s) => s.published(),
         }
     }
-    fn published_proof(&self, sha: &str) -> Result<cadence_agent::upgrade::RetainedProof> {
+    fn published_proof(&self, sha: &str) -> Result<cadence_ops::upgrade::RetainedProof> {
         match self {
             Self::Gh(s) => s.published_proof(sha),
             Self::Http(s) => s.published_proof(sha),
@@ -236,14 +236,14 @@ impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
 
 pub(crate) struct RealUpdateHost<'a> {
     pub(super) state_dir: &'a Path,
-    pub(super) layout: cadence_agent::upgrade::Layout,
+    pub(super) layout: cadence_ops::upgrade::Layout,
     pub(super) source: UpdateSource,
     pub(super) label: String,
     /// Collect the plain lines for `--json`; `None` prints them as they
     /// happen (the plain form).
     pub(super) collect: Option<std::cell::RefCell<Vec<String>>>,
     /// The marker this run last recorded, for the drain re-assertion.
-    pub(super) pending: std::cell::RefCell<Option<cadence_agent::update::PendingUpdate>>,
+    pub(super) pending: std::cell::RefCell<Option<cadence_ops::update::PendingUpdate>>,
     /// `--progress`: append every line here too, so the board's card can
     /// read the run while this process is detached from it (CAD-561 r2).
     pub(super) progress_log: Option<PathBuf>,
@@ -255,7 +255,7 @@ impl RealUpdateHost<'_> {
     fn line(&self, line: &str) {
         let log = self.progress_log.as_deref();
         if let Some(path) = log {
-            cadence_agent::update::run_log_line(path, line);
+            cadence_ops::update::run_log_line(path, line);
         }
         match &self.collect {
             Some(lines) => lines.borrow_mut().push(line.to_string()),
@@ -284,17 +284,17 @@ pub(crate) fn fd_is_path(fd: i32, path: &Path) -> bool {
     descriptor.dev() == file.dev() && descriptor.ino() == file.ino()
 }
 
-impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
+impl cadence_ops::update::UpdateHost for RealUpdateHost<'_> {
     fn pin(&self) -> Option<&str> {
         self.pin.as_deref()
     }
     fn state_dir(&self) -> &Path {
         self.state_dir
     }
-    fn layout(&self) -> &cadence_agent::upgrade::Layout {
+    fn layout(&self) -> &cadence_ops::upgrade::Layout {
         &self.layout
     }
-    fn source(&self) -> &dyn cadence_agent::upgrade::ReleaseSource {
+    fn source(&self) -> &dyn cadence_ops::upgrade::ReleaseSource {
         &self.source
     }
     fn identity(&self) -> &str {
@@ -303,7 +303,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
     fn progress(&self, line: &str) {
         self.line(line);
     }
-    fn waiters(&self) -> Result<Vec<cadence_agent::update::Waiter>> {
+    fn waiters(&self) -> Result<Vec<cadence_ops::update::Waiter>> {
         // The daemon's own view is authoritative (it reads the message
         // rows); with no daemon running nothing is in flight.
         let status = match client::rpc(self.state_dir, "update_status", json!({})) {
@@ -315,7 +315,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             .map(|rows| {
                 rows.iter()
                     .filter_map(|r| {
-                        Some(cadence_agent::update::Waiter {
+                        Some(cadence_ops::update::Waiter {
                             alias: r["alias"].as_str()?.to_string(),
                             message: r["message"].as_str().unwrap_or_default().to_string(),
                             state: r["state"].as_str().unwrap_or_default().to_string(),
@@ -326,17 +326,17 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             })
             .unwrap_or_default())
     }
-    fn set_pending(&self, pending: Option<&cadence_agent::update::PendingUpdate>) -> Result<()> {
+    fn set_pending(&self, pending: Option<&cadence_ops::update::PendingUpdate>) -> Result<()> {
         *self.pending.borrow_mut() = pending.cloned();
         match pending {
-            Some(pending) => cadence_agent::update::write_pending(self.state_dir, pending),
+            Some(pending) => cadence_ops::update::write_pending(self.state_dir, pending),
             None => {
-                cadence_agent::update::clear_pending(self.state_dir);
+                cadence_ops::update::clear_pending(self.state_dir);
                 Ok(())
             }
         }
     }
-    fn pending(&self) -> Option<cadence_agent::update::PendingUpdate> {
+    fn pending(&self) -> Option<cadence_ops::update::PendingUpdate> {
         self.pending.borrow().clone()
     }
     fn set_drain(&self, on: bool) -> Result<()> {
@@ -361,8 +361,8 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             Err(e) => Err(e),
         }
     }
-    fn restart(&self, binary: &Path) -> Result<cadence_agent::update::RestartOutcome> {
-        use cadence_agent::update::RestartOutcome;
+    fn restart(&self, binary: &Path) -> Result<cadence_ops::update::RestartOutcome> {
+        use cadence_ops::update::RestartOutcome;
         // Rollback may select an older CLI whose `daemon restart`
         // requires a live fleet RPC. Select its cold-start command
         // before invoking it, with the current updater's guards.
@@ -447,7 +447,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             // health budget, not the interactive 10 s.
             cmd.env(
                 cadence_agent::ui::START_BUDGET_ENV,
-                cadence_agent::update::HEALTH_TIMEOUT.as_secs().to_string(),
+                cadence_ops::update::HEALTH_TIMEOUT.as_secs().to_string(),
             );
             let out = cadence_agent::reaper::spawn(&mut cmd)
                 .and_then(|child| child.wait_with_output())
@@ -505,7 +505,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
     fn start_board(&self, binary: &Path) -> Result<()> {
         let began = std::time::Instant::now();
         let mut last = String::new();
-        while began.elapsed() < cadence_agent::update::HEALTH_TIMEOUT {
+        while began.elapsed() < cadence_ops::update::HEALTH_TIMEOUT {
             let mut cmd = Command::new(binary);
             cmd.arg("--state-dir")
                 .arg(self.state_dir)
@@ -513,7 +513,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
                 .env_remove("CADENCE_ALIAS")
                 .env(
                     cadence_agent::ui::START_BUDGET_ENV,
-                    cadence_agent::update::HEALTH_TIMEOUT.as_secs().to_string(),
+                    cadence_ops::update::HEALTH_TIMEOUT.as_secs().to_string(),
                 )
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -533,7 +533,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
         }
         Err(Error::rejected(format!(
             "`ui start` did not succeed within {}s: {last}",
-            cadence_agent::update::HEALTH_TIMEOUT.as_secs()
+            cadence_ops::update::HEALTH_TIMEOUT.as_secs()
         )))
     }
     fn progress_log(&self) -> Option<PathBuf> {

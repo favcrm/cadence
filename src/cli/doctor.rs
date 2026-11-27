@@ -136,7 +136,7 @@ pub(super) fn run_remote(
             "install",
             format!(
                 "{kind} installation, version {}",
-                cadence_agent::overview::BUILD_ID
+                cadence_ops::overview::BUILD_ID
             ),
         ),
         Check::ok(

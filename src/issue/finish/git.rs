@@ -10,7 +10,8 @@ pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// `git -C dir <args>`; non-zero exit is a rejected error carrying
 /// stderr, like `issue::git`. `pub(crate)`: `issue reconcile` runs
 /// the same bounded probes for its merge classification.
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
+#[doc(hidden)]
+pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = git_out(dir, args, &[])?;
     if !out.status.success() {
         return Err(Error::rejected(format!(
@@ -103,12 +104,8 @@ pub(crate) fn same_tree(root: &Path, tip: &str, into: &str) -> bool {
 /// [`content_hint`], for messages and status only. `pr_head` is the
 /// head branch name the `pr` arm filters on. The first match wins and
 /// is reported as `merged_by`.
-pub(crate) fn merge_rule(
-    root: &Path,
-    pr_head: &str,
-    tip: &str,
-    into: &str,
-) -> Option<&'static str> {
+#[doc(hidden)]
+pub fn merge_rule(root: &Path, pr_head: &str, tip: &str, into: &str) -> Option<&'static str> {
     if ancestor(root, tip, into) {
         return Some("ancestry");
     }

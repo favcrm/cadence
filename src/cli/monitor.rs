@@ -175,7 +175,7 @@ pub(super) fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i3
             if out[cadence_core::board_api::READER_SCOPE_FIELD].as_str()
                 != Some(cadence_core::board_api::MONITOR_OPERATOR_SCOPE_ACK)
             {
-                cadence_agent::overview::monitoring::validate_scoped_monitor_alert_response(
+                cadence_ops::overview::monitoring::validate_scoped_monitor_alert_response(
                     monitor,
                     &out,
                 )

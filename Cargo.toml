@@ -11,11 +11,18 @@ description = "Local controller coordinating coding agents across terminals"
 members = [
     ".",
     "crates/cadence-core",
+    "crates/cadence-ops",
     "crates/cadence-daemon",
     "crates/cadence-ui",
     "crates/cadence-cli",
 ]
-default-members = [".", "crates/cadence-daemon", "crates/cadence-ui", "crates/cadence-cli"]
+default-members = [
+    ".",
+    "crates/cadence-ops",
+    "crates/cadence-daemon",
+    "crates/cadence-ui",
+    "crates/cadence-cli",
+]
 resolver = "2"
 
 [lib]
@@ -63,6 +70,9 @@ ui = []
 # and review tests can inject proc roots. The compile_error! in
 # src/test_seam.rs keeps these seams out of every release build.
 test-seam = []
+# The ops dev-dependency enables shared probes in both debug and release
+# tests. This feature adds no callers or identity override to shipping builds.
+ops-test-support = []
 # CAD-1159 SEC-002: admit an owner-elected PUBLIC fixture image-verification
 # root into a separately labelled debug/test-seam constructor artifact. Opt-in
 # only, never a default: the compile_error! in src/test_seam.rs refuses every
@@ -201,6 +211,9 @@ lto = false
 # Dependencies keep opt-level 1; the one workspace crate is front-end bound,
 # so skipping its LLVM optimisation is the cheap win (CAD-1103 measurements).
 [profile.ci.package.cadence-agent]
+opt-level = 0
+
+[profile.ci.package.cadence-ops]
 opt-level = 0
 
 [profile.ci.package.cadence-daemon]

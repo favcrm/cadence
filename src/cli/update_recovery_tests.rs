@@ -2,7 +2,7 @@
 //! contract, rather than the UpdateHost mock's restart implementation.
 use super::*;
 use cadence_agent::test_seam::{self, Asserted};
-use cadence_agent::update::{RestartOutcome, UpdateHost};
+use cadence_ops::update::{RestartOutcome, UpdateHost};
 use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
 
 struct OldCli {
@@ -47,11 +47,11 @@ exit 2
     fn host(&self) -> RealUpdateHost<'_> {
         RealUpdateHost {
             state_dir: &self.state,
-            layout: cadence_agent::upgrade::Layout {
+            layout: cadence_ops::upgrade::Layout {
                 releases: self.dir.path().join("releases"),
                 link: self.dir.path().join("cadence"),
             },
-            source: crate::cli::UpdateSource::Gh(cadence_agent::upgrade::Gh::new("unused/fixture")),
+            source: crate::cli::UpdateSource::Gh(cadence_ops::upgrade::Gh::new("unused/fixture")),
             label: "operator:cad628".into(),
             collect: Some(std::cell::RefCell::new(Vec::new())),
             pending: std::cell::RefCell::new(None),

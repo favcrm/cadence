@@ -6,25 +6,20 @@
 
 use super::*;
 
-#[cfg(test)]
-thread_local! {
-    pub(crate) static BEFORE_FINAL_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        std::cell::RefCell::new(None);
-}
-
 /// Release `path` (branch `branch`) once its exact tip survives somewhere
 /// durable: an ancestor of `origin/<default>`, or the head of a merged PR on
 /// origin's own GitHub repository (see [`hosted_evidence`]). Nothing is
 /// inferred from content, and "pushed" alone, which native finish accepts, is
 /// not enough: a hosted lane has no tracker ref to keep a branch findable.
-pub(crate) fn release_hosted_lane(
+#[doc(hidden)]
+pub fn release_hosted_lane(
     issue: &str,
     root: &Path,
     path: &Path,
     branch: &str,
     state_dir: &Path,
     prs: &dyn Fn(&str, &str) -> Option<Value>,
-    lock_and_validate: &dyn Fn() -> Result<std::fs::File>,
+    lock_and_validate: &dyn Fn() -> Result<crate::remote_cli::AssignmentCoordinationGuard>,
 ) -> Result<Value> {
     if !path.is_dir() {
         return Err(Error::rejected(format!(
@@ -134,12 +129,6 @@ pub(crate) fn release_hosted_lane(
             Ok(_) => Ok(()),
         }
     };
-    #[cfg(test)]
-    BEFORE_FINAL_LOCK.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
     let _assignment_ledger = lock_and_validate()?;
     verify_hosted_checkout_ownership(root, path, issue, Some(branch))?;
     let mut lifecycle = crate::worktree::lifecycle::begin_hosted_release(
@@ -267,7 +256,8 @@ pub(crate) fn github_slug(url: &str) -> Option<String> {
 
 /// The real lookup: `gh pr list -R <slug> --head <branch> --state merged`.
 /// `None` on any failure (no `gh`, not signed in, a timeout, bad JSON).
-pub(crate) fn gh_merged_prs(slug: &str, branch: &str) -> Option<Value> {
+#[doc(hidden)]
+pub fn gh_merged_prs(slug: &str, branch: &str) -> Option<Value> {
     let mut cmd = Command::new("gh");
     cmd.args([
         "-R",

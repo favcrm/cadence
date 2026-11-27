@@ -613,7 +613,7 @@ fn run_connect_command(action: &commands::ConnectAction) -> Result<i32> {
     // already belongs to. Without one the flow stays anonymous and the
     // owner chooses explicitly in the browser.
     let token = org::saved_login_token(None)?;
-    let poll = cadence_agent::github_connect::connect(
+    let poll = cadence_ops::github_connect::connect(
         issuer,
         token.as_deref(),
         std::time::Duration::from_secs(*wait),
@@ -621,13 +621,13 @@ fn run_connect_command(action: &commands::ConnectAction) -> Result<i32> {
             let _ = show_login_code(url, code, *no_open);
         },
     )?;
-    let line = cadence_agent::github_connect::outcome_line(&poll)
+    let line = cadence_ops::github_connect::outcome_line(&poll)
         .unwrap_or_else(|| "The connection did not settle in time.".to_string());
     // The outcome line precedes a possible exit 1: a closed stderr
     // must not panic the verdict into success.
     eprint_line(&line);
     Ok(match poll {
-        cadence_agent::github_connect::Poll::Connected(_) => 0,
+        cadence_ops::github_connect::Poll::Connected(_) => 0,
         _ => 1,
     })
 }

@@ -10,20 +10,20 @@ pub(super) fn run_overview(
     state_dir: &Path,
     json_out: bool,
     watch: Option<u64>,
-    scope: cadence_agent::overview::Scope,
+    scope: cadence_ops::overview::Scope,
 ) -> Result<i32> {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let json = cadence_agent::output::json_selected(json_out);
     let pm_dir = cadence_agent::issue::default_dir().unwrap_or_default();
-    let opts = cadence_agent::overview::Options {
+    let opts = cadence_ops::overview::Options {
         scope,
-        ..cadence_agent::overview::Options::cli()
+        ..cadence_ops::overview::Options::cli()
     };
     loop {
         if cadence_agent::output::stdout_closed() {
             return Ok(0);
         }
-        let view = cadence_agent::overview::overview_with(state_dir, &pm_dir, &opts)
+        let view = cadence_ops::overview::overview_with(state_dir, &pm_dir, &opts)
             .map_err(Error::rejected)?;
         if json {
             let body = cadence_agent::output::observation_body(&view, watch.is_some())?;
@@ -233,6 +233,6 @@ pub(super) fn run(
     project: Option<String>,
     group: Option<String>,
 ) -> Result<i32> {
-    let scope = cadence_agent::overview::Scope { project, group };
+    let scope = cadence_ops::overview::Scope { project, group };
     run_overview(&state_dir, json, watch, scope)
 }

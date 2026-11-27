@@ -25,8 +25,7 @@ use crate::error::{Error, Result};
 
 /// Remote (device-grant) board sessions live shorter than on-host ones:
 /// 12 h idle, 24 h absolute. See `open_device`.
-pub const REMOTE_IDLE_SECS: i64 = 12 * 3600;
-pub const REMOTE_ABSOLUTE_SECS: i64 = 24 * 3600;
+pub use cadence_agent::device_login::{REMOTE_ABSOLUTE_SECS, REMOTE_IDLE_SECS};
 
 const BODY_CAP: u64 = 64 * 1024;
 const TOKEN_CAP: usize = 4096;

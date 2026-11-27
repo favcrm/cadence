@@ -3268,13 +3268,82 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
     Ok(cred)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "ops-test-support"))]
 thread_local! {
-    pub(crate) static CREDENTIAL_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    #[doc(hidden)]
+    pub static CREDENTIAL_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The fixed coordination namespaces used by the local assignment protocol.
+#[doc(hidden)]
+pub enum AssignmentCoordinationLock<'a> {
+    Ledger,
+    Assignment {
+        organization: &'a str,
+        assignment: &'a str,
+    },
+    EventConfig,
+    EventInbox,
+    WorkspaceOwner {
+        organization: &'a str,
+    },
+}
+
+/// Holds the coordination lock until dropped, without exposing its file.
+#[doc(hidden)]
+pub struct AssignmentCoordinationGuard {
+    _file: File,
+}
+
+#[doc(hidden)]
+pub fn assignment_coordination_lock(
+    dir: &Path,
+    lock: AssignmentCoordinationLock<'_>,
+    deadline: Instant,
+) -> Result<AssignmentCoordinationGuard> {
+    let (name, observe_assignment_wait) = match lock {
+        AssignmentCoordinationLock::Ledger => (std::borrow::Cow::Borrowed("local-assign"), false),
+        AssignmentCoordinationLock::Assignment {
+            organization,
+            assignment,
+        } => {
+            let mut key = Sha256::new();
+            key.update((organization.len() as u64).to_be_bytes());
+            key.update(organization.as_bytes());
+            key.update(assignment.as_bytes());
+            (format!("local-reassign-{:x}", key.finalize()).into(), true)
+        }
+        AssignmentCoordinationLock::EventConfig => {
+            (std::borrow::Cow::Borrowed("hosted-event-config"), false)
+        }
+        AssignmentCoordinationLock::EventInbox => {
+            (std::borrow::Cow::Borrowed("hosted-event-inbox"), false)
+        }
+        AssignmentCoordinationLock::WorkspaceOwner { organization } => {
+            if organization.contains('/') || organization.contains('\0') {
+                return Err(reject("invalid workspace coordination identity"));
+            }
+            (format!("hosted-workspace-{organization}").into(), false)
+        }
+    };
+    Ok(AssignmentCoordinationGuard {
+        _file: private_lock_inner(dir, &name, deadline, observe_assignment_wait)?,
+    })
 }
 
 pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
+    private_lock_inner(dir, slug, deadline, false)
+}
+
+fn private_lock_inner(
+    dir: &Path,
+    slug: &str,
+    deadline: Instant,
+    #[cfg_attr(not(any(test, feature = "ops-test-support")), allow(unused_variables))]
+    observe_assignment_wait: bool,
+) -> Result<File> {
     private_directory(dir)?;
+
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -3292,12 +3361,14 @@ pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(file);
         }
-        #[cfg(test)]
-        CREDENTIAL_WAITING.with(|observer| {
-            if let Some(sender) = observer.borrow_mut().take() {
-                let _ = sender.send(());
-            }
-        });
+        #[cfg(any(test, feature = "ops-test-support"))]
+        if observe_assignment_wait {
+            CREDENTIAL_WAITING.with(|observer| {
+                if let Some(sender) = observer.borrow_mut().take() {
+                    let _ = sender.send(());
+                }
+            });
+        }
         if Instant::now() >= deadline {
             return Err(Error::busy_coded(
                 "timeout",
@@ -4302,7 +4373,8 @@ pub fn upload_artifact(
     upload_artifact_in(&dir, target, upload, wake_timeout, agent.as_deref(), note)
 }
 
-pub(crate) fn upload_artifact_for_slot(
+#[doc(hidden)]
+pub fn upload_artifact_for_slot(
     dir: &Path,
     target: &RemoteTarget,
     upload: &ArtifactUpload,
@@ -6561,7 +6633,8 @@ pub fn call_verb(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn call_verb_for_slot(
+#[doc(hidden)]
+pub fn call_verb_for_slot(
     dir: &Path,
     target: &RemoteTarget,
     verb: &str,

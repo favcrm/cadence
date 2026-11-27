@@ -85,7 +85,7 @@ pub fn run(timeout_secs: Option<u64>) -> Result<i32> {
                     .unwrap_or("2025-11-25"),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "cadence",
-                               "version": env!("CARGO_PKG_VERSION")}}}),
+                               "version": cadence_agent::HOST_VERSION}}}),
             "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result": {
             "tools": [{
                 "name": TOOL,
