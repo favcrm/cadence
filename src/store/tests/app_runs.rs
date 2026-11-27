@@ -1577,7 +1577,9 @@ fn cad1887_fresh_schema_includes_the_operator_decision_tables() {
 
 #[test]
 fn cad1887_proposed_steps_parser_keeps_only_the_section() {
-    let steps = crate::store::app_runs::parse_proposed_steps(TWO_PROPOSALS).unwrap();
+    use crate::store::app_runs::artifact_actions::parse_proposed_steps;
+
+    let steps = parse_proposed_steps(TWO_PROPOSALS).unwrap();
     assert_eq!(
         steps,
         vec![
@@ -1585,25 +1587,18 @@ fn cad1887_proposed_steps_parser_keeps_only_the_section() {
             "Ask the vendor for a written quote.".to_string(),
         ]
     );
-    assert_eq!(
-        crate::store::app_runs::parse_proposed_steps(ONE_PROPOSAL)
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(parse_proposed_steps(ONE_PROPOSAL).unwrap().len(), 1);
     let prose = "## Proposed next steps\n\n- One\nAlso this\n- Two\n";
-    assert!(crate::store::app_runs::parse_proposed_steps(prose)
+    assert!(parse_proposed_steps(prose)
         .unwrap_err()
         .to_string()
         .contains("not a single proposal"));
-    assert!(
-        crate::store::app_runs::parse_proposed_steps("No heading\n- One\n- Two\n")
-            .unwrap_err()
-            .to_string()
-            .contains("no Proposed next steps")
-    );
+    assert!(parse_proposed_steps("No heading\n- One\n- Two\n")
+        .unwrap_err()
+        .to_string()
+        .contains("no Proposed next steps"));
     let twice = format!("{TWO_PROPOSALS}\n## Proposed next steps\n\n- Again\n- Twice\n");
-    assert!(crate::store::app_runs::parse_proposed_steps(&twice)
+    assert!(parse_proposed_steps(&twice)
         .unwrap_err()
         .to_string()
         .contains("more than one"));
