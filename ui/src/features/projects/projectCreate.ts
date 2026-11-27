@@ -147,3 +147,32 @@ export function createProjectErrorMessage(
   }
   return t("Could not create project. Check your connection and try again.");
 }
+
+export function normalizeProjectPreset(preset: string | null | undefined): ProjectPreset | "" {
+  const match = PROJECT_PRESETS.find((item) => item.value === preset);
+  return match ? match.value : "";
+}
+
+export function updateProjectErrorMessage(
+  err: unknown,
+  t: (text: string) => string,
+): string {
+  const code = readErrorCode(err);
+  if (code === "owner_required" || code === "forbidden") {
+    return t("Only a workspace owner can edit project details.");
+  }
+  if (code === "project_archived") {
+    return t("Restore the project before editing its details.");
+  }
+  if (code === "not_found") {
+    return t("This project could not be found.");
+  }
+  if (code === "prefix_conflict") {
+    return t("That project prefix is already taken.");
+  }
+  const msg = readErrorMessage(err);
+  if (msg && !/^(Failed to fetch|NetworkError|Load failed)/i.test(msg)) {
+    return msg;
+  }
+  return t("Could not update project details. Check your connection and try again.");
+}

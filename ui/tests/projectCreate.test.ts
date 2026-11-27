@@ -118,6 +118,7 @@ async function main() {
     projectDisplayName,
     projectPresetLabel,
     slugifyProjectKey,
+    updateProjectErrorMessage,
   } = require("../src/features/projects/projectCreate") as typeof ProjectCreateModule;
   const ProjectsOverview = (
     require("../src/features/projects/ProjectsOverview") as typeof ProjectsOverviewModule
@@ -244,6 +245,74 @@ async function main() {
     createProjectErrorMessage(hostedErr).includes("already exists"),
     "hosted message mapped",
   );
+
+  // 3b. updateProjectErrorMessage & api.updateProject (PATCH /api/projects/:key)
+  const echo = (s: string) => s;
+  eq(
+    updateProjectErrorMessage(new ApiError("owner required", 403, { code: "owner_required" }), echo),
+    "Only a workspace owner can edit project details.",
+    "owner_required maps cleanly",
+  );
+  eq(
+    updateProjectErrorMessage(new ApiError("archived", 409, { code: "project_archived" }), echo),
+    "Restore the project before editing its details.",
+    "project_archived maps cleanly",
+  );
+  eq(
+    updateProjectErrorMessage(new ApiError("missing", 404, { code: "not_found" }), echo),
+    "This project could not be found.",
+    "not_found maps cleanly",
+  );
+  eq(
+    updateProjectErrorMessage(new ApiError("conflict", 409, { code: "prefix_conflict" }), echo),
+    "That project prefix is already taken.",
+    "prefix_conflict maps cleanly",
+  );
+  eq(
+    updateProjectErrorMessage(
+      new ApiError("owner required", 403, { code: "owner_required" }),
+      (s) => translateUiText(s, "zh-TW"),
+    ),
+    "只有工作區擁有者可以編輯專案詳情。",
+    "zh-TW update error translation",
+  );
+
+  let patchUrl = "";
+  let patchMethod = "";
+  let patchHeaders: Record<string, string> = {};
+  let patchBody: Record<string, unknown> = {};
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    patchUrl = typeof input === "string" ? input : String((input as Request).url);
+    patchMethod = init?.method ?? "";
+    patchHeaders = (init?.headers as Record<string, string>) ?? {};
+    patchBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    return jsonResponse(
+      {
+        project: {
+          key: "alpha",
+          name: "Alpha Renamed",
+          prefix: "ALP",
+          goal: "",
+          preset: "operations",
+          components: [],
+          repos: [],
+          issues: 2,
+        },
+      },
+      200,
+    );
+  }) as typeof globalThis.fetch;
+
+  const updated = await api.updateProject("alpha", {
+    name: "Alpha Renamed",
+    goal: "",
+    preset: "operations",
+  });
+  ok(patchUrl.endsWith("/api/projects/alpha"), `expected PATCH /api/projects/alpha, got ${patchUrl}`);
+  eq(patchMethod, "PATCH", "updateProject uses PATCH");
+  eq(patchHeaders["Content-Type"], "application/json", "updateProject sends application/json");
+  eq(patchBody, { name: "Alpha Renamed", goal: "", preset: "operations" }, "updateProject sends PATCH body");
+  eq(updated.project.name, "Alpha Renamed", "updateProject returns updated project");
 
   // 4. DOM & keyboard interaction for ProjectsOverview + NewProjectModal
   const emptyIssues: ResourceState<IssueCard[]> = {

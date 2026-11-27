@@ -325,6 +325,16 @@ export interface CreateProjectResponse {
   duplicate?: boolean;
 }
 
+export interface UpdateProjectInput {
+  name?: string;
+  goal?: string | null;
+  preset?: ProjectPreset | "" | null;
+}
+
+export interface UpdateProjectResponse {
+  project: Project;
+}
+
 export interface ProjectLifecycle {
   archive_capability?: string;
   project: string;
