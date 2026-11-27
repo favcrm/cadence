@@ -2993,6 +2993,16 @@ fn support(
 ) -> Result<i32> {
     use super::commands::SupportAction;
     use std::io::Read;
+    // This transport spends the stored member login, not an agent credential.
+    if target.identity.is_some()
+        || std::env::var_os("CADENCE_ALIAS").is_some()
+        || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+    {
+        return Err(Error::rejected(
+            "remote `support` refused for a managed caller: use the Board or CLI from an authorized human session. Nothing was sent",
+        ));
+    }
+    cadence_agent::remote_cli::refuse_non_human_actor(Some(&target), "support")?;
     let (method, suffix, body) = match action {
         SupportAction::New {
             subject,
@@ -3025,7 +3035,7 @@ fn support(
                 String::new(),
                 Some(json!({
                     "requestId": request_id.to_string(),
-                    "subject": subject.trim(),
+                    "subject": subject,
                     "impact": impact.as_str(),
                     "description": description,
                 })),
@@ -3054,12 +3064,8 @@ fn support(
         timeout,
     )?;
     let valid = match action {
-        SupportAction::New {
-            subject, impact, ..
-        } => {
-            support_receipt(&answer)
-                && answer["subject"] == subject.trim()
-                && answer["impact"] == impact.as_str()
+        SupportAction::New { impact, .. } => {
+            support_receipt(&answer) && answer["impact"] == impact.as_str()
         }
         SupportAction::Status { id } => support_receipt(&answer) && answer["id"] == *id,
         SupportAction::Ls { .. } => {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useLocale } from "../../lib/locale";
-import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
+import { onPrivateSessionReset, privateFetch, withPrivateOperation } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
 import Link from "../../ui/Link";
 
@@ -10,9 +10,13 @@ type Receipt = { id: string; subject: string; impact: Impact; status: Status; so
 type Page = { cases: Receipt[]; hasMore: boolean };
 const CASE_ID = /^SUP-[0-9A-F]{16}$/;
 
-// Hosted board receipts are private, tenant-scoped projections; they are not
-// project issues. Keep the submission key until a draft field changes or a
-// receipt arrives so an outcome-unknown retry cannot create a second case.
+type Draft = { subject: string; impact: Impact; description: string; includeDiagnostics: boolean; requestId: string | null };
+const emptyDraft: Draft = { subject: "", impact: "blocked", description: "", includeDiagnostics: false, requestId: null };
+
+// Keep an uncertain submission in memory across navigation and temporary
+// verification pauses, but never carry it across a confirmed identity change.
+let pendingDraft = emptyDraft;
+onPrivateSessionReset(() => { pendingDraft = emptyDraft; });
 
 function receipt(value: unknown): value is Receipt {
   if (!value || typeof value !== "object") return false;
@@ -49,10 +53,7 @@ function page(value: unknown): Page {
 export default function TechnicalSupport({ search }: { search: string }) {
   const { t, locale } = useLocale();
   const id = new URLSearchParams(search).get("case");
-  const [subject, setSubject] = useState("");
-  const [impact, setImpact] = useState<Impact>("blocked");
-  const [description, setDescription] = useState("");
-  const [includeDiagnostics, setIncludeDiagnostics] = useState(false);
+  const [{ subject, impact, description, includeDiagnostics }, setDraft] = useState(() => pendingDraft);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [saved, setSaved] = useState<Receipt | null>(null);
@@ -63,7 +64,6 @@ export default function TechnicalSupport({ search }: { search: string }) {
   const [detail, setDetail] = useState<Receipt | null>(null);
   const [detailError, setDetailError] = useState(false);
   const [refresh, setRefresh] = useState(0);
-  const requestId = useRef<string | null>(null);
   const savingRef = useRef(false);
   const lifetime = useRef<AbortController | null>(null);
 
@@ -74,6 +74,7 @@ export default function TechnicalSupport({ search }: { search: string }) {
   }, []);
 
   useEffect(() => {
+    if (id) return;
     const controller = new AbortController();
     setLoading(true);
     setListError(false);
@@ -84,7 +85,7 @@ export default function TechnicalSupport({ search }: { search: string }) {
     }).catch(() => { if (!controller.signal.aborted) setListError(true); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [refresh]);
+  }, [id, refresh]);
 
   useEffect(() => {
     setDetail(null);
@@ -99,7 +100,12 @@ export default function TechnicalSupport({ search }: { search: string }) {
     return () => controller.abort();
   }, [id, refresh]);
 
-  const changed = () => { requestId.current = null; setSaveError(""); setSaved(null); };
+  const change = (fields: Partial<Omit<Draft, "requestId">>) => {
+    pendingDraft = { ...pendingDraft, ...fields, requestId: null };
+    setDraft(pendingDraft);
+    setSaveError("");
+    setSaved(null);
+  };
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (savingRef.current) return;
@@ -108,8 +114,8 @@ export default function TechnicalSupport({ search }: { search: string }) {
     setSaving(true);
     setSaveError("");
     const controller = lifetime.current;
-    const key = requestId.current ?? crypto.randomUUID();
-    requestId.current = key;
+    const key = pendingDraft.requestId ?? crypto.randomUUID();
+    pendingDraft = { ...pendingDraft, requestId: key };
     try {
       const body = await request("/api/support/cases", {
         method: "POST",
@@ -117,9 +123,10 @@ export default function TechnicalSupport({ search }: { search: string }) {
         body: JSON.stringify({ requestId: key, subject, impact, description, includeDiagnostics }),
       }, controller?.signal);
       if (!receipt(body)) throw new Error("Invalid support receipt");
+      if (controller?.signal.aborted || pendingDraft.requestId !== key) return;
       setSaved(body);
-      setSubject(""); setDescription(""); setImpact("blocked"); setIncludeDiagnostics(false);
-      requestId.current = null;
+      pendingDraft = emptyDraft;
+      setDraft(emptyDraft);
       setRefresh((n) => n + 1);
     } catch (error) {
       if (!controller?.signal.aborted) setSaveError(error instanceof SupportError && error.status === 501
@@ -161,10 +168,10 @@ export default function TechnicalSupport({ search }: { search: string }) {
           <form className="card p-5 grid gap-4" onSubmit={submit} method="post" action="/api/support/cases">
             <h2 className="text-body font-semibold">{t("New request")}</h2>
             {saved && <div role="status" className="bg-ink-800 rounded-md p-3"><strong>{t("Request received")}</strong><p><Link href={`/settings/support?case=${encodeURIComponent(saved.id)}`} className="underline num">{saved.id}</Link> · {status(saved.status)}</p></div>}
-            <label className="grid gap-1 text-secondary font-medium">{t("Subject")} <input name="subject" className="field w-full" required maxLength={100} value={subject} disabled={saving} onChange={(e) => { changed(); setSubject(e.target.value); }} /></label>
-            <fieldset><legend className="text-secondary font-medium mb-2">{t("Impact")}</legend><div className="flex flex-wrap gap-3">{(["blocked", "degraded", "question"] as const).map((value) => <label className="flex items-center gap-2 text-secondary" key={value}><input type="radio" name="impact" value={value} checked={impact === value} disabled={saving} onChange={() => { changed(); setImpact(value); }} />{t(value === "blocked" ? "Blocked" : value === "degraded" ? "Degraded" : "Question")}</label>)}</div></fieldset>
-            <label className="grid gap-1 text-secondary font-medium">{t("What happened?")} <textarea name="description" className="field w-full" rows={5} required maxLength={4000} value={description} disabled={saving} onChange={(e) => { changed(); setDescription(e.target.value); }} /></label>
-            <div><label className="flex items-center gap-2 text-secondary"><input type="checkbox" name="includeDiagnostics" checked={includeDiagnostics} disabled={saving} onChange={(e) => { changed(); setIncludeDiagnostics(e.target.checked); }} />{t("Include screen diagnostics")}</label><p className="text-secondary text-ink-400 mt-2">{t("Only screen diagnostics are included if you opt in. Logs and workspace data are not attached.")}</p></div>
+            <label className="grid gap-1 text-secondary font-medium">{t("Subject")} <input name="subject" className="field w-full" required maxLength={100} value={subject} disabled={saving} onChange={(e) => change({ subject: e.target.value })} /></label>
+            <fieldset><legend className="text-secondary font-medium mb-2">{t("Impact")}</legend><div className="flex flex-wrap gap-3">{(["blocked", "degraded", "question"] as const).map((value) => <label className="flex items-center gap-2 text-secondary" key={value}><input type="radio" name="impact" value={value} checked={impact === value} disabled={saving} onChange={() => change({ impact: value })} />{t(value === "blocked" ? "Blocked" : value === "degraded" ? "Degraded" : "Question")}</label>)}</div></fieldset>
+            <label className="grid gap-1 text-secondary font-medium">{t("What happened?")} <textarea name="description" className="field w-full" rows={5} required maxLength={4000} value={description} disabled={saving} onChange={(e) => change({ description: e.target.value })} /></label>
+            <div><label className="flex items-center gap-2 text-secondary"><input type="checkbox" name="includeDiagnostics" checked={includeDiagnostics} disabled={saving} onChange={(e) => change({ includeDiagnostics: e.target.checked })} />{t("Include screen diagnostics")}</label><p className="text-secondary text-ink-400 mt-2">{t("Opt in to include the screen and Board version. Logs and workspace data are not attached.")}</p></div>
             {saveError && <p role="alert" className="text-secondary text-fail">{saveError}</p>}
             <div><button className="btn btn-primary" type="submit" disabled={saving}>{t(saving ? "Sending…" : "Send request")}</button></div>
           </form>
