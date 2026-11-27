@@ -26,7 +26,7 @@ export function useFileAccessSupport() {
   useEffect(() => {
     const controller = new AbortController();
     const valid = fence();
-    void listAccessRequests(controller.signal).then(() => { if (valid()) setSupported(true); }).catch(() => { if (valid()) setSupported(false); });
+    void listAccessRequests(controller.signal).then(({ paused }) => { if (valid()) setSupported(!paused); }).catch(() => { if (valid()) setSupported(false); });
     return () => controller.abort();
   }, []);
   return supported;
@@ -82,10 +82,12 @@ export function FileSharing({ id, version, href, readOnly, onConflict }: { id: s
       const result = await shareFile(id, version, confirm ? preview!.ticket : ticket.trim(), confirm ? preview!.audience : undefined);
       if (!valid()) return;
       if (result.status === "preview") setPreview(result);
-      else { setPreview(null); setMessage(t("This version was shared with ticket readers.")); }
+      else { setPreview(null); setMessage(t(result.status === "linked" ? "This version was linked without changing access." : "This version was shared with ticket readers.")); }
     } catch (e) {
       if (!valid()) return;
-      if (e instanceof FileAccessError && e.status === 409) { setPreview(null); onConflict(); setError(t("The audience changed. Reload and confirm again.")); }
+      if (e instanceof FileAccessError && e.code === "revision_conflict") { setPreview(null); onConflict(); setError(t("The audience changed. Reload and confirm again.")); }
+      else if (e instanceof FileAccessError && e.code === "document_not_approved") setError(t("Get approval for this version before sharing."));
+      else if (e instanceof FileAccessError && e.code === "document_archived") setError(t("Restore this document before sharing."));
       else setError(t("Could not share this version. Try again."));
     } finally { if (valid()) setBusy(false); }
   };
@@ -95,7 +97,7 @@ export function FileSharing({ id, version, href, readOnly, onConflict }: { id: s
       <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void submit(false); }}>
         <label htmlFor="share-ticket">{t("Ticket ID")}</label>
         <input id="share-ticket" className="field" value={ticket} required disabled={busy} onChange={(event) => { setTicket(event.target.value); setPreview(null); }} />
-        <div><Button type="submit" disabled={busy}>{t("Review ticket audience")}</Button></div>
+        <div><Button type="submit" disabled={busy}>{t("Link to ticket")}</Button></div>
       </form>
       {preview && <div className="grid gap-2">
         <p>{t("Share this version with ticket readers?")}</p>
@@ -118,8 +120,10 @@ export function AccessInbox({ readOnly }: { readOnly: boolean }) {
   const fence = useFence(() => { setRows(null); setError(false); setBusy(false); });
   useEffect(() => {
     const controller = new AbortController(); const valid = fence();
-    void listAccessRequests(controller.signal).then((next) => { if (valid()) { setRows(next); setError(false); } }).catch((e) => {
-      if (valid() && !(e instanceof FileAccessError && [400, 404, 503].includes(e.status))) setError(true);
+    void listAccessRequests(controller.signal).then(({ requests }) => { if (valid()) { setRows(requests); setError(false); } }).catch((e) => {
+      if (!valid()) return;
+      setRows(null);
+      if (!(e instanceof FileAccessError && [400, 404, 501].includes(e.status))) setError(true);
     });
     return () => controller.abort();
   }, [tick]);

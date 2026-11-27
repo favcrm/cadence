@@ -21,6 +21,7 @@
     ]
   },
   "empty_requests": { "requests": [] },
+  "paused_requests": { "paused": true, "requests": [] },
   "request_pending": { "status": "pending" },
   "request_granted": { "status": "granted" },
   "request_declined": { "status": "declined" },
@@ -41,8 +42,14 @@
     "ticket": "BETA-1",
     "audience": { "project": "BETA", "visibility": "workspace", "revision": null }
   },
+  "share_linked": {
+    "status": "linked",
+    "ticket": "BETA-1",
+    "audience": { "project": "BETA", "visibility": "workspace", "revision": null }
+  },
   "decision_granted": { "status": "granted" },
   "decision_declined": { "status": "declined" },
   "decision_revoked": { "status": "revoked" },
-  "refused": { "error": { "code": "forbidden", "message": "Access denied." } }
+  "refused": { "code": "forbidden", "error": "Access denied." },
+  "document_not_approved": { "code": "document_not_approved", "error": "Approval required." }
 }

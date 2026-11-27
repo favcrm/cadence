@@ -27,11 +27,11 @@ async function run() {
     return Response.json(response, { status: httpStatus });
   }) as typeof fetch;
   try {
-    const rows = await listAccessRequests();
+    const { requests: rows } = await listAccessRequests();
     assert(calls[0].path === "/api/wiki/file-access/requests" && calls[0].method === "GET", "list uses the hosted endpoint");
     assert(rows.length === 2 && rows[0].id === "art-example" && rows[0].title === "Project brief" && rows[1].title === undefined, "list preserves request identity and optional title");
     response = fixture.empty_requests;
-    assert((await listAccessRequests()).length === 0, "an empty request list is supported");
+    assert((await listAccessRequests()).requests.length === 0, "an empty request list is supported");
     for (const status of ["pending", "granted", "declined", "revoked", "available"]) {
       response = fixture[`request_${status}`];
       assert(await requestAccess("file /1", 2) === status, `request accepts ${status}`);
@@ -51,6 +51,14 @@ async function run() {
     response = fixture.share_workspace_preview;
     const workspace = await shareFile("file /1", 2, "BETA-1");
     assert(workspace.audience.visibility === "workspace" && workspace.audience.revision === null, "workspace audience can have a null revision");
+    response = fixture.share_linked;
+    assert((await shareFile("file /1", 2, "BETA-1")).status === "linked", "an unchanged audience links in one request");
+    httpStatus = 409;
+    response = fixture.document_not_approved;
+    let approvalNeeded = false;
+    try { await shareFile("file /1", 2, "ALPHA-1", preview.audience); } catch (error) { approvalNeeded = error instanceof FileAccessError && error.code === "document_not_approved"; }
+    assert(approvalNeeded, "an approval refusal is distinct from an audience conflict");
+    httpStatus = 200;
     for (const [decision, status] of [["grant", "granted"], ["decline", "declined"], ["revoke", "revoked"]] as const) {
       response = fixture[`decision_${status}`];
       await decideAccess(rows[0], decision);
@@ -101,6 +109,12 @@ async function run() {
       assert(host.textContent === "disabled", "malformed capability response cannot enable actions");
       await React.act(async () => { root.unmount(); });
     }
+    response = fixture.paused_requests;
+    const pausedRoot = createRoot(host);
+    await React.act(async () => { pausedRoot.render(React.createElement(Capability)); });
+    await flush();
+    assert(host.textContent === "disabled", "a paused response does not enable new requests or shares");
+    await React.act(async () => { pausedRoot.unmount(); });
     response = fixture.empty_requests;
     const root = createRoot(host);
     await React.act(async () => { root.render(React.createElement(Capability)); });

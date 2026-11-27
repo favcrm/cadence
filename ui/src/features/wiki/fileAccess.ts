@@ -6,7 +6,7 @@ export type AccessRequest = { id: string; version: number; requester: string; re
 export type Audience = { project: string; visibility: "private" | "workspace"; revision: string | null };
 export type SharePreview = { status: "preview"; ticket: string; audience: Audience };
 export class FileAccessError extends Error {
-  constructor(readonly status: number) { super(`File access request failed (${status}).`); }
+  constructor(readonly status: number, readonly code?: string) { super(`File access request failed (${status}).`); }
 }
 
 async function call(path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -18,16 +18,19 @@ async function call(path: string, body?: unknown, signal?: AbortSignal): Promise
     });
     const data: unknown = await response.json().catch(() => null);
     operation.assertCurrent();
-    if (!response.ok) throw new FileAccessError(response.status);
+    if (!response.ok) {
+      const code = (data as { code?: unknown } | null)?.code;
+      throw new FileAccessError(response.status, typeof code === "string" ? code : undefined);
+    }
     return data;
   }, signal);
 }
 const endpoint = (id: string, version: number, action: string) => `/api/wiki/file-access/${encodeURIComponent(id)}/${version}/${action}`;
 const statuses = ["pending", "granted", "declined", "revoked"];
-export async function listAccessRequests(signal?: AbortSignal): Promise<AccessRequest[]> {
-  const data = await call("/api/wiki/file-access/requests", undefined, signal) as { requests?: unknown } | null;
-  if (!Array.isArray(data?.requests) || !data.requests.every((r: AccessRequest) => r && typeof r.id === "string" && Number.isSafeInteger(r.version) && r.version > 0 && typeof r.requester === "string" && typeof r.requested_at === "string" && statuses.includes(r.status) && (r.title === undefined || typeof r.title === "string"))) throw new Error("Invalid file access response.");
-  return data.requests as AccessRequest[];
+export async function listAccessRequests(signal?: AbortSignal): Promise<{ requests: AccessRequest[]; paused: boolean }> {
+  const data = await call("/api/wiki/file-access/requests", undefined, signal) as { requests?: unknown; paused?: unknown } | null;
+  if ((data?.paused !== undefined && typeof data.paused !== "boolean") || !Array.isArray(data?.requests) || !data.requests.every((r: AccessRequest) => r && typeof r.id === "string" && Number.isSafeInteger(r.version) && r.version > 0 && typeof r.requester === "string" && typeof r.requested_at === "string" && statuses.includes(r.status) && (r.title === undefined || typeof r.title === "string"))) throw new Error("Invalid file access response.");
+  return { requests: data.requests, paused: data.paused === true };
 }
 export async function requestAccess(id: string, version: number): Promise<AccessStatus | "available"> {
   // The request endpoint deliberately has no body.
@@ -54,8 +57,9 @@ function sameJson(left: unknown, right: unknown): boolean {
   return keys.length === Object.keys(b).length && keys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && sameJson(a[key], b[key]));
 }
 
-export async function shareFile(id: string, version: number, ticket: string, audience?: Audience): Promise<SharePreview | { status: "shared"; ticket: string; audience: Audience }> {
-  const data = await call(endpoint(id, version, "share"), { ticket, ...(audience ? { audience } : {}) }) as SharePreview | { status: "shared"; ticket: string; audience: Audience } | null;
-  if (!data || data.status !== (audience ? "shared" : "preview") || data.ticket !== ticket || !data.audience || typeof data.audience.project !== "string" || !["private", "workspace"].includes(data.audience.visibility) || !(data.audience.revision === null || typeof data.audience.revision === "string") || (audience && !sameJson(data.audience, audience))) throw new Error("Invalid share response.");
+export async function shareFile(id: string, version: number, ticket: string, audience?: Audience): Promise<SharePreview | { status: "shared" | "linked"; ticket: string; audience: Audience }> {
+  const data = await call(endpoint(id, version, "share"), { ticket, ...(audience ? { audience } : {}) }) as SharePreview | { status: "shared" | "linked"; ticket: string; audience: Audience } | null;
+  const statuses = audience ? ["shared", "linked"] : ["preview", "linked"];
+  if (!data || !statuses.includes(data.status) || data.ticket !== ticket || !data.audience || typeof data.audience.project !== "string" || !["private", "workspace"].includes(data.audience.visibility) || !(data.audience.revision === null || typeof data.audience.revision === "string") || (audience && !sameJson(data.audience, audience))) throw new Error("Invalid share response.");
   return data;
 }
