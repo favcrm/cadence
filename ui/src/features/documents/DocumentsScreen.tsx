@@ -105,12 +105,16 @@ function restoreFailure(code: string | null, t: Translate): string {
 }
 
 export default function DocumentsScreen({
+  project,
   hosted,
   viewer,
   archived,
   stage,
   hrefFor,
+  onOpenIssue,
 }: {
+  /** Optional project key; when set, lists and links within that project. */
+  project?: string;
   /** The lifecycle is hosted only: a native board never reads the probe. */
   hosted: boolean;
   viewer: DocumentsViewer;
@@ -119,20 +123,24 @@ export default function DocumentsScreen({
   /** The Active tab's stage filter (`?stage=`). */
   stage?: DocumentStageFilter;
   hrefFor: (route: Route) => string;
+  onOpenIssue?: (id: string) => void;
 }) {
   const t = useTranslate();
   const { formatDate } = useLocale();
+  const scopeProject = project ?? null;
   const probeState = useMaybeResource(hosted ? documentsProbe : null);
   const answer = probeState?.data ?? null;
   const available = answer?.kind === "available";
   const types: DocumentType[] = answer?.kind === "available" ? answer.types : [];
 
-  /** The rows of one tab; `null` until that tab's first list answers. */
-  const [rows, setRows] = useState<{ archived: boolean; rows: DocumentRow[] } | null>(null);
+  /** The rows of one project/tab pair; `null` until that view's first list answers. */
+  const [rows, setRows] = useState<{ project: string | null; archived: boolean; rows: DocumentRow[] } | null>(null);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
-  /** A list answered 404 after the probe said available: the lifecycle was turned off. */
+  /** A global list answered 404 after the probe said available: the lifecycle was turned off. */
   const [gone, setGone] = useState(false);
+  /** A project-scoped list answered 404: kept local so the workspace probe stays intact. */
+  const [projectGone, setProjectGone] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [confirming, setConfirming] = useState<Pending | null>(null);
   const [writing, setWriting] = useState(false);
@@ -163,10 +171,16 @@ export default function DocumentsScreen({
   }, []);
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
+  useEffect(() => {
+    setProjectGone(null);
+    setFailed(false);
+  }, [scopeProject]);
+
   useEffect(() => onPrivateSessionReset(() => {
     probeAsked.current = false;
     setRows(null);
     setGone(false);
+    setProjectGone(null);
     setConfirming(null);
     setApprovedByMe({});
     setToast(null);
@@ -197,18 +211,25 @@ export default function DocumentsScreen({
       const seq = ++readSeq.current;
       setLoading(true);
       setFailed(false);
+      setProjectGone(null);
       try {
-        const result = await list(archived, signal);
+        const result = await list(archived, scopeProject, signal);
         if (signal?.aborted || seq !== readSeq.current) return;
-        if (result.ok) setRows({ archived, rows: result.value });
-        else if (result.failure.status === 404 && refusalCode(result) === "not_found") {
-          setGone(true);
-          // Let the shared probe learn it too, so the nav item goes. Once per
-          // mount: if the probe still says available, its answer lists once
-          // more, and a lasting 404 stops there instead of looping.
-          if (!probeAsked.current) {
-            probeAsked.current = true;
-            void documentsProbe.invalidate();
+        if (result.ok) {
+          setProjectGone(null);
+          setRows({ project: scopeProject, archived, rows: result.value });
+        } else if (result.failure.status === 404 && refusalCode(result) === "not_found") {
+          if (scopeProject !== null) {
+            setProjectGone(scopeProject);
+          } else {
+            setGone(true);
+            // Let the shared probe learn it too, so the nav item goes. Once per
+            // mount: if the probe still says available, its answer lists once
+            // more, and a lasting 404 stops there instead of looping.
+            if (!probeAsked.current) {
+              probeAsked.current = true;
+              void documentsProbe.invalidate();
+            }
           }
         } else setFailed(true);
       } catch {
@@ -217,7 +238,7 @@ export default function DocumentsScreen({
         if (!signal?.aborted && seq === readSeq.current) setLoading(false);
       }
     },
-    [archived],
+    [archived, scopeProject],
   );
 
   useEffect(() => {
@@ -263,8 +284,9 @@ export default function DocumentsScreen({
       // An archived row leaves the Active tab, a restored one the Archived tab.
       const leaves = action !== "approve" && (next === "archived") !== archived;
       setRows((current) =>
-        current && current.archived === archived
+        current && current.project === scopeProject && current.archived === archived
           ? {
+              project: scopeProject,
               archived,
               rows: leaves ? current.rows.filter((entry) => entry.file.id !== id) : current.rows.map((entry) =>
                 entry.file.id !== id
@@ -297,11 +319,35 @@ export default function DocumentsScreen({
     else void refresh();
   };
 
+  const documentsRoute = (opts: { archived: boolean; stage?: DocumentStageFilter }): Route =>
+    scopeProject !== null
+      ? {
+          screen: "projects",
+          slug: scopeProject,
+          section: "documents",
+          ...(opts.archived ? { archived: true } : {}),
+          ...(!opts.archived && opts.stage ? { stage: opts.stage } : {}),
+        }
+      : {
+          screen: "documents",
+          archived: opts.archived,
+          ...(!opts.archived && opts.stage ? { stage: opts.stage } : {}),
+        };
+
+  const pageClassName = scopeProject !== null
+    ? "documents-page documents-project-page px-4 lg:px-8 py-6 grid gap-4 min-w-0"
+    : "documents-page px-4 lg:px-8 py-5 grid gap-4 min-w-0";
+
+  const backHref = scopeProject !== null
+    ? hrefFor({ screen: "projects", slug: scopeProject, section: "overview" })
+    : hrefFor({ screen: "home" });
+  const backLabel = scopeProject !== null ? t("Overview") : t("Home");
+
   const unavailable = !hosted || answer?.kind === "unavailable" || gone;
   if (unavailable) {
     return (
-      <section className="documents-page px-4 lg:px-8 py-5">
-        <PageState title={t("Documents aren’t available here")} actions={<Button href={hrefFor({ screen: "home" })}>{t("Home")}</Button>}>
+      <section className={pageClassName}>
+        <PageState title={t("Documents aren’t available here")} actions={<Button href={backHref}>{backLabel}</Button>}>
           {t("This workspace doesn’t have document review turned on.")}
         </PageState>
       </section>
@@ -311,12 +357,29 @@ export default function DocumentsScreen({
   // answer: the screen is unavailable for now, with a retry of the real probe.
   if (answer?.kind === "error" && !probeState?.inFlight) {
     return (
-      <section className="documents-page px-4 lg:px-8 py-5">
+      <section className={pageClassName}>
         <PageState
           title={t("Documents aren’t available here")}
           actions={<Button onClick={() => void documentsProbe.refresh()}>{t("Retry")}</Button>}
         >
           {t("Couldn’t check whether documents are available.")}
+        </PageState>
+      </section>
+    );
+  }
+  if (scopeProject !== null && projectGone === scopeProject) {
+    return (
+      <section className={pageClassName}>
+        <PageState
+          title={t("Documents aren’t available for this project")}
+          actions={
+            <>
+              <Button onClick={() => setAttempt((count) => count + 1)}>{t("Retry")}</Button>
+              <Button href={backHref}>{backLabel}</Button>
+            </>
+          }
+        >
+          {t("This project doesn’t have document review turned on or couldn’t be found.")}
         </PageState>
       </section>
     );
@@ -359,20 +422,60 @@ export default function DocumentsScreen({
       key: "title",
       header: t("Document"),
       cellClassName: "documents-title-cell",
-      cell: (row) =>
-        isArtifactKind(row.file.kind) ? (
-          <button
-            type="button"
-            className="documents-title text-left text-ink-100 hover:text-accent hover:underline focus-visible:outline-2 focus-visible:outline-accent"
-            onClick={() => open(row)}
-          >
-            {row.file.title}
-          </button>
-        ) : (
-          <span className="documents-title text-ink-100">{row.file.title}</span>
-        ),
+      cell: (row) => {
+        const issueId = row.file.issue;
+        const issueProject = scopeProject ?? row.file.project;
+        const baseHref = hrefFor(documentsRoute({ archived, ...(!archived && stage ? { stage } : {}) }));
+        const issueHref = issueId
+          ? issueProject
+            ? hrefFor({ screen: "issue", project: issueProject, id: issueId, tab: "overview" })
+            : `${baseHref}${baseHref.includes("?") ? "&" : "?"}issue=${encodeURIComponent(issueId)}`
+          : null;
+        return (
+          <div className="documents-title-stack">
+            {isArtifactKind(row.file.kind) ? (
+              <button
+                type="button"
+                className="documents-title text-left text-ink-100 hover:text-accent hover:underline focus-visible:outline-2 focus-visible:outline-accent"
+                onClick={() => open(row)}
+              >
+                {row.file.title}
+              </button>
+            ) : (
+              <span className="documents-title text-ink-100">{row.file.title}</span>
+            )}
+            <div className="documents-title-meta">
+              <span className="chip documents-version-chip num" data-document-version>
+                {`v${row.file.version}`}
+              </span>
+              {issueId && (
+                onOpenIssue ? (
+                  <button
+                    type="button"
+                    className="chip documents-issue-chip num"
+                    data-document-issue={issueId}
+                    aria-label={t("Open work item {id}").replace("{id}", () => issueId)}
+                    onClick={() => onOpenIssue(issueId)}
+                  >
+                    {issueId}
+                  </button>
+                ) : (
+                  <Link
+                    href={issueHref!}
+                    className="chip documents-issue-chip num"
+                    data-document-issue={issueId}
+                    aria-label={t("Open work item {id}").replace("{id}", () => issueId)}
+                  >
+                    {issueId}
+                  </Link>
+                )
+              )}
+            </div>
+          </div>
+        );
+      },
     },
-    { key: "type", header: t("Document type"), cell: (row) => row.document.type },
+    { key: "type", header: t("Document type"), cell: (row) => <span className="documents-type-label">{row.document.type}</span> },
     {
       key: "stage",
       header: t("Stage"),
@@ -380,7 +483,9 @@ export default function DocumentsScreen({
         const mine = approvedByMe[row.file.id];
         return (
           <span className="inline-flex flex-wrap items-center gap-1.5">
-            <span className={STAGE_CHIP[row.document.stage]}>{t(STAGE_LABEL[row.document.stage])}</span>
+            <span className={STAGE_CHIP[row.document.stage]} data-document-stage={row.document.stage}>
+              {t(STAGE_LABEL[row.document.stage])}
+            </span>
             {row.document.stage === "approved" && mine !== undefined && (
               <span className="text-label text-ink-400">{mine ? t("Approved by you (self)") : t("Approved by you")}</span>
             )}
@@ -393,7 +498,7 @@ export default function DocumentsScreen({
       header: t("Version under review"),
       cell: (row) =>
         row.document.stage === "in_review" && row.document.submittedVersion !== null ? `v${row.document.submittedVersion}` : "—",
-      cellClassName: "num",
+      cellClassName: "num documents-review-cell",
     },
     { key: "delivered", header: t("Delivered"), cell: (row) => dateOf(row.document.deliveredAt), cellClassName: "num" },
     ...(archived
@@ -428,7 +533,7 @@ export default function DocumentsScreen({
     },
   ];
 
-  const tabRows = rows !== null && rows.archived === archived ? rows.rows : null;
+  const tabRows = rows !== null && rows.project === scopeProject && rows.archived === archived ? rows.rows : null;
   const shown = tabRows === null ? null : !archived && stage ? tabRows.filter((row) => row.document.stage === stage) : tabRows;
 
   let body;
@@ -456,7 +561,7 @@ export default function DocumentsScreen({
   } else if (shown.length === 0) {
     body = (
       <EmptyState name="documents-filtered" title={t("No documents at this stage")}>
-        <Link href={hrefFor({ screen: "documents", archived: false })} replace className="text-accent hover:underline">
+        <Link href={hrefFor(documentsRoute({ archived: false }))} replace className="text-accent hover:underline">
           {t("Show all stages")}
         </Link>
       </EmptyState>
@@ -476,36 +581,48 @@ export default function DocumentsScreen({
 
   const confirmingTitle = confirming?.row.file.title ?? "";
   return (
-    <section className="documents-page px-4 lg:px-8 py-5 grid gap-4" aria-labelledby="documents-title" aria-busy={loading || undefined}>
-      <h1 id="documents-title" ref={headingRef} tabIndex={-1} className="text-section font-semibold text-ink-100 focus:outline-none">
-        {t("Documents")}
-      </h1>
-      <SectionTabs
-        label={t("Documents")}
-        bare
-        tabs={[
-          { label: "Active", href: hrefFor({ screen: "documents", archived: false }), on: !archived },
-          { label: "Archived", href: hrefFor({ screen: "documents", archived: true }), on: archived },
-        ]}
-      />
-      {!archived && (
-        <nav aria-label={t("Filter by stage")} data-stage-filter className="flex flex-wrap items-center gap-1.5 min-w-0">
-          {STAGE_FILTERS.map((filter) => {
-            const on = (stage ?? null) === filter.stage;
-            return (
-              <Link
-                key={filter.label}
-                href={hrefFor({ screen: "documents", archived: false, ...(filter.stage ? { stage: filter.stage } : {}) })}
-                replace
-                aria-current={on ? "page" : undefined}
-                className={`chip ${on ? "bg-accent/15 text-accent" : "bg-ink-800 text-ink-400 hover:text-ink-100"}`}
-              >
-                {t(filter.label)}
-              </Link>
-            );
-          })}
-        </nav>
-      )}
+    <section className={pageClassName} aria-labelledby="documents-title" aria-busy={loading || undefined}>
+      <header className="documents-header">
+        <div>
+          {scopeProject !== null && <div className="slabel">{t("Project documents")}</div>}
+          <h1 id="documents-title" ref={headingRef} tabIndex={-1} className="text-section font-semibold text-ink-100 focus:outline-none">
+            {t("Documents")}
+          </h1>
+          {scopeProject !== null && (
+            <p className="text-label text-ink-500 mt-1 mb-0">
+              {t("Files, reviews, and approvals for {project}.").replace("{project}", () => scopeProject)}
+            </p>
+          )}
+        </div>
+      </header>
+      <div className="documents-toolbar">
+        <SectionTabs
+          label={t("Documents")}
+          bare
+          tabs={[
+            { label: "Active", href: hrefFor(documentsRoute({ archived: false })), on: !archived },
+            { label: "Archived", href: hrefFor(documentsRoute({ archived: true })), on: archived },
+          ]}
+        />
+        {!archived && (
+          <nav aria-label={t("Filter by stage")} data-stage-filter className="documents-stage-filters flex flex-wrap items-center gap-1.5 min-w-0">
+            {STAGE_FILTERS.map((filter) => {
+              const on = (stage ?? null) === filter.stage;
+              return (
+                <Link
+                  key={filter.label}
+                  href={hrefFor(documentsRoute({ archived: false, ...(filter.stage ? { stage: filter.stage } : {}) }))}
+                  replace
+                  aria-current={on ? "page" : undefined}
+                  className={`chip ${on ? "bg-accent/15 text-accent" : "bg-ink-800 text-ink-400 hover:text-ink-100"}`}
+                >
+                  {t(filter.label)}
+                </Link>
+              );
+            })}
+          </nav>
+        )}
+      </div>
       {body}
       {failed && shown !== null && (
         <ErrorNotice onRetry={() => setAttempt((count) => count + 1)} retryLabel={t("Retry")}>

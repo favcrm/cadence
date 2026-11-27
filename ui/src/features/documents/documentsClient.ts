@@ -98,6 +98,7 @@ export interface DocumentFile {
   /** ISO timestamp of this version. */
   created: string;
   issue: string | null;
+  project: string | null;
   shared: boolean;
 }
 
@@ -270,6 +271,7 @@ function parseFile(value: unknown): DocumentFile {
     digest: str(row, "digest"),
     created: str(row, "created"),
     issue: strOrNull(row, "issue"),
+    project: row.project === undefined ? null : strOrNull(row, "project"),
     shared: bool(row, "shared"),
   };
 }
@@ -413,9 +415,16 @@ export async function probe(signal?: AbortSignal): Promise<DocumentsProbe> {
   return { kind: "error", failure };
 }
 
-/** `GET /api/documents?archived=0|1`: the documents this viewer may see. */
-export async function list(archived: boolean, signal?: AbortSignal): Promise<DocumentsResult<DocumentRow[]>> {
-  return (await call(`/api/documents?archived=${archived ? 1 : 0}`, read(), parseRows, signal)).result;
+/** `GET /api/documents?archived=0|1` (and optional `project=<key>`): the documents this viewer may see. */
+export async function list(
+  archived: boolean,
+  project?: string | null,
+  signal?: AbortSignal,
+): Promise<DocumentsResult<DocumentRow[]>> {
+  const query = project
+    ? `project=${encodeURIComponent(project)}&archived=${archived ? 1 : 0}`
+    : `archived=${archived ? 1 : 0}`;
+  return (await call(`/api/documents?${query}`, read(), parseRows, signal)).result;
 }
 
 /** `POST /api/documents/:id/approve` for the version the approver reviewed.

@@ -91,6 +91,7 @@ async function main() {
   }
   const go = (path: string) => React.act(async () => { navigate(path); });
   const navItem = () => host.querySelector('aside nav[aria-label="Primary"] a[href="/documents"]');
+  const projectTab = () => host.querySelector('nav.section-nav a[href="/projects/acme/documents"]');
   const probes = () => requests.filter((path) => path === "/api/document-types").length;
 
   // ---- a native board ----
@@ -101,6 +102,9 @@ async function main() {
   await settle(() => assert(host.querySelector('aside nav[aria-label="Primary"]'), "the nav renders"), "native nav");
   await settle(() => assert(requests.includes("/api/health"), "the routine refresh ran"), "native refresh");
   assert(!navItem(), "a native board shows no Documents nav item");
+  await go("/projects/acme");
+  await settle(() => assert(host.querySelector('nav.section-nav'), "the project section tabs render"), "native project tabs");
+  assert(!projectTab(), "a native board shows no Documents project tab");
   await go("/documents");
   await settle(() => assert(host.textContent?.includes("Documents aren’t available here"), "a direct link shows the unavailable state"), "native direct link");
   await flush();
@@ -126,6 +130,11 @@ async function main() {
   await settle(() => assert(host.textContent?.includes("No documents to show"), "the screen mounts on /documents"), "hosted screen");
   assert(requests.includes("/api/documents?archived=0"), "the screen lists active documents");
   equal(probes(), 1, "opening the screen does not probe again");
+  await go("/projects/acme");
+  await settle(() => assert(projectTab(), "an available probe shows the Documents project section tab"), "hosted project tab");
+  await go("/projects/acme/documents");
+  await settle(() => assert(requests.includes("/api/documents?project=acme&archived=0"), "the project Documents tab lists project-scoped documents"), "hosted project documents");
+  equal(probes(), 1, "opening project Documents reads the shared probe, not a second one");
   // Settings → Documents mounts where the other sections are, from the same probe.
   await go("/settings/documents");
   await settle(() => assert(host.textContent?.includes("Default for new types"), "Settings → Documents mounts the type preferences"), "settings documents");

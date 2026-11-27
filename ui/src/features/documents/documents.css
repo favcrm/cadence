@@ -1,10 +1,43 @@
-/* CAD-2286: the Documents table keeps a readable floor, as `.crm-table` and
-   `.av-table` do: at a 390px viewport, or beside the open canvas, the shared
-   `.stable-wrap` scrolls it internally instead of crushing the columns. The
-   floor is sized for the six Active columns with whole headers and chips; the
-   Archived tab adds a seventh, and the table grows past the floor (and
+/* CAD-2286 / CAD-2860: the Documents table keeps a readable floor, as `.crm-table`
+   and `.av-table` do: at a 390px viewport, or beside the open canvas, the
+   shared `.stable-wrap` scrolls it internally instead of crushing the columns.
+   The floor is sized for the six Active columns with whole headers and chips;
+   the Archived tab adds a seventh, and the table grows past the floor (and
    scrolls in its wrapper) when its columns need more. Wider, the table's 100%
    width rules. */
+.documents-page {
+  min-width: 0;
+}
+
+.documents-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.documents-toolbar {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border: 0;
+  border-radius: 0.625rem;
+  background: var(--board-surface-recessed);
+  min-width: 0;
+}
+
+.documents-stage-filters {
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--board-surface-hairline);
+}
+
+.documents-page .stable-wrap {
+  border: 0;
+  border-radius: 0.625rem;
+  background: var(--board-surface-card);
+}
+
 .documents-table {
   min-width: 760px;
 }
@@ -14,8 +47,19 @@
    Here cells wrap only between words, and headers and chips never wrap.
    `.stable.documents-table` outranks the shared `.stable` rules by
    specificity, whichever stylesheet loads last. */
+.stable.documents-table thead th {
+  background: var(--board-surface-recessed);
+  border-bottom: 1px solid var(--board-surface-hairline);
+}
+
 .stable.documents-table td {
   overflow-wrap: normal;
+  border-bottom: 1px solid var(--board-surface-hairline);
+}
+
+.stable.documents-table tbody tr:hover,
+.stable.documents-table tbody tr:hover td {
+  background: var(--board-surface-card-hover);
 }
 
 .stable.documents-table th {
@@ -37,9 +81,56 @@
   overflow-wrap: anywhere;
 }
 
+.documents-title-stack {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
 .documents-title {
   display: inline-block;
   min-width: 12rem;
+}
+
+.documents-title-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+}
+
+.documents-version-chip {
+  background: var(--board-surface-recessed);
+  color: var(--color-ink-300);
+  border-color: var(--board-surface-hairline);
+}
+
+.documents-issue-chip {
+  background: var(--board-surface-recessed);
+  color: var(--color-ink-200);
+  border-color: var(--board-surface-hairline);
+  cursor: pointer;
+  text-decoration: none;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.documents-issue-chip:hover,
+.documents-issue-chip:focus-visible {
+  background: var(--board-surface-recessed-hover);
+  color: var(--color-accent);
+  border-color: color-mix(in srgb, var(--color-accent) 45%, transparent);
+  outline: none;
+}
+
+.documents-type-label {
+  color: var(--color-ink-200);
+}
+
+@media (max-width: 639px) {
+  .documents-toolbar {
+    padding: 0.625rem 0.75rem;
+  }
 }
 
 /* CAD-2286 Settings → Documents. Rows reuse the shared `.settings-row`; only

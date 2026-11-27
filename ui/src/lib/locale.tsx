@@ -3514,6 +3514,11 @@ Object.assign(zhTW, {
   "Couldn’t archive this document. Try again.": "無法封存此文件。請再試。",
   "Only the workspace owner can restore documents.": "只有工作區擁有者可以還原文件。",
   "Couldn’t restore this document. Try again.": "無法還原此文件。請再試。",
+  "Project documents": "專案文件",
+  "Files, reviews, and approvals for {project}.": "{project} 的檔案、審查與核准。",
+  "Open work item {id}": "開啟工作項目 {id}",
+  "Documents aren’t available for this project": "此專案無法使用文件",
+  "This project doesn’t have document review turned on or couldn’t be found.": "此專案尚未開啟文件審查，或找不到此專案。",
 });
 
 // CAD-2286: Settings → Documents, the document type preferences. ("Documents",
@@ -4047,7 +4052,6 @@ Object.assign(zhTW, {
   "The remote Custom MCP server reported an error.": "遠端自訂 MCP 伺服器回報錯誤。",
   "Custom MCP operation could not be completed.": "無法完成此自訂 MCP 操作。",
   "Could not complete the Custom MCP request. Try again.": "無法完成自訂 MCP 要求，請稍後再試。",
-  "Active": "已啟用",
   "Drift review": "變更待審",
   "Auth expired": "授權過期",
   "Awaiting sign-in": "等待登入",

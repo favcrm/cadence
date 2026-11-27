@@ -72,15 +72,18 @@ async function main() {
   type Call = { method: string; path: string; body: unknown };
   let calls: Call[] = [];
   let probeReply: () => Reply = () => json(probeBody());
-  let listReply: (archived: boolean) => Reply = (archived) => json({ documents: archived ? ARCHIVED : ACTIVE });
+  let listReply: (archived: boolean, project?: string | null) => Reply = (archived) => json({ documents: archived ? ARCHIVED : ACTIVE });
   let writeReply: (path: string, body: unknown) => Reply = () => refusal(500, "internal");
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = String(input);
     const method = init?.method ?? "GET";
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
     calls.push({ method, path, body });
-    if (path === "/api/document-types") return probeReply();
-    if (path.startsWith("/api/documents?archived=")) return listReply(path.endsWith("archived=1"));
+    const url = new URL(path, "http://localhost");
+    if (url.pathname === "/api/document-types") return probeReply();
+    if (url.pathname === "/api/documents" && url.searchParams.has("archived")) {
+      return listReply(url.searchParams.get("archived") === "1", url.searchParams.get("project"));
+    }
     if (method === "POST" && path.startsWith("/api/documents/")) return writeReply(path, body);
     return refusal(404, "not_found");
   }) as typeof fetch;
@@ -98,9 +101,9 @@ async function main() {
     return { capability: DOCUMENT_CAPABILITY, baseline: BASELINE, types };
   }
 
-  const file = (id: string, title: string, version: number, kind = "md") => ({
+  const file = (id: string, title: string, version: number, kind = "md", extra: Record<string, unknown> = {}) => ({
     id, version, kind, title, label: "Proposal", customer: "", bytes: 120 + version, digest: `digest-${id}`,
-    created: "2026-11-10T08:00:00Z", issue: null, shared: false,
+    created: "2026-11-10T08:00:00Z", issue: null, project: null, shared: false, ...extra,
   });
   const doc = (stage: string, over: Record<string, unknown> = {}) => ({
     type: "proposal", stage, submittedVersion: null, approvedVersion: null, selfApproved: false,
@@ -142,8 +145,17 @@ async function main() {
     throw new Error(`${what}: ${last instanceof Error ? last.message : String(last)}`);
   }
 
-  type Props = { hosted?: boolean; viewer?: Viewer; archived?: boolean; stage?: "draft" | "in_review" | "approved" | "delivered" };
+  type Props = {
+    project?: string;
+    hosted?: boolean;
+    viewer?: Viewer;
+    archived?: boolean;
+    stage?: "draft" | "in_review" | "approved" | "delivered";
+    onOpenIssue?: (id: string) => void;
+  };
   async function render(props: Props = {}) {
+    const baseHref = props.project ? `/projects/${encodeURIComponent(props.project)}/documents` : "/documents";
+    const scopedHrefFor = (route: Route) => locationHref(goTo(readLocation(baseHref, ""), route), "");
     await React.act(async () => {
       root.render(
         React.createElement(
@@ -152,15 +164,18 @@ async function main() {
           React.createElement(NavigationProvider, {
             adapter: hostNavigation,
             children: React.createElement(DocumentsScreen, {
+              ...(props.project !== undefined ? { project: props.project } : {}),
               hosted: props.hosted ?? true,
               viewer: props.viewer ?? OWNER,
               archived: props.archived ?? false,
               ...(props.stage ? { stage: props.stage } : {}),
-              hrefFor,
+              hrefFor: props.project ? scopedHrefFor : hrefFor,
+              ...(props.onOpenIssue ? { onOpenIssue: props.onOpenIssue } : {}),
             }),
           }),
         ),
       );
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
   }
 
@@ -301,8 +316,10 @@ async function main() {
   ok(Array.from(review.querySelectorAll("td")).some((td) => td.textContent === "proposal"), "the type");
   ok(!Array.from(host.querySelectorAll("th")).some((th) => th.textContent === "Archived"), "the Active tab has no archived column");
   ok(review.textContent?.includes("In review"), "the stage");
-  ok(review.textContent?.includes("v2"), "the version under review");
-  ok(!row("art-approved")!.textContent?.includes("v1"), "a version under review shows only while in review");
+  ok(review.querySelector("td.documents-review-cell")?.textContent === "v2", "the version under review");
+  ok(review.querySelector("[data-document-version]")?.textContent === "v3", "the version badge shows the file version");
+  ok(row("art-approved")!.querySelector("[data-document-version]")?.textContent === "v1", "the approved row shows its file version badge");
+  ok(row("art-approved")!.querySelector("td.documents-review-cell")?.textContent === "—", "a version under review shows only while in review");
   ok(host.querySelector("table.stable.documents-table"), "the table keeps a readable floor and scrolls in its wrapper at 390px");
   ok(host.querySelector(".stable-wrap table.documents-table"), "inside the shared scrolling wrapper");
   // Browser QA: headers and stage chips broke mid-word ("In revie/w") where
@@ -342,7 +359,7 @@ async function main() {
   }
   equal([heading()?.tagName, heading()?.tabIndex, heading()?.className.includes("font-semibold")], ["H1", -1, true], "the heading can take focus");
   ok(Array.from(host.querySelectorAll("th")).some((th) => th.textContent === "Version under review"), "the column says what it counts");
-  ok(review.querySelector(".chip")?.textContent?.includes("In review"), "the stage is a chip");
+  ok(review.querySelector("[data-document-stage]")?.classList.contains("chip") && review.querySelector("[data-document-stage]")?.textContent?.includes("In review"), "the stage is a chip");
   ok(row("art-delivered")!.textContent?.includes("2026"), "the delivered date");
   ok(!text().includes("Share"), "the screen never offers sharing");
 
@@ -501,7 +518,7 @@ async function main() {
   await settle(() => ok(row("art-review")!.textContent?.includes("Approved by you (self)"), "the row says who approved"), "approve success");
   const post = calls.find((call) => call.method === "POST")!;
   equal([post.path, post.body], ["/api/documents/art-review/approve", { version: 2 }], "approve sends exactly the submitted version");
-  ok(row("art-review")!.querySelector(".chip")?.textContent?.includes("Approved"), "the row's stage is approved");
+  ok(row("art-review")!.querySelector("[data-document-stage]")?.textContent?.includes("Approved"), "the row's stage is approved");
   ok(!buttonIn(row("art-review"), "Approve"), "an approved row has no Approve");
   ok(calls.slice(calls.indexOf(post)).some((call) => call.path === "/api/documents?archived=0"), "the list is read again");
   ok(!dialog(), "the dialog closes");
@@ -647,6 +664,85 @@ async function main() {
   await settle(() => ok(calls.slice(beforeRestoreAbort).some((call) => call.path === "/api/documents?archived=1"), "an aborted restore reads the list again"), "restore abort");
   ok(!dialog(), "an aborted restore closes the dialog");
 
+  // ---- project-scoped documents, version badges, linked work item chips, and 404 isolation ----
+
+  const ACME_DOC = {
+    file: file("art-acme", "Acme proposal", 2, "md", { issue: "CAD-2860", project: "acme" }),
+    document: doc("in_review", { submittedVersion: 2 }),
+  };
+  const BETA_DOC = {
+    file: file("art-beta", "Beta memo", 4, "md", { project: "beta" }),
+    document: doc("approved", { approvedVersion: 4 }),
+  };
+  let openedIssue: string | null = null;
+  await fresh({ project: "acme", onOpenIssue: (id) => { openedIssue = id; } }, false);
+  listReply = (_archived, project) =>
+    project === "acme"
+      ? json({ documents: [ACME_DOC] })
+      : project === "beta"
+        ? json({ documents: [BETA_DOC] })
+        : json({ documents: [] });
+  await React.act(async () => { await documentsProbe.revalidate(); });
+  await settle(() => ok(row("art-acme"), "project-scoped active list rendered"), "project list");
+  ok(calls.some((call) => call.path === "/api/documents?project=acme&archived=0"), "requests project-scoped active documents");
+  equal(row("art-acme")!.querySelector("[data-document-version]")?.textContent, "v2", "renders v2 version badge");
+  const issueChip = row("art-acme")!.querySelector('[data-document-issue="CAD-2860"]') as HTMLButtonElement | null;
+  ok(issueChip, "renders linked work item chip");
+  await click(issueChip);
+  equal(openedIssue, "CAD-2860", "clicking linked work item chip calls onOpenIssue");
+
+  // Without onOpenIssue, the linked work item chip renders an accessible Link to the issue page.
+  await render({ project: "acme" });
+  const issueLink = row("art-acme")!.querySelector('a[data-document-issue="CAD-2860"]') as HTMLAnchorElement | null;
+  ok(issueLink, "without onOpenIssue, linked work item chip is a Link");
+  equal(issueLink.getAttribute("href"), "/projects/acme/issues/CAD-2860", "issue chip links to project issue route");
+
+  // Project-scoped hrefFor links for tabs, stage chips, and empty filter link.
+  const projectTabs = Array.from(host.querySelectorAll("nav.section-nav a")) as HTMLAnchorElement[];
+  equal(projectTabs.map((tab) => [tab.textContent, tab.getAttribute("href")]), [
+    ["Active", "/projects/acme/documents"],
+    ["Archived", "/projects/acme/documents?archived=1"],
+  ], "project-scoped Active and Archived tabs");
+  const projectChips = Array.from(host.querySelectorAll('nav[data-stage-filter] a')) as HTMLAnchorElement[];
+  equal(projectChips.map((chip) => [chip.textContent, chip.getAttribute("href")]), [
+    ["All", "/projects/acme/documents"],
+    ["In review", "/projects/acme/documents?stage=in_review"],
+    ["Approved", "/projects/acme/documents?stage=approved"],
+    ["Delivered", "/projects/acme/documents?stage=delivered"],
+    ["Draft", "/projects/acme/documents?stage=draft"],
+  ], "project-scoped stage chips");
+  await render({ project: "acme", stage: "delivered" });
+  await settle(() => ok(text().includes("No documents at this stage"), "project empty filter"), "project empty filter");
+  const projectBack = Array.from(host.querySelectorAll('[data-empty="documents-filtered"] a')) as HTMLAnchorElement[];
+  equal(projectBack.map((a) => [a.textContent, a.getAttribute("href")]), [["Show all stages", "/projects/acme/documents"]], "project empty filter links back to project All");
+
+  // Switching projects never flashes stale rows from the previous project while loading.
+  let releaseBeta: () => void = () => {};
+  listReply = (_archived, project) =>
+    project === "beta"
+      ? new Promise<Response>((resolve) => { releaseBeta = () => resolve(json({ documents: [BETA_DOC] })); })
+      : json({ documents: [ACME_DOC] });
+  await render({ project: "beta" });
+  ok(!row("art-acme"), "switching projects clears previous project rows while loading");
+  ok(text().includes("Loading documents…"), "switching projects shows loading while fetching new project");
+  await React.act(async () => { releaseBeta(); });
+  await settle(() => ok(row("art-beta"), "new project rows render"), "beta list");
+
+  // A 404 on a project-scoped list renders a project-scoped message and does NOT invalidate workspace documentsProbe.
+  const probesBeforeProject404 = gets("/api/document-types");
+  listReply = (_archived, project) => project === "missing" ? refusal(404, "not_found") : json({ documents: [ACME_DOC] });
+  await render({ project: "missing" });
+  await settle(() => ok(text().includes("Documents aren’t available for this project"), "project 404 shows project-scoped message"), "project 404");
+  for (let i = 0; i < 4; i++) await flush();
+  equal(gets("/api/document-types"), probesBeforeProject404, "project 404 does not invalidate or re-ask global documentsProbe");
+  equal(documentsProbe.get().data?.kind, "available", "workspace documentsProbe remains available after project 404");
+
+  // Direct link to /projects/:slug/documents on a native board links back to project Overview.
+  await fresh({ project: "acme", hosted: false }, false);
+  await settle(() => ok(text().includes("Documents aren’t available here"), "native project documents shows unavailable"), "native project");
+  const overviewLink = host.querySelector('a[href="/projects/acme"]') as HTMLAnchorElement | null;
+  ok(overviewLink && overviewLink.textContent === "Overview", "native project documents links back to project Overview");
+
   // ---- the copy is translated ----
 
   const strings = [
@@ -699,6 +795,11 @@ async function main() {
     "Only the workspace owner can restore documents.",
     "Couldn’t archive this document. Try again.",
     "Couldn’t restore this document. Try again.",
+    "Project documents",
+    "Files, reviews, and approvals for {project}.",
+    "Open work item {id}",
+    "Documents aren’t available for this project",
+    "This project doesn’t have document review turned on or couldn’t be found.",
     ...approveRefusals.map(([, , copy]) => copy),
   ];
   for (const english of strings) ok(translateUiText(english, "zh-TW") !== english, `zh-TW has “${english}”`);
