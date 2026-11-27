@@ -40,6 +40,7 @@ import Button from "../../ui/Button";
 import { Select } from "../../ui/Select";
 import { appErrorCopy, appLoadErrorCopy, UNVERIFIED_APPS_COPY } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
+import { AppGlyph } from "../explorer/shared";
 import PageState from "../../ui/PageState";
 import { IconApps, IconLock, IconSearch, IconSettings } from "../../ui/icons";
 import "../explorer/explorer.css";
@@ -765,7 +766,8 @@ function InstalledCard({
       </>}
       version={h.version ? `v${h.version}` : t("Installed")}
       status={t(statusKey)}
-      statusAction={catalogUpdate ? <Link className="app-update-link num" href={catalogUpdateHref(catalogUpdate.catalogId, h.install_id)} aria-label={`${t("Review update")} — ${title} (v${catalogUpdate.latestVersion})`} title={t("Review update")}>→ v{catalogUpdate.latestVersion}</Link> : undefined}
+      statusId={`app-card-status-${h.install_id}`}
+      statusAction={catalogUpdate ? <Link id={`app-card-status-${h.install_id}`} className="app-update-link num" href={catalogUpdateHref(catalogUpdate.catalogId, h.install_id)} aria-label={`${t("Review update")} — ${title} (v${catalogUpdate.latestVersion})`} title={t("Review update")}>→ v{catalogUpdate.latestVersion}</Link> : undefined}
       tone={tone}
       href={href}
       note={t("No unique app page — see Manage")}

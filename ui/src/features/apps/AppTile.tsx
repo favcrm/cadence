@@ -4,7 +4,7 @@ import { AppGlyph } from "../explorer/shared";
 import "./apps.css";
 
 /** One gallery tile. The caller owns its destination, status and sibling actions. */
-export function AppTile({ name, icon, title, summary, version, status, statusAction, tone = "", href, category, meta, note, pinned, compact, actions, onOpen, onPrefetch }: {
+export function AppTile({ name, icon, title, summary, version, status, statusAction, statusId: suppliedStatusId, tone = "", href, category, meta, note, pinned, compact, actions, onOpen, onPrefetch }: {
   name: string;
   icon?: string;
   title: string;
@@ -12,6 +12,7 @@ export function AppTile({ name, icon, title, summary, version, status, statusAct
   version: string;
   status: string;
   statusAction?: ReactNode;
+  statusId?: string;
   tone?: "" | "info" | "warn" | "muted";
   href: string | null;
   category?: string;
@@ -25,7 +26,7 @@ export function AppTile({ name, icon, title, summary, version, status, statusAct
 }) {
   const id = useId();
   const nameId = `${id}-name`;
-  const statusId = `${id}-status`;
+  const statusId = suppliedStatusId ?? `${id}-status`;
   const body = <>
     <div className="app-tile-icon">
       <AppGlyph name={name} icon={icon} title={title} size={compact ? "sm" : "xl"} />
@@ -39,7 +40,7 @@ export function AppTile({ name, icon, title, summary, version, status, statusAct
       {meta}
       <div className="card-footer">
         <span className="num">{version}</span>
-        <span className="app-status" id={statusId} data-state={tone}>{statusAction ?? status}</span>
+        {statusAction ?? <span className="app-status" id={statusId} data-state={tone}>{status}</span>}
       </div>
     </div>
   </>;
