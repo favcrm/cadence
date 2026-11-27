@@ -1,5 +1,5 @@
 import { ApiError } from "../../lib/apiError";
-import type { ProjectPreset } from "../../lib/types";
+import type { Project, ProjectPreset } from "../../lib/types";
 
 export interface ProjectPresetOption {
   value: ProjectPreset;
@@ -56,6 +56,19 @@ export function deriveProjectPrefix(key: string): string {
     .slice(0, 3)
     .toUpperCase();
   return PROJECT_PREFIX.test(prefix) ? prefix : "";
+}
+
+/** Resolve display title for a project, falling back to its key. */
+export function projectDisplayName(project: Pick<Project, "key" | "name">): string {
+  const name = project.name?.trim();
+  return name && name.length > 0 ? name : project.key;
+}
+
+/** Resolve the English label for a project preset key, or null when unset/unknown. */
+export function projectPresetLabel(preset: string | null | undefined): string | null {
+  const trimmed = preset?.trim();
+  if (!trimmed) return null;
+  return PROJECT_PRESETS.find((option) => option.value === trimmed)?.label ?? null;
 }
 
 function readErrorCode(err: unknown): string | undefined {
