@@ -237,6 +237,37 @@ an answer it does not recognize: an unknown field or review shape, required
 checks that do not match the policy's `check` reviews, or a check with no App.
 A project without an approved custom policy is unchanged.
 
+### Hosted CI-only contract
+
+The core contract accepts an optional owner-approved `ci_only` scope in
+`delivery:`: `repo` is one normalized `owner/name`, and `paths` is a nonempty
+list using the policy's repo-relative path grammar. The setting is included in
+the policy digest; policies without it retain their existing digests. This
+contract alone does not enable agent enqueue or change the native route.
+
+Only a trusted hosted adapter may supply `hosted_ci_only` to
+`delivery.requirements.evaluate`. It attests the currently selected project
+repository, an open non-draft exact head against the actual protected default
+branch at its live anchor, a complete merge-base-to-head diff with real file
+modes and valid line counts, and role-list reads at that anchor. Its
+`both_role_lists_absent` is true only for two confirmed absences, never failed
+or partial reads. Otherwise both list texts must parse. The host validates
+repository membership when saving policy and again before writing; these
+caller-supplied facts are not themselves authorization.
+
+With the exact current owner-approved scope and matching selected repository,
+only unique safe paths wholly inside the allowlist, regular `100644` additions
+and modifications, and no applicable stronger path, size, review, approval or
+Browser QA rule qualify. Workflow, agent-instruction and delivery-policy paths
+are excluded even without role lists. Only the unconditional unprofiled default
+general `review` slot is elided; required checks remain, including all
+base-branch required checks. The response marks eligibility with `ci_only: true`
+outside `requirements`; otherwise it omits the marker and preserves the legacy
+requirements. A hosted consumer must still prove all checks and an active
+authorized assignment and bind a server-issued receipt to the current policy,
+repo, issue, PR, base and exact head before the existing GitHub App write.
+Deploy the consumer and authorization changes before enabling any scope.
+
 ## Review evidence
 
 A review is by a session that is not the author and carries no conversation or

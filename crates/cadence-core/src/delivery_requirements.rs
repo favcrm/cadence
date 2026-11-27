@@ -458,6 +458,7 @@ pub(crate) fn activation_of(resolved: &Resolved) -> Activation {
     // admits — it does not change the requirements level. An approved
     // default-equivalent-plus-target policy stays Active.
     policy.integration_branch = None;
+    policy.ci_only = None;
     if matches!(resolved.source, "default" | "file" | "approved") && policy == default_policy() {
         Activation::Active
     } else {
@@ -711,6 +712,7 @@ fn applying_reviews(
     changes: &[Change],
     lines: u64,
     reasons: &mut Vec<String>,
+    omit_default_floor: bool,
 ) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for (i, rule) in policy.risk.iter().enumerate() {
@@ -739,6 +741,13 @@ fn applying_reviews(
         if let Some(why) = why {
             reasons.push(format!("policy rule {i} applies: {why}"));
             for name in &rule.require {
+                if omit_default_floor
+                    && rule.when.is_none()
+                    && name == "review"
+                    && matches!(policy.reviews.get(name), Some(crate::delivery::Review::Agent { focus, profile: None }) if focus == "general")
+                {
+                    continue;
+                }
                 if !names.contains(name) {
                     names.push(name.clone());
                 }
@@ -746,6 +755,142 @@ fn applying_reviews(
         }
     }
     names
+}
+
+fn ci_only_protected_path(path: &str) -> bool {
+    const DIRECTORIES: &[&str] = &[
+        ".github",
+        ".cadence",
+        ".claude",
+        ".agents",
+        "agents",
+        "skills",
+        "workflows",
+    ];
+    const BASENAMES: &[&str] = &[
+        "agents.md",
+        "claude.md",
+        "skill.md",
+        "project.md",
+        "codeowners",
+        "cadence-review.toml",
+        "delivery.yaml",
+        "delivery.yml",
+    ];
+    let basename = path.rsplit('/').next().unwrap_or_default();
+    path.get(.."docs/roles/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("docs/roles/"))
+        || path.split('/').any(|part| {
+            DIRECTORIES
+                .iter()
+                .any(|name| part.eq_ignore_ascii_case(name))
+        })
+        || BASENAMES
+            .iter()
+            .any(|name| basename.eq_ignore_ascii_case(name))
+}
+
+/// Hosted-only classification. The caller vouches for the protected-base,
+/// complete diff and selected repository; this function grants no authority.
+pub(crate) fn hosted_ci_only(
+    resolved: &Resolved,
+    changes: &[Change],
+    lines: u64,
+    lists: &TrustedLists,
+    selected_repo: &str,
+    both_absent: bool,
+) -> Option<Requirements> {
+    use crate::delivery::{CheckMode, Review};
+    let scope = resolved.policy.ci_only.as_ref()?;
+    if resolved.source != "approved"
+        || resolved.note.is_some()
+        || selected_repo != scope.repo
+        || evidence_refusal(changes).is_some()
+        || lines > HUMAN_LINES
+        || lines > resolved.policy.heavy.lines_over
+        || changes.len() as u64 > resolved.policy.heavy.files_over
+    {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    if changes.iter().any(|c| {
+        !reviewable_change(c)
+            || c.new_mode != "100644"
+            || !scope
+                .paths
+                .iter()
+                .any(|p| crate::delivery_rules::area_match(p, &c.path))
+            || c.path.chars().any(crate::delivery_rules::is_format)
+            || ci_only_protected_path(&c.path)
+            || !seen.insert(&c.path)
+    }) {
+        return None;
+    }
+    let activation = activation_of(resolved);
+    if !matches!(activation, Activation::Active | Activation::NoProfile) {
+        return None;
+    }
+    let parsed = if both_absent {
+        if lists.risk_paths.is_some() || lists.one_review.is_some() {
+            return None;
+        }
+        None
+    } else {
+        Some(parse_lists(lists)?)
+    };
+    if let Some(lists) = parsed.as_ref() {
+        if browser_qa_needed(changes, Some(lists))
+            || changes.iter().any(|c| {
+                human_path(&c.path, Some(lists))
+                    || any_glob(lists.sensitive.iter(), &c.path)
+                    || lists
+                        .one_review_exclude
+                        .iter()
+                        .any(|g| one_glob(g, &c.path))
+            })
+        {
+            return None;
+        }
+    }
+    let mut reasons = vec!["owner-approved hosted CI-only scope applies".to_string()];
+    let names = applying_reviews(&resolved.policy, changes, lines, &mut reasons, true);
+    let mut required_reviews = Vec::new();
+    let mut required_checks = Vec::new();
+    for name in names {
+        let Review::Check {
+            app,
+            mode: CheckMode::Required,
+        } = resolved.policy.reviews.get(&name)?
+        else {
+            return None;
+        };
+        required_checks.push(RequiredCheck {
+            name: name.clone(),
+            app: app.clone(),
+        });
+        required_reviews.push(RequiredReview {
+            name,
+            kind: "check".into(),
+            focus: None,
+            profile: None,
+            app: Some(app.clone()),
+            mode: Some("required".into()),
+        });
+    }
+    Some(Requirements {
+        class: DeliveryClass::Consequential,
+        reviews: 0,
+        review_kind: ReviewKind::None,
+        security_capable: false,
+        browser_qa: false,
+        operator_approval: false,
+        full_checks: true,
+        reasons,
+        policy_digest: resolved.digest.clone(),
+        activation,
+        required_reviews: Some(required_reviews),
+        required_checks: Some(required_checks),
+    })
 }
 
 /// The review that satisfies both `a` and `b`. A single-axis review never
@@ -781,7 +926,7 @@ fn classify_approved(
 ) -> Requirements {
     use crate::delivery::{CheckMode, Review};
     let mut reasons = vec!["an approved delivery policy is in force".to_string()];
-    let names = applying_reviews(&resolved.policy, changes, lines, &mut reasons);
+    let names = applying_reviews(&resolved.policy, changes, lines, &mut reasons, false);
     let (mut standards, mut spec, mut general) = (false, false, false);
     let (mut operator, mut browser_qa) = (false, false);
     let mut required_reviews = Vec::new();
