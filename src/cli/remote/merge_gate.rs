@@ -376,6 +376,7 @@ pub(super) fn merge_gate(
                     delegated,
                     scope,
                     source,
+                    standing,
                     repo,
                     action,
                     id,
@@ -385,10 +386,11 @@ pub(super) fn merge_gate(
         } => {
             if action == "scope" {
                 refuse_managed(target, "audit approve --action scope")?;
-                if *delegated || scope.is_some() || pr.is_some() || head.is_some() {
+                if *delegated || scope.is_some() || pr.is_some() || head.is_some() || *standing {
                     return Err(Error::usage(
                         "remote `audit approve --action scope` names `--issue <ID> --project <KEY>` \
-                         and never `--pr`, `--head`, `--delegated` or `--scope`. Nothing was sent.",
+                         and never `--pr`, `--head`, `--delegated`, `--scope` or `--standing`. \
+                         Nothing was sent.",
                     ));
                 }
                 let project = project_arg(project)?;
@@ -451,6 +453,7 @@ pub(super) fn merge_gate(
                     wake_timeout,
                     &binding(project, &repo, issue_arg(issue)?, pr, &head)?,
                     source,
+                    *standing,
                 )
                 .map_err(|error| {
                     scope_hint(

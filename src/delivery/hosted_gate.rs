@@ -1906,14 +1906,23 @@ pub fn approve(
     wake_timeout: u64,
     binding: &GateBinding,
     source: &str,
+    standing: bool,
 ) -> Result<Value> {
     let mut call_args = binding.arguments();
     call_args.insert("source".into(), json!(source));
+    if standing {
+        call_args.insert("standing".into(), json!(true));
+    }
     let body = call(target, wake_timeout, "audit_approve_project", call_args)?;
-    approve_answer(&body, binding, source)
+    approve_answer(&body, binding, source, standing)
 }
 
-pub(crate) fn approve_answer(body: &Value, binding: &GateBinding, source: &str) -> Result<Value> {
+pub(crate) fn approve_answer(
+    body: &Value,
+    binding: &GateBinding,
+    source: &str,
+    standing: bool,
+) -> Result<Value> {
     let verb = "audit_approve_project";
     check_receipt(verb, || {
         if body["state"].as_str() != Some("recorded") || body["action"].as_str() != Some("merge") {
@@ -1945,10 +1954,46 @@ pub(crate) fn approve_answer(body: &Value, binding: &GateBinding, source: &str) 
         if body["source"].as_str() != Some(source) {
             return Err(refuse(format!("`{verb}` receipt names another source")));
         }
-        text(body, "approval_id", verb)?;
+        let approval_id = text(body, "approval_id", verb)?.to_string();
         text(body, "recorded_via", verb)?;
         if !body["duplicate"].is_boolean() {
             return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
+        }
+        // CAD-2843: a standing approval's receipt names the outcome for the
+        // same approval. A receipt that does not is not proof the wait was
+        // armed, so the caller re-reads the approval before repeating.
+        if standing {
+            let reported = body.get("standing").ok_or_else(|| {
+                refuse(format!(
+                    "`{verb}` receipt does not report the standing outcome; the approval may be \
+                     recorded — read it back before repeating"
+                ))
+            })?;
+            if reported["approval_id"].as_str() != Some(approval_id.as_str()) {
+                return Err(refuse(format!(
+                    "`{verb}` standing outcome names another approval"
+                )));
+            }
+            const STATES: [&str; 10] = [
+                "off",
+                "waiting",
+                "enqueued",
+                "already_enqueued",
+                "not_standing",
+                "not_found",
+                "refused",
+                "head_moved",
+                "expired",
+                "revoked",
+            ];
+            let state = reported["state"]
+                .as_str()
+                .ok_or_else(|| refuse(format!("`{verb}` standing outcome has no state")))?;
+            if !STATES.contains(&state) {
+                return Err(refuse(format!(
+                    "`{verb}` standing outcome has unknown state {state}"
+                )));
+            }
         }
         Ok(body.clone())
     })
@@ -3487,7 +3532,7 @@ mod tests {
                              "issue": "CAD-1", "recorded_via": "hosted-owner-login",
                              "scope": {"pr": 7, "repo": "favcrm/cadence"},
                              "source": "chris", "state": "recorded"});
-        assert!(approve_answer(&receipt, &binding(), "chris").is_ok());
+        assert!(approve_answer(&receipt, &binding(), "chris", false).is_ok());
         // A moved head, another PR, repo, project, issue or source.
         for (project, issue, pr, head) in [
             ("cadence", "CAD-1", 7, OTHER),
@@ -3497,16 +3542,37 @@ mod tests {
         ] {
             let other = GateBinding::new(project, "favcrm/cadence", issue, pr, head).unwrap();
             assert!(
-                approve_answer(&receipt, &other, "chris").is_err(),
+                approve_answer(&receipt, &other, "chris", false).is_err(),
                 "{project} {issue}"
             );
         }
         let other_repo = GateBinding::new("cadence", "favcrm/pm", "CAD-1", 7, HEAD).unwrap();
-        assert!(approve_answer(&receipt, &other_repo, "chris").is_err());
-        assert!(approve_answer(&receipt, &binding(), "someone").is_err());
+        assert!(approve_answer(&receipt, &other_repo, "chris", false).is_err());
+        assert!(approve_answer(&receipt, &binding(), "someone", false).is_err());
         let mut refused = receipt.clone();
         refused["state"] = json!("refused");
-        assert!(approve_answer(&refused, &binding(), "chris").is_err());
+        assert!(approve_answer(&refused, &binding(), "chris", false).is_err());
+    }
+
+    #[test]
+    fn a_standing_approval_receipt_must_name_the_outcome_of_the_same_approval() {
+        let receipt = json!({"action": "merge", "approval_id": "merge-pr7-0123456789ab",
+                             "duplicate": false, "head_sha": HEAD, "project": "cadence",
+                             "issue": "CAD-1", "recorded_via": "hosted-owner-login",
+                             "scope": {"pr": 7, "repo": "favcrm/cadence"},
+                             "source": "chris", "state": "recorded"});
+        // An ordinary receipt proves nothing about the wait that was asked for.
+        assert!(approve_answer(&receipt, &binding(), "chris", true).is_err());
+        // The outcome must name this approval and a known state.
+        let mut other = receipt.clone();
+        other["standing"] = json!({"approval_id": "merge-pr7-other", "state": "waiting"});
+        assert!(approve_answer(&other, &binding(), "chris", true).is_err());
+        let mut unknown = receipt.clone();
+        unknown["standing"] = json!({"approval_id": "merge-pr7-0123456789ab", "state": "maybe"});
+        assert!(approve_answer(&unknown, &binding(), "chris", true).is_err());
+        let mut waiting = receipt.clone();
+        waiting["standing"] = json!({"approval_id": "merge-pr7-0123456789ab", "state": "waiting"});
+        assert!(approve_answer(&waiting, &binding(), "chris", true).is_ok());
     }
 
     fn answer(repos: Value, delivery: Value, approval: Value) -> Value {

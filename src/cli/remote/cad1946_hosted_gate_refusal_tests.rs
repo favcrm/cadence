@@ -399,6 +399,7 @@ fn cmd_audit_approve_merge() -> Commands {
             repo: Some(TEST_REPO.into()),
             action: "merge".into(),
             id: None,
+            standing: false,
         }),
         since: None,
         class: None,
@@ -424,6 +425,7 @@ fn cmd_audit_approve_scope() -> Commands {
             repo: None,
             action: "scope".into(),
             id: Some("scope-1".into()),
+            standing: false,
         }),
         since: None,
         class: None,
@@ -449,6 +451,7 @@ fn cmd_audit_approve_delegated() -> Commands {
             repo: Some(TEST_REPO.into()),
             action: "merge".into(),
             id: None,
+            standing: false,
         }),
         since: None,
         class: None,
@@ -869,7 +872,7 @@ fn forged_http_200_receipts_for_audit_approve_are_rejected_as_unknown() {
         "duplicate": false,
     });
     call_with_single_reply(valid.clone(), |t| {
-        approve(t, 5, &binding, "owner in chat").map(|_| ())
+        approve(t, 5, &binding, "owner in chat", false).map(|_| ())
     })
     .expect("baseline valid approve receipt must succeed");
 
@@ -933,7 +936,7 @@ fn forged_http_200_receipts_for_audit_approve_are_rejected_as_unknown() {
 
     for (label, payload) in forged_cases {
         let err = call_with_single_reply(payload, |t| {
-            approve(t, 5, &binding, "owner in chat").map(|_| ())
+            approve(t, 5, &binding, "owner in chat", false).map(|_| ())
         })
         .unwrap_err();
         assert_eq!(

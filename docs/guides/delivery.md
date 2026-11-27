@@ -399,6 +399,14 @@ rule fails, and the receipt says whether the approval was recorded. A board
 that predates the option reports the outcome as unknown: read the approval back
 with `audit approval` before repeating.
 
+`audit approve --standing` is the other order: the owner decides before the last
+check lands, and the tenant enqueues exactly this head once when the rest of the
+gate passes, with no second command. The wait is bounded (24 hours), void on a
+moved head or a revoke, and needs a tenant that serves the option. `delivery
+check` reports it as `standing_approval` with the rule it last lacked and when it
+looks again. The enqueue still runs the same gate: a standing approval grants no
+rule by itself.
+
 Related owner verbs: `audit revoke <id> --reason <why>` withdraws an approval
 (and dequeues a PR that is merging), `audit approval` reads whether a merge
 approval is in force for a head, and `audit designate` / `designations` / `digest`
