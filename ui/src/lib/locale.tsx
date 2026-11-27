@@ -4919,3 +4919,52 @@ const CAD2859_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2859_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2869_ZHTW: Record<string, string> = {
+  "New document": "新增文件",
+  "Project · {project}": "專案 · {project}",
+  "Workspace documents": "工作區文件",
+  "Document source": "文件來源",
+  "Write Markdown": "撰寫 Markdown",
+  "Upload file": "上傳檔案",
+  "Title": "標題",
+  "e.g. Quarterly proposal": "例如：季度提案",
+  "Document type": "文件類型",
+  "e.g. brief, proposal, report": "例如：brief、proposal、report",
+  "Existing document types": "現有文件類型",
+  "Markdown content": "Markdown 內容",
+  "# Title\n\nWrite your deliverable in Markdown…": "# 標題\n\n以 Markdown 撰寫交付文件…",
+  "Deliverable file": "交付檔案",
+  "Drop a file here or browse (.md, .html, .csv, .pdf, images up to 10 MiB).": "拖曳檔案至此或瀏覽選擇（.md、.html、.csv、.pdf 或圖片，上限 10 MiB）。",
+  "Replace file": "更換檔案",
+  "Choose file": "選擇檔案",
+  "Save as draft": "儲存草稿",
+  "Submit for review": "送審",
+  "Submitting…": "送審中…",
+  "Draft document saved.": "草稿文件已儲存。",
+  "Document submitted for review.": "文件已送審。",
+  "Document title is required.": "請輸入文件標題。",
+  "Document title cannot contain control characters.": "文件標題不能包含控制字元。",
+  "Enter a valid document type label (1–40 characters, no slashes).": "請輸入有效的文件類型標籤（1 至 40 個字元，不可含斜線）。",
+  "Write some Markdown content before saving.": "儲存前請先輸入 Markdown 內容。",
+  "Documents are at most 10 MiB.": "文件大小上限為 10 MiB。",
+  "Choose a file (.md, .html, .csv, .pdf, or image) to upload.": "請選擇要上傳的檔案（.md、.html、.csv、.pdf 或圖片）。",
+  "Unsupported file type. Choose .md, .html, .csv, .pdf, or an image.": "不支援的檔案格式。請選擇 .md、.html、.csv、.pdf 或圖片。",
+  "The selected file is empty.": "選擇的檔案是空的。",
+  "Couldn’t read the selected file. Try again.": "無法讀取選擇的檔案。請再試。",
+  "This project or linked record could not be found.": "找不到此專案或關聯項目。",
+  "Only the workspace’s own members can create documents.": "只有此工作區自己的成員可以建立文件。",
+  "Check the document details and try again.": "請檢查文件內容後再試。",
+  "Couldn’t create this document. Try again.": "無法建立此文件。請再試。",
+  "Submit": "送審",
+  "Submit {title} for review": "將「{title}」送審",
+  "Submit document for review?": "要將文件送審嗎？",
+  "Submit “{title}” for review? Once submitted, its approver can review and approve it.": "要將「{title}」送審嗎？送審後，核准者即可審查並核准此文件。",
+  "Only the member who created this draft can submit it for review.": "只有建立此草稿的成員可以將其送審。",
+  "Add a document type label before submitting for review.": "送審前請先加上文件類型標籤。",
+  "This document cannot be submitted in its current stage.": "此文件目前的階段無法送審。",
+  "Couldn’t submit this document for review. Try again.": "無法將此文件送審。請再試。",
+};
+for (const [key, value] of Object.entries(CAD2869_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

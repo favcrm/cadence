@@ -13,19 +13,21 @@ import DataTable, { type DataTableColumn } from "../app-shell/shared/DataTable";
 import { EmptyState, ErrorNotice, Loading } from "../app-shell/shared/States";
 import { ARTIFACT_KINDS, canvasSnapshot, resetCanvas, type ArtifactKind, type ArtifactRef } from "../canvas/canvasStore";
 import { openRecordedArtifact } from "../threads/WorkContext";
-import { canApprove, canArchive, canRestore, typeFor, type DocumentsViewer } from "./documentsAccess";
+import { canApprove, canArchive, canCreate, canRestore, canSubmit, typeFor, type DocumentsViewer } from "./documentsAccess";
 import {
   approve,
   archive,
   list,
   refusalCode,
   restore,
+  submit,
   type DocumentRow,
   type DocumentsResult,
   type DocumentStage,
   type DocumentType,
 } from "./documentsClient";
 import { documentsProbe } from "./documentsProbe";
+import NewDocumentModal from "./NewDocumentModal";
 import "./documents.css";
 
 /**
@@ -44,7 +46,7 @@ import "./documents.css";
 export const DOCUMENTS_CONVERSATION = "documents:screen";
 
 type Translate = (english: string) => string;
-type Write = "approve" | "archive" | "restore";
+type Write = "submit" | "approve" | "archive" | "restore";
 type Pending = { action: Write; row: DocumentRow; version: number };
 
 const STAGE_LABEL: Record<DocumentStage, string> = {
@@ -81,6 +83,14 @@ function sharedFailure(code: string | null, t: Translate): string | null {
   if (code === "owner_required") return t("Only the workspace’s own members can change documents.");
   if (code === "membership_changed") return t("Your access changed. Reload the page and try again.");
   return null;
+}
+
+function submitFailure(code: string | null, t: Translate): string {
+  if (code === "not_creator") return t("Only the member who created this draft can submit it for review.");
+  if (code === "unlabelled") return t("Add a document type label before submitting for review.");
+  if (code === "document_archived") return t("This document has been archived.");
+  if (code === "conflict" || code === "invalid_state") return t("This document cannot be submitted in its current stage.");
+  return sharedFailure(code, t) ?? t("Couldn’t submit this document for review. Try again.");
 }
 
 function approveFailure(code: string | null, t: Translate): string {
@@ -143,6 +153,7 @@ export default function DocumentsScreen({
   const [projectGone, setProjectGone] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [confirming, setConfirming] = useState<Pending | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   const [writing, setWriting] = useState(false);
   /** Approvals this session made, with the receipt's `selfApproved`: the wire
    *  names no approver, so only this session can say "by you". */
@@ -174,6 +185,7 @@ export default function DocumentsScreen({
   useEffect(() => {
     setProjectGone(null);
     setFailed(false);
+    setCreateOpen(false);
   }, [scopeProject]);
 
   useEffect(() => onPrivateSessionReset(() => {
@@ -182,6 +194,7 @@ export default function DocumentsScreen({
     setGone(false);
     setProjectGone(null);
     setConfirming(null);
+    setCreateOpen(false);
     setApprovedByMe({});
     setToast(null);
   }), []);
@@ -265,7 +278,11 @@ export default function DocumentsScreen({
         const answered = await approve(id, version);
         if (answered.ok) receipt = answered.value;
         result = answered;
-      } else result = action === "archive" ? await archive(id) : await restore(id);
+      } else if (action === "submit") {
+        result = await submit(id);
+      } else {
+        result = action === "archive" ? await archive(id) : await restore(id);
+      }
     } catch {
       // The client rejects only for an abort (an AbortError once the private
       // session paused), and the server may have applied the change by then:
@@ -282,7 +299,7 @@ export default function DocumentsScreen({
     if (result.ok) {
       const next = result.value.stage;
       // An archived row leaves the Active tab, a restored one the Archived tab.
-      const leaves = action !== "approve" && (next === "archived") !== archived;
+      const leaves = (action === "archive" || action === "restore") && (next === "archived") !== archived;
       setRows((current) =>
         current && current.project === scopeProject && current.archived === archived
           ? {
@@ -296,6 +313,7 @@ export default function DocumentsScreen({
                       document: {
                         ...entry.document,
                         stage: next,
+                        ...(action === "submit" ? { submittedVersion: version } : {}),
                         ...(action === "approve" && receipt
                           ? { approvedVersion: version, selfApproved: receipt.selfApproved }
                           : {}),
@@ -309,14 +327,50 @@ export default function DocumentsScreen({
         const self = receipt.selfApproved;
         setApprovedByMe((current) => ({ ...current, [id]: self }));
       }
-      say("ok", action === "approve" ? t("Document approved.") : action === "archive" ? t("Document archived.") : t("Document restored."));
+      say(
+        "ok",
+        action === "submit"
+          ? t("Document submitted for review.")
+          : action === "approve"
+            ? t("Document approved.")
+            : action === "archive"
+              ? t("Document archived.")
+              : t("Document restored."),
+      );
       void refresh();
       return;
     }
     const code = refusalCode(result);
-    say("err", action === "approve" ? approveFailure(code, t) : action === "archive" ? archiveFailure(code, t) : restoreFailure(code, t));
-    if (action === "approve") rereadAll();
+    say(
+      "err",
+      action === "submit"
+        ? submitFailure(code, t)
+        : action === "approve"
+          ? approveFailure(code, t)
+          : action === "archive"
+            ? archiveFailure(code, t)
+            : restoreFailure(code, t),
+    );
+    if (action === "submit" || action === "approve") rereadAll();
     else void refresh();
+  };
+
+  const handleCreated = (created: DocumentRow, submitted: boolean) => {
+    setCreateOpen(false);
+    setFocusHeading((count) => count + 1);
+    if (!archived) {
+      setRows((current) =>
+        current && current.project === scopeProject && !current.archived
+          ? {
+              project: scopeProject,
+              archived: false,
+              rows: [created, ...current.rows.filter((entry) => entry.file.id !== created.file.id)],
+            }
+          : current,
+      );
+    }
+    say("ok", submitted ? t("Document submitted for review.") : t("Draft document saved."));
+    void refresh();
   };
 
   const documentsRoute = (opts: { archived: boolean; stage?: DocumentStageFilter }): Route =>
@@ -512,6 +566,11 @@ export default function DocumentsScreen({
         const title = row.file.title;
         return (
           <span className="inline-flex flex-wrap gap-1.5">
+            {canSubmit(viewer, row.document) && (
+              <Button size="sm" variant="primary" aria-label={t("Submit {title} for review").replace("{title}", () => title)} onClick={() => ask("submit", row)}>
+                {t("Submit")}
+              </Button>
+            )}
             {row.document.submittedVersion !== null && canApprove(viewer, row.document, type) && (
               <Button size="sm" variant="primary" aria-label={t("Approve {title}").replace("{title}", () => title)} onClick={() => ask("approve", row)}>
                 {t("Approve")}
@@ -594,6 +653,13 @@ export default function DocumentsScreen({
             </p>
           )}
         </div>
+        {available && canCreate(viewer) && (
+          <div className="documents-header-actions">
+            <Button variant="primary" onClick={() => setCreateOpen(true)}>
+              {t("New document")}
+            </Button>
+          </div>
+        )}
       </header>
       <div className="documents-toolbar">
         <SectionTabs
@@ -632,24 +698,36 @@ export default function DocumentsScreen({
       {confirming && (
         <ConfirmDialog
           title={
-            confirming.action === "approve"
-              ? t("Approve document?")
-              : confirming.action === "archive"
-                ? t("Archive document?")
-                : t("Restore document?")
+            confirming.action === "submit"
+              ? t("Submit document for review?")
+              : confirming.action === "approve"
+                ? t("Approve document?")
+                : confirming.action === "archive"
+                  ? t("Archive document?")
+                  : t("Restore document?")
           }
           body={
             <p>
-              {confirming.action === "approve"
-                ? t("Approve version {version} of “{title}”? A later version needs its own approval.")
-                    .replace("{version}", () => String(confirming.version))
-                    .replace("{title}", () => confirmingTitle)
-                : confirming.action === "archive"
-                  ? t("Archive “{title}”? It moves to the Archived tab, and the owner can restore it.").replace("{title}", () => confirmingTitle)
-                  : t("Restore “{title}”? It returns to the stage it had before it was archived. Nothing is re-run.").replace("{title}", () => confirmingTitle)}
+              {confirming.action === "submit"
+                ? t("Submit “{title}” for review? Once submitted, its approver can review and approve it.").replace("{title}", () => confirmingTitle)
+                : confirming.action === "approve"
+                  ? t("Approve version {version} of “{title}”? A later version needs its own approval.")
+                      .replace("{version}", () => String(confirming.version))
+                      .replace("{title}", () => confirmingTitle)
+                  : confirming.action === "archive"
+                    ? t("Archive “{title}”? It moves to the Archived tab, and the owner can restore it.").replace("{title}", () => confirmingTitle)
+                    : t("Restore “{title}”? It returns to the stage it had before it was archived. Nothing is re-run.").replace("{title}", () => confirmingTitle)}
             </p>
           }
-          confirmLabel={confirming.action === "approve" ? t("Approve") : confirming.action === "archive" ? t("Archive") : t("Restore")}
+          confirmLabel={
+            confirming.action === "submit"
+              ? t("Submit for review")
+              : confirming.action === "approve"
+                ? t("Approve")
+                : confirming.action === "archive"
+                  ? t("Archive")
+                  : t("Restore")
+          }
           confirmVariant={confirming.action === "archive" ? "danger" : "primary"}
           pending={writing}
           error={null}
@@ -659,6 +737,13 @@ export default function DocumentsScreen({
           onConfirm={() => void run(confirming)}
         />
       )}
+      <NewDocumentModal
+        open={createOpen}
+        project={scopeProject}
+        types={types}
+        onClose={() => setCreateOpen(false)}
+        onCreated={handleCreated}
+      />
       <Toast msg={toast} />
     </section>
   );

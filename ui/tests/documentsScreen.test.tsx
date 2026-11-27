@@ -24,12 +24,12 @@ async function main() {
   const { Window } = require("happy-dom");
   const win = new Window({ url: "http://localhost/documents" });
   for (const name of [
-    "window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLButtonElement", "SVGElement",
+    "window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLButtonElement", "SVGElement",
     "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "localStorage",
     "sessionStorage",
   ])
     Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
-  for (const name of ["addEventListener", "removeEventListener", "dispatchEvent"])
+  for (const name of ["addEventListener", "removeEventListener", "dispatchEvent", "requestAnimationFrame", "cancelAnimationFrame"])
     Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
 
@@ -50,6 +50,7 @@ async function main() {
   const screenModule = require("../src/features/documents/DocumentsScreen") as typeof import("../src/features/documents/DocumentsScreen");
   const DocumentsScreen = screenModule.default;
   const { DOCUMENTS_CONVERSATION } = screenModule;
+  const modalModule = require("../src/features/documents/NewDocumentModal") as typeof import("../src/features/documents/NewDocumentModal");
   const { DOCUMENT_CAPABILITY } = require("../src/features/documents/documentsClient") as typeof import("../src/features/documents/documentsClient");
   const { documentsViewer } = require("../src/features/documents/documentsAccess") as typeof import("../src/features/documents/documentsAccess");
   const { documentsProbe } = require("../src/features/documents/documentsProbe") as typeof import("../src/features/documents/documentsProbe");
@@ -84,7 +85,7 @@ async function main() {
     if (url.pathname === "/api/documents" && url.searchParams.has("archived")) {
       return listReply(url.searchParams.get("archived") === "1", url.searchParams.get("project"));
     }
-    if (method === "POST" && path.startsWith("/api/documents/")) return writeReply(path, body);
+    if (method === "POST" && (url.pathname === "/api/documents" || path.startsWith("/api/documents/"))) return writeReply(url.pathname, body);
     return refusal(404, "not_found");
   }) as typeof fetch;
 
@@ -743,9 +744,223 @@ async function main() {
   const overviewLink = host.querySelector('a[href="/projects/acme"]') as HTMLAnchorElement | null;
   ok(overviewLink && overviewLink.textContent === "Overview", "native project documents links back to project Overview");
 
+  // ---- CAD-2869: New / Upload deliverable modal & Draft Submit ----
+
+  const {
+    bytesToBase64,
+    createDocumentFailure,
+    inferDocumentKind,
+    utf8ToBase64,
+    validDocumentLabelInput,
+  } = modalModule;
+
+  equal(validDocumentLabelInput("  Brief "), "Brief", "valid label trims spaces");
+  equal(validDocumentLabelInput("brief/1"), null, "slash is refused in label");
+  equal(validDocumentLabelInput(".."), null, "dot-only label is refused");
+  equal(inferDocumentKind("notes.MARKDOWN", ""), "md", "infer md from extension");
+  equal(inferDocumentKind("sheet.csv", ""), "csv", "infer csv from extension");
+  equal(inferDocumentKind("deck.pdf", ""), "pdf", "infer pdf from extension");
+  equal(inferDocumentKind("photo.webp", ""), "image", "infer image from extension");
+  equal(inferDocumentKind("no-ext", "text/html; charset=utf-8"), "html", "infer html from mime");
+  equal(inferDocumentKind("archive.zip", "application/zip"), null, "unsupported extension/mime rejected");
+  equal(bytesToBase64(new Uint8Array([72, 105])), "SGk=", "bytesToBase64 encodes raw bytes");
+  const decodeUtf8Base64 = (b64: string) =>
+    new TextDecoder().decode(Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0)));
+  const cjkBase64 = utf8ToBase64("專案提案");
+  equal(decodeUtf8Base64(cjkBase64), "專案提案", "utf8ToBase64 roundtrips UTF-8/CJK");
+  equal(createDocumentFailure("payload_too_large", "too big", (s) => s), "Documents are at most 10 MiB.", "413 refusal message");
+
+  async function typeValue(el: HTMLInputElement | HTMLTextAreaElement | null, value: string) {
+    ok(el, "form input exists");
+    const proto = el.tagName === "TEXTAREA" ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")!.set!;
+    await React.act(async () => {
+      setter.call(el, value);
+      el.dispatchEvent(new win.Event("input", { bubbles: true }));
+    });
+    await flush();
+  }
+
+  // Operator session and unavailable boards hide New document CTA and Draft Submit.
+  await fresh({ viewer: OPERATOR });
+  await listed();
+  ok(!buttonIn(host, "New document"), "operator session does not see New document CTA");
+  ok(!row("art-draft")!.querySelector("button"), "operator sees no Draft Submit button");
+
+  // Project-scoped New document: creates Draft with automatic `project` binding and UTF-8 content.
+  await fresh({ project: "acme", viewer: MEMBER });
+  await listed();
+  ok(buttonIn(host, "New document"), "member sees New document CTA on project Documents tab");
+  await click(buttonIn(host, "New document"));
+  ok(dialog(), "New document opens dialog");
+  ok(dialog()!.textContent?.includes("Project · acme"), "modal displays project binding scope");
+
+  const titleInput = dialog()!.querySelector<HTMLInputElement>('input[maxlength="120"]');
+  const typeInput = dialog()!.querySelector<HTMLInputElement>('input[maxlength="40"]');
+  const mdArea = dialog()!.querySelector<HTMLTextAreaElement>("textarea");
+  await typeValue(titleInput, "客戶提案");
+  await typeValue(mdArea, "# 客戶提案\n\n第一版");
+  await click(buttonIn(dialog(), "Brief"));
+  equal(typeInput?.value, "Brief", "clicking existing type chip fills label input");
+
+  const createdDraft = {
+    file: file("art-created-1", "客戶提案", 1, "md", { label: "Brief", project: "acme" }),
+    document: doc("draft", { type: "brief" }),
+  };
+  let activeProjectRows: Array<{ file: Record<string, unknown>; document: Record<string, unknown> }> = [...ACTIVE];
+  listReply = (_archived, project) => json({ documents: project === "acme" ? activeProjectRows : [] });
+  const createRequests: Array<Record<string, unknown>> = [];
+  writeReply = (path, body) => {
+    if (path === "/api/documents") {
+      createRequests.push(body as Record<string, unknown>);
+      activeProjectRows = [createdDraft, ...activeProjectRows];
+      return json(createdDraft, 201);
+    }
+    return refusal(500, "internal");
+  };
+  await click(buttonIn(dialog(), "Save as draft"));
+  await settle(() => ok(!dialog() && row("art-created-1"), "draft row added to project documents list"), "project draft created");
+  equal(createRequests.length, 1, "POST /api/documents was called once");
+  const postedCreateBody = createRequests[0]!;
+  equal(postedCreateBody.project, "acme", "project is bound automatically when inside /projects/:slug/documents");
+  equal(postedCreateBody.submit, false, "Save as draft sends submit: false");
+  equal(decodeUtf8Base64(String(postedCreateBody.contentBase64)), "# 客戶提案\n\n第一版", "UTF-8 CJK Markdown encoded properly");
+  ok(text().includes("Draft document saved."), "shows saved draft toast");
+
+  // Draft Submit button -> ConfirmDialog -> POST /api/documents/:id/submit -> In review.
+  const submitBtn = Array.from(row("art-created-1")!.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Submit");
+  ok(submitBtn, "Draft row renders Submit button for member");
+  await click(submitBtn);
+  ok(dialog() && dialog()!.textContent?.includes("Submit document for review?"), "Submit opens confirmation dialog");
+  writeReply = (path) => {
+    if (path === "/api/documents/art-created-1/submit") {
+      activeProjectRows = activeProjectRows.map((entry) =>
+        entry.file.id === "art-created-1"
+          ? { ...entry, document: { ...entry.document, stage: "in_review", submittedVersion: 1 } }
+          : entry,
+      );
+      return json({ stage: "in_review", type: "brief", typeConfirmed: true });
+    }
+    return refusal(500, "internal");
+  };
+  await click(confirmButton("Submit for review"));
+  await settle(
+    () => equal(row("art-created-1")!.querySelector("[data-document-stage]")?.getAttribute("data-document-stage"), "in_review", "row updated to in_review"),
+    "draft submitted",
+  );
+  ok(text().includes("Document submitted for review."), "shows submitted toast");
+
+  // Refusals on Draft Submit surface exact translated messages.
+  for (const [code, copy] of [
+    ["not_creator", "Only the member who created this draft can submit it for review."],
+    ["unlabelled", "Add a document type label before submitting for review."],
+    ["document_archived", "This document has been archived."],
+  ] as const) {
+    await fresh({ viewer: OWNER });
+    await listed();
+    const draftSubmit = Array.from(row("art-draft")!.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Submit");
+    await click(draftSubmit);
+    writeReply = () => refusal(code === "not_creator" ? 403 : 409, code);
+    await click(confirmButton("Submit for review"));
+    await settle(() => ok(text().includes(copy), `submit ${code} surfaces message`), `submit refusal ${code}`);
+  }
+
+  // Global /documents Upload file mode: omits `project`, submits directly (`submit: true`), rejects unsupported file & surfaces 413.
+  await fresh({ viewer: OWNER });
+  await listed();
+  await click(buttonIn(host, "New document"));
+  await click(buttonIn(dialog(), "Upload file"));
+  const fileInput = dialog()!.querySelector<HTMLInputElement>('input[type="file"]');
+  ok(fileInput, "upload mode renders file input");
+  const FileCtor = (win.File ?? globalThis.File) as typeof File;
+  async function pickFile(selected: File) {
+    await React.act(async () => {
+      Object.defineProperty(fileInput!, "files", { value: [selected], configurable: true });
+      fileInput!.dispatchEvent(new win.Event("change", { bubbles: true }));
+    });
+    await flush();
+  }
+  await pickFile(new FileCtor(["zip"], "bad.zip", { type: "application/zip" }));
+  ok(dialog()!.textContent?.includes("Unsupported file type."), "rejects unsupported upload extension inline");
+  await pickFile(new FileCtor([], "empty.md", { type: "text/markdown" }));
+  ok(dialog()!.textContent?.includes("The selected file is empty."), "rejects empty file inline");
+
+  await pickFile(new FileCtor(["%PDF-1.7\n"], "proposal-deck.pdf", { type: "application/pdf" }));
+  await settle(() => ok(dialog()!.textContent?.includes("proposal-deck.pdf"), "displays chosen file name"), "pdf selected");
+  equal(dialog()!.querySelector<HTMLInputElement>('input[maxlength="120"]')?.value, "proposal-deck", "pre-fills title from uploaded filename");
+  await typeValue(dialog()!.querySelector<HTMLInputElement>('input[maxlength="40"]'), "proposal");
+
+  writeReply = (path) => (path === "/api/documents" ? refusal(413, "payload_too_large") : refusal(500, "internal"));
+  await click(buttonIn(dialog(), "Submit for review"));
+  await settle(() => ok(dialog()!.textContent?.includes("Documents are at most 10 MiB."), "413 surfaces inline error inside modal"), "modal 413");
+
+  const globalUploads: Array<Record<string, unknown>> = [];
+  const uploadedRow = {
+    file: file("art-uploaded-1", "proposal-deck", 1, "pdf", { label: "proposal" }),
+    document: doc("in_review", { type: "proposal", submittedVersion: 1 }),
+  };
+  let globalActiveRows: Array<{ file: Record<string, unknown>; document: Record<string, unknown> }> = [...ACTIVE];
+  listReply = () => json({ documents: globalActiveRows });
+  writeReply = (path, body) => {
+    if (path === "/api/documents") {
+      globalUploads.push(body as Record<string, unknown>);
+      globalActiveRows = [uploadedRow, ...globalActiveRows];
+      return json(uploadedRow, 201);
+    }
+    return refusal(500, "internal");
+  };
+  await click(buttonIn(dialog(), "Submit for review"));
+  await settle(() => ok(!dialog() && row("art-uploaded-1"), "uploaded deliverable added to list"), "global upload submit");
+  equal(globalUploads.length, 1, "global upload submitted once");
+  const globalUploadBody = globalUploads[0]!;
+  ok(!("project" in globalUploadBody), "global /documents upload omits project");
+  equal(globalUploadBody.kind, "pdf", "upload preserves pdf kind");
+  equal(globalUploadBody.submit, true, "Submit for review sends submit: true");
+
   // ---- the copy is translated ----
 
   const strings = [
+    "New document",
+    "Project · {project}",
+    "Workspace documents",
+    "Document source",
+    "Write Markdown",
+    "Upload file",
+    "Title",
+    "e.g. Quarterly proposal",
+    "e.g. brief, proposal, report",
+    "Existing document types",
+    "Markdown content",
+    "Deliverable file",
+    "Drop a file here or browse (.md, .html, .csv, .pdf, images up to 10 MiB).",
+    "Replace file",
+    "Choose file",
+    "Save as draft",
+    "Submit for review",
+    "Submitting…",
+    "Draft document saved.",
+    "Document submitted for review.",
+    "Document title is required.",
+    "Document title cannot contain control characters.",
+    "Enter a valid document type label (1–40 characters, no slashes).",
+    "Write some Markdown content before saving.",
+    "Documents are at most 10 MiB.",
+    "Choose a file (.md, .html, .csv, .pdf, or image) to upload.",
+    "Unsupported file type. Choose .md, .html, .csv, .pdf, or an image.",
+    "The selected file is empty.",
+    "Couldn’t read the selected file. Try again.",
+    "This project or linked record could not be found.",
+    "Only the workspace’s own members can create documents.",
+    "Check the document details and try again.",
+    "Couldn’t create this document. Try again.",
+    "Submit",
+    "Submit {title} for review",
+    "Submit document for review?",
+    "Submit “{title}” for review? Once submitted, its approver can review and approve it.",
+    "Only the member who created this draft can submit it for review.",
+    "Add a document type label before submitting for review.",
+    "This document cannot be submitted in its current stage.",
+    "Couldn’t submit this document for review. Try again.",
     "Documents aren’t available here",
     "Checking documents…",
     "Couldn’t check whether documents are available.",
