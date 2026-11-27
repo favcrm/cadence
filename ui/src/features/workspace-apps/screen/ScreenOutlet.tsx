@@ -21,6 +21,7 @@ import { recordServices, object, exact, type HostCommand } from "./screenService
 import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./screenDisplayCache";
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { frameRoute, parseRoutePatch, type RoutePatch } from "./screenRoute";
+import { handleScreenFileDownloadMessage } from "./screenFileDownload";
 import { readOnlyReceipt } from "./screenReadOnly";
 import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize, type WhatsAppComposeProvider, type WhatsAppReplyBounds } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
@@ -58,7 +59,7 @@ function mountRefusalCode(body: unknown): string | null {
  *  its host-private action token to that child's mount request. Role is
  *  host-derived: `surfaceRole` is set by the host's own mount, never by the
  *  frame. */
-function triggerWhatsAppMediaSave(bytes: ArrayBuffer, mimeType: string, fileName: string): void {
+function triggerFileSave(bytes: ArrayBuffer, mimeType: string, fileName: string): void {
   const url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
   try {
     const link = document.createElement("a");
@@ -312,6 +313,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
     const session = operation;
     let retired = false;
     let owned: ScreenChannel | null = null;
+    let activeFrameWindow: Window | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let handshakeWaiting = false;
     let hiddenRetryCleanup: (() => void) | null = null;
@@ -413,7 +415,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
         hiddenRetryCleanup = () => document.removeEventListener("visibilitychange", onReturnVisible);
       }
     };
-    const onMessage = (event: MessageEvent) => owned?.receive(event);
+    const onMessage = (event: MessageEvent) => {
+      if (handleScreenFileDownloadMessage(event, activeFrameWindow, isCurrent, triggerFileSave)) return;
+      owned?.receive(event);
+    };
     window.addEventListener("message", onMessage);
     void (async () => {
       let pending: ScreenFailure = { kind: "frame_unavailable" };
@@ -589,6 +594,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
         // The container has no earlier frame: previous layout cleanup removed it.
         container.current.replaceChildren(frame);
         if (!frame.contentWindow) { pending = { kind: "frame_unavailable" }; throw new Error("Screen frame unavailable"); }
+        activeFrameWindow = frame.contentWindow;
         // CAD-1177: hold the mount's action token host-side. It is never
         // rendered into the frame and never crosses the MessagePort — a
         // `tool` op only carries alias/input/request_id, and the host
@@ -659,7 +665,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
                 provider = "linked",
               ) =>
                 mediaDownloadServices.downloadWhatsAppMedia(conversationId, messageId, signal, provider),
-              onWhatsAppMediaSave: triggerWhatsAppMediaSave,
+              onWhatsAppMediaSave: triggerFileSave,
             } : {}),
             ...(whatsappUxEnabled ? {
               onWhatsAppThreadUnread: (conversationId: string, provider: WhatsAppComposeProvider, unread: boolean) => {
@@ -788,6 +794,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
       hiddenRetryCleanup?.();
       hiddenRetryCleanup = null;
       window.removeEventListener("message", onMessage);
+      activeFrameWindow = null;
       owned?.close();
       channel.current = null;
       setSlot(null); setLink(null); setPreview(null); setAudioModal(null);
