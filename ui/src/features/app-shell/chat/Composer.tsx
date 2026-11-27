@@ -906,9 +906,10 @@ export default function Composer({
     () =>
       splitComposerHighlights(draft, {
         candidates: mentionCandidates,
-        highlightCommand: Boolean((commands && commands.length > 0) || allowNote),
+        highlightCommand:
+          commands && commands.length > 0 ? true : allowNote || showSilentToggle ? "note" : false,
       }),
-    [draft, mentionCandidates, commands, allowNote],
+    [draft, mentionCandidates, commands, allowNote, showSilentToggle],
   );
   const hasHighlights = !block && highlightSpans.some((s) => s.kind !== "text");
 

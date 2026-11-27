@@ -4074,7 +4074,9 @@ button.refchip:hover {
   position: relative;
   min-width: 0;
 }
-.composer-input-wrap > :is(textarea, .composer-hl-mirror) {
+/* Keep zero specificity here so responsive `.app-chat-textarea` font-size
+   rules apply equally to both `<textarea>` and its `.composer-hl-mirror`. */
+:where(.composer-input-wrap > textarea, .composer-input-wrap > .composer-hl-mirror) {
   grid-area: 1 / 1;
   width: 100%;
   min-width: 0;
@@ -4082,7 +4084,7 @@ button.refchip:hover {
   white-space: pre-wrap;
   overflow-wrap: break-word;
   word-break: normal;
-  font: inherit;
+  font-family: inherit;
   letter-spacing: inherit;
   line-height: 1.5;
 }

@@ -667,7 +667,7 @@ async function main(): Promise<void> {
   assert(host.querySelector("[data-home-handoff-preview]") === null, "Home composer renders no handoff blocker card");
   assert(!(host.textContent ?? "").includes("Colleague mention in private Home"), "Home composer never surfaces handoff consent warning");
 
-  // 5b. CAD-2873 /note command + @mention highlight mirror in Composer.
+  // 5b. CAD-2873 /note command + @mention highlight mirror in Channels (`showSilentToggle`) & Home (`allowNote`) Composers.
   await React.act(async () => {
     root.render(
       React.createElement(LocaleProvider, null,
@@ -676,7 +676,7 @@ async function main(): Promise<void> {
           storeKey: "home-hl-cmd-test",
           block: null,
           seed: { text: "/note @bob ask @designer", n: 1 },
-          allowNote: true,
+          showSilentToggle: true,
           mentionCandidates: [
             { id: "human-bob", handle: "bob", label: "Bob", kind: "human", subtitle: "Teammate", active: true },
             { id: "p-designer", handle: "designer", label: "designer", kind: "agent", subtitle: "Designer", active: true },
@@ -699,6 +699,11 @@ async function main(): Promise<void> {
       { kind: 'mention-agent', text: '@designer' },
     ],
     'AssistantComposer highlights leading /note command alongside @human and @agent mentions',
+  );
+  equal(
+    splitComposerHighlights("/other @bob", { candidates: [{ id: "human-bob", handle: "bob", label: "Bob", kind: "human", active: true }], highlightCommand: "note" }).filter((s) => s.kind !== "text"),
+    [{ kind: "mention-human", text: "@bob" }],
+    'highlightCommand="note" highlights /note without highlighting arbitrary /commands',
   );
 
   // 6. Human-Turn Brake 3-state branch in HumanContextPanel + NotificationToast CSS stacking

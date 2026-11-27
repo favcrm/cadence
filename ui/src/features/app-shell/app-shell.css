@@ -911,8 +911,7 @@ button.sentchip:focus-visible {
     width: 1rem;
     height: 1rem;
   }
-  .app-chat-textarea,
-  .composer-hl-mirror.app-chat-textarea {
+  .app-chat-textarea {
     font-size: 16px;
   }
   /* CAD-1886: starter rows and the pane's jump pill reach a thumb. */

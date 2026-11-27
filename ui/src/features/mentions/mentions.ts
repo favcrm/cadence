@@ -68,6 +68,7 @@ function isHandleChar(ch: string): boolean {
 
 const MENTION_TOKEN = /@([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?![A-Za-z0-9_-])/g;
 const LEADING_COMMAND_TOKEN = /^(?:\/skill:[a-z0-9][a-z0-9-]{0,31}|\/[a-z][a-z0-9-]{0,31})(?=\s|$)/;
+const LEADING_NOTE_TOKEN = /^\/note(?=\s|$)/i;
 
 export interface MentionSpan {
   start: number;
@@ -113,7 +114,7 @@ export function splitComposerHighlights(
   text: string,
   options?: {
     candidates?: readonly MentionCandidate[];
-    highlightCommand?: boolean;
+    highlightCommand?: boolean | "note";
   },
 ): ComposerHighlightSpan[] {
   if (!text) return [];
@@ -128,7 +129,8 @@ export function splitComposerHighlights(
   let cursor = 0;
 
   if (options?.highlightCommand) {
-    const cmd = LEADING_COMMAND_TOKEN.exec(text);
+    const pattern = options.highlightCommand === "note" ? LEADING_NOTE_TOKEN : LEADING_COMMAND_TOKEN;
+    const cmd = pattern.exec(text);
     if (cmd?.[0]) {
       out.push({ kind: "command", text: cmd[0] });
       cursor = cmd[0].length;
