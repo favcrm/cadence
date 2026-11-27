@@ -16,12 +16,13 @@
 //! seed, not a canned outcome; the refusal/red is produced by the real guard.
 #![cfg(all(unix, feature = "test-seam"))]
 
+use crate::app_run_workflow::LocalWorkflow;
 use crate::daemon::cad1128_canary_fx as fx;
 use crate::daemon::custody_acceptance_fixture::Rig;
 use crate::error::Result;
 use crate::store::app_bindings::BindingProof;
 use crate::store::app_capabilities::AppCapabilityRecord;
-use crate::store::app_runs::{material_digest, LocalRunRequest, LocalWorkflow};
+use crate::store::app_runs::{material_digest, LocalRunRequest};
 use crate::store::{NewAgent, Take};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::{json, Value};

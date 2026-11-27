@@ -1,8 +1,8 @@
 use super::*;
+use crate::app_run_workflow::LocalWorkflow;
 
 #[test]
 fn cad631_explicit_local_schema_refuses_unsupported_execution_and_self_review() {
-    use crate::store::app_runs::LocalWorkflow;
     let workflow = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
     let inputs = std::collections::BTreeMap::new();
     assert!(LocalWorkflow::parse(workflow, &inputs).is_ok());
@@ -24,7 +24,7 @@ fn cad631_explicit_local_schema_refuses_unsupported_execution_and_self_review() 
 /// missing owner, and a capability step outside a host workflow refuses.
 #[test]
 fn cad1171_host_capability_run_needs_no_agents() {
-    use crate::store::app_runs::{LocalRunRequest, LocalWorkflow};
+    use crate::store::app_runs::LocalRunRequest;
     let (_dir, s) = store();
     let host_text = "---\ntitle: Read\ngoal: Retain a bounded provider receipt\nlabel: Find source\ncapability_slots: [source]\nexecution: host\ninputs:\n  profile_handle: { ask: Handle }\n---\n## Acquire: {{profile_handle}}\nsize: S\naction: local.capability.call\n\nCall the frozen source binding.\n\n### Acceptance\n- [ ] receipt retained\n";
     let mut inputs = std::collections::BTreeMap::new();
@@ -119,7 +119,7 @@ pub(super) fn runtime_fixture() -> (TempDir, Store, Value) {
     }
     let text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
     let inputs = std::collections::BTreeMap::new();
-    let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
+    let workflow = LocalWorkflow::parse(text, &inputs).unwrap();
     s.app_capability_decide("install-1", "sha256:bundle", true)
         .unwrap();
     let run = s
@@ -723,7 +723,7 @@ fn cad631_pm_in_owner_group_is_not_an_execution_worker() {
             .map_err(Into::into)
     })
     .unwrap();
-    let workflow: crate::store::app_runs::LocalWorkflow =
+    let workflow: LocalWorkflow =
         serde_json::from_value(run["snapshot"]["workflow"].clone()).unwrap();
     let inputs = std::collections::BTreeMap::new();
     assert!(s
@@ -742,7 +742,7 @@ fn cad631_pm_in_owner_group_is_not_an_execution_worker() {
 #[test]
 fn cad631_generic_job_reads_do_not_reveal_private_rendered_title() {
     let (_dir, s, run) = runtime_fixture();
-    let mut workflow: crate::store::app_runs::LocalWorkflow =
+    let mut workflow: LocalWorkflow =
         serde_json::from_value(run["snapshot"]["workflow"].clone()).unwrap();
     workflow.title = "Private subject sentinel CAD631".into();
     let inputs = std::collections::BTreeMap::new();
@@ -809,7 +809,7 @@ fn cad631_pty_team_is_explicitly_unsupported_and_transcript_history_is_private()
         .map_err(Into::into)
     })
     .unwrap();
-    let workflow: crate::store::app_runs::LocalWorkflow =
+    let workflow: LocalWorkflow =
         serde_json::from_value(run["snapshot"]["workflow"].clone()).unwrap();
     let inputs = std::collections::BTreeMap::new();
     assert!(s
@@ -1174,7 +1174,7 @@ fn cad778_frozen_run_with_float_identity_approves() {
     }
     let text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
     let inputs = std::collections::BTreeMap::new();
-    let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
+    let workflow = LocalWorkflow::parse(text, &inputs).unwrap();
     s.app_capability_decide("install-1", "sha256:bundle", true)
         .unwrap();
     let run = s
@@ -1839,7 +1839,7 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
 
     let text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
     let inputs = std::collections::BTreeMap::new();
-    let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
+    let workflow = LocalWorkflow::parse(text, &inputs).unwrap();
     let run = s
         .app_run_create_with_context(
             crate::store::app_runs::LocalRunRequest {

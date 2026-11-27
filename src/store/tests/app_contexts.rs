@@ -18,8 +18,9 @@ fn cad690_required_context_content_default_is_nonempty_but_optional_may_be_empty
 
 #[test]
 fn cad690_context_receipt_is_rechecked_in_create_and_execution_transactions() {
+    use crate::app_run_workflow::LocalWorkflow;
     use crate::store::app_contexts::ContextConfig;
-    use crate::store::app_runs::{LocalRunRequest, LocalWorkflow};
+    use crate::store::app_runs::LocalRunRequest;
     let (_dir, s, legacy) = runtime_fixture();
     let config = ContextConfig::new("Client", std::collections::BTreeMap::new()).unwrap();
     let context = s

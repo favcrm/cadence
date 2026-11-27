@@ -565,7 +565,7 @@ fn historical_step_receipt(
     let (spec,identity,state,message_id,result_digest):(String,String,String,Option<String>,Option<String>) = conn.query_row(
         "SELECT spec,identity_digest,state,message_id,result_digest FROM app_run_steps WHERE run_id=? AND step_id=?",
         params![run["id"].as_str(),step],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-    let spec: app_runs::LocalStep = serde_json::from_str(&spec)?;
+    let spec: crate::app_run_workflow::LocalStep = serde_json::from_str(&spec)?;
     let assignment = &run["snapshot"]["assignments"][step];
     if state != "succeeded"
         || message_id.as_deref() != Some(message)

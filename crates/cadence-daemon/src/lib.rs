@@ -18,13 +18,13 @@ mod console_macros;
 #[cfg(not(test))]
 use cadence_agent::ui;
 use cadence_agent::{
-    adapter, agent_roles, agent_settings, agent_uid, app_assistant, attachment_image, backup,
-    board_identity, business_templates, cli_actor, client, cloud_agent, confine, context_pack,
-    continuity, contract_fixture, delivery, doctor, error, fd_fs, gh_guard, home, inbox, issue,
-    issuer_transport, lease, managed_section, master, master_perm, memory, model_defaults,
-    needs_dismiss, peer, pi_policy, proc, project_policy, protected_runtime, proto, reaper,
-    remote_cli, rollout, runner, sandbox, secret, skill, slots, store, task_acceptance, test_seam,
-    thread_search, wiki, worktree, Error, Result,
+    adapter, agent_roles, agent_settings, agent_uid, app_assistant, app_run_workflow,
+    attachment_image, backup, board_identity, business_templates, cli_actor, client, cloud_agent,
+    confine, context_pack, continuity, contract_fixture, delivery, doctor, error, fd_fs, gh_guard,
+    home, inbox, issue, issuer_transport, lease, managed_section, master, master_perm, memory,
+    model_defaults, needs_dismiss, peer, pi_policy, proc, project_policy, protected_runtime, proto,
+    reaper, remote_cli, rollout, runner, sandbox, secret, skill, slots, store, task_acceptance,
+    test_seam, thread_search, wiki, worktree, Error, Result,
 };
 #[cfg(all(test, feature = "test-seam"))]
 use cadence_agent::{web_publish, web_sites};

@@ -385,7 +385,7 @@ fn seeded_encrypted_publication_run(
             .join("tests/fixtures/apps/social-content/workflows/facebook.md"),
     )
     .expect("facebook workflow fixture readable");
-    let workflow = crate::store::app_runs::LocalWorkflow::parse(&workflow_text, &inputs)
+    let workflow = crate::app_run_workflow::LocalWorkflow::parse(&workflow_text, &inputs)
         .expect("facebook workflow parses for the historical seed");
     let created = shared
         .store

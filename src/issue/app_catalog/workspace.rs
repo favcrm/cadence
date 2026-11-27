@@ -1996,7 +1996,8 @@ fn describe_with(
             // CAD-1123: the digest a run snapshot records as its
             // workflow `source_digest`, so a reader can name the run's
             // workflow without the snapshot carrying the file name.
-            let source_digest = crate::store::app_runs::artifact_digest(text.as_bytes());
+            let source_digest =
+                cadence_core::connection_dispatch::exact_byte_digest(text.as_bytes());
             // CAD-1171: the run form reads `execution` — a host workflow
             // runs in-process for the operator's click (no PM/worker).
             let execution = template

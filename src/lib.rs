@@ -31,6 +31,7 @@ pub mod agent_settings;
 pub mod agent_uid;
 pub mod app_assistant;
 pub mod app_preview_export;
+pub mod app_run_workflow;
 pub mod attachment_image;
 /// Approval evidence constant shared with [`delivery::hosted_gate`].
 pub mod audit {
