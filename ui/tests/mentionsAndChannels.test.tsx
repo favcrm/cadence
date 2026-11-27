@@ -560,6 +560,7 @@ async function main(): Promise<void> {
   // 5. Hosted profile @mention merging, teammate self-exclusion/disambiguation, and agent @handle validation
   assert(!isShareableProfile({ alias: "master", role: "coder", team_role: "coder" }), "master profile is not shareable");
   assert(!isShareableProfile({ alias: "assist-alice", role: "coder", team_role: "coder" }), "assist-* profile is not shareable");
+  assert(!isShareableProfile({ alias: "retired", role: "coder", team_role: "coder", status: "archived" }), "archived profile is not shareable");
   assert(isShareableProfile({ alias: "coder", role: "coder", team_role: "coder" }), "ordinary hired profile is shareable");
 
   const mergedCandidates = buildMentionCandidates(
@@ -574,6 +575,7 @@ async function main(): Promise<void> {
       { id: "p-1", alias: "builder", role: "coder", team_role: "coder" },
       { id: "p-2", alias: "designer", role: "designer", team_role: "designer" },
       { id: "p-3", alias: "master", role: "master", team_role: "master" },
+      { id: "p-4", alias: "retired", role: "coder", team_role: "coder", status: "archived" },
     ],
   );
   equal(

@@ -29,11 +29,13 @@ export function isShareableAgent(
 export type MentionAgentInput = Pick<Agent, "alias" | "inbox" | "provider" | "dead" | "role" | "personal_assistant">;
 
 /** Fields required to determine and render a hosted hired-profile `@mention` candidate. */
-export type MentionProfileInput = Pick<HiredProfile, "id" | "alias" | "role" | "team_role">;
+export type MentionProfileInput = Pick<HiredProfile, "id" | "alias" | "role" | "team_role"> & {
+  status?: string | null;
+};
 
-/** Exclude `master`, `assist-*`, `reviewer`, and self from hosted hired profiles. */
+/** Exclude `master`, `assist-*`, `reviewer`, `archived`, and self from hosted hired profiles. */
 export function isShareableProfile(
-  profile: Pick<HiredProfile, "alias" | "role" | "team_role">,
+  profile: Pick<HiredProfile, "alias" | "role" | "team_role"> & { status?: string | null },
   excludeAlias?: string | null,
 ): boolean {
   const aliasLower = profile.alias.trim().toLowerCase();
@@ -43,6 +45,7 @@ export function isShareableProfile(
     !aliasLower.startsWith("assist-") &&
     (profile.role ?? "").toLowerCase() !== "reviewer" &&
     (profile.team_role ?? "").toLowerCase() !== "reviewer" &&
+    (profile.status ?? "").toLowerCase() !== "archived" &&
     (!excludeAlias || profile.alias !== excludeAlias)
   );
 }
