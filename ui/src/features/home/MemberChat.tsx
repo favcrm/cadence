@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
-import { navigate } from "../../lib/useLocation";
 import { useQuery, useResource } from "../../lib/useResource";
 import { buildMentionCandidates } from "../mentions/candidates";
-import { HomeMentionHandoffCard, useHomeMentionHandoff } from "../mentions/HomeMentionHandoff";
 import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import { useTranslate } from "../../lib/locale";
 import { onThreadReload } from "../../lib/masterChanged";
@@ -115,6 +113,7 @@ const LOADING_IDENTITY: IdentityRead = { state: "loading" };
 
 export default function MemberChat({
   scope,
+  viewerSub = null,
   readOnly,
   supportWorkspaceId,
   onOpenIssue,
@@ -130,6 +129,7 @@ export default function MemberChat({
 }: {
   /** The session-scoped store/draft key — `${sessionId}:${sub}`. */
   scope: string;
+  viewerSub?: string | null;
   readOnly: boolean;
   supportWorkspaceId?: string;
   onOpenIssue: (id: string) => void;
@@ -145,7 +145,7 @@ export default function MemberChat({
 }) {
   const t = useTranslate();
   const roster = useQuery(resources.agents);
-  const teammates = useWorkspaceTeammates(true);
+  const teammates = useWorkspaceTeammates(true, viewerSub);
   const store = memberThreadStore(scope);
   const thread = useResource(store);
   // The member scope is never named in stream-resource invalidations
@@ -446,12 +446,12 @@ export default function MemberChat({
       buildMentionCandidates(
         roster.data?.agents,
         teammates,
-        t("Teammate · consent to share"),
+        "",
         surface?.alias,
+        roster.data?.profiles,
       ),
-    [roster.data?.agents, teammates, t, surface?.alias],
+    [roster.data?.agents, roster.data?.profiles, teammates, surface?.alias],
   );
-  const handoff = useHomeMentionHandoff(memberMentionCandidates, dockRef);
   const keepDockTail = useCallback(
     (onTail: boolean) => {
       // Nothing unpins `follow` here, so only the reader's position counts:
@@ -848,8 +848,6 @@ export default function MemberChat({
               }
               mentionCandidates={memberMentionCandidates}
               allowNote
-              onDraftChange={handoff.onDraftChange}
-              beforeSend={handoff.beforeSend}
               onNotice={(notice) => setSendNote(displayUiNotice(notice, t))}
               onSend={({ body, attachments }) =>
                 sendToAssistant(scope, body, undefined, undefined, attachments).then((receipt) => {
@@ -876,12 +874,6 @@ export default function MemberChat({
               placeholder={messagePlaceholder(identity, "personal", t)}
               ariaLabel={messageLabel(identity, "personal", t)}
               formProps={{ "data-composer": "" }}
-            />
-            <HomeMentionHandoffCard
-              teammates={handoff.mentionedTeammates}
-              sendBlockedForConsent={handoff.handoffHold}
-              onOpenChannels={() => navigate("/threads")}
-              onKeepPrivate={handoff.onKeepPrivate}
             />
           </div>
         </div>

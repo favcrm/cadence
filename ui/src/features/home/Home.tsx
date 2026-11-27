@@ -6,14 +6,12 @@ import { activityAfterStagedTool, attachmentNames, stagedActionId } from "./turn
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
-import { useQuery, useResource } from "../../lib/useResource";
+import { useQuery } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
-import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
 import { buildMentionCandidates } from "../mentions/candidates";
-import { HomeMentionHandoffCard, useHomeMentionHandoff } from "../mentions/HomeMentionHandoff";
 import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import {
   composerBlock,
@@ -875,6 +873,7 @@ export default function Home({
           supportWorkspaceId={supportWorkspaceId}
           key={scope}
           scope={scope}
+          viewerSub={viewerSub}
           readOnly={readOnly}
           onOpenIssue={onOpenIssue}
           decisions={decisions && operator === true && !viewerIsMember}
@@ -898,6 +897,7 @@ export default function Home({
         readOnly={readOnly}
         canLocalDispatch={canLocalDispatch}
         hosted={hosted}
+        viewerSub={viewerSub}
         supportWorkspaceId={supportWorkspaceId}
         overview={overview}
         documentFollowUps={documentFollowUps}
@@ -930,6 +930,7 @@ function MasterHome({
   readOnly,
   canLocalDispatch = false,
   hosted = null,
+  viewerSub = null,
   supportWorkspaceId,
   overview,
   documentFollowUps,
@@ -953,6 +954,7 @@ function MasterHome({
   readOnly: boolean;
   canLocalDispatch?: boolean;
   hosted?: boolean | null;
+  viewerSub?: string | null;
   supportWorkspaceId?: string;
   credentialRequestsEnabled?: boolean;
   templateRail?: HostedTemplateRail;
@@ -976,8 +978,8 @@ function MasterHome({
 }) {
   const t = useTranslate();
   const thread = useQuery(resources.masterThread);
-  const agents = useResource(resources.agents);
-  const teammates = useWorkspaceTeammates(hosted === true);
+  const agents = useQuery(resources.agents);
+  const teammates = useWorkspaceTeammates(hosted === true, viewerSub);
   const [seed, setSeed] = useState<{ text: string; n: number; refs?: ThreadRef[] }>({
     text: "",
     n: 0,
@@ -1012,10 +1014,9 @@ function MasterHome({
   /** Older history just paged in above: not an arrival, never a pill. */
   const earlierLanded = useRef(false);
   const homeMentionCandidates = useMemo(
-    () => buildMentionCandidates(agents.data?.agents, teammates, t("Teammate · consent to share"), MASTER),
-    [agents.data?.agents, teammates, t],
+    () => buildMentionCandidates(agents.data?.agents, teammates, "", MASTER, agents.data?.profiles),
+    [agents.data?.agents, agents.data?.profiles, teammates],
   );
-  const mentionHandoff = useHomeMentionHandoff(homeMentionCandidates, dockRef);
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
@@ -2017,8 +2018,6 @@ function MasterHome({
               onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
               mentionCandidates={homeMentionCandidates}
               allowNote
-              onDraftChange={mentionHandoff.onDraftChange}
-              beforeSend={mentionHandoff.beforeSend}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               modelPicker={{
@@ -2031,12 +2030,6 @@ function MasterHome({
                 : missing
                   ? t("The Master conversation is unavailable.")
                   : t("A Home conversation must be ready before attaching files.")}
-            />
-            <HomeMentionHandoffCard
-              teammates={mentionHandoff.mentionedTeammates}
-              sendBlockedForConsent={mentionHandoff.handoffHold}
-              onOpenChannels={() => navigate("/threads")}
-              onKeepPrivate={mentionHandoff.onKeepPrivate}
             />
           </div>
         </div>

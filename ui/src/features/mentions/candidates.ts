@@ -1,5 +1,5 @@
 import type { KeyboardEvent } from "react";
-import type { Agent } from "../../lib/types";
+import type { Agent, HiredProfile } from "../../lib/types";
 import type { HumanPerson } from "../threads/humanThreadsClient";
 import type { MentionCandidate } from "./mentions";
 import { teammateMentionCandidates } from "./useWorkspacePeople";
@@ -25,26 +25,71 @@ export function isShareableAgent(
   );
 }
 
-/** Build shared `@mention` picker candidates combining shareable agents and workspace teammates. */
+/** Fields required to determine and render an agent `@mention` candidate. */
+export type MentionAgentInput = Pick<Agent, "alias" | "inbox" | "provider" | "dead" | "role" | "personal_assistant">;
+
+/** Fields required to determine and render a hosted hired-profile `@mention` candidate. */
+export type MentionProfileInput = Pick<HiredProfile, "id" | "alias" | "role" | "team_role"> & {
+  status?: string | null;
+};
+
+/** Exclude `master`, `assist-*`, `reviewer`, `archived`, and self from hosted hired profiles. */
+export function isShareableProfile(
+  profile: Pick<HiredProfile, "alias" | "role" | "team_role"> & { status?: string | null },
+  excludeAlias?: string | null,
+): boolean {
+  const aliasLower = profile.alias.trim().toLowerCase();
+  return (
+    aliasLower !== "" &&
+    aliasLower !== "master" &&
+    !aliasLower.startsWith("assist-") &&
+    (profile.role ?? "").toLowerCase() !== "reviewer" &&
+    (profile.team_role ?? "").toLowerCase() !== "reviewer" &&
+    (profile.status ?? "").toLowerCase() !== "archived" &&
+    (!excludeAlias || profile.alias !== excludeAlias)
+  );
+}
+
+/** Build shared `@mention` picker candidates combining shareable agents, hosted profiles, and workspace teammates. */
 export function buildMentionCandidates(
-  agents: readonly Agent[] | undefined,
+  agents: readonly MentionAgentInput[] | undefined,
   teammates: readonly HumanPerson[],
   teammateSubtitle: string,
   excludeAlias?: string | null,
+  profiles?: readonly MentionProfileInput[] | undefined,
 ): MentionCandidate[] {
-  return [
-    ...(agents ?? [])
-      .filter((a) => isShareableAgent(a, excludeAlias))
-      .map((a) => ({
-        id: a.alias,
-        handle: a.alias,
-        label: a.alias,
-        kind: "agent" as const,
-        subtitle: a.role ?? undefined,
-        active: true,
-      })),
-    ...teammateMentionCandidates(teammates, teammateSubtitle),
-  ];
+  const out: MentionCandidate[] = [];
+  const seenAliases = new Set<string>();
+  for (const a of agents ?? []) {
+    if (!isShareableAgent(a, excludeAlias)) continue;
+    const key = a.alias.trim().toLowerCase();
+    if (!key || seenAliases.has(key)) continue;
+    seenAliases.add(key);
+    out.push({
+      id: a.alias,
+      handle: a.alias,
+      label: a.alias,
+      kind: "agent",
+      subtitle: a.role ?? undefined,
+      active: true,
+    });
+  }
+  for (const p of profiles ?? []) {
+    if (!isShareableProfile(p, excludeAlias)) continue;
+    const key = p.alias.trim().toLowerCase();
+    if (seenAliases.has(key)) continue;
+    seenAliases.add(key);
+    out.push({
+      id: p.id,
+      handle: p.alias,
+      label: p.alias,
+      kind: "agent",
+      subtitle: p.role || undefined,
+      active: true,
+    });
+  }
+  out.push(...teammateMentionCandidates(teammates, teammateSubtitle));
+  return out;
 }
 
 /** Shared keyboard navigation for `@mention` pickers inside textarea inputs. */

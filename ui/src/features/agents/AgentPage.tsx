@@ -1,6 +1,7 @@
 import { useContext, useEffect, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
+import { navigate } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import { IconSettings } from "../../ui/icons";
 import { WriteGate } from "../auth/WriteGate";
@@ -252,6 +253,9 @@ export default function AgentPage({
     setRetry((r) => r + 1);
     if (!observed) onRetryRoster();
   };
+  const otherAliases = profiles
+    .map((p) => p.alias)
+    .filter((other) => other.trim().toLowerCase() !== alias.trim().toLowerCase());
   const ctx: TabContext = {
     alias,
     profile,
@@ -264,6 +268,11 @@ export default function AgentPage({
     resume,
     onOpenIssue,
     hired,
+    otherAliases,
+    onRenamed: (nextAlias) => {
+      setGear(false);
+      navigate(`/agents/${encodeURIComponent(nextAlias)}`);
+    },
     operator: operator === true,
     writable: operator === true && boardBlock === null && !rosterStale,
     // Why the page is read-only, from what it already knows; null when it isn't.
@@ -396,6 +405,7 @@ export default function AgentPage({
   const isMaster = companyMaster || alias === MASTER;
   const showHomeCta = isMaster && !hired && !mailbox;
   const showChannelsCta = !isMaster && !mailbox && Boolean(profile && isShareableAgent(profile));
+  const showHandle = !isMaster && !mailbox && (hired !== undefined || Boolean(profile && isShareableAgent(profile)));
   const unknownOverview501 = section === "overview" && rosterLoaded && !hired && !profile && notServed;
 
   return (
@@ -414,6 +424,12 @@ export default function AgentPage({
         <div className="min-w-0">
           <h1>{alias}</h1>
           <div className="ap-sub">
+            {showHandle && (
+              <>
+                <span className="num" data-agent-handle="">@{alias}</span>
+                <span aria-hidden="true">·</span>
+              </>
+            )}
             <span>{manageSubline}</span>
           </div>
         </div>

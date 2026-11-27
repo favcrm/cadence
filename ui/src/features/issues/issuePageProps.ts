@@ -29,4 +29,5 @@ export interface IssuePageProps {
   projectRepos?: readonly unknown[] | null;
   /** Staged/decided assistant actions from the shared decisions store, when available. */
   stagedActions?: readonly StagedWrite[];
+  viewerSub?: string | null;
 }

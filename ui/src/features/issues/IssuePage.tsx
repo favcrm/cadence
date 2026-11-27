@@ -238,6 +238,7 @@ function PageBody({
   managedFiles,
   projectRepos,
   stagedActions,
+  viewerSub,
 }: Props & {
   detail: IssueDetail;
   history: ResourceState<IssueHistoryEntry[]>;
@@ -250,7 +251,7 @@ function PageBody({
 }) {
   const { t } = useLocale();
   const fieldsId = useId();
-  const teammates = useWorkspaceTeammates(hosted === true);
+  const teammates = useWorkspaceTeammates(hosted === true, viewerSub);
   const items = useMemo(() => acceptanceItems(detail.body), [detail.body]);
   const pr = prRef(detail.refs);
   const codeDelivery = hasCodeDelivery(detail, projectRepos, hosted);
@@ -545,6 +546,8 @@ function PageBody({
                 agents?.agents,
                 teammates,
                 t("Teammate · notify"),
+                undefined,
+                agents?.profiles,
               )}
             />
           )}

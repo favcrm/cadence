@@ -1681,6 +1681,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             writeBlock={projectWriteBlock}
             kickoffBlock={projectWriteBlock ?? operatorKickoffBlock(meta)}
             hosted={meta?.hosted === true}
+            viewerSub={viewerSub}
             canLocalDispatch={meta?.settings_sections?.includes("daemons") === true}
             daemonsHref={meta?.settings_sections?.includes("daemons") ? hrefFor({ screen: "settings", section: "daemons" }) : undefined}
             managedFiles={managedFiles}
