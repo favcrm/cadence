@@ -1,9 +1,11 @@
 import { api, ApiError, type MyWorkMembership, type MyWorkPayload } from "./api";
+import { errorMessage } from "./apiError";
 import { normalizeAgentsPayload } from "./agentOn";
 import { myWorkApiQuery, myWorkViewKey, type MyWorkView } from "./myWorkQuery";
 import { QueryCache, type Resource } from "./cache";
 import { loadThread, type PageReader, type ThreadState } from "../features/home/thread";
-import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed } from "./privateSession";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateFetch, privateReadsAllowed, usingPrivateOperation } from "./privateSession";
+import { sessionHeaders } from "./sessionKey";
 
 /** Page reads of one agent's thread. */
 export function threadReader(alias: string): PageReader {
@@ -21,6 +23,7 @@ import type {
   AppRun,
   Connection,
   ConnectionProvider,
+  ConnectionsPayload,
   IssueCard,
   IssueDetail,
   IssueHistoryEntry,
@@ -38,6 +41,26 @@ let connectionsListPartial = false;
 
 const unavailablePrivateRecord = (error: unknown) => error instanceof ApiError &&
   (error.status === 401 || error.status === 403 || error.status === 404);
+
+/** Hosted-only projection. Native connection routes reject query parameters. */
+function readHostedSmtpConnections(): Promise<ConnectionsPayload> {
+  return usingPrivateOperation(undefined, async (operation) => {
+    const response = await privateFetch("/api/connections?scope=smtp", {
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: sessionHeaders(),
+    }, operation);
+    const body: unknown = await response.json().catch(() => null);
+    operation.assertCurrent();
+    if (!response.ok) {
+      throw new ApiError(errorMessage(body, "Email accounts could not be loaded."), response.status);
+    }
+    if (!body || typeof body !== "object" || !("connections" in body) || !Array.isArray(body.connections)) {
+      throw new ApiError("The server returned an invalid email account list.", 502);
+    }
+    return body as ConnectionsPayload;
+  });
+}
 
 let myWorkController: AbortController | null = null;
 const unavailableIssueListeners = new Set<(id: string) => void>();
@@ -325,6 +348,12 @@ export const resources = {
       return r.connections;
     }),
   ),
+  /** One warm snapshot per board transport, still fenced to the private session. */
+  smtpConnections: cache.family("smtp-connections",
+    (board: "hosted" | "native") => board === "hosted" ? readHostedSmtpConnections() : api.connections(), {
+      freshMs: 30_000,
+      discardOnError: unavailablePrivateRecord,
+    }),
   /**
    * Whether that list is partial, because the board couldn't reach the platform's
    * accounts. The list read sets it, so the two can't disagree and nothing reads twice.

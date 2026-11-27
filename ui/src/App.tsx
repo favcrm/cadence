@@ -49,7 +49,7 @@ import { parseHostedWorkspaces } from "./features/settings/accountDisplay";
 import Connections from "./features/settings/Connections";
 import CredentialEntry from "./features/connections/CredentialEntry";
 import CredentialAuthorize from "./features/connections/CredentialAuthorize";
-import EmailSending from "./features/settings/EmailSending";
+import EmailSending, { EmailAccount } from "./features/settings/EmailSending";
 import SettingsLayout from "./features/settings/SettingsLayout";
 import General from "./features/settings/General";
 import HostedStatus from "./features/settings/HostedStatus";
@@ -542,7 +542,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // A board that says what Settings it serves never shows a page it doesn't.
   const emailAvailable = !meta?.settings_sections || meta.settings_sections.includes("email");
   const settingsTarget = route.screen === "settings"
-    ? settingsRedirect(route.section, meta) ?? (!emailAvailable && route.section === "connections" && route.page?.kind === "email" ? settingsRedirect("email", meta) : null)
+    ? settingsRedirect(route.section, meta) ?? (!emailAvailable && route.section === "connections" && (route.page?.kind === "email" || route.page?.kind === "emailAccount") ? settingsRedirect("email", meta) : null)
     : null;
   useEffect(() => {
     const path = href.split("?")[0];
@@ -1953,6 +1953,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             )}
             {route.section === "connections" && (route.page?.kind === "email" ? (
               <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} focusSenders={route.page.focusSenders} />
+            ) : route.page?.kind === "emailAccount" ? (
+              <EmailAccount key={route.page.id} id={route.page.id} viewer={viewer} hostedBoard={Boolean(meta?.settings_sections)} />
             ) : (
               <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} emailAvailable={emailAvailable} />
             ))}

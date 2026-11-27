@@ -26,9 +26,12 @@ interface World {
   origin: { unsubscribe_origin: string | null; stored: boolean };
   posts: { path: string; body: any }[];
   failConnectionsOnce?: boolean;
+  denyConnections?: boolean;
+  failBindOnce?: boolean;
   connectionsPartial?: boolean;
   failContextsOnce?: boolean;
   reads?: string[];
+  connectionQueries?: string[];
   failShowOnce?: boolean;
 }
 
@@ -51,7 +54,7 @@ const bindingFor = (row: any, over: any = {}) => ({
   ...over,
 });
 
-async function mount(world: World, viewer = { operator: true, readOnly: false }, fixedUnsubscribeAddress = false) {
+async function mount(world: World, viewer = { operator: true, readOnly: false }, fixedUnsubscribeAddress = false, accountId?: string) {
   const { Window } = require("happy-dom");
   const win = new Window({ url: "http://localhost/settings/connections/email" });
   for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLSelectElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
@@ -69,7 +72,11 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
   };
   const React = require("react");
   const { createRoot } = require("react-dom/client");
-  const EmailSendingView = (require("../src/features/settings/EmailSending") as typeof import("../src/features/settings/EmailSending")).default;
+  const emailModule = require("../src/features/settings/EmailSending");
+  const EmailSendingView = emailModule.default;
+  const session = require("../src/lib/privateSession");
+  session.resetPrivateSession();
+  session.allowPrivateReads();
   const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
   const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
   const EmailSending = (props: React.ComponentProps<typeof EmailSendingView>) =>
@@ -80,8 +87,10 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     if (method === "GET") world.reads?.push(url.pathname);
+    if (method === "GET" && url.pathname === "/api/connections") world.connectionQueries?.push(url.search);
     if (method === "POST") world.posts.push({ path: url.pathname, body });
     switch (`${method} ${url.pathname}`) {
+      case "GET /api/protected-entry": return json({ configured: false, origin: null });
       case "GET /api/app-installations":
         return json(world.installations ?? [{ install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true }, { install_id: "install-social", name: "social-content", title: "Social" }]);
       case "GET /api/app-installations/install-crm/contexts":
@@ -91,6 +100,8 @@ async function mount(world: World, viewer = { operator: true, readOnly: false },
         }
         return json({ contexts: world.contexts });
       case "GET /api/connections":
+        if (world.denyConnections) return json({ error: { code: "operator_required", message: "Operator required" } }, 403);
+        if (!fixedUnsubscribeAddress && url.search) return json({ error: "connection query parameters are unsupported" }, 400);
         if (world.failConnectionsOnce) {
           world.failConnectionsOnce = false;
           return json({ error: "connections are unavailable" }, 503);
@@ -115,6 +126,10 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
         // As the daemon does: the receipt names the value, and only a read says `stored`.
         return json({ unsubscribe_origin: body.unsubscribe_origin });
       case "POST /api/crm-smtp/bind": {
+        if (world.failBindOnce) {
+          world.failBindOnce = false;
+          return json({ error: "The sender could not be saved." }, 503);
+        }
         const row = world.connections.find((r) => r.id === body.connection_id);
         const next = bindingFor(row);
         next.context_id = body.context_id;
@@ -159,7 +174,10 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
   const button = (label: string) =>
     Array.from(document.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === label) as HTMLButtonElement | undefined;
   const render = async (focusSenders = false) => {
-    await React.act(async () => { root.render(React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress, focusSenders })); });
+    const view = accountId
+      ? React.createElement(emailModule.EmailAccount, { id: accountId, viewer, hostedBoard: fixedUnsubscribeAddress })
+      : React.createElement(EmailSending, { viewer, fixedUnsubscribeAddress, focusSenders });
+    await React.act(async () => { root.render(accountId ? React.createElement(NavigationProvider, { adapter: hostNavigation, children: view }) : view); });
   };
   await render();
   // A row is a name and one line; everything else is in the drawer it opens.
@@ -192,6 +210,7 @@ world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsub
     React,
     mainText,
     render,
+    showAccount: async (id: string) => { accountId = id; await render(); },
     unmount: async () => {
       await React.act(async () => root.unmount());
       host.remove();
@@ -235,7 +254,7 @@ async function main() {
       assert(m.rowFor("CRM · Acme")?.textContent?.includes("conn-a@example.com"), "the bound context names its sender");
       assert(m.rowFor("CRM · Billing")?.textContent?.includes("No sender chosen"), "the other context is unbound");
     });
-    assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "a listed SMTP account can be managed");
+    assert(m.host.querySelector('a[href="/settings/connections/email/account/conn-a"]'), "a listed SMTP account can be managed");
     assert(!m.host.querySelector("input[type=password]"), "no password field on the policy page");
     await m.open("CRM · Billing");
     await m.settle(() => assert(m.button("Use this sender"), "bind button"));
@@ -385,7 +404,7 @@ async function main() {
     const m = await mount(world);
     await m.settle(() => assert(m.host.querySelector("[data-state=connections-partial]"), "partial list notice"));
     assert(m.host.textContent!.includes("Some connected accounts couldn't be loaded"), "partial notice explains the list");
-    assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "known account remains manageable");
+    assert(m.host.querySelector('a[href="/settings/connections/email/account/conn-a"]'), "known account remains manageable");
     assert(!m.button("Add email") && !m.host.textContent!.includes("No email accounts connected"), "partial list does not imply empty or permit Add");
     await m.open("CRM · Acme");
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "known binding is displayed"));
@@ -412,7 +431,7 @@ async function main() {
     const m = await mount(world);
     await m.settle(() => {
       assert(m.button("Retry"), "context discovery offers Retry");
-      assert(m.host.querySelector('a[href="/settings/connections/account/conn-a"]'), "account remains manageable");
+      assert(m.host.querySelector('a[href="/settings/connections/email/account/conn-a"]'), "account remains manageable");
       assert(m.button("Add email"), "account add remains available");
       assert(m.rowFor("Unsubscribe links"), "unsubscribe remains available");
     });
@@ -436,6 +455,18 @@ async function main() {
     await m.settle(() => assert(m.host.querySelector("[data-state=live]"), "Retry recovers"));
     await m.unmount();
   }
+  {
+    const world = fresh({ failBindOnce: true });
+    const m = await mount(world);
+    await m.open("CRM · Acme");
+    await m.settle(() => assert(m.button("Use this sender"), "binding can start"));
+    await m.click(m.button("Use this sender"));
+    await m.settle(() => assert(m.button("Retry"), "a refused write is recoverable in the same drawer"));
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.button("Use this sender"), "retry re-reads the binding and restores the action"));
+    equal(world.posts.filter((post) => post.path.endsWith("/bind")).length, 1, "retry does not replay a write");
+    await m.unmount();
+  }
   // The two Email routes share a mounted page; returning still focuses App senders.
   {
     const m = await mount(fresh());
@@ -454,7 +485,7 @@ async function main() {
     const m = await mount(fresh({
       hostedSmtp: true, connections: [smtpRow("conn-hosted", { account: "email" })],
     }), { operator: true, readOnly: false }, true);
-    await m.settle(() => assert(m.host.querySelector('a[href="/settings/connections/account/conn-hosted"]'), "existing hosted account can be managed"));
+    await m.settle(() => assert(m.host.querySelector('a[href="/settings/connections/email/account/conn-hosted"]'), "existing hosted account can be managed"));
     assert(!m.button("Add email"), "the single hosted SMTP account cannot be replaced through Add email");
     await m.unmount();
   }
@@ -463,6 +494,121 @@ async function main() {
     const m = await mount(fresh(), { operator: true, readOnly: false }, true);
     await m.settle(() => assert(m.rowFor("CRM · Acme"), "the app row renders"));
     assert(!m.rowFor("Unsubscribe links"), "no unsubscribe setting on a hosted board");
+    await m.unmount();
+  }
+  {
+    const world = fresh({ hostedSmtp: true, connections: [smtpRow("conn-a"), { ...smtpRow("unrelated"), smtp_sender: false, smtp: null }], reads: [], connectionQueries: [] });
+    const m = await mount(world, { operator: true, readOnly: false }, true);
+    await m.settle(() => assert(m.host.querySelector('a[href="/settings/connections/email/account/conn-a"]'), "SMTP account renders"));
+    assert(!m.host.textContent?.includes("unrelated"), "legacy non-SMTP rows are filtered");
+    equal(world.connectionQueries, ["?scope=smtp"], "email requests SMTP scope");
+    assert(!world.reads?.includes("/api/connection-providers"), "email overview does not load providers");
+    await m.unmount();
+  }
+  {
+    const a = smtpRow("conn-a");
+    const world = fresh({ connections: [a], binding: bindingFor(a), failShowOnce: true });
+    const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
+    await m.settle(() => assert(m.host.textContent?.includes("usage may be incomplete"), "binding failure is explicit"));
+    world.failShowOnce = true;
+    await m.click(m.button("Disconnect account"));
+    await m.settle(() => assert(m.host.textContent?.includes("Disconnect is refused while an app still uses this account"), "disconnect warns when usage is unknown"));
+    assert(!world.posts.some((post) => post.path.endsWith("/revoke")), "opening confirmation does not disconnect");
+    await m.click(m.button("Cancel"));
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.host.textContent?.includes("CRM · Acme"), "binding retry restores the affected app"));
+    assert(!m.button("Disconnect account")?.disabled, "operator can open the disconnect explanation");
+    await m.click(m.button("Disconnect account"));
+    await m.settle(() => assert(m.host.textContent?.includes("Stop using this account in CRM · Acme before disconnecting"), "hosted confirmation explains the bound-account refusal"));
+    assert(!m.button("Disconnect") && m.host.querySelector('a[href="/settings/connections/email/senders"]'), "the drawer links to the remedy instead of offering an impossible write");
+    await m.unmount();
+  }
+  {
+    const a = smtpRow("conn-a");
+    const world = fresh({
+      connections: [a], binding: bindingFor(a), failShowOnce: true,
+      contexts: [{ id: "ctx-a", state: "active", config: { label: "Acme" } }, { id: "ctx-b", state: "active", config: { label: "Billing" } }],
+    });
+    const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
+    await m.settle(() => assert(m.host.textContent?.includes("usage may be incomplete"), "a failed context lookup leaves app usage incomplete"));
+    world.failShowOnce = true;
+    await m.click(m.button("Disconnect account"));
+    const drawer = () => m.host.querySelector('[role="dialog"]');
+    await m.settle(() => {
+      assert(drawer()?.textContent?.includes("CRM · Billing before disconnecting"), "the confirmed app is named");
+      assert(drawer()?.textContent?.includes("App usage could not be fully confirmed"), "the drawer also reports incomplete usage");
+    });
+    assert(!m.button("Disconnect"), "a confirmed live binding prevents disconnect");
+    world.binding = null;
+    await m.click(m.button("Refresh app usage"));
+    await m.settle(() => assert(m.button("Disconnect")?.disabled, "removing the binding elsewhere restores the explicitly armed confirmation"));
+    assert(!world.posts.some((post) => post.path.endsWith("/revoke")), "refreshing the drawer never writes");
+    await m.unmount();
+  }
+  {
+    const world = fresh({ connectionsPartial: true });
+    const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
+    await m.settle(() => assert(m.host.textContent?.includes("could not be fully confirmed"), "partial account warning"));
+    assert(m.button("Update credentials")?.disabled, "partial account cannot rotate");
+    assert(m.button("Disconnect account")?.disabled, "partial account cannot disconnect");
+    await m.unmount();
+  }
+  // Legacy peers may ignore scope and return unrelated rows; Manage reads the
+  // same scoped resource and reports only bindings for this exact account.
+  {
+    const { connections: [a] } = JSON.parse(require("node:fs").readFileSync("tests/fixtures/smtp-connections.json", "utf8"));
+    const other = smtpRow("conn-b");
+    const world = fresh({
+      hostedSmtp: true, connections: [a, other, { ...smtpRow("unrelated"), smtp_sender: false, smtp: null }],
+      contexts: [{ id: "ctx-a", state: "active", config: { label: "Acme" } }, { id: "ctx-b", state: "active", config: { label: "Billing" } }],
+      bindings: { "ctx-a": bindingFor(a), "ctx-b": bindingFor(other) },
+      reads: [], connectionQueries: [],
+    });
+    const m = await mount(world, { operator: true, readOnly: false }, true);
+    await m.settle(() => assert(m.host.textContent?.includes("hello@example.test"), "Email renders the scoped account"));
+    await m.showAccount(a.id);
+    await m.settle(() => assert(m.host.textContent?.includes("CRM · Acme"), "exact matching app is shown"));
+    assert(!m.host.textContent?.includes("CRM · Billing"), "other account's binding is excluded");
+    assert(m.host.querySelector("details:not([open])"), "advanced settings start collapsed");
+    assert(!m.host.querySelector("input[type=password]"), "account overview displays no password");
+    equal(world.connectionQueries, ["?scope=smtp"], "manage requests only SMTP metadata");
+    assert(!world.reads?.includes("/api/connection-providers"), "manage never loads the provider directory");
+    await m.unmount();
+  }
+  {
+    const world = fresh({ connectionQueries: [] });
+    const m = await mount(world);
+    await m.settle(() => assert(m.host.querySelector('a[href="/settings/connections/email/account/conn-a"]'), "native Email opens without query parameters"));
+    await m.showAccount("conn-a");
+    await m.settle(() => assert(m.button("Update credentials") && !m.button("Update credentials")?.disabled, "native Manage enables credentials after its ordinary list read"));
+    equal(world.connectionQueries, [""], "native Email and Manage reuse the native-compatible read");
+    await m.unmount();
+  }
+  {
+    const world = fresh({ hostedSmtp: true, denyConnections: true });
+    const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
+    await m.settle(() => assert(m.host.textContent?.includes("Account access could not be confirmed"), "the server's refusal has its own state"));
+    assert(!m.button("Update credentials") && !m.host.textContent?.includes("Email account not found"), "access denial neither exposes actions nor looks like a missing account");
+    await m.unmount();
+  }
+  {
+    const world = fresh({ hostedSmtp: true, connectionQueries: [] });
+    const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
+    await m.settle(() => assert(m.button("Update credentials") && !m.button("Update credentials")?.disabled, "known account displays the update action"));
+    world.failConnectionsOnce = true;
+    await m.click(m.button("Update credentials"));
+    await m.settle(() => assert(m.host.textContent?.includes("could not be fully confirmed"), "rotation needs a successful fresh account read"));
+    assert(!m.host.querySelector("input[type=password]"), "the warm account is not a rotation baseline after a failed read");
+    equal(world.connectionQueries, ["?scope=smtp", "?scope=smtp"], "only the explicit write action obtains a fresh baseline");
+    world.connections = [smtpRow("conn-a", { revision: 2 })];
+    await m.click(m.button("Retry"));
+    await m.settle(() => assert(m.button("Update credentials") && !m.button("Update credentials")?.disabled, "retry restores account controls"));
+    const latest = smtpRow("conn-a", { revision: 3 });
+    latest.smtp.host = "smtp.current.example.test";
+    world.connections = [latest];
+    await m.click(m.button("Update credentials"));
+    await m.settle(() => assert(m.host.querySelector("input[type=password]"), "a fresh account opens the credential drawer"));
+    assert(m.host.querySelector('form input[placeholder="smtp.current.example.test"]'), "the form inherits the newly confirmed settings, not the warm snapshot");
     await m.unmount();
   }
   console.log("email sending checks passed");

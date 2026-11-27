@@ -75,6 +75,7 @@ export type ConnectionPage =
   | { kind: "add" }
   | { kind: "addProvider"; provider: string }
   | { kind: "email"; focusSenders: boolean }
+  | { kind: "emailAccount"; id: string }
   | { kind: "detail"; id: string };
 
 export type Route =
@@ -247,7 +248,7 @@ export function matchRoute(pathname: string): Route {
     const issueId = segment(rest[0]);
     if (slug && issueId) return { screen: "issue", project: slug, id: issueId, tab: "overview" };
   }
-  if (rest.length === 0 || (head === "settings" && a === "connections" && rest.length === 1)) {
+  if (rest.length === 0 || (head === "settings" && a === "connections" && rest.length <= 2)) {
     if (!head && !a && rest.length === 0) return { screen: "home" };
     if (head === "index.html" && !a && rest.length === 0) return { screen: "home" };
     if (head === "projects") {
@@ -339,6 +340,10 @@ export function matchRoute(pathname: string): Route {
         const rawSegs = pathname.split("/").slice(1);
         const emptyInternal = rawSegs.some((s, i) => s === "" && i < rawSegs.length - 1);
         if (!emptyInternal) {
+          if (b === "email" && rest.length === 2 && rest[0] === "account") {
+            const id = segment(rest[1]);
+            if (id) return { screen: "settings", section: "connections", page: { kind: "emailAccount", id } };
+          }
           if (b === "email" && (rest.length === 0 || (rest.length === 1 && rest[0] === "senders"))) {
             return { screen: "settings", section: "connections", page: { kind: "email", focusSenders: rest.length === 1 } };
           }
@@ -431,6 +436,7 @@ export function routePath(route: Route): string {
       if (route.section === "permissions") return "/settings/permissions";
       if (route.section === "connections") {
         if (route.page?.kind === "email") return route.page.focusSenders ? EMAIL_SENDING_HREF : EMAIL_CONNECTIONS_HREF;
+        if (route.page?.kind === "emailAccount") return `/settings/connections/email/account/${encodeURIComponent(route.page.id)}`;
         if (route.page?.kind === "add") return "/settings/connections/new";
         if (route.page?.kind === "addProvider") {
           return `/settings/connections/new/${encodeURIComponent(route.page.provider)}`;

@@ -1,0 +1,34 @@
+{
+  "connections": [
+    {
+      "id": "conn_preview_smtp",
+      "provider": "smtp",
+      "account": "email",
+      "kind": "enrolled",
+      "revision": 1,
+      "registration_digest": null,
+      "scopes": ["email:send"],
+      "smtp": {
+        "host": "smtp.example.test",
+        "port": 587,
+        "tls_mode": "starttls",
+        "username": "hello@example.test",
+        "sender": "hello@example.test",
+        "sender_name": "Workspace email"
+      },
+      "smtp_sender": true,
+      "smtp_error": null,
+      "status": {
+        "adapter_registered": true,
+        "descriptor_available": true,
+        "custody_available": true,
+        "manifest_status": "approved",
+        "reviewed_pin": null,
+        "reported_pin": null,
+        "execution_authority": true,
+        "network_checked": true
+      }
+    }
+  ],
+  "hosted_smtp": true
+}
