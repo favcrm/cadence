@@ -75,6 +75,7 @@ import MemberChat from "./MemberChat";
 import { useHostedTemplateReview, type HostedTemplateList, type HostedTemplateRail } from "../templates/HostedTemplateReview";
 import { consumeCanvasTemplateReview, onCanvasTemplateReview } from "../templates/canvasTemplateDraft";
 import { closeDrawer as closeCanvas } from "../canvas/canvasStore";
+import WorksCanvasLauncher from "../canvas/WorksCanvasLauncher";
 import { useSendHandoff } from "./sendHandoff";
 import { memberScope } from "./memberThread";
 import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
@@ -1813,6 +1814,7 @@ function MasterHome({
               {!missing && homeConversation && (
                 <ConversationIdCopy key={homeConversation} id={homeConversation} workspaceId={supportWorkspaceId} />
               )}
+              {hosted ? <WorksCanvasLauncher /> : null}
               {compactHome && latestLabel && (
                 <button
                   type="button"

@@ -447,21 +447,61 @@ export function openWorkbook(conversation: string, attachment: { id: string; nam
 /** Open (or focus) an installed app's screen from a resource link. A
  *  malformed reference opens nothing and says so. */
 export function openAppView(input: unknown, placement?: Placement): boolean {
-  const ref = appViewRef(input);
-  if (!ref) return false;
+  return openValidatedAppView(input, false, placement);
+}
+
+/** Open (or focus) an installed app's screen in editable mode from a local operator control. */
+export function openAppViewEditable(input: unknown, placement?: Placement): boolean {
+  return openValidatedAppView(input, true, placement);
+}
+
+function openValidatedAppView(input: unknown, editable: boolean, placement?: Placement): boolean {
+  const base = appViewRef(input);
+  if (!base) return false;
+  const ref = editable ? { ...base, editable: true as const } : base;
   const id = appViewId(ref);
-  // An open tab that moved inside its frame goes back to the card's own route.
+  // An open tab that moved inside its frame goes back to the card's own route;
+  // chat card opens (`editable: false`) always strip any prior edit flag.
   const tabs = state.tabs.some((t) => t.id === id)
     ? state.tabs.map((t) => {
-        if (t.id !== id || !t.app || (sameRoute(t.app.route, ref.route) && t.app.viewId === ref.viewId)) return t;
+        if (t.id !== id || !t.app) return t;
+        const nextEditable = editable ? true : undefined;
+        if (
+          sameRoute(t.app.route, ref.route) &&
+          t.app.viewId === ref.viewId &&
+          t.app.editable === nextEditable
+        )
+          return t;
         // The declared view (CAD-2710) travels with the route: two views can share a section and record.
-        const { viewId: _viewId, viewLabel: _viewLabel, ...rest } = t.app;
-        return { ...t, title: ref.title, app: { ...rest, route: ref.route, ...(ref.viewId === undefined ? {} : { viewId: ref.viewId }), ...(ref.viewLabel === undefined ? {} : { viewLabel: ref.viewLabel }) } };
+        const { viewId: _viewId, viewLabel: _viewLabel, editable: _editable, ...rest } = t.app;
+        return {
+          ...t,
+          title: ref.title,
+          app: {
+            ...rest,
+            route: ref.route,
+            ...(ref.viewId === undefined ? {} : { viewId: ref.viewId }),
+            ...(ref.viewLabel === undefined ? {} : { viewLabel: ref.viewLabel }),
+            ...(editable ? { editable: true as const } : {}),
+          },
+        };
       })
     : [...state.tabs, appTab(id, ref)];
   set({ ...state, tabs, ...present(tabs, state.active, state.lastOpened, state.layout, id, placement), lastOpened: id, open: true });
   artifactFocused("user");
   return true;
+}
+
+/** Toggle editable mode on an existing app tab in place. */
+export function setAppViewEditable(id: string, editable: boolean): void {
+  set({
+    ...state,
+    tabs: state.tabs.map((t) => {
+      if (!t.app || t.id !== id) return t;
+      const { editable: _prev, ...rest } = t.app;
+      return { ...t, app: editable ? { ...rest, editable: true as const } : rest };
+    }),
+  });
 }
 
 /** The frame navigated inside its tab. The route stays on the tab: the

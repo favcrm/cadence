@@ -2635,6 +2635,13 @@ Object.assign(zhTW, {
   "Opened": "已開啟",
   // CAD-2657: the canvas header, the lock and the full-width canvas.
   "Read-only here — open in {app} to edit": "此處唯讀 — 請在 {app} 開啟以編輯",
+  "Edit here": "在此編輯",
+  "Done editing": "完成編輯",
+  "New": "新增",
+  "New in Works": "在 Works 建立新項目",
+  "New Doc": "新增文件",
+  "New Sheet": "新增試算表",
+  "New Deck": "新增簡報",
   // CAD-2690: view options in words.
   "as at {date}": "截至 {date}",
   "Prior year": "去年同期",

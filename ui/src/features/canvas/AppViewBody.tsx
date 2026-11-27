@@ -4,9 +4,10 @@
  * outlet, read-only, under the viewer's own session. A viewer who cannot read
  * the app sees "No access", never another member's data.
  */
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { ApiError } from "../../lib/api";
 import { useLocaleTag, useTranslate } from "../../lib/locale";
+import { HireBlock, WriteGate } from "../auth/WriteGate";
 import { AppGlyph } from "../explorer/shared";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenPaneState } from "../workspace-apps/screen/screenFailure";
@@ -14,7 +15,7 @@ import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
 import { installedAppHref } from "../apps/appViewModel";
 import AppLoadingSurface from "../workspace-apps/AppLoadingSurface";
 import { readAppScopeFresh, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
-import { closeTab, patchAppViewRoute, type CanvasTab } from "./canvasStore";
+import { closeTab, patchAppViewRoute, setAppViewEditable, type CanvasTab } from "./canvasStore";
 import type { AppViewRef } from "./appView";
 import { setQueryParams } from "../workspace-apps/screen/routeParams";
 import { declaredOptionLabel, optionsLine } from "./viewParams";
@@ -85,11 +86,15 @@ export default function AppViewBody({ tab, app, sheet, tabbed, tabRow, expanded,
 }) {
   const t = useTranslate();
   const locale = useLocaleTag();
+  const writeGate = useContext(WriteGate);
+  const hireBlock = useContext(HireBlock);
   const [attempt, setAttempt] = useState(0);
   const load = useAppScope(app.installId, attempt);
   // No access (the scope refused, or the frame's own mount did): the tab offers no way into the app.
   const [frameDenied, setFrameDenied] = useState(false);
   const noAccess = load.status === "denied" || frameDenied;
+  const canEdit = !noAccess && writeGate === null && hireBlock === null && load.status === "ready";
+  const editing = canEdit && app.editable === true;
   const appName = load.status === "ready" ? load.installation.title || load.installation.name : app.appLabel || t("App");
   // The frame's own navigation stays on this tab; it never reaches the board URL.
   const onRoute = useCallback((patch: RoutePatch) => patchAppViewRoute(tab.id, patch), [tab.id]);
@@ -117,6 +122,16 @@ export default function AppViewBody({ tab, app, sheet, tabbed, tabRow, expanded,
         appName={appName}
         options={options}
         note={noAccess ? null : t("Read-only here — open in {app} to edit").replace("{app}", appName)}
+        editing={editing}
+        edit={
+          canEdit
+            ? {
+                active: editing,
+                label: editing ? t("Done editing") : t("Edit here"),
+                onToggle: () => setAppViewEditable(tab.id, !editing),
+              }
+            : null
+        }
         open={noAccess || href === null ? null : {
           label: openLabel,
           href,
@@ -138,12 +153,12 @@ export default function AppViewBody({ tab, app, sheet, tabbed, tabRow, expanded,
         ) : null}
         {load.status === "ready" ? (
           <InstalledScreenOutlet
-            key={attempt}
+            key={`${attempt}:${editing ? "edit" : "ro"}`}
             installation={load.installation}
             contexts={load.contexts}
             contextId={app.contextId}
             admitted
-            readOnly
+            readOnly={!editing}
             route={app.route}
             onRoute={onRoute}
             renderFailure={failure}

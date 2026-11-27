@@ -25,6 +25,8 @@ export interface AppViewRef {
   /** Set by a view card: its `href` is only a placeholder, and the tab builds the
    *  full-page link from the installation it reads (canonical key and section query). */
   fromCard?: true;
+  /** Operator-initiated opt-in to mount the Canvas screen editable instead of read-only. Never populated from untrusted input. */
+  editable?: true;
   /** The full-page link (`/apps/<key>?…`) that "Open in <App>" navigates to. */
   href: string;
 }

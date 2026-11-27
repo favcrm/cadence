@@ -20,6 +20,7 @@ import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
 import AppViewBody from "./AppViewBody";
 import RecordViewBody from "./RecordViewBody";
+import WorksCanvasLauncher from "./WorksCanvasLauncher";
 import WorkbookPreview from "./workbook/WorkbookPreview";
 import { attachmentHref } from "../home/AttachmentMedia";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
@@ -794,6 +795,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
             onExpand={() => setExpanded(true)}
           />
         ) : null}
+        {hosted ? <WorksCanvasLauncher compact /> : null}
         <div className="cv-tabactions" ref={setTabActions} />
         </div>
       ) : null}
