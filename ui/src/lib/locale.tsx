@@ -5002,3 +5002,28 @@ const CAD2869_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2869_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2872_ZHTW: Record<string, string> = {
+  "Project details": "專案詳情",
+  "Display name, summary goal, and domain preset.": "顯示名稱、一句話目標與領域範本。",
+  "Project name": "專案名稱",
+  "1-line goal": "一句話目標",
+  "optional": "選填",
+  "Domain preset": "領域範本",
+  "What is this project delivering?": "這個專案要交付什麼？",
+  "Click the active preset again to clear it.": "再次點擊已選範本即可清除。",
+  "Project name is required.": "請輸入專案名稱。",
+  "Save details": "儲存詳情",
+  "Saving…": "儲存中…",
+  "Reset": "重設",
+  "Project details saved.": "已儲存專案詳情。",
+  "This project is archived. Restore it before editing its details.": "此專案已封存，請先還原再編輯專案詳情。",
+  "Only a workspace owner can edit project details.": "只有工作區擁有者可以編輯專案詳情。",
+  "Restore the project before editing its details.": "請先還原專案再編輯詳情。",
+  "This project could not be found.": "找不到此專案。",
+  "That project prefix is already taken.": "此專案前綴已被使用。",
+  "Could not update project details. Check your connection and try again.": "無法更新專案詳情。請檢查連線後再試。",
+};
+for (const [key, value] of Object.entries(CAD2872_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

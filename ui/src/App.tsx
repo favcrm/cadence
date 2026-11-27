@@ -1654,6 +1654,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {route.screen === "projects" && route.slug && route.section === "settings" && (
           <ProjectSettings
             project={route.slug}
+            projectInfo={
+              projects.find((item) => item.key === route.slug) ??
+              archivedProjectsState.projects?.find((item) => item.key === route.slug) ??
+              null
+            }
             block={policyBlock(meta)}
             archived={viewedProjectArchived}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}

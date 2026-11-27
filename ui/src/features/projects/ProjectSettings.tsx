@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import type { ProjectLifecycle } from "../../lib/types";
+import type { Project, ProjectLifecycle } from "../../lib/types";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
@@ -10,6 +10,8 @@ import { readTeamMembers, type TeamMember } from "../../lib/teamRoster";
 import { objectField } from "../../lib/wire";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import Select from "../../ui/Select";
+import { ProjectDetailsCard } from "./ProjectDetailsCard";
+import { projectDisplayName } from "./projectCreate";
 import { cliCommand, type PolicyDraft } from "./policyView";
 import {
   draftDirty,
@@ -42,6 +44,7 @@ type LifecycleState =
 
 export default function ProjectSettings({
   project,
+  projectInfo,
   block,
   archived,
   hosted,
@@ -50,6 +53,7 @@ export default function ProjectSettings({
   onLifecycleChange,
 }: {
   project: string;
+  projectInfo?: Project | null;
   /** Why this session may not change the policy, or null when it may. */
   block: string | null;
   /** True when the viewed project is already known to be archived. */
@@ -61,6 +65,10 @@ export default function ProjectSettings({
   onLifecycleChange?: (lifecycle: ProjectLifecycle) => void;
 }) {
   const { t, formatNumber } = useLocale();
+  const [resolvedProject, setResolvedProject] = useState<Project | null>(projectInfo ?? null);
+  useEffect(() => {
+    setResolvedProject(projectInfo ?? null);
+  }, [project, projectInfo]);
   const resource = resources.projectPolicy(project);
   const state = useQuery(resource);
   const [edits, setEdits] = useState<Draft | null>(null);
@@ -340,16 +348,31 @@ export default function ProjectSettings({
   }
 
   const sharesHeading = hosted === true ? t("Hosted project access") : t("Project access");
+  const detailsReadOnlyReason =
+    block ??
+    (isArchived
+      ? t("This project is archived. Restore it before editing its details.")
+      : null);
+  const displayName = projectDisplayName(resolvedProject ?? projectInfo ?? { key: project });
 
   return (
     <main className="project-overview px-4 lg:px-8 py-6 min-w-0">
       <header className="project-page-heading">
         <div>
           <div className="slabel">{t("Project settings")}</div>
-          <h1>{project}</h1>
+          <h1>{displayName}</h1>
           <p>{t("Who can see this project, and who can open it.")}</p>
         </div>
       </header>
+      {hosted === true && (
+        <ProjectDetailsCard
+          projectKey={project}
+          projectInfo={projectInfo}
+          readOnlyReason={detailsReadOnlyReason}
+          onProjectResolved={setResolvedProject}
+          onToast={onToast}
+        />
+      )}
       <ResourceGate
         state={state}
         loading={t("Reading the project policy…")}

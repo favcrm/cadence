@@ -87,6 +87,8 @@ import type {
   Project,
   CreateProjectInput,
   CreateProjectResponse,
+  UpdateProjectInput,
+  UpdateProjectResponse,
   ProjectContext,
   ProjectLifecycle,
   ArchivedProjectsPayload,
@@ -615,11 +617,15 @@ function unwrapPostJson<T>(status: number, fallbackMessage: string, parsed: unkn
   return parsed as T;
 }
 
-/** A board write that answers its own JSON (not an issue `WriteResp`). */
-async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+async function jsonWrite<T>(
+  method: "POST" | "PUT" | "PATCH",
+  path: string,
+  body: object,
+  operation?: PrivateOperation,
+): Promise<T> {
   return usingPrivateOperation(operation, async (op) => {
     const resp = await privateFetch(path, {
-      method: "POST",
+      method,
       headers: {
         "Content-Type": "application/json",
         "X-Cadence-Board": "1",
@@ -633,22 +639,19 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
   });
 }
 
+/** A board write that answers its own JSON (not an issue `WriteResp`). */
+function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return jsonWrite<T>("POST", path, body, operation);
+}
+
 /** A board write whose verb is PUT and which answers its own JSON. */
-async function put<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
-  return usingPrivateOperation(operation, async (op) => {
-    const resp = await privateFetch(path, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Cadence-Board": "1",
-        ...sessionHeaders(),
-      },
-      body: JSON.stringify(body),
-    }, op);
-    const parsed = await resp.json().catch(() => null);
-    op.assertCurrent();
-    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
-  });
+function put<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return jsonWrite<T>("PUT", path, body, operation);
+}
+
+/** A board write whose verb is PATCH and which answers its own JSON. */
+function patch<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return jsonWrite<T>("PATCH", path, body, operation);
 }
 
 /** A board delete whose response is its own JSON. */
@@ -866,6 +869,8 @@ export const api = {
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   createProject: (req: CreateProjectInput) =>
     post<CreateProjectResponse>("/api/projects", req),
+  updateProject: (project: string, req: UpdateProjectInput) =>
+    patch<UpdateProjectResponse>(`/api/projects/${encodeURIComponent(project)}`, req),
   archivedProjects: () => get<ArchivedProjectsPayload>("/api/projects?archived=1"),
   archivedProjectIssues: (project: string) =>
     get<{ issues: IssueCard[] }>(`/api/issues?project=${encodeURIComponent(project)}&archived=1`),
