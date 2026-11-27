@@ -276,6 +276,30 @@ async function main(): Promise<void> {
   await flush();
   equal(patches[2]?.owner, "", "selecting Unassigned clears owner");
 
+  // Directory-less fallback keeps text input even when hosted=true if neither people nor agents exist
+  root.render(
+    React.createElement(
+      LocaleProvider,
+      null,
+      React.createElement(Fields, {
+        detail: baseDetail,
+        epics: [],
+        readOnly: false,
+        hosted: true,
+        people: [],
+        profiles: [],
+        onWrite: () => undefined,
+        onError: () => undefined,
+        onPatch: () => undefined,
+      }),
+    ),
+  );
+  await flush();
+  assert(
+    host.querySelector('input[aria-label="Owner"]') !== null,
+    "hosted directory-less fallback renders text input",
+  );
+
   // Native fallback without hosted directory keeps text input
   root.render(
     React.createElement(

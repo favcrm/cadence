@@ -44,7 +44,8 @@ export function Fields({
   useEffect(() => setOwner(detail.owner ?? ""), [detail.owner, detail.rev]);
 
   const usePicker =
-    hosted || people.length > 0 || selectCloudSpecialists(profiles ?? undefined).length > 0;
+    Boolean(hosted) &&
+    (people.length > 0 || selectCloudSpecialists(profiles ?? undefined).length > 0);
   const ownerOptions = useMemo(
     () =>
       buildOwnerSelectOptions({
