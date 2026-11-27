@@ -59,6 +59,16 @@ export function approverInForce(type: DocumentType | undefined): string | null {
   return type?.state === "confirmed" ? type.approver : null;
 }
 
+/** Create: any signed-in workspace session except a read-only platform operator session. */
+export function canCreate(viewer: DocumentsViewer): boolean {
+  return viewer.viewerSub !== null && !viewer.isOperatorSession;
+}
+
+/** Submit: a draft document, by a non-operator member (creator ownership is enforced by the server). */
+export function canSubmit(viewer: DocumentsViewer, document: DocumentState): boolean {
+  return document.stage === "draft" && viewer.viewerSub !== null && !viewer.isOperatorSession;
+}
+
 /** Approve: a document in review, by its approver in force; never an operator session. */
 export function canApprove(viewer: DocumentsViewer, document: DocumentState, type: DocumentType | undefined): boolean {
   if (document.stage !== "in_review" || viewer.isOperatorSession) return false;

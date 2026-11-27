@@ -26,6 +26,10 @@ export const DOCUMENT_CAPABILITY = "cad2286.document-lifecycle.v1";
 export const DOCUMENT_STAGES = ["draft", "in_review", "approved", "delivered", "archived"] as const;
 export type DocumentStage = (typeof DOCUMENT_STAGES)[number];
 
+export const DOCUMENT_KINDS = ["md", "html", "csv", "pdf", "image"] as const;
+export type DocumentKind = (typeof DOCUMENT_KINDS)[number];
+export const DOCUMENT_MAX_BYTES = 10 * 1024 * 1024;
+
 /**
  * The lifecycle's own codes; the shared gate may also answer others
  * (board_session_required, membership_changed, tenant_placement_changed…),
@@ -43,6 +47,7 @@ export const DOCUMENT_REFUSAL_CODES = [
   "not_in_review",
   "already_shared",
   "unlabelled",
+  "payload_too_large",
   "conflict",
   "not_found",
   "origin_refused",
@@ -137,6 +142,24 @@ export interface ApproveReceipt {
 
 export interface StageReceipt {
   stage: DocumentStage;
+}
+
+export interface CreateDocumentInput {
+  title: string;
+  label: string;
+  kind: DocumentKind;
+  contentBase64: string;
+  project?: string;
+  issue?: string;
+  customer?: string;
+  submit?: boolean;
+  requestKey?: string;
+}
+
+export interface SubmitReceipt {
+  stage: DocumentStage;
+  type: string;
+  typeConfirmed: boolean;
 }
 
 /**
@@ -291,11 +314,22 @@ function parseState(value: unknown): DocumentState {
   };
 }
 
+function parseRow(value: unknown): DocumentRow {
+  const row = record(value, "document row");
+  return { file: parseFile(row.file), document: parseState(row.document) };
+}
+
 function parseRows(value: unknown): DocumentRow[] {
-  return array(record(value, "document list"), "documents").map((item) => {
-    const row = record(item, "document row");
-    return { file: parseFile(row.file), document: parseState(row.document) };
-  });
+  return array(record(value, "document list"), "documents").map(parseRow);
+}
+
+function parseSubmit(value: unknown): SubmitReceipt {
+  const row = record(value, "submit receipt");
+  return {
+    stage: stage(row),
+    type: str(row, "type"),
+    typeConfirmed: bool(row, "typeConfirmed"),
+  };
 }
 
 function parseApprove(value: unknown): ApproveReceipt {
@@ -425,6 +459,27 @@ export async function list(
     ? `project=${encodeURIComponent(project)}&archived=${archived ? 1 : 0}`
     : `archived=${archived ? 1 : 0}`;
   return (await call(`/api/documents?${query}`, read(), parseRows, signal)).result;
+}
+
+/** `POST /api/documents`: create a new versioned document in `draft` or direct `in_review`. */
+export async function create(input: CreateDocumentInput): Promise<DocumentsResult<DocumentRow>> {
+  const body = {
+    title: input.title,
+    label: input.label,
+    kind: input.kind,
+    contentBase64: input.contentBase64,
+    ...(input.project === undefined ? {} : { project: input.project }),
+    ...(input.issue === undefined ? {} : { issue: input.issue }),
+    ...(input.customer === undefined ? {} : { customer: input.customer }),
+    ...(input.submit === undefined ? {} : { submit: input.submit }),
+    ...(input.requestKey === undefined ? {} : { requestKey: input.requestKey }),
+  };
+  return (await call("/api/documents", write(body), parseRow)).result;
+}
+
+/** `POST /api/documents/:id/submit`: creator submits a draft document for review. */
+export async function submit(id: string): Promise<DocumentsResult<SubmitReceipt>> {
+  return (await call(documentPath(id, "submit"), write(), parseSubmit)).result;
 }
 
 /** `POST /api/documents/:id/approve` for the version the approver reviewed.

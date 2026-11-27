@@ -258,6 +258,60 @@ function expectWrite(why: string, url: string, body: unknown): void {
 }
 
 async function writeChecks(): Promise<void> {
+  const { shared: _unusedShared, ...fileBase } = file;
+  const draftFile = { ...fileBase, id: "art_new", version: 1, kind: "md", title: "Draft brief", label: "brief", customer: "", project: "acme", shared: false };
+  const draftState = { ...state, type: "brief", stage: "draft", submittedVersion: null, approvedVersion: null, deliveredVersion: null, deliveredAt: null, rev: 1 };
+  reset(reply(201, { file: draftFile, document: draftState }));
+  const created = await documents.create({
+    title: "Draft brief",
+    label: "brief",
+    kind: "md",
+    contentBase64: "IyBEcmFmdA==",
+    project: "acme",
+    submit: false,
+    requestKey: "req-1",
+  });
+  expectWrite("create", "/api/documents", {
+    title: "Draft brief",
+    label: "brief",
+    kind: "md",
+    contentBase64: "IyBEcmFmdA==",
+    project: "acme",
+    submit: false,
+    requestKey: "req-1",
+  });
+  assert(created.ok, "create answers file and document");
+  equal(created.value, { file: draftFile, document: draftState }, "create row parsed");
+
+  reset(reply(201, { file: { ...draftFile, project: null }, document: { ...draftState, stage: "in_review", submittedVersion: 1 } }));
+  const minimalCreated = await documents.create({
+    title: "Workspace brief",
+    label: "brief",
+    kind: "md",
+    contentBase64: "IyBIZWxsbw==",
+  });
+  expectWrite("create minimal", "/api/documents", {
+    title: "Workspace brief",
+    label: "brief",
+    kind: "md",
+    contentBase64: "IyBIZWxsbw==",
+  });
+  assert(minimalCreated.ok, "minimal create succeeds without optional fields");
+
+  reset(reply(201, { file: { ...draftFile, kind: 99 }, document: draftState }));
+  const badCreate = await documents.create({ title: "x", label: "brief", kind: "md", contentBase64: "eA==" });
+  assert(!badCreate.ok && badCreate.failure.kind === "invalid", "malformed create response is invalid");
+
+  reset(reply(200, { stage: "in_review", type: "brief", typeConfirmed: true }));
+  const submitted = await documents.submit("art_new");
+  expectWrite("submit", "/api/documents/art_new/submit", undefined);
+  assert(submitted.ok, "submit answers receipt");
+  equal(submitted.value, { stage: "in_review", type: "brief", typeConfirmed: true }, "submit receipt parsed");
+
+  reset(reply(200, { stage: "in_review", type: "brief" }));
+  const badSubmit = await documents.submit("art_new");
+  assert(!badSubmit.ok && badSubmit.failure.kind === "invalid", "submit receipt missing typeConfirmed is invalid");
+
   reset(reply(200, { stage: "approved", version: 2, selfApproved: true }));
   const approved = await documents.approve("art_01", 2);
   expectWrite("approve", "/api/documents/art_01/approve", { version: 2 });
@@ -332,6 +386,7 @@ async function refusalChecks(): Promise<void> {
       "origin_refused",
       "owner_only",
       "owner_required",
+      "payload_too_large",
       "self_approval",
       "unlabelled",
     ],
@@ -339,6 +394,8 @@ async function refusalChecks(): Promise<void> {
   );
   const calls: Array<[string, () => Promise<documents.DocumentsResult<unknown>>]> = [
     ["list", () => documents.list(false)],
+    ["create", () => documents.create({ title: "t", label: "brief", kind: "md", contentBase64: "eA==" })],
+    ["submit", () => documents.submit("art_01")],
     ["approve", () => documents.approve("art_01", 2)],
     ["archive", () => documents.archive("art_01")],
     ["restore", () => documents.restore("art_01")],

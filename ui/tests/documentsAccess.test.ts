@@ -9,8 +9,10 @@ import {
   approverMissing,
   canApprove,
   canArchive,
+  canCreate,
   canEditTypes,
   canRestore,
+  canSubmit,
   documentsViewer,
   isOperatorSession,
   typeFor,
@@ -148,12 +150,29 @@ function missingChecks(): void {
   for (const viewer of [owner, sam]) equal(canApprove(viewer, doc("in_review"), gone), false, "approve is unreachable");
 }
 
+function createAndSubmitChecks(): void {
+  equal(canCreate(owner), true, "owner can create documents");
+  equal(canCreate(mia), true, "member can create documents");
+  equal(canCreate(operator), false, "operator session cannot create documents");
+  equal(canCreate(signedOut), false, "signed out viewer cannot create documents");
+
+  equal(canSubmit(owner, doc("draft")), true, "owner sees Submit on draft");
+  equal(canSubmit(mia, doc("draft")), true, "member sees Submit on draft");
+  equal(canSubmit(operator, doc("draft")), false, "operator session does not see Submit");
+  equal(canSubmit(signedOut, doc("draft")), false, "signed out viewer does not see Submit");
+  for (const stage of ["in_review", "approved", "delivered", "archived"] as const) {
+    equal(canSubmit(owner, doc(stage)), false, `stage ${stage} is not submittable`);
+    equal(canSubmit(mia, doc(stage)), false, `member cannot submit stage ${stage}`);
+  }
+}
+
 function main(): void {
   viewerChecks();
   typeChecks();
   approveChecks();
   ownerActionChecks();
   missingChecks();
+  createAndSubmitChecks();
   console.log("documentsAccess checks passed");
 }
 
