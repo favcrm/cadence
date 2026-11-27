@@ -23,7 +23,22 @@ export function htmlFrameDocument(html: string): string {
   return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="referrer" content="no-referrer"></head><body>${html}</body></html>`;
 }
 
-const EXT: Record<ArtifactKind, string> = { md: "md", pdf: "pdf", html: "html", image: "png", csv: "csv" };
+const EXT: Record<ArtifactKind, string> = {
+  md: "md",
+  pdf: "pdf",
+  html: "html",
+  image: "png",
+  csv: "csv",
+  docx: "docx",
+  xlsx: "xlsx",
+  pptx: "pptx",
+};
+
+const OFFICE_KIND_LABEL: Record<"docx" | "xlsx" | "pptx", string> = {
+  docx: "Word document (.docx)",
+  xlsx: "Excel workbook (.xlsx)",
+  pptx: "PowerPoint deck (.pptx)",
+};
 
 export function downloadName(title: string, kind: ArtifactKind, mime: string): string {
   const base = title.replace(/[^\w.\- ]+/g, "_").trim().slice(0, 80) || "artifact";
@@ -234,6 +249,25 @@ export default function ArtifactView({
               onClick={() => openPdfInTab(data.bytes)}
             >
               {t("Open in new tab")}
+            </button>
+          </div>
+        </div>
+      );
+    case "docx":
+    case "xlsx":
+    case "pptx":
+      return (
+        <div className="canvas-doc canvas-pdf" data-artifact-view={kind}>
+          <p className="text-body text-ink-100">{title}</p>
+          <p className="num text-micro text-ink-500">{t(OFFICE_KIND_LABEL[kind])} · {sizeLabel(data.bytes.byteLength)}</p>
+          <p className="text-micro text-ink-400">{t("Office file — use Download to open locally.")}</p>
+          <div className="flex flex-wrap items-center gap-3 pt-1">
+            <button
+              type="button"
+              className="btn"
+              onClick={() => saveBytes(data.bytes, data.mime, downloadName(title, kind, data.mime))}
+            >
+              {t("Download")}
             </button>
           </div>
         </div>

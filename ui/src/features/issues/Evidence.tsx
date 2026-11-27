@@ -16,7 +16,6 @@ import ArtifactView, {
   saveBytes,
   type HtmlView,
 } from "../canvas/ArtifactView";
-import type { ArtifactKind } from "../canvas/canvasStore";
 import { Attach } from "./Attach";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { ManagedList } from "../wiki/ManagedFileViews";
@@ -24,7 +23,7 @@ import DrawerShell from "../app-shell/shared/DrawerShell";
 import { CodeSurface } from "../../ui/Md";
 import "./evidence.css";
 
-export type DeliverablePreviewKind = Exclude<ArtifactKind, "image">;
+export type DeliverablePreviewKind = "md" | "html" | "csv" | "pdf";
 
 const PREVIEW_MIME: Record<DeliverablePreviewKind, string> = {
   md: "text/markdown",

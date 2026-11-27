@@ -8,7 +8,16 @@ import { isBrowserPanelShown, useBrowserTab } from "./browserStore";
 import type { ThreadEntry } from "../home/thread";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 
-export const KIND_LABEL: Record<string, string> = { md: "MD", pdf: "PDF", html: "HTML", image: "IMG", csv: "CSV" };
+export const KIND_LABEL: Record<string, string> = {
+  md: "MD",
+  pdf: "PDF",
+  html: "HTML",
+  image: "IMG",
+  csv: "CSV",
+  docx: "DOCX",
+  xlsx: "XLSX",
+  pptx: "PPTX",
+};
 
 export function sizeLabel(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

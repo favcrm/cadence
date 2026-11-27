@@ -21,7 +21,7 @@ import { recordServices, object, exact, type HostCommand } from "./screenService
 import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./screenDisplayCache";
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { frameRoute, parseRoutePatch, type RoutePatch } from "./screenRoute";
-import { handleScreenFileDownloadMessage } from "./screenFileDownload";
+import { handleScreenFileDownloadMessage, handleScreenPdfExportMessage } from "./screenFileDownload";
 import { readOnlyReceipt } from "./screenReadOnly";
 import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize, type WhatsAppComposeProvider, type WhatsAppReplyBounds } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
@@ -417,6 +417,42 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, onRe
     };
     const onMessage = (event: MessageEvent) => {
       if (handleScreenFileDownloadMessage(event, activeFrameWindow, isCurrent, triggerFileSave)) return;
+      if (
+        handleScreenPdfExportMessage(event, activeFrameWindow, isCurrent, async (parsed) => {
+          const response = await privateFetch(
+            "/api/screen-pdf",
+            {
+              method: "POST",
+              credentials: "same-origin",
+              cache: "no-store",
+              signal: controller.signal,
+              headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+              body: JSON.stringify({
+                html: parsed.html,
+                ...(parsed.paper ? { paper: parsed.paper } : {}),
+              }),
+            },
+            session,
+          );
+          if (!response.ok) {
+            const payload = (await response.json().catch(() => null)) as { error?: { message?: string } | string; message?: string } | null;
+            const detail =
+              (typeof payload?.error === "object" ? payload.error?.message : payload?.error) ??
+              payload?.message ??
+              `HTTP ${response.status}`;
+            throw new Error(`PDF export failed: ${detail}`);
+          }
+          const ct = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+          if (ct !== "application/pdf") {
+            throw new Error("Unexpected PDF response type.");
+          }
+          const bytes = await response.arrayBuffer();
+          if (bytes.byteLength === 0 || !isCurrent()) return;
+          triggerFileSave(bytes, "application/pdf", parsed.fileName);
+        })
+      ) {
+        return;
+      }
       owned?.receive(event);
     };
     window.addEventListener("message", onMessage);

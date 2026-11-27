@@ -42,10 +42,10 @@ import {
   MAX_PANES, type DropZone, type LayoutMode, type PaneLayout, type Placement,
 } from "./canvasLayout";
 
-export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
+export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv" | "docx" | "xlsx" | "pptx";
 /** A tab's kind includes views that are not versioned artifacts. */
 export type TabKind = ArtifactKind | "app" | "record" | "workbook";
-export const ARTIFACT_KINDS: readonly ArtifactKind[] = ["md", "pdf", "html", "image", "csv"];
+export const ARTIFACT_KINDS: readonly ArtifactKind[] = ["md", "pdf", "html", "image", "csv", "docx", "xlsx", "pptx"];
 
 /** What a thread card carries — never the content. */
 export interface ArtifactRef {

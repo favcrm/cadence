@@ -59,6 +59,9 @@ const FOOT: Record<string, string[]> = {
   pdf: ["download only"],
   image: ["inline image"],
   csv: ["table · first 2,000 rows · 50 columns"],
+  docx: ["Word document"],
+  xlsx: ["Excel workbook"],
+  pptx: ["PowerPoint deck"],
 };
 
 const HTML_SOURCE_FOOT = ["source", "read-only"];
