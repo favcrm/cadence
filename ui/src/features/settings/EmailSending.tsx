@@ -365,6 +365,11 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard, confirmCurr
     })();
     return () => { live = false; };
   }, [row.id, attempt]);
+  const refreshUsage = () => {
+    setUsedBy(null);
+    setUsageUnknown(false);
+    setAttempt((n) => n + 1);
+  };
   const ready = row.smtp != null && row.status.custody_available && !connectionNeedsAttention(row);
   const label = row.smtp?.sender_name || row.account;
   const update = async () => {
@@ -398,7 +403,7 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard, confirmCurr
           <span className="inline-flex items-center justify-center rounded-lg bg-accent/10 text-accent size-10 shrink-0" aria-hidden="true"><IconOutbox size={21} /></span>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <h1 className="text-section font-medium text-ink-100 break-words">{label}</h1>
+              <h1 className="text-section font-medium text-ink-100 min-w-0 wrap-anywhere">{label}</h1>
               <span className={`chip ${current && ready ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"}`}>
                 {!current ? t("Not confirmed") : ready ? t("Ready") : t("Needs attention")}
               </span>
@@ -441,7 +446,7 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard, confirmCurr
         )}
         {usageUnknown && (
           <p role="alert" className="text-label text-fail">{t("Some app sender bindings could not be loaded; usage may be incomplete.")}{" "}
-            <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
+            <Button size="sm" onClick={refreshUsage}>{t("Retry")}</Button>
           </p>
         )}
       </section>
@@ -470,25 +475,30 @@ function EmailAccountOverview({ row, current, canWrite, hostedBoard, confirmCurr
       </details>
       {row.kind === "enrolled" && (
         <footer className="border-t border-ink-700 pt-2">
-          <Button variant="ghost" className="text-fail!" disabled={!canWrite} onClick={() => setDisconnecting(true)}>
+          <Button variant="ghost" className="text-fail!" disabled={!canWrite} onClick={() => { refreshUsage(); setDisconnecting(true); }}>
             {t("Disconnect account")}
           </Button>
           {canWrite && disconnecting && (
             <SettingsDrawer title={t("Disconnect account")} onClose={() => setDisconnecting(false)}>
               <div className="grid gap-3">
-                {hostedBoard && !!usedBy?.length ? (
-                  <p className="text-label text-ink-300 break-words">
-                    {t("Stop using this account in {apps} before disconnecting.").replace("{apps}", () => usedBy.join(", "))}
-                  </p>
-                ) : (
+                {usedBy === null ? <p role="status" className="text-label text-ink-400">{t("Loading app senders…")}</p> : (
                   <>
-                    {!hostedBoard && !!usedBy?.length && <p className="text-label text-ink-300 break-words">{t("{apps} will stop sending from this address.").replace("{apps}", () => usedBy.join(", "))}</p>}
-                    {(usedBy === null || usageUnknown) && <p className="text-label text-ink-300">
+                    {usedBy.length > 0 && <p className="text-label text-ink-300 break-words">
+                      {(hostedBoard
+                        ? t("Stop using this account in {apps} before disconnecting.")
+                        : t("{apps} will stop sending from this address.")).replace("{apps}", () => usedBy.join(", "))}
+                    </p>}
+                    {usageUnknown && <p className="text-label text-ink-300">
                       {hostedBoard
                         ? t("App usage could not be fully confirmed. Disconnect is refused while an app still uses this account.")
                         : t("App usage could not be fully confirmed. Any app using this account will stop sending from it.")}
                     </p>}
-                    <RevokeConfirm row={row} hostedSmtp={hostedBoard} onClose={() => setDisconnecting(false)} onDone={() => { invalidateAccounts(); navigate(EMAIL_CONNECTIONS_HREF); }} />
+                    {(!hostedBoard || usedBy.length === 0) && (
+                      <RevokeConfirm row={row} hostedSmtp={hostedBoard} onClose={() => setDisconnecting(false)} onDone={() => { invalidateAccounts(); navigate(EMAIL_CONNECTIONS_HREF); }} />
+                    )}
+                    {(usedBy.length > 0 || usageUnknown) && (
+                      <Button size="sm" variant="ghost" className="justify-self-start" onClick={refreshUsage}>{t("Refresh app usage")}</Button>
+                    )}
                   </>
                 )}
                 {hostedBoard && <Link className="lnk" href={EMAIL_SENDING_HREF} onClick={() => setDisconnecting(false)}>{t("View app senders")}</Link>}

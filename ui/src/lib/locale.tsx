@@ -2360,6 +2360,7 @@ Object.assign(zhTW, {
   "Loading app senders…": "正在載入應用程式寄件者…",
   "No app currently uses this account.": "目前沒有應用程式使用此帳戶。",
   "Some app sender bindings could not be loaded; usage may be incomplete.": "無法載入部分應用程式的寄件者設定，使用情況可能不完整。",
+  "Refresh app usage": "重新整理使用情況",
   "Advanced settings": "進階設定",
   "SMTP configuration and connection ID": "SMTP 設定與連線 ID",
   "Port and encryption": "連接埠與加密",

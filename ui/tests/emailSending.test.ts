@@ -510,16 +510,39 @@ async function main() {
     const world = fresh({ connections: [a], binding: bindingFor(a), failShowOnce: true });
     const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
     await m.settle(() => assert(m.host.textContent?.includes("usage may be incomplete"), "binding failure is explicit"));
+    world.failShowOnce = true;
     await m.click(m.button("Disconnect account"));
-    assert(m.host.textContent?.includes("Disconnect is refused while an app still uses this account"), "disconnect warns when usage is unknown");
+    await m.settle(() => assert(m.host.textContent?.includes("Disconnect is refused while an app still uses this account"), "disconnect warns when usage is unknown"));
     assert(!world.posts.some((post) => post.path.endsWith("/revoke")), "opening confirmation does not disconnect");
     await m.click(m.button("Cancel"));
     await m.click(m.button("Retry"));
     await m.settle(() => assert(m.host.textContent?.includes("CRM · Acme"), "binding retry restores the affected app"));
     assert(!m.button("Disconnect account")?.disabled, "operator can open the disconnect explanation");
     await m.click(m.button("Disconnect account"));
-    assert(m.host.textContent?.includes("Stop using this account in CRM · Acme before disconnecting"), "hosted confirmation explains the bound-account refusal");
+    await m.settle(() => assert(m.host.textContent?.includes("Stop using this account in CRM · Acme before disconnecting"), "hosted confirmation explains the bound-account refusal"));
     assert(!m.button("Disconnect") && m.host.querySelector('a[href="/settings/connections/email/senders"]'), "the drawer links to the remedy instead of offering an impossible write");
+    await m.unmount();
+  }
+  {
+    const a = smtpRow("conn-a");
+    const world = fresh({
+      connections: [a], binding: bindingFor(a), failShowOnce: true,
+      contexts: [{ id: "ctx-a", state: "active", config: { label: "Acme" } }, { id: "ctx-b", state: "active", config: { label: "Billing" } }],
+    });
+    const m = await mount(world, { operator: true, readOnly: false }, true, "conn-a");
+    await m.settle(() => assert(m.host.textContent?.includes("usage may be incomplete"), "a failed context lookup leaves app usage incomplete"));
+    world.failShowOnce = true;
+    await m.click(m.button("Disconnect account"));
+    const drawer = () => m.host.querySelector('[role="dialog"]');
+    await m.settle(() => {
+      assert(drawer()?.textContent?.includes("CRM · Billing before disconnecting"), "the confirmed app is named");
+      assert(drawer()?.textContent?.includes("App usage could not be fully confirmed"), "the drawer also reports incomplete usage");
+    });
+    assert(!m.button("Disconnect"), "a confirmed live binding prevents disconnect");
+    world.binding = null;
+    await m.click(m.button("Refresh app usage"));
+    await m.settle(() => assert(m.button("Disconnect")?.disabled, "removing the binding elsewhere restores the explicitly armed confirmation"));
+    assert(!world.posts.some((post) => post.path.endsWith("/revoke")), "refreshing the drawer never writes");
     await m.unmount();
   }
   {
