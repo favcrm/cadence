@@ -15,7 +15,7 @@ import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import SectionTabs from "../../ui/SectionTabs";
 import { buildMentionCandidates } from "../mentions/candidates";
-import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
+import { useWorkspacePeopleDirectory } from "../mentions/useWorkspacePeople";
 import "./issues.css";
 import KickoffDialog from "./KickoffDialog";
 import HostedDispatchDialog from "./HostedDispatchDialog";
@@ -251,7 +251,7 @@ function PageBody({
 }) {
   const { t } = useLocale();
   const fieldsId = useId();
-  const teammates = useWorkspaceTeammates(hosted === true, viewerSub);
+  const { people, teammates } = useWorkspacePeopleDirectory(hosted === true, viewerSub);
   const items = useMemo(() => acceptanceItems(detail.body), [detail.body]);
   const pr = prRef(detail.refs);
   const codeDelivery = hasCodeDelivery(detail, projectRepos, hosted);
@@ -607,6 +607,9 @@ function PageBody({
             detail={detail}
             epics={epics}
             readOnly={readOnly}
+            hosted={hosted === true}
+            people={people}
+            profiles={agents?.profiles}
             onWrite={onWrite}
             onError={onError}
             onPatch={patch}

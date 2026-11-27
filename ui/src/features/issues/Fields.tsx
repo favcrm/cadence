@@ -1,10 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
+import type { AgentProfile } from "../../lib/generated/board-api";
 import type { IssueCard, IssueDetail } from "../../lib/types";
 import Select from "../../ui/Select";
 import { noDragReason } from "../projects/Card";
+import type { HumanPerson } from "../threads/humanThreadsClient";
 import { useLocale } from "../../lib/locale";
+import { selectCloudSpecialists } from "./hostedDispatchModel";
 import { type IssuePageProps as Props } from "./issuePageProps";
+import { buildOwnerSelectOptions } from "./ownerFormat";
 
 const STATUSES = ["backlog", "ready", "doing", "review", "done", "dropped"];
 const PRIORITIES = ["P0", "P1", "P2", "P3"];
@@ -15,6 +19,9 @@ export function Fields({
   detail,
   epics,
   readOnly,
+  hosted = false,
+  people = [],
+  profiles,
   onWrite,
   onError,
   onPatch,
@@ -22,6 +29,9 @@ export function Fields({
   detail: IssueDetail;
   epics: IssueCard[];
   readOnly: boolean;
+  hosted?: boolean;
+  people?: readonly HumanPerson[];
+  profiles?: readonly AgentProfile[] | null;
   onWrite: Props["onWrite"];
   onError: Props["onError"];
   onPatch: (body: Parameters<typeof api.patch>[1], verb: string) => Promise<void> | void;
@@ -32,6 +42,20 @@ export function Fields({
   const [savingField, setSavingField] = useState<SavingField>(null);
   const ownerSavingRef = useRef(false);
   useEffect(() => setOwner(detail.owner ?? ""), [detail.owner, detail.rev]);
+
+  const usePicker =
+    Boolean(hosted) &&
+    (people.length > 0 || selectCloudSpecialists(profiles ?? undefined).length > 0);
+  const ownerOptions = useMemo(
+    () =>
+      buildOwnerSelectOptions({
+        currentOwner: detail.owner,
+        people,
+        profiles,
+        t,
+      }),
+    [detail.owner, people, profiles, t],
+  );
 
   const runPatch = (field: Exclude<SavingField, null>, body: Parameters<typeof api.patch>[1], verb: string) => {
     if (field === "owner") ownerSavingRef.current = true;
@@ -116,21 +140,37 @@ export function Fields({
       </label>
       <label className="issue-field">
         <span>{t("Owner")}</span>
-        <input
-          className="field w-full"
-          value={owner}
-          disabled={readOnly}
-          aria-label={t("Owner")}
-          onChange={(e) => setOwner(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              commitOwner();
-              e.currentTarget.blur();
-            }
-          }}
-          onBlur={commitOwner}
-        />
+        {usePicker ? (
+          <Select
+            full
+            searchable
+            value={detail.owner ?? ""}
+            disabled={readOnly}
+            aria-label={t("Owner")}
+            options={ownerOptions}
+            onChange={(next) => {
+              if ((detail.owner ?? "") !== next) {
+                runPatch("owner", { owner: next }, `${detail.id} owner`);
+              }
+            }}
+          />
+        ) : (
+          <input
+            className="field w-full"
+            value={owner}
+            disabled={readOnly}
+            aria-label={t("Owner")}
+            onChange={(e) => setOwner(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitOwner();
+                e.currentTarget.blur();
+              }
+            }}
+            onBlur={commitOwner}
+          />
+        )}
       </label>
       <label className="issue-field">
         <span>{t("Epic")}</span>

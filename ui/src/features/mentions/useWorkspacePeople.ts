@@ -16,8 +16,11 @@ export function filterSelfTeammates(
   );
 }
 
-/** Load workspace teammates (excluding the signed-in user) for `@mention` pickers. */
-export function useWorkspaceTeammates(enabled = true, viewerSub?: string | null): HumanPerson[] {
+/** Load both all workspace members (for assignee pickers) and filtered teammates (for @mentions). */
+export function useWorkspacePeopleDirectory(
+  enabled = true,
+  viewerSub?: string | null,
+): { people: HumanPerson[]; teammates: HumanPerson[] } {
   const [state, setState] = useState<{ actor: string | null; people: HumanPerson[] }>({
     actor: null,
     people: [],
@@ -42,10 +45,16 @@ export function useWorkspaceTeammates(enabled = true, viewerSub?: string | null)
     };
   }, [enabled]);
 
-  return useMemo(
+  const teammates = useMemo(
     () => filterSelfTeammates(state.people, state.actor, viewerSub),
     [state.actor, state.people, viewerSub],
   );
+  return { people: state.people, teammates };
+}
+
+/** Load workspace teammates (excluding the signed-in user) for `@mention` pickers. */
+export function useWorkspaceTeammates(enabled = true, viewerSub?: string | null): HumanPerson[] {
+  return useWorkspacePeopleDirectory(enabled, viewerSub).teammates;
 }
 
 /** Convert workspace teammates into `MentionCandidate` entries, disambiguating colliding handles. */
