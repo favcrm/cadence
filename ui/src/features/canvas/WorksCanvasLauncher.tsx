@@ -13,6 +13,9 @@ import { openAppViewEditable } from "./canvasStore";
 type WorksSection = "docs" | "sheets" | "decks";
 type LauncherEntry = { section: WorksSection | "all"; key: string; label: string };
 
+const MENU_ESTIMATED_WIDTH_PX = 176;
+const VIEWPORT_EDGE_MARGIN_PX = 8;
+
 function findWorksApp(rows: Installation[] | null): Installation | null {
   if (!rows) return null;
   return (
@@ -150,7 +153,12 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
             if (!was) {
               const rect = triggerRef.current?.getBoundingClientRect();
               setAlignRight(
-                Boolean(rect && rect.left + 176 > window.innerWidth - 8 && rect.right >= 176),
+                Boolean(
+                  rect &&
+                    rect.left + MENU_ESTIMATED_WIDTH_PX >
+                      window.innerWidth - VIEWPORT_EDGE_MARGIN_PX &&
+                    rect.right >= MENU_ESTIMATED_WIDTH_PX,
+                ),
               );
             }
             return !was;
