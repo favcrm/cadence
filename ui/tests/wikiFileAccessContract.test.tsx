@@ -113,7 +113,7 @@ async function run() {
     const pausedRoot = createRoot(host);
     await React.act(async () => { pausedRoot.render(React.createElement(Capability)); });
     await flush();
-    assert(host.textContent === "disabled", "a paused response does not enable new requests or shares");
+    assert(String(host.textContent) === "disabled", "a paused response does not enable new requests or shares");
     await React.act(async () => { pausedRoot.unmount(); });
     response = fixture.empty_requests;
     const root = createRoot(host);
