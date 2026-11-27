@@ -5055,7 +5055,7 @@ const CAD2876_ZHTW: Record<string, string> = {
   "File access requests": "檔案存取要求",
   "No file access requests.": "沒有檔案存取要求。",
   "Could not load access requests.": "無法載入存取要求。",
-  "Could not update access. Requests have been reloaded.": "無法更新存取權。要求已重新載入。",
+  "Could not update file access.": "無法更新檔案存取權。",
   "Grant access": "授予存取權",
   "Decline": "拒絕",
   "Revoke access": "撤銷存取權",

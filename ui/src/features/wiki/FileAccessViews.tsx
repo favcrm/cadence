@@ -114,26 +114,34 @@ export function FileSharing({ id, version, href, readOnly, onConflict }: { id: s
 export function AccessInbox({ readOnly }: { readOnly: boolean }) {
   const t = useTranslate();
   const [rows, setRows] = useState<AccessRequest[] | null>(null);
-  const [error, setError] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [decisionError, setDecisionError] = useState("");
   const [busy, setBusy] = useState(false);
   const [tick, setTick] = useState(0);
-  const fence = useFence(() => { setRows(null); setError(false); setBusy(false); });
+  const fence = useFence(() => { setRows(null); setLoadError(false); setDecisionError(""); setBusy(false); });
   useEffect(() => {
     const controller = new AbortController(); const valid = fence();
-    void listAccessRequests(controller.signal).then(({ requests }) => { if (valid()) { setRows(requests); setError(false); } }).catch((e) => {
+    void listAccessRequests(controller.signal).then(({ requests }) => { if (valid()) { setRows(requests); setLoadError(false); } }).catch((e) => {
       if (!valid()) return;
       setRows(null);
-      if (!(e instanceof FileAccessError && [400, 404, 501].includes(e.status))) setError(true);
+      setLoadError(!(e instanceof FileAccessError && [400, 404, 501].includes(e.status)));
     });
     return () => controller.abort();
   }, [tick]);
   const decide = async (row: AccessRequest, decision: "grant" | "decline" | "revoke") => {
-    const valid = fence(); setBusy(true); setError(false);
-    try { await decideAccess(row, decision); if (valid()) setTick((n) => n + 1); }
-    catch { if (valid()) { setError(true); setTick((n) => n + 1); } }
-    finally { if (valid()) setBusy(false); }
+    const valid = fence(); setBusy(true); setDecisionError("");
+    try { await decideAccess(row, decision); }
+    catch (e) {
+      if (valid()) setDecisionError(t(e instanceof FileAccessError && e.code === "document_not_approved"
+        ? "Get approval for this version before sharing."
+        : e instanceof FileAccessError && e.code === "document_archived"
+          ? "Restore this document before sharing."
+          : "Could not update file access."));
+    } finally {
+      if (valid()) { setRows(null); setTick((n) => n + 1); setBusy(false); }
+    }
   };
-  if (!rows) return error ? <p role="alert" className="text-fail">{t("Could not load access requests.")}</p> : null;
+  if (!rows) return decisionError || loadError ? <p role="alert" className="text-fail">{decisionError || t("Could not load access requests.")}</p> : null;
   return <section className="card grid gap-2 p-3">
     <h2 className="text-cardtitle font-semibold text-ink-100">{t("File access requests")}</h2>
     {!rows.length && <p>{t("No file access requests.")}</p>}
@@ -144,6 +152,6 @@ export function AccessInbox({ readOnly }: { readOnly: boolean }) {
         {row.status === "granted" && <Button disabled={busy} onClick={() => void decide(row, "revoke")}>{t("Revoke access")}</Button>}
       </div>}
     </div>)}
-    {error && <p role="alert" className="text-fail">{t("Could not update access. Requests have been reloaded.")}</p>}
+    {decisionError && <p role="alert" className="text-fail">{decisionError}</p>}
   </section>;
 }
