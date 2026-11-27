@@ -615,7 +615,9 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   // A disabled or removed install has no openable route: offering Open there
   // sends the reader to "Unknown installation".
   const openable = addressable !== null && canOpenInstall(addressable.state, addressable.removed);
-  const openHref = addressable && openable ? installationAppHref(rows, addressable.install_id) : null;
+  const openHref = addressable && openable
+    ? installationAppHref(rows?.filter((row) => row.state !== "removed"), addressable.install_id)
+    : null;
   const titleSource = install ?? catalogued[0];
   const title = titleSource ? localizedAppTitle(titleSource, locale, t) : id;
   return (
@@ -831,7 +833,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   const install = installationParam !== null ? named : matching.length === 1 ? matching[0] : null;
   const openHref =
     install && canOpenInstall(install.state, install.removed)
-      ? installationAppHref(installs.rows, install.install_id)
+      ? installationAppHref(installs.rows?.filter((row) => row.state !== "removed"), install.install_id)
       : null;
   const { release, missing } = selectedRelease(versions, versionParam);
 

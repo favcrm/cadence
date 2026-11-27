@@ -50,6 +50,8 @@ const home = {
 let favorites: unknown = { owner: "operator", is_default: false, favorites: [{ install_id: "inst-a", position: 0, opened_at: null }] };
 let socialState: "active" | "disabled" | "removed" | "absent" = "active";
 let directoryFails = false;
+let removedSiblingPresent = false;
+let publicDetailMissing = false;
 const catalog = { catalog: [{
   id: "crm", source_kind: "builtin", retired: true,
   retired_reason: "This embedded catalogue entry is retired.",
@@ -106,12 +108,15 @@ globalThis.fetch = async (input: any, init?: any) => {
   if (path === "/api/app-installations") return json([
     { install_id: "inst-a", name: "crm", title: "CRM", removed: null },
     ...(socialState === "absent" ? [] : [{ install_id: "inst-b", name: "social-content", title: "Social Content", version: "0.9.6", removed: null, state: socialState, catalogue: { id: publishedApp.id, version: "0.9.6", digest: publishedApp.digest } }]),
+    ...(removedSiblingPresent ? [{ install_id: "inst-old", name: "social-content", title: "Social Content (old)", removed: null, state: "removed", catalogue: { id: publishedApp.id, version: "0.9.6", digest: publishedApp.digest } }] : []),
   ]);
   if (path === "/api/app-favorites") return json(favorites);
   if (path === "/api/app-catalog") return json(catalog);
   if (path === "/api/app-requests") return json({ requests: [] });
   if (path === "/api/public-apps") return directoryFails ? new Response("unavailable", { status: 503 }) : json({ ok: true, data: { apps: [publishedApp] } });
-  if (path === "/api/public-apps/social-content") return json({ ok: true, data: { app: publishedApp } });
+  if (path === "/api/public-apps/social-content") return publicDetailMissing
+    ? new Response("not found", { status: 404 })
+    : json({ ok: true, data: { app: publishedApp } });
   if (path === "/api/public-apps/social-content/versions") return json({
     app_id: publishedApp.id, app: publishedApp.app, recommended_version: publishedApp.version,
     releases: [{ version: publishedApp.version, digest: publishedApp.digest, installable: true, unavailableReason: null, release_notes: null }],
@@ -276,6 +281,21 @@ async function main() {
         await React.act(() => root.render(React.createElement("div")));
       }
     }
+  });
+  await check("a removed sibling must not hide the active installation's Open link", async () => {
+    socialState = "active";
+    removedSiblingPresent = true;
+    history.replaceState(null, "", "/apps/catalog/social-content?installation=inst-b");
+    for (const missing of [false, true]) {
+      publicDetailMissing = missing;
+      await React.act(() => root.render(React.createElement(CatalogDetail, { id: publishedApp.id, viewer: operator })));
+      await flush();
+      assert(host.querySelector('a[href="/apps/social-content"]'),
+        "the selected active installation stays openable on both published and local detail");
+      await React.act(() => root.render(React.createElement("div")));
+    }
+    removedSiblingPresent = false;
+    publicDetailMissing = false;
   });
   await check("busy fresh install retains the checked review for an explicit retry", async () => {
     socialState = "absent";
