@@ -958,12 +958,12 @@ fn cad631_operator_audit_survives_revoke_while_worker_fetch_and_corruption_refus
 const CAD749_PRODUCER: &str = r##"{"schema":1,"kind":"produce_text","run_id":"run-a","step_id":"s1","revision":1,"outcome":"succeeded","artifacts":[{"media_type":"text/markdown","text":"# Twelve retained posts"}]}"##;
 
 fn cad749_parse(text: &str) -> bool {
-    super::super::app_runs::parse_local_result_text(text).is_some()
+    super::super::app_runs::worker_completion::parse_local_result_text(text).is_some()
 }
 
 #[test]
 fn cad749_accepts_one_bounded_bare_or_fenced_envelope_amid_prose() {
-    use super::super::app_runs::MAX_RESULT_TEXT_BYTES;
+    use super::super::app_runs::worker_completion::MAX_RESULT_TEXT_BYTES;
     assert!(cad749_parse(CAD749_PRODUCER));
     // Bare envelope with trailing whitespace is still one envelope.
     assert!(cad749_parse(&format!("{CAD749_PRODUCER}  \n")));
