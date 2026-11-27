@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useQuery } from "../../../lib/useResource";
 import { useNotificationToast } from "../../threads/NotificationToast";
 import { conversationLabel, conversationList } from "../conversationClient";
@@ -86,8 +86,6 @@ function UnreadProbe({ installId }: { installId: string }) {
 
 /** One observed list per installed app; ownership reads also resolve queued View. */
 export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] | null }) {
-  // A paused or signed-out shell no longer supplies queued-chat destinations.
-  useLayoutEffect(() => () => setKnownInstalls([]), []);
   useEffect(() => {
     setKnownInstalls(apps === null ? [] : apps.map((app) => app.installId));
   }, [apps]);

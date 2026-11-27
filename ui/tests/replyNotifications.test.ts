@@ -11,7 +11,6 @@ import type * as Visibility from "../src/features/app-shell/chat/chatVisibility"
 import type * as Toast from "../src/features/threads/NotificationToast";
 import type * as Conversations from "../src/features/app-shell/conversationClient";
 import type * as Changes from "../src/lib/masterChanged";
-import type * as Navigation from "../src/features/app-shell/chat/conversationNavigation";
 import type * as Resources from "../src/lib/resources";
 import type { ThreadEntry } from "../src/features/home/thread";
 declare function require<T>(name: string): T;
@@ -40,7 +39,6 @@ const { useHomeUnread, noteHomeSeen } = require<typeof HomeUnread>("../src/featu
 const { useAssistantUnread } = require<typeof Unread>("../src/features/app-shell/chat/assistantUnread");
 const { readSeen, writeSeen, announceReply } = require<typeof Seen>("../src/features/app-shell/chat/unreadSeen");
 const { setVisibleConversation } = require<typeof Visibility>("../src/features/app-shell/chat/chatVisibility");
-const { useConversationDestination } = require<typeof Navigation>("../src/features/app-shell/chat/conversationNavigation");
 const { NotificationToastProvider } = require<typeof Toast>("../src/features/threads/NotificationToast");
 const { conversationList } = require<typeof Conversations>("../src/features/app-shell/conversationClient");
 const { noteMasterChanged } = require<typeof Changes>("../src/lib/masterChanged");
@@ -48,15 +46,12 @@ const { resources } = require<typeof Resources>("../src/lib/resources");
 let updated = 100;
 let replySeq = 1;
 let homeReplySeq = 2;
-let conversationReads = 0;
 let homeEntries: ThreadEntry[] = [{ seq: 2, role: "agent", kind: "turn_result", text: "An existing unseen Home reply" }];
 const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
 globalThis.fetch = async (input) => {
   const url = new URL(String(input), "http://localhost");
-  if (url.pathname.endsWith("/conversations")) {
-    conversationReads += 1;
+  if (url.pathname.endsWith("/conversations"))
     return json({ conversations: [{ id: "general", is_general: true, updated, reply_seq: replySeq }] });
-  }
   if (url.pathname === "/api/threads/master") {
     // Model the bounded pages: a tail holds the newest `limit` entries, a
     // forward read the oldest entries after its cursor, an older read the
@@ -207,20 +202,6 @@ async function main() {
   await settle();
   assert((await readSeen("home")).home === 21, "the cold load does not advance the seen watermark");
   assert(host.querySelector('[aria-label="Home new reply"]') && notices() === 1, "a cold Home reply outside the loaded tail is still unseen");
-  function Destination() {
-    useConversationDestination("general", null, undefined);
-    return null;
-  }
-  const shell = (showProbes: boolean) => React.createElement(NotificationToastProvider, null,
-    React.createElement(Destination),
-    showProbes && React.createElement(AssistantUnreadProbes, { apps }));
-  await React.act(async () => { root.render(shell(true)); });
-  await settle();
-  await React.act(async () => { root.render(shell(false)); });
-  const beforeMaster = conversationReads;
-  await React.act(async () => { noteMasterChanged(); });
-  await settle();
-  assert(conversationReads === beforeMaster, "remaining destination subscriber does not reload old session conversations");
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();
   console.log("reply notification checks passed");

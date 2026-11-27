@@ -1412,7 +1412,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           {onAppScreen && <div ref={setAppActionsTarget} className="app-header-actions-target" />}
         </header>
 
-        {listReader && unreadProbesMounted && (
+        {unreadProbesMounted && (
           <>
             <AssistantUnreadProbes apps={installed} />
             <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />
