@@ -100,6 +100,38 @@
   outline-offset: 2px;
 }
 
+.assistant-about-trigger.assistant-identity-trigger {
+  width: auto;
+  height: auto;
+  gap: 0.55rem;
+  padding: 0.25rem 0.45rem 0.25rem 0.25rem;
+  margin: -0.25rem 0 -0.25rem -0.25rem;
+  border-radius: 0.5rem;
+  color: inherit;
+  text-align: left;
+  min-width: 0;
+  max-width: 100%;
+}
+.assistant-identity-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.assistant-identity-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.0625rem;
+  min-width: 0;
+}
+.assistant-identity-chevron {
+  color: var(--color-ink-500);
+  opacity: 0.5;
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+.assistant-identity-trigger:hover .assistant-identity-chevron {
+  opacity: 1;
+  transform: translateX(1px);
+}
+
 .assistant-about-body {
   display: flex;
   flex-direction: column;
@@ -360,10 +392,13 @@
   .assistant-menu { display: inline-flex; }
   .assistant-menu-trigger,
   /* MemberChat and the installed-app header keep this trigger with no sheet. */
-  .assistant-heading:not(:has(.assistant-menu)) .assistant-about-trigger,
+  .assistant-heading:not(:has(.assistant-menu)) .assistant-about-trigger:not(.assistant-identity-trigger),
   .app-chat-head .assistant-about-trigger {
     width: 2.75rem;
     height: 2.75rem;
+  }
+  .assistant-about-trigger.assistant-identity-trigger {
+    min-height: 2.75rem;
   }
   .assistant-menu-panel .lnk { min-width: 2.75rem; }
   /* The trigger sits after the name, not at the header's right edge: pin the

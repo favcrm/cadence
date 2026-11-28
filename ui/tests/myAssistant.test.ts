@@ -9,6 +9,7 @@ for (const name of [
   "Element",
   "HTMLElement",
   "HTMLInputElement",
+  "HTMLTextAreaElement",
   "HTMLSelectElement",
   "SVGElement",
   "navigator",
@@ -94,6 +95,9 @@ const endpointQueryAgents: (string | null)[] = [];
 const personalAssistantId = "assistant_0123456789abcdef0123456789abcdef";
 let personalSettingsMode = false;
 let personalRev = 1;
+let personalName: string | null = "Nova";
+let personalTone: string | null = null;
+let personalLook = "robot";
 let personalInstructions: string | null = "Personal prompt";
 let personalSkills: string[] = [];
 let personalEnabledTools: string[] = [];
@@ -152,7 +156,7 @@ globalThis.fetch = async (input, init) => {
       assistant: {
         assistant_id: personalAssistantId,
         alias: "assistant-1",
-        identity: { name: "Nova", tone: null, look: "robot", revision: personalRev },
+        identity: { name: personalName, tone: personalTone, look: personalLook, revision: personalRev },
       },
       conversation_id: "c1",
     });
@@ -179,6 +183,9 @@ globalThis.fetch = async (input, init) => {
         return json({ code: "owner_required", message: "Only workspace owners may change workspace opt-in tool groups." }, 403);
       }
     }
+    if (typeof body.name === "string") personalName = body.name.trim() || null;
+    if (typeof body.tone === "string") personalTone = body.tone.trim() || null;
+    if (typeof body.look === "string") personalLook = body.look;
     if (typeof body.instructions === "string") personalInstructions = body.instructions.trim() || null;
     if (Array.isArray(body.skills)) personalSkills = body.skills.filter((s): s is string => typeof s === "string");
     if (Array.isArray(body.enabled_tools)) {
@@ -189,7 +196,7 @@ globalThis.fetch = async (input, init) => {
       assistant: {
         assistant_id: personalAssistantId,
         alias: "assistant-1",
-        identity: { name: "Nova", tone: null, look: "robot", revision: personalRev },
+        identity: { name: personalName, tone: personalTone, look: personalLook, revision: personalRev },
       },
       conversation_id: "c1",
       action: "update",
@@ -756,6 +763,70 @@ async function main() {
   assert(
     readPatch()?.expected_revision === 4 && JSON.stringify(readPatch()?.skills) === JSON.stringify([]),
     "member can toggle their own assistant skills",
+  );
+
+  // View-first Hero identity editing: Avatar popover + inline Edit + shared revision sync with Instructions.
+  await at("/agents/assistant?tab=instructions");
+  const avatarBtn = host.querySelector<HTMLButtonElement>(".ap-avatar-btn");
+  assert(avatarBtn !== null, "hero avatar button allows changing avatar");
+  await click(avatarBtn);
+  const avatarPopover = host.querySelector<HTMLElement>("[data-avatar-popover]");
+  assert(
+    avatarPopover !== null && avatarPopover.querySelectorAll("[data-assistant-look]").length === 11,
+    "avatar popover offers all 11 looks",
+  );
+  await click(avatarPopover.querySelector<HTMLButtonElement>('[data-assistant-look="designer"]'));
+  assert(
+    readPatch()?.expected_revision === 5 && readPatch()?.look === "designer",
+    "clicking an avatar in the popover saves look immediately with expected_revision",
+  );
+  assert(host.querySelector("[data-avatar-popover]") === null, "avatar popover closes after choosing look");
+
+  const editBtn = host.querySelector<HTMLButtonElement>("[data-identity-edit]");
+  assert(editBtn !== null, "quiet Edit button present in hero");
+  await click(editBtn);
+  const inlineForm = host.querySelector<HTMLFormElement>("[data-identity-inline-edit]");
+  assert(inlineForm !== null, "clicking Edit opens inline identity editor");
+  const [nameField, toneField] = Array.from(inlineForm.querySelectorAll<HTMLInputElement>("input.field"));
+  assert(nameField && toneField, "inline identity editor renders Display name and Tone inputs");
+  await React.act(async () => {
+    const desc = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!;
+    desc.set!.call(nameField, "Atlas");
+    nameField.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const presetChip = Array.from(inlineForm.querySelectorAll<HTMLButtonElement>(".ap-tone-chip")).find(
+    (b) => b.textContent === "Concise & direct",
+  );
+  assert(presetChip !== undefined, "tone preset chip present");
+  await click(presetChip);
+  await click(inlineForm.querySelector<HTMLButtonElement>('button[type="submit"]'));
+  assert(
+    readPatch()?.expected_revision === 6 &&
+      readPatch()?.name === "Atlas" &&
+      readPatch()?.tone === "Concise & direct",
+    "inline Save writes name and tone with latest revision",
+  );
+  assert(
+    host.querySelector("[data-identity-inline-edit]") === null &&
+      host.textContent?.includes("Atlas · Your assistant") &&
+      host.textContent?.includes("Concise & direct"),
+    "inline editor collapses and updates hero name and tone",
+  );
+
+  // Immediately editing Instructions after Identity uses the synced revision (7), avoiding a stale 409.
+  const instArea = host.querySelector<HTMLTextAreaElement>("textarea.ap-doc-text");
+  assert(instArea !== null, "Instructions textarea present below hero");
+  await React.act(async () => {
+    const desc = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")!;
+    desc.set!.call(instArea, "Updated personal instructions");
+    instArea.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const saveInstBtn = Array.from(host.querySelectorAll("button")).find((b) => b.textContent === "Save");
+  assert(saveInstBtn !== undefined, "Instructions Save button appears when dirty");
+  await click(saveInstBtn);
+  assert(
+    readPatch()?.expected_revision === 7 && readPatch()?.instructions === "Updated personal instructions",
+    "Instructions save uses the revision synced from Identity save",
   );
 
   // Memory tab: inspect SOUL.md / MEMORY.md / topics, save edit with expected_sha, Undo, and 409 conflict recovery.

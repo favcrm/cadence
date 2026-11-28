@@ -300,6 +300,17 @@
 .bz-card:has(> .artopen) { grid-template-columns: auto minmax(0, 1fr) auto; }
 .bz-card:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 
+.bz-header-toggle { display: inline-flex; align-items: center; gap: 0.4rem; min-height: 2rem; padding: 0 0.65rem; flex-shrink: 0; }
+.bz-header-toggle[aria-pressed="true"] {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-ink-850));
+  color: var(--color-ink-100);
+}
+@media (max-width: 1023.98px) {
+  .bz-header-toggle { min-width: 2.75rem; min-height: 2.75rem; padding: 0 0.5rem; justify-content: center; }
+  .bz-header-toggle-label { display: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .bz-dot[data-pulse], .cv-bar-run { animation: none; }
 }

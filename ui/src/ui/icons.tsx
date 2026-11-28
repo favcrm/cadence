@@ -32,6 +32,7 @@ import {
   MoreHorizontalIcon,
   PanelLeftOpenIcon,
   PanelLeftCloseIcon,
+  PencilEdit01Icon,
   PinIcon,
   Pulse01Icon,
   RefreshIcon,
@@ -227,4 +228,9 @@ export const IconConnection = ({ size = 18, ...rest }: IconProps = {}) => (
 /** Assistant details / About — an information affordance, not a warning. */
 export const IconInfo = ({ size = 14, ...rest }: IconProps = {}) => (
   <Glyph icon={InformationCircleIcon} size={size} {...rest} />
+);
+
+/** Edit affordance for inline profile / avatar actions. */
+export const IconEdit = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={PencilEdit01Icon} size={size} {...rest} />
 );

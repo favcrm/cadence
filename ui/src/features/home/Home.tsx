@@ -11,6 +11,7 @@ import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
+import { IconCaret } from "../../ui/icons";
 import { buildMentionCandidates } from "../mentions/candidates";
 import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import {
@@ -30,7 +31,7 @@ import {
 } from "./master";
 import { useAssistantModelState } from "../app-shell/chat/assistantModelState";
 import { useCanvasFeed } from "../canvas/feed";
-import { BrowserCard } from "../canvas/BrowserPanel";
+import { BrowserCard, BrowserHeaderToggle } from "../canvas/BrowserPanel";
 import { useBrowserFeed } from "../canvas/browserStore";
 import { ImageConversation } from "../canvas/imageConversation";
 import Composer from "./Composer";
@@ -73,7 +74,6 @@ import MemberChat from "./MemberChat";
 import { useHostedTemplateReview, type HostedTemplateList, type HostedTemplateRail } from "../templates/HostedTemplateReview";
 import { consumeCanvasTemplateReview, onCanvasTemplateReview } from "../templates/canvasTemplateDraft";
 import { closeDrawer as closeCanvas } from "../canvas/canvasStore";
-import WorksCanvasLauncher from "../canvas/WorksCanvasLauncher";
 import { useSendHandoff } from "./sendHandoff";
 import { memberScope } from "./memberThread";
 import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
@@ -1790,10 +1790,15 @@ function MasterHome({
             data-assistant-identity={actor.scope ?? undefined}
             data-identity-state={actor.read.state}
           >
-            <AssistantFace size={30} active={status.kind === "running"} />
             <div className="assistant-heading-text">
               <div className="assistant-heading-name">
-                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, actor.scope, t)}</h1>
+                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>
+                  <AssistantAboutButton className="assistant-identity-trigger" profileHref={profileHref}>
+                    <AssistantFace size={30} active={status.kind === "running"} />
+                    <span className="assistant-identity-name">{displayName(actor.read, actor.scope, t)}</span>
+                    <IconCaret size={11} className="assistant-identity-chevron" />
+                  </AssistantAboutButton>
+                </h1>
                 <span className={`chip chip-sans ${headerChip.tone}`} data-assistant-status>
                   {headerChip.label}
                 </span>
@@ -1815,7 +1820,6 @@ function MasterHome({
               {!missing && homeConversation && (
                 <ConversationIdCopy key={homeConversation} id={homeConversation} workspaceId={supportWorkspaceId} />
               )}
-              {hosted ? <WorksCanvasLauncher /> : null}
               {compactHome && latestLabel && (
                 <button
                   type="button"
@@ -1843,7 +1847,7 @@ function MasterHome({
                   {t("Finish setup")}
                 </button>
               )}
-              <AssistantAboutButton profileHref={profileHref} />
+              <BrowserHeaderToggle />
             </div>
           </div>
 
