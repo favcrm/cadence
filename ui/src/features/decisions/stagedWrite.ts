@@ -11,6 +11,7 @@
  */
 
 import { optionsLine } from "../canvas/viewParams";
+import { parseAccessInput, type AccessInput } from "../home/accessRequest";
 import { parseShareInput, type ShareInput } from "../home/shareRequest";
 
 export type StagedStatus = "pending" | "approved" | "denied";
@@ -62,7 +63,7 @@ export interface StagedWhatsApp {
 
 export interface StagedWrite {
   id: string;
-  kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli" | "custom_mcp_effect" | "share_request";
+  kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli" | "custom_mcp_effect" | "share_request" | "access_request";
   status: StagedStatus;
   createdAt: number;
   decidedAt: number | null;
@@ -92,7 +93,9 @@ export interface StagedWrite {
   whatsapp?: StagedWhatsApp | null;
   /** AOS-711 `share_request`: a member's ask for an owner-only report. Decided through the share-request routes, never approve/deny. */
   share?: ShareInput;
-  /** `share_request`: the owner who shared it, once decided. */
+  /** AOS-816 `access_request`: a member's ask for project membership or a wiki path grant. */
+  access?: AccessInput;
+  /** `share_request` / `access_request`: the owner who decided, once decided. */
   decidedBy?: string | null;
   /** `connected_effect`: the draft or send a connected tool would make. */
   connected: {
@@ -629,6 +632,34 @@ function parseShareRequest(base: Pick<StagedWrite, "id" | "status" | "createdAt"
   };
 }
 
+function parseAccessRequest(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+  const access = parseAccessInput(row.input);
+  if (access === null) return null;
+  const approvedBy = isRecord(row.approvedBy) ? str(row.approvedBy.label) : null;
+  return {
+    ...base,
+    proposer: null,
+    kind: "access_request",
+    title: `${access.requester} · ${access.targetLabel}`,
+    app: access.kind === "project" ? "Project access" : "Wiki access",
+    target: null,
+    changes: [],
+    unchangedCount: 0,
+    changesComplete: true,
+    reason: access.reason ?? null,
+    consent: null,
+    effects: [],
+    raw: rawText(row.input),
+    origin: null,
+    result,
+    recordLink: null,
+    connected: null,
+    customMcp: null,
+    access,
+    decidedBy: approvedBy,
+  };
+}
+
 /** Approve is offered only for a row whose whole request can be read. Deny is always safe. */
 export const approvable = (write: StagedWrite): boolean => write.kind !== "cadence_cli" || write.changesComplete;
 
@@ -657,6 +688,7 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
   if (row.tool === "custom_mcp_effect") return parseCustomMcpEffect(base, row, result);
   if (row.tool === "cadence_cli") return parseCadenceCli(base, row, result);
   if (row.tool === "share_request") return parseShareRequest(base, row, result);
+  if (row.tool === "access_request") return parseAccessRequest(base, row, result);
   return null;
 }
 
@@ -757,6 +789,11 @@ export function shareHeadline(share: Pick<ShareInput, "requester" | "viewLabel" 
 /** The row's own heading: a connected effect leads with its verb. */
 export function titleOf(write: StagedWrite, t: (english: string) => string): string {
   if (write.share) return shareHeadline(write.share, t);
+  if (write.access) {
+    return t("{name} asks for {target}")
+      .replace("{name}", () => write.access!.requester)
+      .replace("{target}", () => write.access!.targetLabel);
+  }
   if (write.customMcp != null) return `${t("Run tool")} · ${write.title}`;
   return write.connected === null ? write.title : `${t(write.connected.effect === "send" ? "Send" : "Draft")} · ${write.title}`;
 }
@@ -767,6 +804,7 @@ const same: Say = (s) => s;
 /** External attribution is kept by the parser; a verified assistant label wins over a Home fallback. */
 export function askedBy(write: StagedWrite, t: Say = same): string | null {
   if (write.share) return write.share.requester;
+  if (write.access) return write.access.requesterHandle ? `${write.access.requester} (${write.access.requesterHandle})` : write.access.requester;
   if (write.proposer) {
     const { label, scope } = write.proposer;
     return `${label} · ${t(scope === "workspace" ? "Workspace assistant" : "Personal assistant")}`;

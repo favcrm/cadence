@@ -18,7 +18,7 @@ import { unwrapHarnessText } from "./turnText";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal" | "ticket_proposal" | "surface" | "connect_ref" | "record_ref" | "view_ref" | "share_request" | "context_receipt";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal" | "ticket_proposal" | "surface" | "connect_ref" | "record_ref" | "view_ref" | "share_request" | "access_request" | "context_receipt";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -373,6 +373,7 @@ export type ThreadItem =
   | { type: "record"; key: string; entry: ThreadEntry }
   | { type: "view"; key: string; entry: ThreadEntry }
   | { type: "share"; key: string; entry: ThreadEntry }
+  | { type: "access"; key: string; entry: ThreadEntry }
   | { type: "context_receipt"; key: string; entry: ThreadEntry }
   | { type: "image"; key: string; entry: ThreadEntry }
   | { type: "video"; key: string; entry: ThreadEntry }
@@ -413,7 +414,7 @@ export function formStatus(seq: number, entries: ThreadEntry[], pending: Pending
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
 
 /** The item type of an entry kind that is a card in a turn; null otherwise. */
-const cardType = (kind: string): "artifact" | "image" | "video" | "connect" | "record" | "view" | "share" | "context_receipt" | null =>
+const cardType = (kind: string): "artifact" | "image" | "video" | "connect" | "record" | "view" | "share" | "access" | "context_receipt" | null =>
   kind === "artifact"
     ? "artifact"
     : kind === "image_job"
@@ -428,9 +429,11 @@ const cardType = (kind: string): "artifact" | "image" | "video" | "connect" | "r
               ? "view"
               : kind === "share_request"
                 ? "share"
-                : kind === "context_receipt"
-                  ? "context_receipt"
-                  : null;
+                : kind === "access_request"
+                  ? "access"
+                  : kind === "context_receipt"
+                    ? "context_receipt"
+                    : null;
 
 /**
  * Entries by kind: the operator's message, `assistant_text` as
@@ -504,6 +507,9 @@ export function threadItems(state: ThreadState | null, homeToolApprovals = false
     } else if (entry.kind === "share_request") {
       // AOS-711 (CAD-2705): the member's request for an owner-only report — the host's card.
       items.push({ type: "share", key, entry });
+    } else if (entry.kind === "access_request") {
+      // AOS-816 (CAD-2885): member's project/wiki access request offer or card.
+      items.push({ type: "access", key, entry });
     } else if (entry.kind === "context_receipt") {
       // CAD-2834: compact inline receipt when the assistant updated its SOUL/MEMORY context.
       items.push({ type: "context_receipt", key, entry });

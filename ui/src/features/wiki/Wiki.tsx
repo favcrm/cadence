@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
@@ -42,6 +42,9 @@ import FolderPane, { type DeleteReceipt } from "./FolderPane";
 import UploadPane from "./UploadPane";
 import SearchPane from "./SearchPane";
 import HistoryPane from "./HistoryPane";
+import { useWorkspacePeopleDirectory } from "../mentions/useWorkspacePeople";
+import type { HumanPerson } from "../threads/humanThreadsClient";
+import WikiAccessPanel from "./WikiAccessPanel";
 import TrashPane from "./TrashPane";
 import { ManagedFilePane, ManagedList } from "./ManagedFileViews";
 import "./wiki.css";
@@ -98,6 +101,7 @@ function unavailableRevision(error: unknown): boolean {
 export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, onToast, scope, hosted, viewerSub, operator, managedFiles, onManagedChange }: WikiProps) {
   const t = useTranslate();
   const root = scope?.root ?? "";
+  const { people } = useWorkspacePeopleDirectory(hosted === true && operator === true, viewerSub);
   const current = route.path ?? root;
   const validPath = withinScope(current, root);
   const trashMode = route.mode === "trash";
@@ -379,6 +383,8 @@ export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, 
               readOnlyReason={readOnlyReason}
               hosted={hosted}
               viewerSub={viewerSub}
+              accessOwner={hosted === true && operator === true}
+              people={people}
               trashHref={trashHref}
               section={route.section}
               page={route.page}
@@ -449,6 +455,8 @@ function BrowsePane({
   readOnlyReason,
   hosted,
   viewerSub,
+  accessOwner,
+  people,
   trashHref,
   section,
   page: citedPage,
@@ -468,6 +476,8 @@ function BrowsePane({
   readOnlyReason?: string | null;
   hosted?: boolean;
   viewerSub?: string | null;
+  accessOwner?: boolean;
+  people?: readonly HumanPerson[];
   /** The operator's Trash screen, absent for a non-operator or a context. */
   trashHref: string | null;
   section?: string;
@@ -480,8 +490,9 @@ function BrowsePane({
   const t = useTranslate();
   const [creating, setCreating] = useState<{ kind: "page" | "dir"; value: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [accessOpen, setAccessOpen] = useState(false);
   const [receipt, setReceipt] = useState<(DeleteReceipt & { folder: string }) | null>(null);
-  useEffect(() => { setReceipt(null); }, [path]);
+  useEffect(() => { setReceipt(null); setAccessOpen(false); }, [path]);
   useEffect(() => onPrivateReadsPaused(() => setReceipt(null)), []);
   const createContext = async () => {
     if (!scope || readOnly) return;
@@ -593,6 +604,21 @@ function BrowsePane({
   );
 
   if (open.kind === "dir") {
+    const accessButton = accessOwner && path !== "" ? (
+      <Button aria-expanded={accessOpen} onClick={() => setAccessOpen((v) => !v)}>
+        {t("Access")}
+      </Button>
+    ) : null;
+    const accessPanel = accessOwner && path !== "" ? (
+      <WikiAccessPanel
+        path={path}
+        open={accessOpen}
+        onClose={() => setAccessOpen(false)}
+        people={people ?? []}
+        readOnly={readOnly}
+        onToast={onToast}
+      />
+    ) : null;
     // The root is a list of folders on both boards: neither accepts a page or
     // an upload at `""` itself (the namespaces below it carry their own
     // grants), so its buttons stay off without claiming the caller is
@@ -619,7 +645,9 @@ function BrowsePane({
             {trashHref && <Button href={trashHref} icon={<IconTrash />}>{t("Trash")}</Button>}
             {managedFiles && <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null, archived: true })}>{t("Archived")}</Button>}
             {managedFiles && rootHere && <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null, protectedFiles: true })}>{t("Restricted files")}</Button>}
+            {accessButton}
         </>} />
+        {accessPanel}
         {missingRoot && scope && (
           <EmptyCard title={t("No project context yet")} action={
             <Button disabled={readOnly || busy} onClick={() => void createContext()}>{t("Create project context")}</Button>
@@ -656,16 +684,57 @@ function BrowsePane({
   }
 
   const page = open.page;
-  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} hosted={hosted} viewerSub={viewerSub} section={section} citedPage={citedPage} />;
-  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} hosted={hosted} viewerSub={viewerSub} />;
+  const fileAccessButton = accessOwner && page.path !== "" ? (
+    <Button aria-expanded={accessOpen} onClick={() => setAccessOpen((v) => !v)}>
+      {t("Access")}
+    </Button>
+  ) : null;
+  const fileAccessPanel = accessOwner && page.path !== "" ? (
+    <WikiAccessPanel
+      path={page.path}
+      open={accessOpen}
+      onClose={() => setAccessOpen(false)}
+      people={people ?? []}
+      readOnly={readOnly}
+      onToast={onToast}
+    />
+  ) : null;
+  if (page.kind === "page" || page.historical) {
+    return (
+      <PagePane
+        page={page}
+        navHref={navHref}
+        readOnly={readOnly || page.historical === true}
+        hosted={hosted}
+        viewerSub={viewerSub}
+        section={section}
+        citedPage={citedPage}
+        accessButton={fileAccessButton}
+        accessPanel={fileAccessPanel}
+      />
+    );
+  }
+  return (
+    <BlobPane
+      page={page}
+      blob={previewKind(baseName(page.path), page.mime)}
+      navHref={navHref}
+      hosted={hosted}
+      viewerSub={viewerSub}
+      accessButton={fileAccessButton}
+      accessPanel={fileAccessPanel}
+    />
+  );
 }
 
-function BlobPane({ page, blob, navHref, hosted, viewerSub }: {
+function BlobPane({ page, blob, navHref, hosted, viewerSub, accessButton, accessPanel }: {
   page: WikiPage;
   blob: PreviewKind;
   navHref: (route: Route) => string;
   hosted?: boolean;
   viewerSub?: string | null;
+  accessButton?: ReactNode;
+  accessPanel?: ReactNode;
 }) {
   const t = useTranslate();
   const { src, download, error, loading } = useWikiBlobSource(page.path, blob, true);
@@ -676,7 +745,9 @@ function BlobPane({ page, blob, navHref, hosted, viewerSub }: {
       <WikiToolbar path={page.path} navHref={navHref} actions={<>
         <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
         {download ? <a className="btn" href={download} download={name}>{t("Download")}</a> : <Button disabled>{t("Download")}</Button>}
+        {accessButton}
       </>} />
+      {accessPanel}
       {error && <Failure what="could not open this file" error={error} />}
       <div className="wk-pstage">
         {loading ? <Loading what="loading the file…" /> : blob === "image" && src ? (

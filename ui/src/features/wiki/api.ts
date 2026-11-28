@@ -240,7 +240,7 @@ function get<T>(url: string, operation?: PrivateOperation): Promise<T> {
   });
 }
 
-function send<T>(method: "PUT" | "POST", url: string, body: object, operation?: PrivateOperation): Promise<T> {
+function send<T>(method: "PUT" | "POST" | "DELETE", url: string, body: object, operation?: PrivateOperation): Promise<T> {
   return usingPrivateOperation(operation, async (op) => {
     const resp = await privateFetch(url, {
       method,
@@ -315,6 +315,26 @@ export function trashItemsQuery(from: string, cursor?: string | null, limit = TR
   return `/api/wiki/trash/items?${params.toString().replaceAll("+", "%20")}`;
 }
 
+export interface WikiAccessGrant {
+  path: string;
+  subject_id: string;
+  mode: "read" | "write";
+  expires_at: string | null;
+  granted_by: string;
+  updated_at: string;
+  inherited?: boolean;
+}
+
+export interface WikiAccessOverview {
+  ok: true;
+  path: string;
+  grantable: boolean;
+  reason?: string;
+  inherited_policy: string;
+  grants: WikiAccessGrant[];
+  pending_requests: Record<string, unknown>[];
+}
+
 export const mkdirBody = (path: string) => ({ path });
 export const mvBody = (from: string, to: string) => ({ from, to });
 export const rmBody = (path: string) => ({ path });
@@ -330,6 +350,12 @@ export const wiki = {
   search: (query: string, type?: string, path?: string) => get<Parameters<typeof normalizeSearch>[0]>(searchQuery(query, type, path)).then(normalizeSearch),
   history: (path: string, from?: string, to?: string) =>
     get<Parameters<typeof normalizeHistory>[0]>(historyQuery(path, from, to)).then(normalizeHistory),
+  /** AOS-816: Owner-only wiki path access policy, active grants, and pending requests. */
+  access: (path: string) => get<WikiAccessOverview>(`/api/wiki/access?path=${encodeURIComponent(path)}`),
+  setGrant: (body: { path: string; subject_id: string; mode: "read" | "write"; duration?: "ongoing" | "7d" | "30d" }) =>
+    send<{ ok: true; grant: WikiAccessGrant }>("POST", "/api/wiki/access/grants", body),
+  revokeGrant: (body: { path: string; subject_id: string }) =>
+    send<{ ok: true; revoked: boolean }>("DELETE", "/api/wiki/access/grants", body),
   /** CAD-2018: the operator's deleted landings. A board without the route
    *  answers 404, which the screen reports as "not available here". */
   trash: (cursor?: string | null) =>
