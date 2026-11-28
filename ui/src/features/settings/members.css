@@ -247,6 +247,134 @@
   margin-inline-start: auto;
 }
 
+.members-projects-section {
+  display: grid;
+  gap: 0.625rem;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  background: var(--color-ink-800);
+  min-inline-size: 0;
+}
+
+.members-projects-head {
+  display: grid;
+  gap: 0.2rem;
+  min-inline-size: 0;
+}
+
+.members-project-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(8.25rem, auto) auto;
+  gap: 0.45rem;
+  align-items: center;
+  min-inline-size: 0;
+}
+
+.members-project-list {
+  display: grid;
+  gap: 0.375rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-inline-size: 0;
+}
+
+.members-project-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.375rem 0.55rem;
+  border-radius: 0.375rem;
+  background: var(--color-ink-700);
+  min-inline-size: 0;
+}
+
+.members-project-row-static {
+  padding-block: 0.45rem;
+}
+
+.members-project-name {
+  min-inline-size: 0;
+  color: var(--color-ink-100);
+  font-size: var(--text-label);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.members-project-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-shrink: 0;
+}
+
+.members-project-remove {
+  padding: 0.2rem 0.35rem;
+  border-radius: 0.25rem;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+
+.members-project-remove:hover {
+  color: var(--color-fail);
+}
+
+.members-project-remove:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+.members-project-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  margin-block-start: 0.3rem;
+  min-inline-size: 0;
+}
+
+.members-project-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-inline-size: 100%;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: var(--color-ink-800);
+  color: var(--color-ink-200);
+  font-size: var(--text-micro);
+  line-height: 1.4;
+}
+
+.settings-row:hover .members-project-chip {
+  background: var(--color-ink-700);
+}
+
+.members-project-chip-name {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.members-project-chip-role {
+  flex-shrink: 0;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+
+.members-project-chip-more {
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+
+.members-drawer-projects {
+  display: grid;
+  gap: 0.45rem;
+  min-inline-size: 0;
+}
+
 @media (max-width: 640px) {
   .members-page {
     padding-inline: 1rem;
@@ -262,5 +390,18 @@
 
   .members-confirm-actions {
     margin-inline-start: 0;
+  }
+
+  .members-project-picker {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .members-project-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .members-project-controls {
+    justify-content: space-between;
   }
 }

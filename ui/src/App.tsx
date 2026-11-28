@@ -2026,7 +2026,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 never does — so a direct link here mounts nothing, and
                 `settingsRedirect` has already moved the URL off. */}
             {route.section === "members" && meta?.settings_sections?.includes("members") && (
-              <Members viewer={viewer} />
+              <Members
+                viewer={viewer}
+                projects={projects
+                  .filter((p) => !p.archived)
+                  .map((p) => ({ key: p.key, name: p.name?.trim() || p.key }))}
+              />
             )}
             {/* CAD-2286: hosted only, offered while the board names `documents`
                 in `settings_sections`. The page reads the shared probe and
