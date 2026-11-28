@@ -191,7 +191,7 @@ export default function AddToChannelDialog({
   return (
     <dialog
       ref={ref}
-      className="threads-context-sheet threads-add-dialog"
+      className="threads-add-dialog"
       aria-labelledby={titleId}
       onCancel={(event) => {
         event.preventDefault();
@@ -201,7 +201,7 @@ export default function AddToChannelDialog({
         if (event.target === ref.current && !pending) onClose();
       }}
     >
-      <div className="threads-context-sheet-head">
+      <div className="threads-add-dialog-head">
         <h2 id={titleId}>{t("Add to channel")}</h2>
         <Button
           variant="ghost"

@@ -402,6 +402,10 @@ interface PendingChannelPost {
 
 const GROUP_WINDOW_MS = 3 * 60 * 1000;
 
+function toEpochMs(ts: number): number {
+  return ts < 1e12 ? ts * 1000 : ts;
+}
+
 function senderIdentityKey(sender: HumanPost["sender"]): string {
   if (sender.id) return `${sender.kind ?? "unknown"}:${sender.id}`;
   return `${sender.kind ?? "unknown"}:${sender.label.toLowerCase()}`;
@@ -426,7 +430,11 @@ function MentionOutcomes({
         const alias = cleanAgentAlias(o.handle).toLowerCase();
         if (activeAgentAliases?.has(alias)) return false;
         const answeredAt = latestAgentPostAt?.get(alias);
-        if (answeredAt !== undefined && postCreated !== undefined && answeredAt > postCreated) {
+        if (
+          answeredAt !== undefined &&
+          postCreated !== undefined &&
+          toEpochMs(answeredAt) > toEpochMs(postCreated)
+        ) {
           return false;
         }
         return true;
@@ -1007,7 +1015,7 @@ export function HumanRoomTimeline({
       const alias = cleanAgentAlias(p.alias);
       const answeredAt = latestAgentPostAt.get(alias.toLowerCase());
       const startedAt = p.started_at ?? prev?.startedAt ?? Date.now();
-      if (answeredAt !== undefined && answeredAt > startedAt) continue;
+      if (answeredAt !== undefined && toEpochMs(answeredAt) > toEpochMs(startedAt)) continue;
       const look =
         prev?.look ??
         agentIdentity.byId.get(p.agent_id)?.look ??
@@ -1025,7 +1033,7 @@ export function HumanRoomTimeline({
     }
     return [...merged.values()].filter((entry) => {
       const answeredAt = latestAgentPostAt.get(entry.alias.toLowerCase());
-      return answeredAt === undefined || answeredAt <= entry.startedAt;
+      return answeredAt === undefined || toEpochMs(answeredAt) <= toEpochMs(entry.startedAt);
     });
   }, [currentPage?.active_agents, livePreviews, agentIdentity, latestAgentPostAt]);
 
@@ -1053,6 +1061,13 @@ export function HumanRoomTimeline({
       clearChannelRoomPreviews(id);
     }
   }, [id, currentPage, livePreviews.length, liveAgents.length]);
+
+  useEffect(() => {
+    const root = messagesRef.current;
+    if (!root || !pinnedToTailRef.current) return;
+    if (pendingPosts.length === 0 && liveAgents.length === 0) return;
+    root.scrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+  }, [pendingPosts, liveAgents]);
 
   const sendPendingPost = useCallback(
     (entry: PendingChannelPost) => {
@@ -1234,8 +1249,8 @@ export function HumanRoomTimeline({
             !p.silent &&
             !prevItem.post.silent &&
             senderIdentityKey(prevItem.post.sender) === senderIdentityKey(p.sender) &&
-            p.created - prevItem.post.created >= 0 &&
-            p.created - prevItem.post.created <= GROUP_WINDOW_MS;
+            toEpochMs(p.created) - toEpochMs(prevItem.post.created) >= 0 &&
+            toEpochMs(p.created) - toEpochMs(prevItem.post.created) <= GROUP_WINDOW_MS;
           return (
             <div key={item.key}>
               {showUnreadDivider && (
@@ -1344,7 +1359,7 @@ export function HumanRoomTimeline({
           </div>
         ))}
         {liveAgents.map((agent) => {
-          const secs = Math.max(0, Math.floor((nowMs - agent.startedAt) / 1000));
+          const secs = Math.max(0, Math.floor((nowMs - toEpochMs(agent.startedAt)) / 1000));
           const hasPreview = typeof agent.text === "string" && agent.text.length > 0;
           const healed = hasPreview ? healStreamingMarkdown(agent.text!) : "";
           return (
@@ -1440,7 +1455,7 @@ export function HumanRoomTimeline({
                 body,
                 silent: isSilent,
                 attachmentIds,
-                created: Date.now(),
+                created: Math.floor(Date.now() / 1000),
                 status: "sending",
               };
               setSilentNote(false);

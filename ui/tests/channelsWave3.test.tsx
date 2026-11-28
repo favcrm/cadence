@@ -206,7 +206,7 @@ async function main(): Promise<void> {
         read_cursor: "csc1_post1",
         sender: { id: "h-alice", label: "Alice Chen", kind: "human" },
         body: "First teammate message",
-        created: 1_700_000_000_000,
+        created: 1_700_000_000,
         silent: false,
         outcomes: [],
       },
@@ -215,7 +215,7 @@ async function main(): Promise<void> {
         read_cursor: "csc1_post2",
         sender: { id: "h-alice", label: "Alice Chen", kind: "human" },
         body: "Second consecutive message within 3m",
-        created: 1_700_000_030_000,
+        created: 1_700_000_030,
         silent: false,
         outcomes: [{ kind: "queued", handle: "@bookkeeper", label: "bookkeeper" }],
       },
@@ -224,7 +224,7 @@ async function main(): Promise<void> {
         read_cursor: "csc1_post3",
         sender: { id: "uid-bookkeeper", label: "bookkeeper", kind: "agent" },
         body: "Ledger looks clean!",
-        created: 1_700_000_060_000,
+        created: 1_700_000_060,
         silent: false,
         outcomes: [],
       },
@@ -233,7 +233,7 @@ async function main(): Promise<void> {
         read_cursor: "csc1_post4",
         sender: { id: "h-me", label: "Patrick", kind: "human" },
         body: "@bookkeeper double check Q4",
-        created: 1_700_000_090_000,
+        created: 1_700_000_090,
         silent: false,
         outcomes: [{ kind: "queued", handle: "@bookkeeper", label: "bookkeeper" }],
       },
@@ -289,7 +289,7 @@ async function main(): Promise<void> {
           read_cursor: "csc1_post5",
           sender: { id: "h-me", label: "Patrick", kind: "human" },
           body: parsed.body,
-          created: 1_700_000_120_000,
+          created: 1_700_000_120,
           silent: false,
           outcomes: [],
         };
@@ -370,6 +370,8 @@ async function main(): Promise<void> {
     const firstClientId = postedPayloads[0]!.client_id;
     const failedBubble = host.querySelector(`.threads-msg-pending.is-failed[data-client-id="${firstClientId}"]`);
     assert(failedBubble !== null && (failedBubble.textContent ?? "").includes("Retry"), "marks failed optimistic post with inline Retry");
+    const pendingTime = failedBubble.querySelector(".threads-wa-at")?.textContent ?? "";
+    assert(pendingTime.length > 0 && !pendingTime.startsWith("+0"), `renders formatted epoch-seconds pending timestamp, got "${pendingTime}"`);
 
     postMode = "succeed";
     const retryBtn = failedBubble.querySelector<HTMLButtonElement>(".threads-pending-btn.is-retry");

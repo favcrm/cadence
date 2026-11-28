@@ -1460,31 +1460,31 @@
 }
 
 :root[data-theme="light"] .threads-wa-bubble.is-me {
-  background: color-mix(in srgb, var(--color-accent) 14%, #ffffff);
-  border-color: color-mix(in srgb, var(--color-accent) 26%, transparent);
+  background: color-mix(in srgb, var(--color-accent) 10%, #ffffff);
+  border-color: color-mix(in srgb, var(--color-ink-100) 16%, transparent);
 }
 :root[data-theme="light"] .threads-wa-bubble.is-them {
-  background: #ffffff;
-  border-color: color-mix(in srgb, var(--color-ink-900) 11%, transparent);
+  background: #f8fafc;
+  border-color: color-mix(in srgb, var(--color-ink-100) 14%, transparent);
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
 }
 :root[data-theme="light"] .threads-wa-bubble.is-agent {
   background: color-mix(in srgb, var(--color-info) 6%, #ffffff);
-  border-color: color-mix(in srgb, var(--color-info) 22%, transparent);
+  border-color: color-mix(in srgb, var(--color-info) 24%, transparent);
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) .threads-wa-bubble.is-me {
-    background: color-mix(in srgb, var(--color-accent) 14%, #ffffff);
-    border-color: color-mix(in srgb, var(--color-accent) 26%, transparent);
+    background: color-mix(in srgb, var(--color-accent) 10%, #ffffff);
+    border-color: color-mix(in srgb, var(--color-ink-100) 16%, transparent);
   }
   :root:not([data-theme="dark"]) .threads-wa-bubble.is-them {
-    background: #ffffff;
-    border-color: color-mix(in srgb, var(--color-ink-900) 11%, transparent);
+    background: #f8fafc;
+    border-color: color-mix(in srgb, var(--color-ink-100) 14%, transparent);
     box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
   }
   :root:not([data-theme="dark"]) .threads-wa-bubble.is-agent {
     background: color-mix(in srgb, var(--color-info) 6%, #ffffff);
-    border-color: color-mix(in srgb, var(--color-info) 22%, transparent);
+    border-color: color-mix(in srgb, var(--color-info) 24%, transparent);
   }
 }
 
@@ -1613,12 +1613,29 @@
 .threads-add-dialog {
   width: min(29rem, calc(100vw - 2rem));
   max-height: min(36rem, calc(100vh - 2.5rem));
+  margin: auto;
   padding: 0;
   border-radius: 0.75rem;
   border: 1px solid var(--color-ink-700);
   background: var(--color-ink-900);
   color: var(--color-ink-100);
   box-shadow: 0 20px 44px rgba(0, 0, 0, 0.38);
+}
+.threads-add-dialog[open] {
+  display: block;
+}
+.threads-add-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.85rem 1rem 0.65rem;
+}
+.threads-add-dialog-head h2 {
+  margin: 0;
+  font-size: var(--text-secondary);
+  font-weight: 600;
+  color: var(--color-ink-100);
 }
 .threads-add-dialog::backdrop {
   background: rgba(8, 10, 14, 0.55);
