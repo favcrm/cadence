@@ -205,6 +205,7 @@ struct Fx {
     _dir: tempfile::TempDir,
     state: std::path::PathBuf,
     shared: Arc<Shared>,
+    install_id: String,
     asset_id: String,
     revision: i64,
     sha256: String,
@@ -388,6 +389,7 @@ impl Fx {
         });
         let mut fx = Self {
             state,
+            install_id: String::new(),
             asset_id: String::new(),
             revision: 0,
             sha256: format!("sha256:{:x}", Sha256::digest(&original)),
@@ -420,6 +422,7 @@ impl Fx {
             )
             .expect("install");
         let install = installed["install_id"].as_str().unwrap().to_string();
+        self.install_id = install.clone();
         self.op(
             "app_local_install_approve",
             json!({"install_id": install, "digest": installed["digest"]}),
@@ -954,6 +957,128 @@ fn cad1482_unattached_library_image_inspect_refuses_without_bytes_or_provider_su
         gets,
         "HTTP inspect fetched a provider artifact"
     );
+}
+
+#[test]
+fn cad2893_legacy_host_failed_retention_is_terminal_and_send_is_unlocked() {
+    let fx = Fx::boot();
+    let (token, key) = fx.session();
+    let created = fx
+        .op(
+            "app_run_create",
+            json!({"install_id": fx.install_id, "workflow": "create-image",
+                "inputs": {"subject": "Harbour mark",
+                    "source": "A red lighthouse marks the harbour",
+                    "image_prompt": "Use an editorial palette"},
+                "request_id": "run-2893",
+                "token": token, "key": key, "origin": "loopback"}),
+        )
+        .unwrap_or_else(|_| panic!("create run failed"));
+    let run = created["id"].as_str().unwrap().to_string();
+    fx.op(
+        "app_run_approve",
+        json!({"run_id": run, "digest": created["snapshot_digest"]}),
+    )
+    .unwrap_or_else(|_| panic!("approve run failed"));
+
+    let posts_before = fx.provider_posts();
+    let pm_dir = fx._dir.path().join("pm");
+    let db_path = fx.state.join("cadence.sqlite3");
+    let seen = fx.seen.clone();
+    let provider_hook = std::rc::Rc::new(std::cell::Cell::new(false));
+    let unlocked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let record_hook = std::rc::Rc::new(std::cell::Cell::new(false));
+    let provider_hook_in = provider_hook.clone();
+    let unlocked_in = unlocked.clone();
+    let record_hook_in = record_hook.clone();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        if point == "app-host-provider-call" {
+            provider_hook_in.set(true);
+            unlocked_in.set(
+                crate::issue::Pm::at(&pm_dir)
+                    .unwrap()
+                    .try_lock()
+                    .unwrap()
+                    .is_some(),
+            );
+        } else if point == "app-host-before-record" {
+            assert_eq!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.method == "POST")
+                    .count(),
+                posts_before + 1
+            );
+            rusqlite::Connection::open(&db_path)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER cad2893_retention_fault BEFORE INSERT ON app_capability_results
+                 BEGIN SELECT RAISE(ABORT, 'fixture retention failure'); END;",
+                )
+                .unwrap();
+            record_hook_in.set(true);
+        }
+    })));
+    let result = scoped(Asserted::Operator, || {
+        fx.shared.dispatch(
+            "app_run_dispatch",
+            &json!({"run_id": run}),
+            std::process::id(),
+        )
+    });
+    crate::issue::lockseam::set_hook(None);
+    assert!(result.is_err(), "retention fault must fail dispatch");
+    assert!(provider_hook.get(), "provider-call hook was not reached");
+    assert!(unlocked.get(), "PM lock must be free at the provider call");
+    assert!(
+        record_hook.get(),
+        "post-provider retention fault was not installed"
+    );
+    assert_eq!(fx.provider_posts(), posts_before + 1);
+
+    let db = rusqlite::Connection::open(fx.state.join("cadence.sqlite3")).unwrap();
+    db.execute_batch("DROP TRIGGER cad2893_retention_fault")
+        .unwrap();
+    let claims: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM app_capability_claims WHERE run_id=?1",
+            [&run],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let receipts: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM app_capability_results WHERE run_id=?1",
+            [&run],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claims, 1, "provider claim must remain durable");
+    assert_eq!(receipts, 0, "failed retention must not leave a receipt");
+    let shown = fx
+        .op("app_run_show", json!({"run_id": run}))
+        .unwrap_or_else(|_| panic!("show run failed"));
+    assert_eq!(shown["state"], "failed");
+    assert_eq!(shown["failure"]["kind"], "uncertain");
+    assert_eq!(shown["steps"][0]["state"], "failed");
+    let _ = scoped(Asserted::Operator, || {
+        fx.shared.dispatch(
+            "app_run_dispatch",
+            &json!({"run_id": run}),
+            std::process::id(),
+        )
+    });
+    assert_eq!(
+        fx.provider_posts(),
+        posts_before + 1,
+        "terminal run must not submit again"
+    );
+    let after = fx
+        .op("app_run_show", json!({"run_id": run}))
+        .unwrap_or_else(|_| panic!("show terminal run failed"));
+    assert_eq!(after["state"], "failed");
+    assert_eq!(after["failure"]["kind"], "uncertain");
 }
 
 #[path = "cad1962_media_import_acceptance.rs"]

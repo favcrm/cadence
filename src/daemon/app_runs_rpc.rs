@@ -1534,366 +1534,335 @@ impl Shared {
         let pm = self.pm_at(&self.pm_dir()?)?;
         // CAD-1258: per legacy slot, lock 1 verifies and claims, the provider
         // call runs with NO PM lock, and lock 2 re-verifies the same authority
-        // before the result is retained. Mixed runs release only at the
-        // necessary account boundaries.
-        let execute_legacy = |legacy_slots: &[String], finish: bool| -> Result<()> {
-            type Files = std::collections::BTreeMap<String, String>;
-            type Held<'a> = Option<(&'a Value, &'a Files)>;
-            let snap = |f: &mut dyn FnMut(&Value, &Files, Held<'_>) -> Result<()>| -> Result<()> {
+        // before the result is retained.
+        type Files = std::collections::BTreeMap<String, String>;
+        type Held<'a> = Option<(&'a Value, &'a Files)>;
+        let snap = |f: &mut dyn FnMut(&Value, &Files, Held<'_>) -> Result<()>| -> Result<()> {
+            if let Some(original) = &reference_original {
+                workspace::with_runtime_snapshot_pair(
+                    &pm,
+                    install,
+                    original.install_id(),
+                    |(bundle, files), producer| f(bundle, files, Some(producer)),
+                )
+            } else {
+                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                    f(bundle, files, None)
+                })
+            }
+        };
+        // Called with the custody and release guards held.
+        let current =
+            |bundle: &Value, files: &Files, producer: Option<(&Value, &Files)>| -> Result<()> {
                 if let Some(original) = &reference_original {
-                    workspace::with_runtime_snapshot_pair(
-                        &pm,
-                        install,
+                    let (producer_bundle, producer_files) = producer.ok_or_else(|| {
+                        Error::rejected("reference producer snapshot is unavailable")
+                    })?;
+                    self.app_binding_receipt_library_source(
                         original.install_id(),
-                        |(bundle, files), producer| f(bundle, files, Some(producer)),
-                    )
-                } else {
-                    workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-                        f(bundle, files, None)
-                    })
-                }
-            };
-            // Called with the custody and release guards held.
-            let current =
-                |bundle: &Value, files: &Files, producer: Option<(&Value, &Files)>| -> Result<()> {
-                    if let Some(original) = &reference_original {
-                        let (producer_bundle, producer_files) = producer.ok_or_else(|| {
-                            Error::rejected("reference producer snapshot is unavailable")
-                        })?;
-                        self.app_binding_receipt_library_source(
-                            original.install_id(),
-                            original.context_id(),
-                            original.slot(),
-                            original.proof(),
-                            producer_bundle,
-                            producer_files,
-                        )?;
-                        if self.store.app_capability_status(
-                            original.install_id(),
-                            required_str(producer_bundle, "digest")?,
-                        )?["state"]
-                            != "approved"
-                        {
-                            return Err(Error::rejected(
-                                "reference producing installation is not approved",
-                            ));
-                        }
-                    }
-                    self.app_run_binding_current(run, bundle, files)
-                };
-            for slot in legacy_slots {
-                let input = json!({});
-                let input_digest = app_runs::material_digest(&input);
-                let request = format!("host-{run_id}-{slot}");
-                let call_id = format!(
-                    "app-call-{}",
-                    uuid::Uuid::new_v5(
-                        &uuid::Uuid::NAMESPACE_OID,
-                        format!("{run_id}:{slot}").as_bytes(),
-                    )
-                    .simple()
-                );
-                let mut prepared = None;
-                snap(&mut |bundle, files, producer| {
-                    let _custody = self.custody_operation()?;
-                    let _release = self
-                        .app_release_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    current(bundle, files, producer)?;
-                    let proof = self
-                        .app_binding_live(install, run["context_id"].as_str(), slot, bundle, files)?
-                        .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
-                    let quote = quotes
-                        .get(slot)
-                        .ok_or_else(|| Error::rejected("run capability quote is absent"))?;
-                    // CAD-1141: price drift is accepted; the fresh quote is
-                    // the call's `max_charge_minor` ceiling (authority below).
-                    self.recheck_app_capability_quote(&proof, quote)?;
-                    let config = &proof.config;
-                    let provider = required_str(config, "provider")?;
-                    let tool = required_str(&config["mapping"], "tool")?;
-                    let effect = required_str(&config["mapping"], "effect")?;
-                    let adapter = self
-                        .platforms
-                        .get(provider)
-                        .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
-                    if !matches!(effect, "read" | "draft")
-                        || classify_call(
-                            adapter.table(),
-                            adapter.reported_manifest_version().as_deref(),
-                            tool,
-                        ) != if effect == "read" {
-                            Effect::Read
-                        } else {
-                            Effect::Draft
-                        }
+                        original.context_id(),
+                        original.slot(),
+                        original.proof(),
+                        producer_bundle,
+                        producer_files,
+                    )?;
+                    if self.store.app_capability_status(
+                        original.install_id(),
+                        required_str(producer_bundle, "digest")?,
+                    )?["state"]
+                        != "approved"
                     {
                         return Err(Error::rejected(
-                            "bound app capability is not a current read/draft action",
+                            "reference producing installation is not approved",
                         ));
                     }
-                    let mut authority = json!({
-                        "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
-                        "install_id":install,"context_id":run["context_id"],
-                        "step_id":step_id,"slot":slot,"binding":proof,
-                        "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
-                        "quote":quote,
-                        "call_id":call_id,
+                }
+                self.app_run_binding_current(run, bundle, files)
+            };
+        let execute_legacy_slot = |slot: &str| -> Result<()> {
+            let input = json!({});
+            let input_digest = app_runs::material_digest(&input);
+            let request = format!("host-{run_id}-{slot}");
+            let call_id = format!(
+                "app-call-{}",
+                uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID,
+                    format!("{run_id}:{slot}").as_bytes(),
+                )
+                .simple()
+            );
+            let mut prepared = None;
+            snap(&mut |bundle, files, producer| {
+                let _custody = self.custody_operation()?;
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                current(bundle, files, producer)?;
+                let proof = self
+                    .app_binding_live(install, run["context_id"].as_str(), slot, bundle, files)?
+                    .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
+                let quote = quotes
+                    .get(slot)
+                    .ok_or_else(|| Error::rejected("run capability quote is absent"))?;
+                // CAD-1141: price drift is accepted; the fresh quote is
+                // the call's `max_charge_minor` ceiling (authority below).
+                self.recheck_app_capability_quote(&proof, quote)?;
+                let config = &proof.config;
+                let provider = required_str(config, "provider")?;
+                let tool = required_str(&config["mapping"], "tool")?;
+                let effect = required_str(&config["mapping"], "effect")?;
+                let adapter = self
+                    .platforms
+                    .get(provider)
+                    .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
+                if !matches!(effect, "read" | "draft")
+                    || classify_call(
+                        adapter.table(),
+                        adapter.reported_manifest_version().as_deref(),
+                        tool,
+                    ) != if effect == "read" {
+                        Effect::Read
+                    } else {
+                        Effect::Draft
+                    }
+                {
+                    return Err(Error::rejected(
+                        "bound app capability is not a current read/draft action",
+                    ));
+                }
+                let mut authority = json!({
+                    "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
+                    "install_id":install,"context_id":run["context_id"],
+                    "step_id":step_id,"slot":slot,"binding":proof,
+                    "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
+                    "quote":quote,
+                    "call_id":call_id,
+                });
+                if effect == "draft"
+                    && config["mapping"]["capability"] == "media.generate"
+                    && library_reference_inputs_value(&run["snapshot"]["inputs"])
+                {
+                    let asset_id = run["snapshot"]["inputs"]["library_asset_id"]
+                        .as_str()
+                        .unwrap_or("");
+                    let revision = run["snapshot"]["inputs"]["library_revision"]
+                        .as_str()
+                        .and_then(|raw| raw.parse::<i64>().ok())
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| Error::rejected("library image revision is not pinned"))?;
+                    let sha256 = run["snapshot"]["inputs"]["library_sha256"]
+                        .as_str()
+                        .ok_or_else(|| Error::rejected("library image digest is not pinned"))?;
+                    // The paired snapshot and these held custody/release guards
+                    // prove the producer as well as the consuming run.
+                    let original = self.store.app_media_pin(asset_id, revision, sha256)?;
+                    if original.sha256() != sha256
+                        || reference_original
+                            .as_ref()
+                            .is_none_or(|expected| original.reference() != expected.reference())
+                    {
+                        return Err(Error::rejected(
+                            "producer reference changed before the reference edit",
+                        ));
+                    }
+                    authority["reference_edit"] = json!({
+                        "asset_id": asset_id,
+                        "sha256": sha256,
+                        "ref": original.reference(),
                     });
-                    if effect == "draft"
-                        && config["mapping"]["capability"] == "media.generate"
-                        && library_reference_inputs_value(&run["snapshot"]["inputs"])
+                    authority["frozen_prompt"] = run["snapshot"]["inputs"]["instructions"].clone();
+                }
+                if self
+                    .store
+                    .app_capability_result_for_slot(run_id, slot)?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                let credential = self.app_capability_credential(config)?;
+                let newly_claimed = self.store.app_capability_claim(
+                    crate::store::app_capabilities::AppCapabilityClaim {
+                        run: run_id,
+                        step: &step_id,
+                        message: "",
+                        turn: "",
+                        slot,
+                        request: &request,
+                        binding_digest: &proof.digest,
+                        input_digest: &input_digest,
+                        call_id: &call_id,
+                    },
+                )?;
+                if !newly_claimed {
+                    let reason = "A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made.";
+                    self.store
+                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)?;
+                    return Err(Error::unknown(reason));
+                }
+                // CAD-1374: re-prove the sealed approver after the claim shows
+                // a NEW call and before any provider bytes leave. A revoked or
+                // demoted approver refuses this step; the claim stays for an
+                // honest, non-retried outcome.
+                if let Some(sealed) = run["approval"]["human"]
+                    .as_object()
+                    .map(|_| &run["approval"]["human"])
+                {
+                    self.fresh_run_human(sealed)?;
+                }
+                prepared = Some((std::sync::Arc::clone(adapter), credential, authority, proof));
+                Ok(())
+            })?;
+            let Some((adapter, credential, authority, proof)) = prepared else {
+                return Ok(());
+            };
+            crate::issue::lockseam::outside_lock("app-host-provider-call");
+            let output = match adapter.execute_app_capability_outcome(
+                &credential,
+                &authority,
+                &input,
+                &call_id,
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    let message = if crate::platform::refuse_leak(
+                        "app capability failure",
+                        error.reason(),
+                        &credential,
+                    )
+                    .is_ok()
                     {
-                        let asset_id = run["snapshot"]["inputs"]["library_asset_id"]
-                            .as_str()
-                            .unwrap_or("");
-                        let revision = run["snapshot"]["inputs"]["library_revision"]
-                            .as_str()
-                            .and_then(|raw| raw.parse::<i64>().ok())
-                            .filter(|n| *n >= 1)
-                            .ok_or_else(|| {
-                                Error::rejected("library image revision is not pinned")
-                            })?;
-                        let sha256 = run["snapshot"]["inputs"]["library_sha256"]
-                            .as_str()
-                            .ok_or_else(|| Error::rejected("library image digest is not pinned"))?;
-                        // The paired snapshot and these held custody/release guards
-                        // prove the producer as well as the consuming run.
-                        let original = self.store.app_media_pin(asset_id, revision, sha256)?;
-                        if original.sha256() != sha256
-                            || reference_original
-                                .as_ref()
-                                .is_none_or(|expected| original.reference() != expected.reference())
-                        {
-                            return Err(Error::rejected(
-                                "producer reference changed before the reference edit",
-                            ));
-                        }
-                        authority["reference_edit"] = json!({
-                            "asset_id": asset_id,
-                            "sha256": sha256,
-                            "ref": original.reference(),
-                        });
-                        authority["frozen_prompt"] =
-                            run["snapshot"]["inputs"]["instructions"].clone();
-                    }
-                    if self
-                        .store
-                        .app_capability_result_for_slot(run_id, slot)?
-                        .is_some()
-                    {
-                        return Ok(());
-                    }
-                    let credential = self.app_capability_credential(config)?;
-                    let newly_claimed = self.store.app_capability_claim(
-                        crate::store::app_capabilities::AppCapabilityClaim {
-                            run: run_id,
-                            step: &step_id,
-                            message: "",
-                            turn: "",
-                            slot,
-                            request: &request,
-                            binding_digest: &proof.digest,
-                            input_digest: &input_digest,
-                            call_id: &call_id,
-                        },
+                        error.reason().chars().take(250).collect::<String>()
+                    } else {
+                        "Provider failure details were withheld because they matched credential custody.".into()
+                    };
+                    self.store.app_run_host_step_failed(
+                        run_id,
+                        &step_id,
+                        error.kind(),
+                        &message,
                     )?;
-                    if !newly_claimed {
-                        let reason = "A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made.";
-                        self.store.app_run_host_step_failed(
+                    return Err(super::app_capabilities_rpc::run_capability_error(
+                        &error, message,
+                    ));
+                }
+            };
+            // CAD-1258 interleaving point: a revoke or upgrade may land here.
+            crate::issue::lockseam::outside_lock("app-host-before-record");
+            let failed = std::cell::Cell::new(false);
+            let uncertain = |reason: &str| -> Error {
+                failed.set(true);
+                // The normal record reads the run's snapshot; if that read
+                // is what failed, fall back to raw columns. If both
+                // writes fail, say so rather than claim a record.
+                let recorded = self
+                    .store
+                    .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)
+                    .map(|_| ())
+                    .or_else(|_| {
+                        self.store.app_run_host_step_failed_unreadable(
                             run_id,
                             &step_id,
                             "uncertain",
                             reason,
-                        )?;
-                        return Err(Error::unknown(reason));
-                    }
-                    // CAD-1374: re-prove the sealed approver after the claim shows
-                    // a NEW call and before any provider bytes leave. A revoked or
-                    // demoted approver refuses this step; the claim stays for an
-                    // honest, non-retried outcome.
-                    if let Some(sealed) = run["approval"]["human"]
-                        .as_object()
-                        .map(|_| &run["approval"]["human"])
-                    {
-                        self.fresh_run_human(sealed)?;
-                    }
-                    prepared = Some((std::sync::Arc::clone(adapter), credential, authority, proof));
-                    Ok(())
-                })?;
-                let Some((adapter, credential, authority, proof)) = prepared else {
-                    continue;
-                };
-                crate::issue::lockseam::outside_lock("app-host-provider-call");
-                let output = match adapter.execute_app_capability_outcome(
+                        )
+                    });
+                match recorded {
+                    Ok(()) => Error::unknown(reason),
+                    Err(error) => Error::unknown(format!(
+                        "{reason} (the failure could not be recorded: {})",
+                        super::app_effects_rpc::lock2_cause(&error, &[credential.as_slice()])
+                    )),
+                }
+            };
+            let recorded = snap(&mut |bundle, files, producer| {
+                let _custody = self.custody_operation()?;
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let live = self.store.app_run_show(run_id)?;
+                let unchanged = current(bundle, files, producer).is_ok()
+                    && self
+                        .app_binding_live(install, run["context_id"].as_str(), slot, bundle, files)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|now| now.digest == proof.digest)
+                    && live["snapshot_digest"] == run["snapshot_digest"]
+                    && live["approval"]["human"] == run["approval"]["human"]
+                    && self
+                        .store
+                        .app_capability_status(install, required_str(bundle, "digest")?)
+                        .is_ok_and(|status| {
+                            status["state"] == "approved" && status["epoch"] == live["epoch"]
+                        });
+                if !unchanged {
+                    return Err(uncertain(
+                        "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
+                    ));
+                }
+                if crate::platform::refuse_leak(
+                    "app capability result",
+                    &output.result.to_string(),
                     &credential,
-                    &authority,
-                    &input,
-                    &call_id,
-                ) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        let message = if crate::platform::refuse_leak(
-                            "app capability failure",
-                            error.reason(),
+                )
+                .is_err()
+                    || output.asset.as_ref().is_some_and(|asset| {
+                        crate::platform::refuse_leak(
+                            "app capability asset",
+                            &String::from_utf8_lossy(&asset.bytes),
                             &credential,
                         )
-                        .is_ok()
-                        {
-                            error.reason().chars().take(250).collect::<String>()
-                        } else {
-                            "Provider failure details were withheld because they matched credential custody.".into()
-                        };
-                        self.store.app_run_host_step_failed(
-                            run_id,
-                            &step_id,
-                            error.kind(),
-                            &message,
-                        )?;
-                        return Err(super::app_capabilities_rpc::run_capability_error(
-                            &error, message,
-                        ));
-                    }
-                };
-                // CAD-1258 interleaving point: a revoke or upgrade may land here.
-                crate::issue::lockseam::outside_lock("app-host-before-record");
-                let failed = std::cell::Cell::new(false);
-                let uncertain = |reason: &str| -> Error {
-                    failed.set(true);
-                    // The normal record reads the run's snapshot; if that read
-                    // is what failed, fall back to raw columns. If both
-                    // writes fail, say so rather than claim a record.
-                    let recorded = self
-                        .store
-                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)
-                        .map(|_| ())
-                        .or_else(|_| {
-                            self.store.app_run_host_step_failed_unreadable(
-                                run_id,
-                                &step_id,
-                                "uncertain",
-                                reason,
-                            )
-                        });
-                    match recorded {
-                        Ok(()) => Error::unknown(reason),
-                        Err(error) => Error::unknown(format!(
-                            "{reason} (the failure could not be recorded: {})",
-                            super::app_effects_rpc::lock2_cause(&error, &[credential.as_slice()])
-                        )),
-                    }
-                };
-                let recorded = snap(&mut |bundle, files, producer| {
-                    let _custody = self.custody_operation()?;
-                    let _release = self
-                        .app_release_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let live = self.store.app_run_show(run_id)?;
-                    let unchanged = current(bundle, files, producer).is_ok()
-                        && self
-                            .app_binding_live(
-                                install,
-                                run["context_id"].as_str(),
-                                slot,
-                                bundle,
-                                files,
-                            )
-                            .ok()
-                            .flatten()
-                            .is_some_and(|now| now.digest == proof.digest)
-                        && live["snapshot_digest"] == run["snapshot_digest"]
-                        && live["approval"]["human"] == run["approval"]["human"]
-                        && self
-                            .store
-                            .app_capability_status(install, required_str(bundle, "digest")?)
-                            .is_ok_and(|status| {
-                                status["state"] == "approved" && status["epoch"] == live["epoch"]
-                            });
-                    if !unchanged {
-                        return Err(uncertain(
-                            "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
-                        ));
-                    }
-                    if crate::platform::refuse_leak(
-                        "app capability result",
-                        &output.result.to_string(),
-                        &credential,
-                    )
-                    .is_err()
-                        || output.asset.as_ref().is_some_and(|asset| {
-                            crate::platform::refuse_leak(
-                                "app capability asset",
-                                &String::from_utf8_lossy(&asset.bytes),
-                                &credential,
-                            )
-                            .is_err()
-                        })
-                    {
-                        return Err(uncertain(
-                            "Provider output could not be safely retained; the outcome is uncertain and no automatic retry was made.",
-                        ));
-                    }
-                    if let Err(error) = self.store.app_capability_record(
-                        crate::store::app_capabilities::AppCapabilityRecord {
-                            id: &call_id,
-                            run: run_id,
-                            step: &step_id,
-                            message: "",
-                            turn: "",
-                            slot,
-                            request: &request,
-                            binding_digest: &proof.digest,
-                            input_digest: &input_digest,
-                            result: &output.result,
-                            asset: output
-                                .asset
-                                .as_ref()
-                                .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
-                        },
-                    ) {
-                        let cause =
-                            super::app_effects_rpc::lock2_cause(&error, &[credential.as_slice()]);
-                        return Err(uncertain(&format!(
-                            "Provider returned a result that could not be durably retained ({cause}); the outcome is uncertain and no automatic retry was made."
-                        )));
-                    }
-                    Ok(())
-                });
-                // Any lock-2 error not already recorded (snapshot refused,
-                // PM busy, `app_run_show` or digest read failed) still
-                // leaves the step failed uncertain, naming its cause.
-                if let Err(error) = recorded {
-                    if failed.get() {
-                        return Err(error);
-                    }
-                    return Err(uncertain(&super::app_effects_rpc::lock2_failure_reason(
-                        &error,
-                        &[credential.as_slice()],
+                        .is_err()
+                    })
+                {
+                    return Err(uncertain(
+                        "Provider output could not be safely retained; the outcome is uncertain and no automatic retry was made.",
+                    ));
+                }
+                if let Err(error) = self.store.app_capability_record(
+                    crate::store::app_capabilities::AppCapabilityRecord {
+                        id: &call_id,
+                        run: run_id,
+                        step: &step_id,
+                        message: "",
+                        turn: "",
+                        slot,
+                        request: &request,
+                        binding_digest: &proof.digest,
+                        input_digest: &input_digest,
+                        result: &output.result,
+                        asset: output
+                            .asset
+                            .as_ref()
+                            .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
+                    },
+                ) {
+                    let cause =
+                        super::app_effects_rpc::lock2_cause(&error, &[credential.as_slice()]);
+                    return Err(uncertain(&format!(
+                        "Provider returned a result that could not be durably retained ({cause}); the outcome is uncertain and no automatic retry was made."
                     )));
                 }
-            }
-            if finish {
-                snap(&mut |bundle, files, producer| {
-                    let _custody = self.custody_operation()?;
-                    let _release = self
-                        .app_release_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    current(bundle, files, producer)?;
-                    self.store.app_run_host_step_succeeded(run_id, &step_id)?;
-                    Ok(())
-                })?;
+                Ok(())
+            });
+            // Any lock-2 error not already recorded (snapshot refused,
+            // PM busy, `app_run_show` or digest read failed) still
+            // leaves the step failed uncertain, naming its cause.
+            if let Err(error) = recorded {
+                if failed.get() {
+                    return Err(error);
+                }
+                return Err(uncertain(&super::app_effects_rpc::lock2_failure_reason(
+                    &error,
+                    &[credential.as_slice()],
+                )));
             }
             Ok(())
         };
-        if account_slots.is_empty() {
-            return execute_legacy(&slots, true);
-        }
         for slot in &slots {
             if !account_slots.contains(&slot) {
-                execute_legacy(std::slice::from_ref(slot), false)?;
+                execute_legacy_slot(slot)?;
                 continue;
             }
             let quote = quotes
@@ -1918,6 +1887,18 @@ impl Shared {
                         .app_run_host_step_failed(run_id, &step_id, kind, &error.to_string());
                 return Err(error);
             }
+        }
+        if account_slots.is_empty() {
+            return snap(&mut |bundle, files, producer| {
+                let _custody = self.custody_operation()?;
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                current(bundle, files, producer)?;
+                self.store.app_run_host_step_succeeded(run_id, &step_id)?;
+                Ok(())
+            });
         }
         if run["approval"]["human"].is_object() {
             self.fresh_run_human(&run["approval"]["human"])?;
