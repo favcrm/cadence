@@ -612,16 +612,6 @@ export default function ThreadsPage({
                 onBack={onBackToList}
                 onOpenContext={toggleContext}
                 detailsOpen={isDesktop ? desktopContextOpen : mobileContextOpen}
-                onInvite={() => {
-                  if (isDesktop) {
-                    setDesktopContextOpen(true);
-                    window.requestAnimationFrame(() => {
-                      document.querySelector<HTMLButtonElement>(".threads-context [data-invite-select] button")?.focus();
-                    });
-                  } else {
-                    setMobileContextOpen(true);
-                  }
-                }}
                 onChanged={humanRooms.reload}
                 isDm={humanRoom?.kind === "dm"}
                 roomTitle={humanRoom?.title}

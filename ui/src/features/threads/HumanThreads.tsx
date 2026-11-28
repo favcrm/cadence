@@ -5,7 +5,7 @@ import { useLocaleTag, useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { IconArrowDown } from "../../ui/icons";
 import Link from "../../ui/Link";
-import Select from "../../ui/Select";
+import Md, { healStreamingMarkdown } from "../../ui/Md";
 import Composer from "../app-shell/chat/Composer";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import { newMessageId } from "../home/thread";
@@ -17,17 +17,19 @@ import {
   type MentionCandidate,
   type MentionOutcome,
 } from "../mentions/mentions";
+import AddToChannelDialog, { type AddToChannelTab } from "./AddToChannelDialog";
 import ChannelAttachments from "./ChannelAttachments";
-import { Turn } from "./ThreadChatParts";
+import { ChannelTurn } from "./ThreadChatParts";
 import { findFirstUnreadPostId } from "./channelsUnread";
 import {
+  clearChannelRoomPreviews,
   HUMAN_LIVE_POLL_MS,
   HUMAN_POLL_MS,
   isHumanThreadsStreamLive,
   subscribeHumanThreadsStream,
+  useChannelRoomPreviews,
 } from "./humanThreadsStream";
 import {
-  addHumanMember,
   createHumanGroup,
   humanAgents,
   humanMe,
@@ -37,10 +39,12 @@ import {
   postHumanRoom,
   readHumanRoom,
   removeHumanMember,
+  type HumanActiveAgent,
   type HumanAgent,
   type HumanMember,
   type HumanMe,
   type HumanPerson,
+  type HumanPost,
   type HumanRoomEvent,
   type HumanRoomPage,
   type HumanRoomSummary,
@@ -386,9 +390,50 @@ function mergeOlder(cur: HumanRoomPage, older: HumanRoomPage): HumanRoomPage {
   };
 }
 
-function MentionOutcomes({ outcomes }: { outcomes: MentionOutcome[] }) {
+interface PendingChannelPost {
+  client_id: string;
+  body: string;
+  silent: boolean;
+  attachmentIds: string[];
+  created: number;
+  status: "sending" | "failed";
+  error?: string;
+}
+
+const GROUP_WINDOW_MS = 3 * 60 * 1000;
+
+function senderIdentityKey(sender: HumanPost["sender"]): string {
+  if (sender.id) return `${sender.kind ?? "unknown"}:${sender.id}`;
+  return `${sender.kind ?? "unknown"}:${sender.label.toLowerCase()}`;
+}
+
+function MentionOutcomes({
+  outcomes,
+  postCreated,
+  latestAgentPostAt,
+  activeAgentAliases,
+}: {
+  outcomes: MentionOutcome[];
+  postCreated?: number;
+  latestAgentPostAt?: ReadonlyMap<string, number>;
+  activeAgentAliases?: ReadonlySet<string>;
+}) {
   const t = useTranslate();
-  if (outcomes.length === 0) return null;
+  const visible = useMemo(
+    () =>
+      outcomes.filter((o) => {
+        if (o.kind !== "queued") return true;
+        const alias = cleanAgentAlias(o.handle).toLowerCase();
+        if (activeAgentAliases?.has(alias)) return false;
+        const answeredAt = latestAgentPostAt?.get(alias);
+        if (answeredAt !== undefined && postCreated !== undefined && answeredAt > postCreated) {
+          return false;
+        }
+        return true;
+      }),
+    [outcomes, postCreated, latestAgentPostAt, activeAgentAliases],
+  );
+  if (visible.length === 0) return null;
   const labelFor = (o: MentionOutcome) => {
     switch (o.kind) {
       case "queued":
@@ -409,7 +454,7 @@ function MentionOutcomes({ outcomes }: { outcomes: MentionOutcome[] }) {
   };
   return (
     <div className="threads-outcomes" aria-label={t("Mention routing outcomes")}>
-      {outcomes.map((o, idx) => (
+      {visible.map((o, idx) => (
         <span
           key={`${o.handle}-${o.kind}-${idx}`}
           className="threads-outcome"
@@ -485,13 +530,16 @@ export function HumanRoomTimeline({
   const [documentVisible, setDocumentVisible] = useState(() => document.visibilityState === "visible");
   const [silentNote, setSilentNote] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [pendingPosts, setPendingPosts] = useState<PendingChannelPost[]>([]);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const agentsState = useHumanAgents(true);
   const catalog = useMemo(() => agentsState.agents ?? [], [agentsState.agents]);
   const currentPage = page?.room === id ? page : null;
+  const livePreviews = useChannelRoomPreviews(id);
 
   const latest = useRef(0);
   const visit = useRef(0);
-  const envelope = useRef<{ key: string; id: string } | null>(null);
   const activeRoom = useRef(id);
   activeRoom.current = id;
   const pageRef = useRef(currentPage);
@@ -593,6 +641,8 @@ export function HumanRoomTimeline({
     setReadError(null);
     setSendError(null);
     setSilentNote(false);
+    setPendingPosts([]);
+    setInviteOpen(false);
     setError(null);
     setDenied(false);
     setOlderBusy(false);
@@ -881,12 +931,11 @@ export function HumanRoomTimeline({
     : `# ${roomTitle?.trim() || t("Channel")}`;
 
   const memberCount = currentPage?.members.length ?? 0;
-  const hasAgents = currentPage?.members.some((m) => m.kind === "agent") ?? false;
   const headerSub = !currentPage
     ? null
     : isDm
       ? t("Direct message")
-      : `${memberCount} ${t(memberCount === 1 ? "member" : "members")}${hasAgents ? ` · ${t("Channel")}` : ""}`;
+      : `${memberCount} ${t(memberCount === 1 ? "member" : "members")}`;
 
   const agentIdentity = useMemo(() => {
     const byId = new Map<string, { alias: string; look?: string | null }>();
@@ -912,7 +961,155 @@ export function HumanRoomTimeline({
     return { byId, byAlias };
   }, [boardAgents, catalog, currentPage?.members]);
 
+  const latestAgentPostAt = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const p of currentPage?.posts ?? []) {
+      const clean = cleanAgentAlias(p.sender.label).toLowerCase();
+      const isAgent =
+        p.sender.kind === "agent" ||
+        (p.sender.kind !== "human" &&
+          ((p.sender.id !== null && agentIdentity.byId.has(p.sender.id)) ||
+            agentIdentity.byAlias.has(clean)));
+      if (!isAgent) continue;
+      const prev = map.get(clean) ?? -1;
+      if (p.created > prev) map.set(clean, p.created);
+    }
+    return map;
+  }, [currentPage?.posts, agentIdentity]);
+
+  const liveAgents = useMemo(() => {
+    type LiveAgentView = {
+      id: string;
+      alias: string;
+      look?: string | null;
+      state: "queued" | "working" | "streaming";
+      text: string | null;
+      step?: string;
+      startedAt: number;
+    };
+    const merged = new Map<string, LiveAgentView>();
+    const snapshotList: readonly HumanActiveAgent[] = currentPage?.active_agents ?? [];
+    for (const a of snapshotList) {
+      const alias = cleanAgentAlias(a.alias);
+      const look = a.look ?? agentIdentity.byId.get(a.id)?.look ?? agentIdentity.byAlias.get(alias.toLowerCase())?.look ?? null;
+      merged.set(a.id, {
+        id: a.id,
+        alias,
+        look,
+        state: a.state,
+        text: null,
+        step: a.step,
+        startedAt: a.started_at,
+      });
+    }
+    for (const p of livePreviews) {
+      const prev = merged.get(p.agent_id);
+      const alias = cleanAgentAlias(p.alias);
+      const answeredAt = latestAgentPostAt.get(alias.toLowerCase());
+      const startedAt = p.started_at ?? prev?.startedAt ?? Date.now();
+      if (answeredAt !== undefined && answeredAt > startedAt) continue;
+      const look =
+        prev?.look ??
+        agentIdentity.byId.get(p.agent_id)?.look ??
+        agentIdentity.byAlias.get(alias.toLowerCase())?.look ??
+        null;
+      merged.set(p.agent_id, {
+        id: p.agent_id,
+        alias,
+        look,
+        state: p.state,
+        text: p.text,
+        step: p.step ?? prev?.step,
+        startedAt,
+      });
+    }
+    return [...merged.values()].filter((entry) => {
+      const answeredAt = latestAgentPostAt.get(entry.alias.toLowerCase());
+      return answeredAt === undefined || answeredAt <= entry.startedAt;
+    });
+  }, [currentPage?.active_agents, livePreviews, agentIdentity, latestAgentPostAt]);
+
+  const activeAgentAliases = useMemo(() => {
+    const set = new Set<string>();
+    for (const a of liveAgents) {
+      if (a.state === "working" || a.state === "streaming") {
+        set.add(a.alias.toLowerCase());
+      }
+    }
+    return set;
+  }, [liveAgents]);
+
+  useEffect(() => {
+    if (liveAgents.length === 0) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [liveAgents.length]);
+
+  useEffect(() => {
+    if (!currentPage || livePreviews.length === 0) return;
+    const activeIds = new Set((currentPage.active_agents ?? []).map((a) => a.id));
+    if (currentPage.active_agents !== undefined && activeIds.size === 0 && liveAgents.length === 0) {
+      clearChannelRoomPreviews(id);
+    }
+  }, [id, currentPage, livePreviews.length, liveAgents.length]);
+
+  const sendPendingPost = useCallback(
+    (entry: PendingChannelPost) => {
+      const roomAtSend = id;
+      void postHumanRoom(roomAtSend, entry.client_id, entry.body, entry.silent, entry.attachmentIds)
+        .then(({ post }) => {
+          if (activeRoom.current !== roomAtSend) return;
+          setPendingPosts((current) => current.filter((item) => item.client_id !== entry.client_id));
+          setPage((cur) => {
+            if (!cur || cur.room !== roomAtSend) return cur;
+            if (cur.posts.some((existing) => existing.id === post.id)) return cur;
+            return { ...cur, posts: [...cur.posts, post] };
+          });
+          setUnreadBoundaryId(null);
+          pinnedToTailRef.current = true;
+          setPendingNewCount(0);
+          onChangedRef.current();
+          void load();
+        })
+        .catch((failure: unknown) => {
+          if (activeRoom.current !== roomAtSend) return;
+          const errMsg = messageOf(failure);
+          setSendError(errMsg);
+          setPendingPosts((current) =>
+            current.map((item) =>
+              item.client_id === entry.client_id
+                ? { ...item, status: "failed", error: errMsg }
+                : item,
+            ),
+          );
+        });
+    },
+    [id, load],
+  );
+
+  const retryPendingPost = useCallback(
+    (entry: PendingChannelPost) => {
+      setSendError(null);
+      const next: PendingChannelPost = { ...entry, status: "sending", error: undefined };
+      setPendingPosts((current) =>
+        current.map((item) => (item.client_id === entry.client_id ? next : item)),
+      );
+      sendPendingPost(next);
+    },
+    [sendPendingPost],
+  );
+
+  const removePendingPost = useCallback((clientId: string) => {
+    setPendingPosts((current) => current.filter((item) => item.client_id !== clientId));
+  }, []);
+
   const previewMembers = currentPage?.members.slice(0, 4) ?? [];
+  const existingMemberIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of currentPage?.members ?? []) set.add(m.id);
+    return set;
+  }, [currentPage?.members]);
   const overflowMembers = Math.max(0, memberCount - previewMembers.length);
 
   return (
@@ -951,8 +1148,15 @@ export function HumanRoomTimeline({
               {overflowMembers > 0 && <span className="threads-avatar-more">+{overflowMembers}</span>}
             </div>
           )}
-          {!isDm && currentPage?.can_manage && onInvite && (
-            <Button variant="secondary" size="sm" onClick={onInvite}>
+          {!isDm && currentPage?.can_manage && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                setInviteOpen(true);
+                onInvite?.();
+              }}
+            >
               {t("+ Invite")}
             </Button>
           )}
@@ -999,7 +1203,7 @@ export function HumanRoomTimeline({
             </Button>
           </div>
         )}
-        {timelineItems.map((item) => {
+        {timelineItems.map((item, idx) => {
           if (item.kind === "event") {
             return (
               <div key={item.key} className="threads-audit-event" role="note">
@@ -1023,6 +1227,15 @@ export function HumanRoomTimeline({
               ? `@${senderClean || p.sender.label}`
               : p.sender.label;
           const showUnreadDivider = unreadBoundaryId === p.id;
+          const prevItem = idx > 0 ? timelineItems[idx - 1] : undefined;
+          const isGrouped =
+            prevItem?.kind === "post" &&
+            !showUnreadDivider &&
+            !p.silent &&
+            !prevItem.post.silent &&
+            senderIdentityKey(prevItem.post.sender) === senderIdentityKey(p.sender) &&
+            p.created - prevItem.post.created >= 0 &&
+            p.created - prevItem.post.created <= GROUP_WINDOW_MS;
           return (
             <div key={item.key}>
               {showUnreadDivider && (
@@ -1037,17 +1250,23 @@ export function HumanRoomTimeline({
                   </span>
                 </div>
               )}
-              <article className="threads-msg" data-post-id={p.id} data-role={mine ? "operator" : "member"}>
+              <article
+                className={`threads-msg ${isGrouped ? "is-grouped" : ""}`}
+                data-post-id={p.id}
+                data-role={mine ? "operator" : "member"}
+              >
                 {p.silent && (
                   <div className="threads-silent-row">
                     <span className="threads-silent-badge">{t("Silent note")}</span>
                   </div>
                 )}
-                <Turn
+                <ChannelTurn
                   who={who}
                   at={fmtTime(p.created)}
                   me={mine}
-                  showName={!mine}
+                  senderKind={isAgent ? "agent" : "human"}
+                  grouped={isGrouped}
+                  status={mine ? "sent" : undefined}
                   markdown={isAgent && !mine}
                   inlineFormat={!isAgent}
                   attachments={
@@ -1067,13 +1286,110 @@ export function HumanRoomTimeline({
                   }
                 >
                   {p.body}
-                </Turn>
-                <MentionOutcomes outcomes={p.outcomes} />
+                </ChannelTurn>
+                <MentionOutcomes
+                  outcomes={p.outcomes}
+                  postCreated={p.created}
+                  latestAgentPostAt={latestAgentPostAt}
+                  activeAgentAliases={activeAgentAliases}
+                />
               </article>
             </div>
           );
         })}
-        {currentPage && timelineItems.length === 0 && (
+        {pendingPosts.map((pending) => (
+          <div key={`pending:${pending.client_id}`}>
+            <article
+              className={`threads-msg threads-msg-pending is-${pending.status}`}
+              data-client-id={pending.client_id}
+              data-role="operator"
+            >
+              {pending.silent && (
+                <div className="threads-silent-row">
+                  <span className="threads-silent-badge">{t("Silent note")}</span>
+                </div>
+              )}
+              <ChannelTurn
+                who={t("You")}
+                at={fmtTime(pending.created)}
+                me
+                senderKind="human"
+                status={pending.status}
+                inlineFormat
+                after={
+                  pending.status === "failed" ? (
+                    <div className="threads-pending-actions" role="status">
+                      <span className="threads-pending-err">{pending.error || t("Failed to send")}</span>
+                      <button
+                        type="button"
+                        className="threads-pending-btn is-retry"
+                        onClick={() => retryPendingPost(pending)}
+                      >
+                        {t("Retry")}
+                      </button>
+                      <button
+                        type="button"
+                        className="threads-pending-btn"
+                        onClick={() => removePendingPost(pending.client_id)}
+                      >
+                        {t("Remove")}
+                      </button>
+                    </div>
+                  ) : null
+                }
+              >
+                {pending.body}
+              </ChannelTurn>
+            </article>
+          </div>
+        ))}
+        {liveAgents.map((agent) => {
+          const secs = Math.max(0, Math.floor((nowMs - agent.startedAt) / 1000));
+          const hasPreview = typeof agent.text === "string" && agent.text.length > 0;
+          const healed = hasPreview ? healStreamingMarkdown(agent.text!) : "";
+          return (
+            <div key={`live:${agent.id}`}>
+              <article
+                className="threads-msg threads-msg-live"
+                data-live-agent={agent.id}
+                data-live-state={agent.state}
+                data-role="member"
+              >
+                <ChannelTurn
+                  who={`@${agent.alias}`}
+                  me={false}
+                  senderKind="agent"
+                  avatar={
+                    <MemberAvatar
+                      kind="agent"
+                      label={agent.alias}
+                      look={agent.look}
+                      size={28}
+                    />
+                  }
+                >
+                  {hasPreview ? (
+                    <div className="answer threads-live-stream">
+                      <div className="answer-body issue-reader">
+                        <Md text={healed} idTokens />
+                        <span className="preview-caret" aria-hidden />
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="threads-live-working">
+                      <span className="workdot live" aria-hidden />
+                      <span className="threads-live-status">
+                        {agent.step || t(agent.state === "queued" ? "Queued…" : "Working…")}
+                      </span>
+                      <span className="threads-live-elapsed num">{secs}s</span>
+                    </div>
+                  )}
+                </ChannelTurn>
+              </article>
+            </div>
+          );
+        })}
+        {currentPage && timelineItems.length === 0 && pendingPosts.length === 0 && liveAgents.length === 0 && (
           <p className="threads-note py-6 text-center">{t("No messages yet.")}</p>
         )}
       </div>
@@ -1115,24 +1431,24 @@ export function HumanRoomTimeline({
               destination: { humanRoom: id },
             }}
             allowEmptyWithAttachments
-            onSend={async ({ body, attachments }) => {
+            onSend={({ body, attachments }) => {
               setSendError(null);
               const isSilent = silentNote || startsWithNote(body);
               const attachmentIds = (attachments ?? []).map((att) => att.id);
-              const key = JSON.stringify({ silent: isSilent, body: body.trim(), attachmentIds });
-              if (envelope.current?.key !== key) envelope.current = { key, id: crypto.randomUUID() };
-              try {
-                await postHumanRoom(id, envelope.current.id, body, isSilent, attachmentIds);
-                envelope.current = null;
-                setSilentNote(false);
-                setUnreadBoundaryId(null);
-                pinnedToTailRef.current = true;
-                setPendingNewCount(0);
-                await load();
-              } catch (e) {
-                setSendError(messageOf(e));
-                throw e;
-              }
+              const entry: PendingChannelPost = {
+                client_id: crypto.randomUUID(),
+                body,
+                silent: isSilent,
+                attachmentIds,
+                created: Date.now(),
+                status: "sending",
+              };
+              setSilentNote(false);
+              setUnreadBoundaryId(null);
+              pinnedToTailRef.current = true;
+              setPendingNewCount(0);
+              setPendingPosts((current) => [...current, entry]);
+              sendPendingPost(entry);
             }}
             refocusAfterSend
             ariaLabel={isDm ? t("Message this direct message…") : t("Message this channel… (@mention teammates or agents)")}
@@ -1152,6 +1468,22 @@ export function HumanRoomTimeline({
           )}
         </div>
       </div>
+      {!isDm && inviteOpen && (
+        <AddToChannelDialog
+          open
+          initialTab="people"
+          me={me}
+          roomId={id}
+          existingMemberIds={existingMemberIds}
+          agents={agentsState.agents}
+          agentsError={agentsState.error}
+          onAdded={async () => {
+            onChanged();
+            await load();
+          }}
+          onClose={() => setInviteOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -1198,8 +1530,7 @@ export function HumanContextPanel({
 }) {
   const t = useTranslate();
   const [error, setError] = useState<string | null>(null);
-  const [picked, setPicked] = useState("");
-  const [addAgentPick, setAddAgentPick] = useState("");
+  const [addDialogTab, setAddDialogTab] = useState<AddToChannelTab | null>(null);
   const [memberFilter, setMemberFilter] = useState("");
   const [pendingRemove, setPendingRemove] = useState<HumanMember | null>(null);
   const [removing, setRemoving] = useState(false);
@@ -1238,16 +1569,6 @@ export function HumanContextPanel({
   const mayManage = canManage ?? room.creator === me.id;
   const roomTitle = room.title.trim() || (room.kind === "dm" ? t("Direct message") : t("Channel"));
 
-  const act = async (fn: () => Promise<unknown>) => {
-    setError(null);
-    try {
-      await fn();
-      onChanged();
-    } catch (e) {
-      setError(messageOf(e));
-    }
-  };
-
   const confirmRemoveMember = async () => {
     if (!pendingRemove) return;
     setRemoving(true);
@@ -1265,8 +1586,7 @@ export function HumanContextPanel({
 
   const humanMembers = members.filter((m) => m.kind === "human");
   const agentMembers = members.filter((m) => m.kind === "agent");
-  const addable = (people ?? []).filter((p) => p.id !== me.id && !members.some((m) => m.id === p.id));
-  const addableAgents = (agents ?? []).filter((a) => !members.some((m) => m.kind === "agent" && m.id === a.uid));
+  const existingMemberIds = new Set(members.map((m) => m.id));
   const query = memberFilter.trim().toLowerCase();
   const shownHumans = query === ""
     ? humanMembers
@@ -1352,6 +1672,16 @@ export function HumanContextPanel({
         <div className="threads-context-heading">
           <h3 className="threads-context-title">{t("Teammates")}</h3>
           <span className="threads-context-count">{humanMembers.length}</span>
+          {isGroup && mayManage && (
+            <Button
+              variant="secondary"
+              size="sm"
+              className="threads-section-add"
+              onClick={() => setAddDialogTab("people")}
+            >
+              {t("+ Add")}
+            </Button>
+          )}
         </div>
         {humanMembers.length >= 5 && (
           <div className="threads-member-filter-wrap">
@@ -1379,44 +1709,6 @@ export function HumanContextPanel({
             </Button>
           </div>
         )}
-
-        {isGroup && mayManage && (
-          <form
-            className="threads-add threads-add-inline"
-            aria-label={t("Invite teammate to channel")}
-            data-invite-select=""
-            onSubmit={(e) => {
-              e.preventDefault();
-              const subject = people?.find((p) => p.id === picked)?.subject;
-              if (!subject) return;
-              void act(async () => {
-                await addHumanMember(room.id, { human_subject: subject });
-                setPicked("");
-              });
-            }}
-          >
-            <div className="threads-form-field">
-              <Select
-                full
-                searchable
-                size="sm"
-                value={picked}
-                onChange={setPicked}
-                disabled={addable.length === 0}
-                placeholder={
-                  people === null && !peopleError
-                    ? t("Loading teammates…")
-                    : addable.length === 0
-                      ? t("No people to add")
-                      : t("+ Invite teammate…")
-                }
-                aria-label={t("Add a person")}
-                options={addable.map((p) => ({ value: p.id, label: p.name }))}
-              />
-            </div>
-            <Button variant="secondary" size="sm" type="submit" disabled={picked === ""}>{t("Add")}</Button>
-          </form>
-        )}
       </section>
 
       {isGroup && (
@@ -1424,6 +1716,16 @@ export function HumanContextPanel({
           <div className="threads-context-heading">
             <h3 className="threads-context-title">{t("Shared Agents")}</h3>
             <span className="threads-context-count">{agentMembers.length}</span>
+            {mayManage && (
+              <Button
+                variant="secondary"
+                size="sm"
+                className="threads-section-add"
+                onClick={() => setAddDialogTab("agents")}
+              >
+                {t("+ Add")}
+              </Button>
+            )}
           </div>
           {agentMembers.length > 0 ? (
             <ul className="threads-roster" data-roster-agents="">
@@ -1431,35 +1733,6 @@ export function HumanContextPanel({
             </ul>
           ) : (
             <p className="threads-note">{t("No shared agents added yet.")}</p>
-          )}
-          {mayManage && (
-            <form
-              className="threads-add threads-add-inline"
-              aria-label={t("Add agent to channel")}
-              onSubmit={(e) => {
-                e.preventDefault();
-                if (addAgentPick === "") return;
-                void act(async () => {
-                  await addHumanMember(room.id, { agent_uid: addAgentPick });
-                  setAddAgentPick("");
-                });
-              }}
-            >
-              <div className="threads-form-field">
-                <Select
-                  full
-                  searchable
-                  size="sm"
-                  value={addAgentPick}
-                  onChange={setAddAgentPick}
-                  disabled={addableAgents.length === 0}
-                  placeholder={addableAgents.length === 0 ? t("No agents available") : t("+ Add shared agent…")}
-                  aria-label={t("Add an agent")}
-                  options={addableAgents.map((a) => ({ value: a.uid, label: `@${a.alias}` }))}
-                />
-              </div>
-              <Button variant="secondary" size="sm" type="submit" disabled={addAgentPick === ""}>{t("Add")}</Button>
-            </form>
           )}
         </section>
       )}
@@ -1552,6 +1825,19 @@ export function HumanContextPanel({
               setRemoveError(null);
             }
           }}
+        />
+      )}
+      {isGroup && mayManage && addDialogTab !== null && (
+        <AddToChannelDialog
+          open
+          initialTab={addDialogTab}
+          me={me}
+          roomId={room.id}
+          existingMemberIds={existingMemberIds}
+          agents={agents}
+          agentsError={null}
+          onAdded={onChanged}
+          onClose={() => setAddDialogTab(null)}
         />
       )}
     </div>

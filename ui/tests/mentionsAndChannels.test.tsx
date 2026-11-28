@@ -221,6 +221,7 @@ async function main(): Promise<void> {
         silent: false,
         outcomes: [
           { kind: "queued", handle: "@dev", label: "dev" },
+          { kind: "queued", handle: "@qa", label: "qa" },
           { kind: "blocked_dm", handle: "@maya", label: "maya" },
         ],
       },
@@ -388,7 +389,12 @@ async function main(): Promise<void> {
   );
   assert(host.querySelector(".threads-composer-dock") !== null, "floating composer dock is rendered");
   assert(host.textContent?.includes("Silent note"), "silent post displays Silent note tag");
-  assert(host.textContent?.includes("@dev · queued") && host.textContent?.includes("@maya · blocked in DM"), "renders server mention outcome pills");
+  assert(
+    !host.textContent?.includes("@dev · queued")
+      && host.textContent?.includes("@qa · queued")
+      && host.textContent?.includes("@maya · blocked in DM"),
+    "retires answered @dev · queued pill while preserving unanswered @qa · queued and @maya · blocked in DM pills",
+  );
   assert(host.textContent?.includes("Mei added @dev"), "renders interleaved channel audit event");
   assert(host.textContent?.includes("Channel paused after consecutive agent turns"), "renders Human-Turn Brake banner at chain limit");
 
@@ -419,18 +425,22 @@ async function main(): Promise<void> {
   });
   await flush();
 
-  // Searchable <Select> for adding person Eva
-  const personCombo = host.querySelector<HTMLButtonElement>('[aria-label="Add a person"][role="combobox"]');
-  assert(personCombo !== null, "Add a person uses searchable <Select> combobox");
-  await React.act(async () => { personCombo!.click(); });
+  // Unified + Add modal for adding person Eva from Details section heading
+  const addTeammateBtn = host.querySelector<HTMLButtonElement>('[aria-label="Teammates"] .threads-section-add');
+  assert(addTeammateBtn !== null, "Teammates section renders compact + Add button");
+  await React.act(async () => { addTeammateBtn!.click(); });
   await flush();
-  assert(document.querySelector(".select-pop .select-search") !== null, "Select renders searchable input in popup");
-  const evaOpt = Array.from(document.querySelectorAll<HTMLElement>(".select-opt")).find((el) => el.textContent?.includes("Eva"));
-  assert(evaOpt !== undefined, "Select lists addable person Eva");
-  await React.act(async () => { evaOpt!.click(); });
+  const addDialog = host.querySelector<HTMLDialogElement>("dialog.threads-add-dialog");
+  assert(addDialog !== null && (addDialog.open || addDialog.hasAttribute("open")), "clicking + Add opens unified AddToChannelDialog");
+  assert(addDialog.querySelector(".threads-add-search input") !== null, "AddToChannelDialog renders searchable input");
+  const evaCheckbox = Array.from(addDialog.querySelectorAll<HTMLLabelElement>(".threads-add-choice"))
+    .find((el) => el.textContent?.includes("Eva"))
+    ?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+  assert(evaCheckbox !== null && evaCheckbox !== undefined, "AddToChannelDialog lists addable person Eva");
+  await React.act(async () => { evaCheckbox!.click(); });
   await flush();
-  const addPersonBtn = host.querySelector<HTMLButtonElement>('form[aria-label="Invite teammate to channel"] button[type="submit"]');
-  assert(addPersonBtn !== null && !addPersonBtn.disabled, "Add person submits once Eva is chosen");
+  const addPersonBtn = addDialog.querySelector<HTMLButtonElement>('.threads-add-dialog-foot button[type="submit"]');
+  assert(addPersonBtn !== null && !addPersonBtn.disabled, "Add selected submits once Eva is chosen");
   await React.act(async () => { addPersonBtn!.click(); });
   await flush();
   assert(calls.some((c) => c.method === "POST" && c.path === "/api/human-threads/rooms/room-1/members" && (c.body as { human_subject?: string }).human_subject === "sub-eva"), "Add person posts sub-eva to members endpoint");
