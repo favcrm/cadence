@@ -2,6 +2,7 @@ import type { AgentsPayload, NeedsMe, StagedRoutineProposal, ThreadRef } from ".
 import { routePath } from "../../lib/router";
 import { hasScopedAssistantRoster, PERSONAL_ALIAS } from "../agents/personalAssistant";
 import { MASTER } from "./master";
+import type { StagedBatch } from "../decisions/actionBatch";
 import { askedBy, sourceLine, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 
 /**
@@ -53,6 +54,7 @@ export type NeedAction =
       app: string | null;
       askedBy: string | null;
       external: boolean;
+      batch?: StagedBatch | null;
     }
   | {
       type: "permission";
@@ -527,6 +529,11 @@ export function needFingerprint(need: HomeNeed): string {
 }
 
 function stagedSummary(write: StagedWrite): string | null {
+  if (write.kind === "action_batch" && write.batch) {
+    if (write.batch.status === "partial_failed" && write.batch.lastError) return write.batch.lastError;
+    if (write.batch.summary) return write.batch.summary;
+    return `${write.batch.totalCount} items`;
+  }
   const cliSummary = write.cli?.summary?.trim();
   if (cliSummary) return cliSummary;
   const reason = write.reason?.trim();
@@ -572,6 +579,7 @@ export function stagedNeed(write: StagedWrite, t: (english: string) => string, n
       app: write.app,
       askedBy: askedBy(write, t),
       external: write.connected !== null || write.customMcp != null,
+      batch: write.batch ?? null,
     },
   };
 }

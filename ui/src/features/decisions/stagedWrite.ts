@@ -13,6 +13,7 @@
 import { optionsLine } from "../canvas/viewParams";
 import { parseAccessInput, type AccessInput } from "../home/accessRequest";
 import { parseShareInput, type ShareInput } from "../home/shareRequest";
+import { parseBatchSummary, type StagedBatch } from "./actionBatch";
 
 export type StagedStatus = "pending" | "approved" | "denied";
 /** What the owner sees: a failed apply is `approved` with `result.ok === false`. */
@@ -63,7 +64,15 @@ export interface StagedWhatsApp {
 
 export interface StagedWrite {
   id: string;
-  kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli" | "custom_mcp_effect" | "share_request" | "access_request";
+  kind:
+    | "app_call"
+    | "create_issue"
+    | "connected_effect"
+    | "cadence_cli"
+    | "custom_mcp_effect"
+    | "share_request"
+    | "access_request"
+    | "action_batch";
   status: StagedStatus;
   createdAt: number;
   decidedAt: number | null;
@@ -115,6 +124,8 @@ export interface StagedWrite {
     snapshotRevision: number;
     preview?: ConnectedPreview;
   } | null;
+  /** AOS-779 `action_batch`: grouped staged items sharing one approval card. */
+  batch?: StagedBatch | null;
 }
 
 /** A connected effect's display preview (AOS-647). Every value is untrusted text. */
@@ -660,6 +671,39 @@ function parseAccessRequest(base: Pick<StagedWrite, "id" | "status" | "createdAt
   };
 }
 
+function parseActionBatch(
+  base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">,
+  row: Record<string, unknown>,
+  result: StagedResult | null,
+): StagedWrite | null {
+  const input = isRecord(row.input) ? row.input : {};
+  const resultBatch = isRecord(row.result) && isRecord(row.result.batch) ? row.result.batch : undefined;
+  const batch = parseBatchSummary(row.batch, base.id, base.createdAt, base.status, input, resultBatch);
+  if (batch === null) return null;
+  const origin = parseOrigin(row.origin);
+  return {
+    ...base,
+    kind: "action_batch",
+    title: batch.title,
+    app: "Batch",
+    target: { kind: "batch", label: `${batch.totalCount} items`, id: batch.batchKey },
+    changes: [],
+    unchangedCount: 0,
+    changesComplete: true,
+    reason: batch.summary,
+    consent: null,
+    effects: [],
+    raw: visible(rawText(row.batch ?? row.input)),
+    origin: origin === null ? null : { ...origin, label: visible(origin.label), via: visible(origin.via) },
+    result,
+    decisionReason: base.decisionReason ?? batch.decisionReason,
+    recordLink: null,
+    connected: null,
+    customMcp: null,
+    batch,
+  };
+}
+
 /** Approve is offered only for a row whose whole request can be read. Deny is always safe. */
 export const approvable = (write: StagedWrite): boolean => write.kind !== "cadence_cli" || write.changesComplete;
 
@@ -689,6 +733,7 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
   if (row.tool === "cadence_cli") return parseCadenceCli(base, row, result);
   if (row.tool === "share_request") return parseShareRequest(base, row, result);
   if (row.tool === "access_request") return parseAccessRequest(base, row, result);
+  if (row.tool === "action_batch") return parseActionBatch(base, row, result);
   return null;
 }
 
@@ -704,6 +749,12 @@ export const isUncertain = (write: StagedWrite): boolean =>
   (write.result.code === "uncertain" || write.result.retry === true);
 
 export function outcomeOf(write: StagedWrite): StagedOutcome {
+  if (write.kind === "action_batch" && write.batch) {
+    if (write.batch.status === "pending" || write.batch.status === "running") return "pending";
+    if (write.batch.status === "denied") return "denied";
+    if (write.batch.status === "completed") return "applied";
+    return "failed";
+  }
   if (write.status === "pending") return "pending";
   if (isUncertain(write)) return "unconfirmed";
   if (write.status === "denied") return "denied";
@@ -763,6 +814,9 @@ const CUSTOM_MCP_REASONS: Readonly<Record<string, string>> = {
 };
 
 export function failureReason(write: StagedWrite): string {
+  if (write.kind === "action_batch" && write.batch) {
+    return write.batch.lastError ?? `${write.batch.failedCount || "some"} batch items failed`;
+  }
   const code = write.result?.code;
   if (write.cli) return `refused (${code ?? "unknown"})`;
   if (write.customMcp != null) return (code && CUSTOM_MCP_REASONS[code]) || `refused (${code ?? "unknown"})`;

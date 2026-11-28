@@ -206,10 +206,21 @@ export function waitingRoutineReason(
 
 /** Shared status label for decided staged writes in Feed cards and the Feed drawer. */
 export function decidedWriteStatusLabel(
-  write: Pick<StagedWrite, "kind" | "result" | "connected">,
+  write: Pick<StagedWrite, "kind" | "result" | "connected" | "batch">,
   outcome: StagedOutcome,
   t: (english: string) => string,
 ): string {
+  if (write.kind === "action_batch" && write.batch) {
+    if (write.batch.status === "denied") return t("Denied");
+    if (write.batch.status === "completed") {
+      return t("Completed · {done}/{total}")
+        .replace("{done}", String(write.batch.completedCount))
+        .replace("{total}", String(write.batch.totalCount));
+    }
+    return t("Partial failure · {done}/{total}")
+      .replace("{done}", String(write.batch.completedCount))
+      .replace("{total}", String(write.batch.totalCount));
+  }
   if (outcome === "failed") return t("Did not apply");
   if (outcome === "unconfirmed") return t("Result not confirmed");
   if (outcome === "denied") return t("Denied");
