@@ -30,6 +30,9 @@ import "./members.css";
 type Translate = (english: string) => string;
 type FormatDate = (value: string, options?: Intl.DateTimeFormatOptions) => string;
 type Role = "owner" | "member";
+export type ProjectRole = "owner" | "member" | "viewer";
+export type InviteProjectGrant = { project: string; role: ProjectRole };
+export type InviteProjectOption = { key: string; name?: string | null };
 
 type Member = {
   userId: string;
@@ -47,6 +50,7 @@ type Invite = {
   expiresAt: string;
   /** Set by the board when the last email was refused or unconfirmed. */
   emailStatus?: "failed" | "uncertain";
+  projectGrants: InviteProjectGrant[];
 };
 
 type Drawer = { kind: "member"; id: string } | { kind: "invite"; id: string } | { kind: "newInvite" };
@@ -65,6 +69,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isRole(value: unknown): value is Role {
   return value === "owner" || value === "member";
+}
+
+function isProjectRole(value: unknown): value is ProjectRole {
+  return value === "owner" || value === "member" || value === "viewer";
+}
+
+function parseInviteProjectGrants(raw: unknown): InviteProjectGrant[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const grants: InviteProjectGrant[] = [];
+  for (const item of raw) {
+    if (!isRecord(item)) continue;
+    const project = typeof item.project === "string" ? item.project.trim() : "";
+    if (!project || seen.has(project) || !isProjectRole(item.role)) continue;
+    seen.add(project);
+    grants.push({ project, role: item.role });
+  }
+  return grants;
+}
+
+function projectRoleLabel(role: ProjectRole, t: Translate): string {
+  if (role === "owner") return t("Project Owner");
+  if (role === "viewer") return t("Viewer");
+  return t("Member");
+}
+
+function projectDisplayName(projectKey: string, projectNames: ReadonlyMap<string, string>): string {
+  return projectNames.get(projectKey) ?? projectKey;
 }
 
 /** The refusal's code, whether the board nested it under `error` or not. */
@@ -150,12 +182,14 @@ function parseInvite(value: unknown): Invite {
   // An older board sends no outcome; anything unrecognised is no known problem.
   const emailStatus =
     value.emailStatus === "failed" || value.emailStatus === "uncertain" ? value.emailStatus : undefined;
+  const projectGrants = parseInviteProjectGrants(value.project_grants);
   return {
     id: value.id,
     email: value.email,
     role,
     expiresAt: value.expiresAt,
     ...(emailStatus ? { emailStatus } : {}),
+    projectGrants,
   };
 }
 
@@ -263,10 +297,31 @@ function useConfirmEscape(active: boolean, cancel: () => void): void {
   }, [active, cancel]);
 }
 
-export default function Members({ viewer }: { viewer: Viewer }) {
+export default function Members({
+  viewer,
+  projects = [],
+}: {
+  viewer: Viewer;
+  projects?: readonly InviteProjectOption[];
+}) {
   const t = useTranslate();
   const { formatDate } = useLocale();
   const canManage = viewer.operator === true && !viewer.readOnly;
+  const normalizedProjects = useMemo(() => {
+    const seen = new Set<string>();
+    const list: Array<{ key: string; name: string }> = [];
+    for (const item of projects) {
+      const key = item.key.trim();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      list.push({ key, name: item.name?.trim() || key });
+    }
+    return list;
+  }, [projects]);
+  const projectNames = useMemo(
+    () => new Map<string, string>(normalizedProjects.map((project) => [project.key, project.name])),
+    [normalizedProjects],
+  );
   const [members, setMembers] = useState<Member[] | null>(null);
   const [invites, setInvites] = useState<Invite[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -594,6 +649,27 @@ export default function Members({ viewer }: { viewer: Viewer }) {
                       <span className="settings-row-text">
                         <b>{invite.email}</b>
                         <small>{roleLine(invite.role, expiryText(invite.expiresAt, formatDate), t)}</small>
+                        {invite.projectGrants.length > 0 && (
+                          <span className="members-project-chips">
+                            {invite.projectGrants.slice(0, 2).map((grant) => (
+                              <span key={grant.project} className="members-project-chip">
+                                <span className="members-project-chip-name">
+                                  {projectDisplayName(grant.project, projectNames)}
+                                </span>
+                                <span className="members-project-chip-role">
+                                  {projectRoleLabel(grant.role, t)}
+                                </span>
+                              </span>
+                            ))}
+                            {invite.projectGrants.length > 2 && (
+                              <span className="members-project-chip-more">
+                                {t("+{count} more").replace("{count}", () =>
+                                  String(invite.projectGrants.length - 2),
+                                )}
+                              </span>
+                            )}
+                          </span>
+                        )}
                       </span>
                       {invite.emailStatus && (
                         <span className="chip bg-warn/10 text-warn">
@@ -631,6 +707,7 @@ export default function Members({ viewer }: { viewer: Viewer }) {
         <InviteDrawer
           key={open?.token}
           invite={openInvite}
+          projectNames={projectNames}
           onClose={() => closeDrawer(open?.token)}
           onRevoked={inviteRevoked}
           onResent={inviteResent}
@@ -642,6 +719,8 @@ export default function Members({ viewer }: { viewer: Viewer }) {
       {canManage && open?.drawer.kind === "newInvite" && (
         <NewInviteDrawer
           key={open.token}
+          projects={normalizedProjects}
+          projectNames={projectNames}
           onClose={() => closeDrawer(open.token)}
           onSent={inviteSent}
           onUndelivered={inviteUndelivered}
@@ -813,6 +892,7 @@ function MemberDrawer({
 
 function InviteDrawer({
   invite,
+  projectNames,
   onClose,
   onRevoked,
   onResent,
@@ -820,6 +900,7 @@ function InviteDrawer({
   onRefresh,
 }: {
   invite: Invite;
+  projectNames: ReadonlyMap<string, string>;
   onClose: () => void;
   onRevoked: (invite: Invite) => void;
   onResent: (invite: Invite) => void;
@@ -903,6 +984,22 @@ function InviteDrawer({
         </dd>
       </dl>
 
+      {invite.projectGrants.length > 0 && (
+        <section className="members-drawer-projects" aria-label={t("Initial projects")}>
+          <p className="members-field-label">{t("Initial projects")}</p>
+          <ul className="members-project-list">
+            {invite.projectGrants.map((grant) => (
+              <li key={grant.project} className="members-project-row members-project-row-static">
+                <span className="members-project-name">
+                  {projectDisplayName(grant.project, projectNames)}
+                </span>
+                <span className="members-project-chip-role">{projectRoleLabel(grant.role, t)}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {error && (
         <p className="members-field-error" role="alert">
           {error}
@@ -956,10 +1053,14 @@ function InviteDrawer({
 }
 
 function NewInviteDrawer({
+  projects,
+  projectNames,
   onClose,
   onSent,
   onUndelivered,
 }: {
+  projects: readonly { key: string; name: string }[];
+  projectNames: ReadonlyMap<string, string>;
   onClose: () => void;
   onSent: (invite: Invite) => void;
   onUndelivered: (failed: boolean) => void;
@@ -970,8 +1071,20 @@ function NewInviteDrawer({
   const emailRef = useRef<HTMLInputElement | null>(null);
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Role>("member");
+  const [projectGrants, setProjectGrants] = useState<InviteProjectGrant[]>([]);
+  const [draftProject, setDraftProject] = useState("");
+  const [draftProjectRole, setDraftProjectRole] = useState<ProjectRole>("member");
   const [fieldError, setFieldError] = useState<string | null>(null);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  const availableProjects = useMemo(
+    () => projects.filter((project) => !projectGrants.some((grant) => grant.project === project.key)),
+    [projects, projectGrants],
+  );
+  const selectedDraftProject = availableProjects.some((project) => project.key === draftProject)
+    ? draftProject
+    : (availableProjects[0]?.key ?? "");
 
   const send = async () => {
     if (busy) return;
@@ -982,9 +1095,12 @@ function NewInviteDrawer({
       return;
     }
     setFieldError(null);
+    setProjectsError(null);
     setBusy(true);
     try {
-      const result = await boardWrite("/api/team/invites", { email: address, role });
+      const payload =
+        projectGrants.length > 0 ? { email: address, role, project_grants: projectGrants } : { email: address, role };
+      const result = await boardWrite("/api/team/invites", payload);
       const created = parseInvitePayload(result);
       // The board stamps what it recorded; a flagged invite is not "sent".
       if (created.emailStatus) {
@@ -996,6 +1112,10 @@ function NewInviteDrawer({
       onClose();
     } catch (failure) {
       const code = failure instanceof ApiError ? failure.code : undefined;
+      if (code === "validation_failed" && projectGrants.length > 0) {
+        setProjectsError(t("One or more selected projects are no longer available."));
+        return;
+      }
       const field = inviteFieldFailure(code, t);
       if (field) {
         setFieldError(field);
@@ -1067,6 +1187,118 @@ function NewInviteDrawer({
           onChange={(value) => setRole(value as Role)}
         />
       </div>
+
+      {projects.length > 0 && (
+        <section className="members-projects-section" aria-label={t("Initial project access (optional)")}>
+          <div className="members-projects-head">
+            <span className="members-field-label">{t("Initial project access (optional)")}</span>
+            <p className="members-field-note">
+              {role === "owner"
+                ? t("Workspace Owners already have full access to all projects.")
+                : t("Choose projects and roles to apply as soon as they join.")}
+            </p>
+          </div>
+
+          {availableProjects.length > 0 && (
+            <div className="members-project-picker">
+              <Select
+                aria-label={t("Project")}
+                size="sm"
+                full
+                value={selectedDraftProject}
+                disabled={busy}
+                options={availableProjects.map((project) => ({ value: project.key, label: project.name }))}
+                onChange={(value) => {
+                  setDraftProject(value);
+                  if (projectsError) setProjectsError(null);
+                }}
+              />
+              <Select
+                aria-label={t("Project role")}
+                size="sm"
+                full
+                value={draftProjectRole}
+                disabled={busy}
+                options={[
+                  { value: "owner", label: t("Project Owner") },
+                  { value: "member", label: t("Member") },
+                  { value: "viewer", label: t("Viewer") },
+                ]}
+                onChange={(value) => setDraftProjectRole(value as ProjectRole)}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy || !selectedDraftProject}
+                onClick={() => {
+                  if (!selectedDraftProject) return;
+                  setProjectGrants((current) =>
+                    current.some((grant) => grant.project === selectedDraftProject)
+                      ? current
+                      : [...current, { project: selectedDraftProject, role: draftProjectRole }],
+                  );
+                  setDraftProject("");
+                  if (projectsError) setProjectsError(null);
+                }}
+              >
+                {t("Add")}
+              </Button>
+            </div>
+          )}
+
+          {projectGrants.length > 0 && (
+            <ul className="members-project-list" aria-label={t("Assigned initial projects")}>
+              {projectGrants.map((grant) => {
+                const name = projectDisplayName(grant.project, projectNames);
+                return (
+                  <li key={grant.project} className="members-project-row">
+                    <span className="members-project-name">{name}</span>
+                    <div className="members-project-controls">
+                      <Select
+                        aria-label={t("Role for {project}").replace("{project}", () => name)}
+                        size="sm"
+                        value={grant.role}
+                        disabled={busy}
+                        options={[
+                          { value: "owner", label: t("Project Owner") },
+                          { value: "member", label: t("Member") },
+                          { value: "viewer", label: t("Viewer") },
+                        ]}
+                        onChange={(value) => {
+                          setProjectGrants((current) =>
+                            current.map((item) =>
+                              item.project === grant.project ? { ...item, role: value as ProjectRole } : item,
+                            ),
+                          );
+                          if (projectsError) setProjectsError(null);
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="members-project-remove"
+                        disabled={busy}
+                        aria-label={t("Remove {project}").replace("{project}", () => name)}
+                        onClick={() => {
+                          setProjectGrants((current) => current.filter((item) => item.project !== grant.project));
+                          if (projectsError) setProjectsError(null);
+                        }}
+                      >
+                        {t("Remove")}
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {projectsError && (
+            <p className="members-field-error" role="alert">
+              {projectsError}
+            </p>
+          )}
+        </section>
+      )}
     </div>
   );
 

@@ -5102,3 +5102,18 @@ const CAD2883_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2883_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2888_ZHTW: Record<string, string> = {
+  "Initial project access (optional)": "初始專案存取權限（選填）",
+  "Choose projects and roles to apply as soon as they join.": "選擇成員加入後立即套用的專案與角色。",
+  "Workspace Owners already have full access to all projects.": "工作區擁有者已具備所有專案的完整存取權限。",
+  "Project role": "專案角色",
+  "Assigned initial projects": "已指派的初始專案",
+  "Initial projects": "初始專案",
+  "Role for {project}": "{project} 的角色",
+  "Remove {project}": "移除 {project}",
+  "One or more selected projects are no longer available.": "所選的部分專案已無法使用。",
+};
+for (const [key, value] of Object.entries(CAD2888_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}
