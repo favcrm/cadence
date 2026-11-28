@@ -2,12 +2,15 @@
 
 use super::identity::scope_allows_issue;
 use super::job_events_opaque;
-use super::members_rpc::MemberCaller;
 use super::*;
 use cadence_core::board_api::{
     JOB_EVENTS_OPERATOR_SCOPE_ACK, JOB_EVENTS_SCOPE_ACK, READER_SCOPE_FIELD,
 };
 use std::collections::BTreeSet;
+
+#[path = "jobs_rpc/assist_dispatch.rs"]
+mod assist_dispatch;
+use assist_dispatch::AssistDispatchAdmission;
 
 /// CAD-2215: the field a relayed, project-scoped `job_list` reply carries to
 /// confirm this daemon applied the reader's proof. It is a distinct marker
@@ -2262,202 +2265,32 @@ impl Shared {
             self.native_app_guard(&plan, optional_str(params, "by"), issue_snapshot.as_ref())?;
             Some(self.prepare_job_delivery(&plan, no_lessons, issue_snapshot.as_ref())?)
         };
-        // CAD-1380 deferred commit: an assist-bound job's dispatch re-proves
-        // the member's live authority at consume time — the approval gate
-        // alone is not the commit. This final proof runs after every blocking
-        // read above (source capture included), immediately before admission,
-        // so a long context capture cannot stale the authority it proved.
-        // The stored `assist_requests` row's `credential_id`/`authority_rev`
-        // name the provenance the consume re-proves (never the member's
-        // latest mint), while the assistant the pull binds is the CURRENT
-        // live binding's — a revoked binding fails, a re-minted one names the
-        // current principal. The final assignee — the request's `to` or the
-        // task's stored `assignee` — is checked after, never silently skipped.
-        //
-        // A store error on the provenance read propagates — the guard never
-        // silently skips the re-prove on an unreadable table. And a job in the
-        // `assist-` id family with NO provenance row is fail-closed too: its
-        // binding was deleted or corrupted, never a silent drop to an ordinary
-        // dispatch (a missing row cannot be re-proven, so the member's
-        // recorded authority is unverifiable). The fenced admission below
-        // re-reads the captured provenance under the write lock.
-        let mut expect: Option<crate::store::AssistDispatchExpect> = None;
-        let mut private_capture = None;
-        match self.store.assist_request_for_job(&plan.job.id)? {
-            Some(assist) => {
-                let binding = self
-                    .store
-                    .assistant_binding(&assist.org, &assist.sub)?
-                    .ok_or_else(|| {
-                        Error::rejected(
-                            "task dispatch refused: the assist-bound job has no live \
-                         assistant binding for its member (CAD-1380)",
-                        )
-                    })?;
-                if !binding.is_active() {
-                    return Err(Error::rejected(format!(
-                        "task dispatch refused: the assist-bound job's member binding is '{}' — \
-                     only an active binding can dispatch (CAD-1380)",
-                        binding.state
-                    )));
-                }
-                let member = MemberCaller {
-                    org: assist.org.clone(),
-                    sub: assist.sub.clone(),
-                    assistant_id: binding.assistant_id.clone(),
-                    alias: binding.alias.clone(),
-                    conversation_id: None,
-                    state: binding.state.clone(),
-                    credential_id: assist.credential_id.clone().unwrap_or_default(),
-                };
-                // Capture the exact issue location before the live authority
-                // pull. It is re-resolved under the tracker writer lock before
-                // the dispatch transaction; a move cannot relabel the kickoff.
-                let issue = plan.job.issue_id.as_deref().ok_or_else(|| {
-                    Error::rejected("task dispatch refused: the private job has no issue")
-                })?;
-                let pm = self.pm()?;
-                let (project, issue_dir) = crate::issue::write::issue_dir(&pm, issue)?;
-                self.member_authority_live(
-                    // No member envelope survives to consume time — the
-                    // deferred-commit bearer is the enrolled `hosted-board`
-                    // service credential (`assist.revalidate`); absent one,
-                    // the empty envelope produces a bearer the platform
-                    // rejects — fail closed. `operation` is the daemon's
-                    // internal deferred-commit name — admitted by the strict
-                    // revalidate schema, absent from the browser-callable
-                    // verb table (`/call` cannot mint it).
-                    "",
-                    &member,
-                    crate::daemon::members_rpc::MemberReprove {
-                        operation: "job_dispatch",
-                        scope: "assist.jobs",
-                        job_id: Some(&plan.job.id),
-                        // The queued effect's own recorded provenance — the
-                        // `assist_requests.credential_id` it committed under.
-                        // The platform re-proves THIS credential live, never
-                        // the binding's latest, so a stale dispatch denied
-                        // after revocation does NOT ride a renewal.
-                        op_credential_id: assist.credential_id.as_deref(),
-                    },
-                    "task dispatch",
-                )?;
-                expect = Some(crate::store::AssistDispatchExpect {
-                    org: assist.org.clone(),
-                    sub: assist.sub.clone(),
-                    assistant_id: binding.assistant_id.clone(),
-                    alias: binding.alias.clone(),
-                    credential_id: assist.credential_id.clone(),
-                    job: plan.job.id.clone(),
-                });
-                // The member-assistant PM never dispatches its own bound
-                // job — that would be self-approval. Check the exact planned
-                // worker — the request's `to` OR the task's stored assignee.
-                if plan.worker.alias == binding.alias {
-                    return Err(Error::rejected(format!(
-                        "task dispatch refused: the assist-bound job cannot be \
-                     dispatched to its own assistant '{}' — that is \
-                     self-approval (CAD-1380)",
-                        binding.alias
-                    )));
-                }
-                private_capture = Some((
-                    pm,
-                    issue_dir,
-                    project.key,
-                    member,
-                    assist.credential_id.clone(),
-                ));
-            }
-            // The `assist-<digest>` id family is minted ONLY by
-            // `member_job_request`; a job in that family with no provenance
-            // row cannot be re-proven — refuse rather than dispatch as though
-            // it were an ordinary job.
-            None if plan.job.id.starts_with("assist-") => {
-                return Err(Error::rejected(format!(
-                    "task dispatch refused: job '{}' is assist-bound but has no \
-                     `assist_requests` provenance — the member's authority cannot be \
-                     re-proven at commit (CAD-1380)",
-                    plan.job.id
-                )));
-            }
-            None => {}
-        }
-        let (task, message, duplicate, behind_dead) =
-            if let Some((pm, issue_dir, project, member, credential)) = private_capture {
-                let policy = issue_dir
-                    .parent()
-                    .ok_or_else(|| {
-                        Error::rejected("task dispatch refused: issue has no project directory")
-                    })?
-                    .join("project.yaml");
-                // Intake evidence spans the tracker; use the full recovery
-                // fence there, and retain the existing scoped private lock
-                // for ordinary jobs and accepted replays.
-                let _tracker = if issue_snapshot.as_ref().is_some_and(|s| s.intake.is_some()) {
-                    pm.lock()?
-                } else {
-                    pm.lock_for_paths(&[issue_dir.clone(), policy])?
-                };
-                if let Some(snapshot) = &issue_snapshot {
-                    snapshot.revalidate(self)?;
-                }
-                let issue = plan.job.issue_id.as_deref().ok_or_else(|| {
-                    Error::rejected("task dispatch refused: the private job has no issue")
-                })?;
-                let (current, current_dir) = crate::issue::write::issue_dir(&pm, issue)?;
-                if current_dir != issue_dir || current.key != project {
-                    return Err(Error::rejected(
-                        "task dispatch refused: the issue moved while dispatch was being prepared",
-                    ));
-                }
-                let actor = crate::project_policy::policy_user_actor(&member.sub);
-                let caller = crate::project_policy::caller_of(&actor).ok_or_else(|| {
-                    Error::rejected("task dispatch refused: invalid member identity")
-                })?;
-                if !current.allows(caller) {
-                    return Err(Error::rejected(
-                        "task dispatch refused: the member can no longer read the issue's project",
-                    ));
-                }
-                // The first pull can have waited for the tracker lock; a
-                // second live proof is the one immediately before the effect.
-                self.member_authority_live(
-                    "",
-                    &member,
-                    crate::daemon::members_rpc::MemberReprove {
-                        operation: "job_dispatch",
-                        scope: "assist.jobs",
-                        job_id: Some(&plan.job.id),
-                        op_credential_id: credential.as_deref(),
-                    },
-                    "task dispatch",
-                )?;
-                self.store.dispatch_task_planned(
-                    &plan,
-                    delivery,
-                    by,
-                    expect.as_ref(),
-                    stall_secs,
-                    Some(&project),
-                )?
-            } else {
-                let _tracker = issue_snapshot
+        let (task, message, duplicate, behind_dead) = {
+            // Prove assist authority after source capture, then keep the tracker
+            // locked through revalidation and the write, not post-commit effects.
+            let admission = AssistDispatchAdmission::capture(self, &plan)?;
+            let _tracker = match &admission {
+                Some(assist) => Some(assist.lock(issue_snapshot.as_ref())?),
+                None => issue_snapshot
                     .as_ref()
                     .map(JobIssueSnapshot::lock)
-                    .transpose()?;
-                if let Some(snapshot) = &issue_snapshot {
-                    snapshot.revalidate(self)?;
-                }
-                self.store.dispatch_task_planned(
-                    &plan,
-                    delivery,
-                    by,
-                    expect.as_ref(),
-                    stall_secs,
-                    None,
-                )?
+                    .transpose()?,
             };
+            if let Some(snapshot) = &issue_snapshot {
+                snapshot.revalidate(self)?;
+            }
+            if let Some(assist) = &admission {
+                assist.revalidate(self)?;
+            }
+            self.store.dispatch_task_planned(
+                &plan,
+                delivery,
+                by,
+                admission.as_ref().map(|assist| &assist.expect),
+                stall_secs,
+                admission.as_ref().map(|assist| assist.project.as_str()),
+            )?
+        };
         // CAD-2215: an assist-bound job's delivery is private state. The
         // ledger write is idempotent and never touches `delivery.json`.
         // A failure does not undo the committed dispatch; it is reported
