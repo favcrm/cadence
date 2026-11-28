@@ -88,6 +88,39 @@ pins, and checked review; changed input conflicts. Installation grants no
 send/deploy, worker registration, or run approval.
 Native install/run/business records remain native-owned; this is not their migration.
 
+## Hosted private-app removal
+
+On a hosted workspace that advertises private-app removal, a current owner can
+remove a private installation from Manage and restore it there or under Recently
+removed on Apps through its server-provided 30-day deadline. Removal prevents
+access and execution but retains the installation, package and app data; expiry
+does not purge them. Connection grants are revoked and are not restored. If a
+result cannot be confirmed, use Check again rather than repeating the write.
+
+The `app_private_removal: true` flag returned by `/api/meta` controls visibility,
+not authorization. The [AOS-776 tenant Worker][hosted-lifecycle-contract] verifies
+same origin, the current owner's membership and tenant placement on each
+empty-body `POST /api/app-installations/<id>/remove` or `/restore`. A member
+request is refused with `403 owner_required`; an expired restore with
+`409 restore_window`. The browser never substitutes a native preview or
+resends an unconfirmed mutation.
+
+To qualify the server boundary, use a clean AgenticOS v2 checkout at
+`2c1bba077f5efc240b34db9a41c7b1a6ce201a67` with dependencies installed. That
+revision has the released AOS-776 lifecycle implementation. From the Cadence root:
+
+```sh
+node ui/scripts/qa-board/aos-776-workerd.mjs /absolute/path/to/agenticos-v2
+```
+
+This local check uses a real tenant Worker and disposable synthetic storage. It
+checks owner remove and same-installation restore with retained records, member
+denials, and an expired restore at the HTTP boundary. It does not contact a
+hosted workspace. The mounted UI test separately consumes the shared wire
+fixture and covers restore confirmation and `409` feedback.
+
+[hosted-lifecycle-contract]: https://github.com/agenticos-stack/agenticos-v2/blob/8e1f78f0f58a6e10287c16a138087abc7d06401f/docs/architecture/hosted-workspace-target.md#hosted-private-app-removal-and-restore-aos-776
+
 ## Offline byte validation: `cadence app check`
 
 `cadence app check <dir>` validates package bytes with no
@@ -441,17 +474,16 @@ under "Recently removed" for 30 days. Within that window
 consent for the same bytes. After the window it refuses: the install can only
 stay removed, and the page no longer offers Restore. Restore remains available
 in **Recently removed** on the Apps page and in historical Explorer details.
-Directory cards are whole links without nested actions. The installed
-gallery's cards open the app itself (`/apps/<key>`); an operator's small
+The installed gallery's cards open the app itself (`/apps/<key>`); an operator's
 settings action on each card opens `/apps/manage/<id>`.
 
 ## Explorer routes
 
 In the board, `/apps` is the installed-app home, including Favorites and project
-apps. **Explore apps** opens the native directory at `/apps/explore`. Each
-directory card opens `/apps/catalog/<id>` with its overview, features, releases
-and workspace panel; installed-gallery cards open the app at `/apps/<key>`, with
-a small operator settings action to `/apps/manage/<id>`.
+apps. **Explore apps** (`/apps/explore`) uses the same icon tiles with search,
+category and installation-status filters. Each directory card is one link to
+`/apps/catalog/<id>`; it does not launch the app. Published listings appear once;
+earlier entries without a published match remain under the retired catalog.
 
 On a compatible hosted board, use **Manage → Default app agent** to select an
 existing active profile for your own conversations in an approved installation.
@@ -465,9 +497,10 @@ Ask questions about installed apps in the regular Home chat. The assistant
 can use the app tools available to that conversation. Proposals still follow
 the existing review and approval flow.
 
-A verified operator selects an immutable published release, chooses **Review
-installation** or **Review update**, reviews the checked package and access
-changes, then explicitly confirms Apply. Fresh installs may choose an older
+For a fresh install, a verified operator chooses **Review & install** to check the
+selected immutable release. The dialog shows its requested access and compatibility.
+Confirm **Install** there only after the check succeeds. Updates still start with
+**Review update**. Fresh installs may choose an older
 eligible release. Updates may skip the recommendation for an eligible intermediate
 version, but never downgrade or run automatically. Apply rechecks publication,
 digest and the checked installation/catalogue generation. A withdrawn release

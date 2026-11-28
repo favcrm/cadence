@@ -420,6 +420,7 @@ export default function ReleasePanel({
   const [checking, setChecking] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [reviewingInstall, setReviewingInstall] = useState(false);
   const [flow, setFlow] = useState<Flow>({ kind: "none" });
   const retainedLock = useSyncExternalStore(
     subscribeOutcomes,
@@ -431,11 +432,15 @@ export default function ReleasePanel({
   const dialogRef = useModal<HTMLDivElement>(confirming, () => {
     if (!applying) setConfirming(false);
   });
+  const installDialog = useRef<HTMLDialogElement>(null);
+  const installOpener = useRef<HTMLElement>(null);
   const reviewHeading = useRef<HTMLHeadingElement>(null);
   const outcomeNote = useRef<HTMLParagraphElement>(null);
 
   const selected = release?.version ?? null;
   const installKey = install?.install_id ?? null;
+  const removed = install !== null && (install.state === "removed" ||
+    (install.removed != null && install.removed !== 0));
 
   // A different selection or a different install clears the check that
   // named the old one; an uncertain lock survives — it is only lifted by
@@ -444,6 +449,7 @@ export default function ReleasePanel({
     serial.current += 1;
     setChecking(false);
     setConfirming(false);
+    setReviewingInstall(false);
     setFlow({ kind: "none" });
     setNote((current) =>
       current?.observed?.installId === installKey &&
@@ -453,7 +459,7 @@ export default function ReleasePanel({
         ? current
         : null,
     );
-  }, [app.id, selected, installKey, install?.version]);
+  }, [app.id, selected, release?.digest, release?.installable, installKey, install?.version, install?.state, install?.removed, operator]);
 
   // Readback follows the app/session, not the selection or the rows it replaces.
   useEffect(() => {
@@ -476,6 +482,7 @@ export default function ReleasePanel({
       reconciliationSerial.current += 1;
       setFlow({ kind: "none" });
       setConfirming(false);
+      setReviewingInstall(false);
       setChecking(false);
       setReconciling(false);
       setNote(null);
@@ -489,6 +496,7 @@ export default function ReleasePanel({
   }, []);
 
   const relation = ():
+    | "removed"
     | "missing"
     | "unavailable"
     | "downgrade"
@@ -497,6 +505,7 @@ export default function ReleasePanel({
     | "unversioned"
     | "unordered"
     | "install" => {
+    if (removed) return "removed";
     if (!release) return "missing";
     if (!release.installable) return "unavailable";
     if (install) {
@@ -584,6 +593,7 @@ export default function ReleasePanel({
       };
     if (chooser || installParamMissing)
       return { key: "", text: t("Not checked") };
+    if (removed) return { key: "statusBlocked", text: t("Removed") };
     if (!install) return { key: "", text: t("Not installed") };
     if (
       mode === "downgrade" ||
@@ -603,9 +613,27 @@ export default function ReleasePanel({
     return { key: "statusRetained", text: t("Installed version kept") };
   };
   const statusView = status();
+  const showInstallReview = reviewingInstall && mode === "install" && !!release;
+  const ReviewSurface = showInstallReview ? "dialog" : "section";
+  const cancelInstallReview = () => {
+    if (applying) return;
+    installDialog.current?.close();
+    installOpener.current?.focus();
+    serial.current += 1;
+    setChecking(false);
+    setReviewingInstall(false);
+    setFlow({ kind: "none" });
+    setNote(null);
+  };
   useEffect(() => {
-    if (proposalMatches && !checking) reviewHeading.current?.focus();
-  }, [proposalMatches, checking]);
+    const dialog = installDialog.current;
+    if (!showInstallReview || !dialog) return;
+    dialog.showModal();
+    return () => dialog.close();
+  }, [showInstallReview]);
+  useEffect(() => {
+    if (reviewingInstall || (proposalMatches && !checking)) reviewHeading.current?.focus();
+  }, [reviewingInstall, proposalMatches, checking]);
   useEffect(() => {
     if (note) outcomeNote.current?.focus();
   }, [note]);
@@ -634,6 +662,7 @@ export default function ReleasePanel({
     const checkedInstall = install;
     setChecking(true);
     setFlow({ kind: "none" });
+    if (!checkedInstall) setReviewingInstall(true);
     setNote(null);
     void (async () => {
       let proposal: InstallCheck | UpgradeProposal;
@@ -800,6 +829,7 @@ export default function ReleasePanel({
       if (currentSession()) notifyAppsChanged();
       if (!live()) return;
       setFlow({ kind: "none" });
+      setReviewingInstall(false);
       setNote({
         tone: "status",
         observed: {
@@ -828,6 +858,7 @@ export default function ReleasePanel({
             (STALE.test(cause.message) && cause.status < 500));
         settleOutcome(app.id, pending, !(busy || withdrawn || stale));
         if (!live()) return;
+        if (!busy) setReviewingInstall(false);
         if (busy) {
           // Admission refused before staging; the checked proposal stays.
           setNote({
@@ -984,6 +1015,11 @@ export default function ReleasePanel({
           </div>
         )}
       </dl>
+      {removed && (
+        <p className="pub-note" role="status">
+          {t("This installation was removed and cannot be opened or changed here.")}
+        </p>
+      )}
 
       {installParamMissing && (
         <p className="pub-note" role="status">
@@ -1038,7 +1074,7 @@ export default function ReleasePanel({
           {t("Loading published versions…")}
         </p>
       )}
-      {note && (
+      {note && !reviewingInstall && (
         <p
           ref={outcomeNote}
           tabIndex={-1}
@@ -1093,7 +1129,7 @@ export default function ReleasePanel({
           )}
         </p>
       )}
-      {!operator && signedIn && !chooser && (
+      {!operator && signedIn && !chooser && !removed && (
         <p className="pub-note">
           {t(
             install
@@ -1113,24 +1149,34 @@ export default function ReleasePanel({
         </p>
       )}
 
-      {proposalMatches && flow.kind === "checked" && release && (
-        <section
-          className="pub-review"
+      {release && (showInstallReview || (proposalMatches && flow.kind === "checked" && mode === "update")) && (
+        <ReviewSurface
+          ref={showInstallReview ? installDialog : undefined}
+          className={showInstallReview ? "pub-review pub-install-review-dialog" : "pub-review"}
+          aria-labelledby={showInstallReview ? "pub-install-review-title" : undefined}
           aria-live="polite"
+          onCancel={showInstallReview ? (event) => { event.preventDefault(); cancelInstallReview(); } : undefined}
           data-version={release.version}
           data-digest={release.digest}
         >
-          <h2 ref={reviewHeading} tabIndex={-1}>
-            {install
-              ? t("Review version {version}").replace(
-                  "{version}",
-                  release.version,
-                )
-              : t("Review installation of {version}").replace(
-                  "{version}",
-                  release.version,
-                )}
+          <h2 id={showInstallReview ? "pub-install-review-title" : undefined} ref={reviewHeading} tabIndex={-1}>
+            {showInstallReview
+              ? t("Install {title} {version}?").replace("{title}", () => app.title).replace("{version}", () => release.version)
+              : t("Review version {version}").replace("{version}", () => release.version)}
           </h2>
+          {reviewingInstall && (
+            <p>
+              {t("Install exactly package {version}. Connections and execution need their own approval checks. Later releases will not install automatically.").replace("{version}", release.version)}
+            </p>
+          )}
+          {checking && <p role="status">{t("Checking…")}</p>}
+          {note && reviewingInstall && (
+            <p ref={outcomeNote} tabIndex={-1} className="pub-note" data-tone={note.tone} role={note.tone === "alert" ? "alert" : "status"}>
+              {note.text}
+            </p>
+          )}
+          {proposalMatches && flow.kind === "checked" && (
+            <>
           {release.release_notes && (
             <div>
               <h3>{t("Release notes")}</h3>
@@ -1205,16 +1251,33 @@ export default function ReleasePanel({
               {t("Catalogue")}: {app.id}
             </p>
           </details>
-        </section>
+            </>
+          )}
+          {reviewingInstall && (
+            <div className="pub-actions">
+              <Button onClick={cancelInstallReview} disabled={applying}>
+                {t("Cancel")}
+              </Button>
+              {!checking && !proposalMatches && (
+                <Button onClick={startCheck} disabled={!checkable}>
+                  {t("Retry")}
+                </Button>
+              )}
+              {offered && (
+                <Button variant="primary" onClick={startApply}>
+                  {t("Install {version}").replace("{version}", release.version)}
+                </Button>
+              )}
+            </div>
+          )}
+        </ReviewSurface>
       )}
 
       {!chooser && (
         <div className="pub-actions">
-          {offered && flow.kind === "checked" && release && (
+          {offered && flow.kind === "checked" && release && mode === "update" && (
             <Button variant="primary" onClick={() => setConfirming(true)}>
-              {install
-                ? t("Update to {version}").replace("{version}", release.version)
-                : t("Install {version}").replace("{version}", release.version)}
+              {t("Update to {version}").replace("{version}", release.version)}
             </Button>
           )}
           {operator &&
@@ -1222,17 +1285,17 @@ export default function ReleasePanel({
             release &&
             (mode === "install" || mode === "update") && (
               <Button
-                variant={proposalMatches ? "secondary" : "primary"}
-                disabled={!checkable}
-                onClick={startCheck}
+                variant={proposalMatches && mode === "update" ? "secondary" : "primary"}
+                disabled={!showInstallReview && !checkable}
+                onClick={(event) => {
+                  if (mode === "install") installOpener.current = event.currentTarget;
+                  startCheck();
+                }}
               >
-                {checking
-                  ? t("Checking…")
-                  : proposalMatches
-                    ? t("Check again")
-                    : install
-                      ? t("Review update")
-                      : t("Review installation")}
+                {mode === "install" ? t("Review & install")
+                  : checking ? t("Checking…")
+                  : proposalMatches ? t("Check again")
+                  : t("Review update")}
               </Button>
             )}
           {isLocked && operator && (
@@ -1242,7 +1305,7 @@ export default function ReleasePanel({
                 : t("Check installation")}
             </Button>
           )}
-          {install && (
+          {install && !removed && (
             <InstalledActions
               install={install}
               openHref={openHref}

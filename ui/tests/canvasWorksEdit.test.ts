@@ -1,3 +1,4 @@
+import type * as WorkspaceApps from "../src/features/workspace-apps/workspaceApps";
 declare function require(name: string): any;
 declare const process: any;
 export {};
@@ -80,6 +81,8 @@ async function main() {
   };
 
   let installFetches = 0;
+  let resolveInitialInstallations!: (response: Response) => void;
+  let deferInitialInstallations = false;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input: unknown) => {
     const url = String(input);
@@ -97,6 +100,10 @@ async function main() {
     }
     if (url.includes("/api/app-installations")) {
       installFetches += 1;
+      if (deferInitialInstallations) {
+        deferInitialInstallations = false;
+        return new Promise<Response>((resolve) => { resolveInitialInstallations = resolve; });
+      }
       return new Response(JSON.stringify([WORKS_INSTALL]), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -116,7 +123,7 @@ async function main() {
     const ViewHeader = require("../src/features/canvas/ViewHeader").default;
     const AppViewBody = require("../src/features/canvas/AppViewBody").default;
     const WorksCanvasLauncher = require("../src/features/canvas/WorksCanvasLauncher").default;
-    const { dropInstallationsSnapshot } = require("../src/features/workspace-apps/workspaceApps") as typeof import("../src/features/workspace-apps/workspaceApps");
+    const { dropInstallationsSnapshot, notifyAppsChanged } = require("../src/features/workspace-apps/workspaceApps") as typeof WorkspaceApps;
 
     const settle = async () => {
       await React.act(async () => {
@@ -232,6 +239,20 @@ async function main() {
     await mountLauncher(null, "Hiring blocked");
     assert(host.querySelector("[data-works-canvas-new]") === null, "HireBlock hides WorksCanvasLauncher");
     assert(installFetches === 0, "hire-blocked launcher skips installation fetch");
+    // A mutation while the initial list is pending invalidates that read. The
+    // launcher must request a fresh list rather than silently losing Works.
+    deferInitialInstallations = true;
+    await mountLauncher(null, null);
+    assert(!deferInitialInstallations && host.querySelector("[data-works-canvas-new]") === null, "initial Works read is pending");
+    await React.act(async () => { notifyAppsChanged(); });
+    await settle();
+    assert(Number(installFetches) === 2 && host.querySelector("[data-works-canvas-new]") !== null, "app mutation refreshes the launcher list");
+    await React.act(async () => {
+      resolveInitialInstallations(new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } }));
+    });
+    await settle();
+    assert(host.querySelector("[data-works-canvas-new]") !== null, "invalidated initial answer cannot replace the fresh list");
+
 
     store.resetCanvas("conv_1", "k", "app");
     await mountLauncher(null, null);

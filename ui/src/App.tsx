@@ -346,6 +346,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const humanThreadsOn = boardSupports(meta, "human_threads");
   const credentialRequestsOn = boardSupports(meta, "credential_requests");
   const automaticUpdatesOn = boardSupports(meta, "app_automatic_updates");
+  // Visibility only. The AOS-776 tenant independently authorizes each POST.
+  const hostedRemovalEnabled = hostedBoard && meta.signed_in === true && meta.app_private_removal === true;
   // CAD-2286: the document lifecycle is hosted only. Only a hosted board is
   // probed; the nav shows Documents once the probe answers `available`.
   const documentsHosted = meta?.hosted === true;
@@ -383,9 +385,19 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const [menuOpen, setMenuOpen] = useState(false);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   // A full-width canvas folds the sidebar to its rail without touching the person's own preference (CAD-2657).
-  const { collapsed: sidebarPref } = useSidebarPrefs();
+  const { collapsed: sidebarPref, appsOpen } = useSidebarPrefs();
   const canvasFull = useCanvasChrome().full;
   const sidebarCollapsed = sidebarPref || canvasFull;
+  const [desktopSidebar, setDesktopSidebar] = useState(() =>
+    typeof window === "undefined" || typeof window.matchMedia !== "function" || window.matchMedia("(min-width: 1024px)").matches);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(min-width: 1024px)");
+    const update = () => setDesktopSidebar(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   const sidebarCollapseRef = useRef<HTMLButtonElement>(null);
   const setSidebarCollapsed = (collapsed: boolean) => {
     updateSidebarPrefs((prefs) => ({ ...prefs, collapsed }));
@@ -1059,7 +1071,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     if (entering) setAppsVisitTick((n) => n + 1);
   }, [onAppsBrowserRoute]);
   const installationsRefreshKey = `${appsVisitTick}:${appsTick}`;
-  const installations = useInstallations(listReader, installationsRefreshKey, memberHome ? "home" : "list");
+  const installations = useInstallations(listReader, installationsRefreshKey, memberHome ? "home" : "list", meta?.operator === true);
   // A removed or disabled app is not an app to open: drop it from the menu.
   // It stays visible on the Apps surface, which is where it is managed.
   const installed: VerifiedApp[] = useMemo(
@@ -1110,22 +1122,28 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
     : null;
-  const [unreadProbesFallback, setUnreadProbesFallback] = useState(false);
-  useEffect(() => {
-    setUnreadProbesFallback(false);
-    if (!onAppScreen) return;
-    const timer = window.setTimeout(() => setUnreadProbesFallback(true), 2500);
-    return () => window.clearTimeout(timer);
-  }, [onAppScreen, routeInstallId]);
-  const deferUnreadProbes = onAppScreen && activeApp === null && !unreadProbesFallback;
-  const [unreadProbesMounted, setUnreadProbesMounted] = useState(() => !onAppScreen);
+  // Keep existing unread subscriptions once mounted. Only defer initial
+  // probes on an Apps route when the sidebar does not display those badges.
+  const browsingApps = onAppsBrowserRoute || route.screen === "appsCatalog" || route.screen === "appsManage";
+  const appsSidebarVisible = appsOpen && (menuOpen || (desktopSidebar && !sidebarCollapsed));
+  const waitForApp = onAppScreen && activeApp === null;
+  const deferUnreadProbes = waitForApp || (browsingApps && !appsSidebarVisible);
+  const [unreadProbesMounted, setUnreadProbesMounted] = useState(false);
   useEffect(() => {
     if (!listReader) {
       setUnreadProbesMounted(false);
       return;
     }
-    if (!deferUnreadProbes) setUnreadProbesMounted(true);
-  }, [listReader, deferUnreadProbes]);
+    if (unreadProbesMounted) return;
+    if (!deferUnreadProbes) {
+      setUnreadProbesMounted(true);
+      return;
+    }
+    // Bound the delay so a cold visit with a closed sidebar still gets
+    // background notifications. Opening the sidebar cancels the delay.
+    const timer = window.setTimeout(() => setUnreadProbesMounted(true), 2500);
+    return () => window.clearTimeout(timer);
+  }, [listReader, unreadProbesMounted, deferUnreadProbes]);
   // CAD-1193: one viewer for every consumer — `access` splits the
   // `operator: null` unknown into "checking" (a probe is still in
   // flight or has never run) and "unavailable" (a completed probe
@@ -1822,16 +1840,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "apps" && !route.project && (
-          <Apps viewer={viewer} installationsList={installations.list} />
+          <Apps key={`${viewer.operator}:${viewer.readOnly}`} viewer={viewer} installationsList={installations.list} hosted={hostedBoard} hostedRemovalEnabled={hostedRemovalEnabled} />
         )}
         {route.screen === "appsExplore" && (
           <Explorer viewer={viewer} />
         )}
         {route.screen === "appsCatalog" && (
-          <CatalogDetail id={route.id} viewer={viewer} />
+          <CatalogDetail key={route.id} id={route.id} viewer={viewer} />
         )}
         {route.screen === "appsManage" && (
-          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} appAgentSession={appAgentSession} hosted={hostedBoard} />
+          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} appAgentSession={appAgentSession} hosted={hostedBoard} hostedRemovalEnabled={hostedRemovalEnabled} />
         )}
         {(route.screen === "workspaceApp" || route.screen === "workspaceAppKey") && (
           <WorkspaceAppEntry

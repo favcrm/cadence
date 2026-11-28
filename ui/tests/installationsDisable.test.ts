@@ -1,3 +1,4 @@
+import type * as WorkspaceApps from "../src/features/workspace-apps/workspaceApps";
 declare function require(name: string): any;
 export {};
 /**
@@ -18,7 +19,7 @@ async function main() {
   const React = require("react") as typeof import("react");
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
   const { act } = React;
-  const { workspaceApps } = require("../src/features/workspace-apps/workspaceApps") as typeof import("../src/features/workspace-apps/workspaceApps");
+  const { workspaceApps, readInstallationsSnapshot } = require("../src/features/workspace-apps/workspaceApps") as typeof WorkspaceApps;
   const { useInstallations } = require("../src/features/workspace-apps/useInstallations") as typeof import("../src/features/workspace-apps/useInstallations");
 
   const operatorList = [{ id: "install-notes" }];
@@ -31,8 +32,8 @@ async function main() {
   };
 
   let seen: ReturnType<typeof useInstallations> | undefined;
-  function Probe({ enabled }: { enabled: boolean }) {
-    seen = useInstallations(enabled, "k");
+  function Probe({ enabled, paused = false, source = "list" }: { enabled: boolean; paused?: boolean; source?: "list" | "home" }) {
+    seen = useInstallations(enabled, "k", source, true, paused);
     return null;
   }
   const root = createRoot(win.document.createElement("div"));
@@ -42,6 +43,14 @@ async function main() {
   await settle();
   equal(seen?.list, operatorList, "operator list loaded while enabled");
   equal(calls, 1, "one request while enabled");
+  await act(async () => { root.render(React.createElement(Probe, { enabled: true, paused: true })); });
+  equal(readInstallationsSnapshot(), operatorList, "an authorized paused consumer preserves the shared snapshot");
+  equal({ list: seen?.list, error: seen?.error, loading: seen?.loading }, { list: null, error: null, loading: false }, "paused consumer exposes no stale state");
+  equal(calls, 1, "pausing does not issue a read");
+  await act(async () => { root.render(React.createElement(Probe, { enabled: true })); });
+  await settle();
+  equal(calls, 2, "resuming reads again");
+
 
   await act(async () => { root.render(React.createElement(Probe, { enabled: false })); });
   await settle();
@@ -51,15 +60,16 @@ async function main() {
     "disabled hook shows nothing of the operator's last state",
   );
   equal(lastSignal?.aborted, true, "the enabled request is aborted on disable");
+  equal(readInstallationsSnapshot(), null, "loss of authority still evicts the shared snapshot");
 
   await act(async () => { root.render(React.createElement(Probe, { enabled: true })); });
   await settle();
-  equal(calls, 2, "re-enabling requests again");
+  equal(calls, 3, "re-enabling requests again");
   equal(seen?.list, operatorList, "re-enabled hook loads the list again");
 
   // Mid-flight pause/session reset must refuse without writing or returning stale installations.
-  const { readInstallationsGuarded, readInstallationsSnapshot, dropInstallationsSnapshot } =
-    require("../src/features/workspace-apps/workspaceApps") as typeof import("../src/features/workspace-apps/workspaceApps");
+  const { readInstallationsGuarded, dropInstallationsSnapshot } =
+    require("../src/features/workspace-apps/workspaceApps") as typeof WorkspaceApps;
   const { pausePrivateReads, allowPrivateReads } =
     require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
   dropInstallationsSnapshot();
@@ -78,6 +88,26 @@ async function main() {
   }
   equal(refused, true, "mid-flight pause refuses installations result with 401");
   equal(readInstallationsSnapshot(), null, "refused mid-flight read never caches under current session");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input), win.location.href);
+    if (url.pathname !== "/api/app-home") throw new Error(`Unexpected member read: ${url.pathname}`);
+    const installations = ["ok", "off", "removed"].map((state) => ({
+      install_id: `install_${state}`, name: state, title: state,
+      attention: { state, message: null, action: null, count: 0 },
+    }));
+    return new Response(JSON.stringify({ installations }), { headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    await act(async () => { root.render(React.createElement(Probe, { enabled: true, source: "home" })); });
+    await settle();
+    const { canOpenInstall } = require("../src/features/explorer/installAccess") as typeof import("../src/features/explorer/installAccess");
+    const launchable = seen?.list?.filter((row) => canOpenInstall(row.state, row.removed)).map((row) => row.install_id);
+    equal(launchable, ["install_ok"], "member launch links exclude disabled and removed installs from app home");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 
   await act(async () => { root.unmount(); });
   win.close?.();

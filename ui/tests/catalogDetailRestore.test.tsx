@@ -1,4 +1,5 @@
 import { streamFixture } from "./streamFixture";
+import type * as WorkspaceApps from "../src/features/workspace-apps/workspaceApps";
 /**
  * A successful legacy restore must leave one consistent installed state,
  * without retaining the removed state or offering another restore.
@@ -30,6 +31,7 @@ const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src
 const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const CatalogDetail = (require("../src/features/explorer/CatalogDetail") as typeof import("../src/features/explorer/CatalogDetail")).default;
+const { readInstallationsGuarded, readInstallationsSnapshot } = require("../src/features/workspace-apps/workspaceApps") as typeof WorkspaceApps;
 
 // CAD-1209 (browser QA on #847): Restore on a removed app's detail page must
 // leave the page reading "Installed" only. The local card kept `removed: true`,
@@ -39,16 +41,20 @@ let card: Record<string, unknown> = {
   state: "available", removed: true, restorable: true, install_id: "inst-1",
   listing: { tagline: "t", category: "customers" }, access: [], digest: "sha256:x",
 };
+let resolvePublic!: (response: Response) => void;
+const publicResponse = new Promise<Response>((resolve) => { resolvePublic = resolve; });
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(typeof input === "string" ? input : (input as { url: string }).url), "http://localhost");
   const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, headers: { "Content-Type": "application/json" } });
   if (url.pathname.endsWith("/stream")) return streamFixture(url.href);
   if (url.pathname.endsWith("/restore") && init?.method === "POST") return json({ restored: true, digest: "sha256:x" });
   if (url.pathname === "/api/app-installations") return json([]);
-  if (url.pathname === "/api/public-apps/crm") return new Response(JSON.stringify({ ok: false, error: { code: "not_found" } }), { status: 404, headers: { "Content-Type": "application/json" } });
+  if (url.pathname === "/api/public-apps/crm") return publicResponse;
   if (url.pathname === "/api/app-catalog/crm") return json(card);
   return json({});
 }) as typeof fetch;
+const warmList = await readInstallationsGuarded();
+assert(readInstallationsSnapshot() === warmList, "operator list is warm before opening detail");
 
 const host = document.createElement("div");
 document.body.appendChild(host);
@@ -59,6 +65,10 @@ await React.act(async () => {
     React.createElement(NavigationProvider, { adapter: hostNavigation, children:
       React.createElement(CatalogDetail, { id: "crm", viewer: { operator: true, readOnly: false } }),
     })));
+});
+assert(readInstallationsSnapshot() === warmList, "pending public detail preserves the warm operator list");
+await React.act(async () => {
+  resolvePublic(new Response(JSON.stringify({ ok: false, error: { code: "not_found" } }), { status: 404, headers: { "Content-Type": "application/json" } }));
 });
 await flush();
 await flush();

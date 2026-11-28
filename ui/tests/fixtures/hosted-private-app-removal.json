@@ -1,0 +1,33 @@
+{
+  "meta": { "app_private_removal": true },
+  "remove_receipt": {
+    "install_id": "install_books",
+    "source_kind": "private",
+    "state": "removed",
+    "executable": false,
+    "removed_at": 1767225600000,
+    "restore_until": 1769817600000
+  },
+  "restore_receipt": {
+    "restored": true,
+    "installation": {
+      "install_id": "install_books",
+      "source_kind": "private",
+      "state": "active",
+      "executable": true,
+      "removed_at": null,
+      "restore_until": null
+    }
+  },
+  "app_home_removed": {
+    "installations": [
+      {
+        "install_id": "install_books",
+        "source_kind": "private",
+        "restore_until": 1769817600000,
+        "attention": { "state": "removed", "message": "Removed", "action": "restore", "count": 0 }
+      }
+    ]
+  },
+  "restore_expired": { "error": { "code": "restore_window" } }
+}

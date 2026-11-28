@@ -1,13 +1,17 @@
 import { canOpenInstall } from "../explorer/installAccess";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { resources } from "../../lib/resources";
 import { navigate, useHref } from "../../lib/useLocation";
 import { useLocale, useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused, onPrivateSessionReset } from "../../lib/privateSession";
+import { privateSessionGeneration } from "../../lib/privateSession";
+import { hostedRestoreAvailable, pendingHostedLifecycle, runHostedLifecycle } from "../workspace-apps/hostedPrivateLifecycle";
 import { localizedAppCategory, localizedAppTagline, localizedAppTitle, parseAppDisplayI18n, type TranslateFn } from "../workspace-apps/appLocale";
 import {
+  applyHostedLifecycleToHome,
   appExplorer,
   catalogUpdateHref,
+  hostedLifecycleFromEvent,
   notifyAppsChanged,
   pendingCatalogUpdates,
   prefetchAppScope,
@@ -33,6 +37,7 @@ import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { PrivateAppDialog } from "../workspace-apps/PrivateAppDialog";
 import { ResourceGate } from "../../ui/ResourceStatus";
+import { AppTile, AppTileSkeletons } from "./AppTile";
 import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
@@ -70,10 +75,14 @@ type FilterKey = "all" | "pinned" | "updates" | "attention" | `cat:${string}`;
 export default function Apps({
   viewer,
   installationsList,
+  hosted = false,
+  hostedRemovalEnabled: hostedRemovalPresentationEnabled = false,
 }: {
   viewer: Viewer;
   /** Optional parent-supplied `/api/app-installations` list to avoid a duplicate read. */
   installationsList?: Installation[] | null;
+  hosted?: boolean;
+  hostedRemovalEnabled?: boolean;
 }) {
   const { locale, t } = useLocale();
   const [revision, setRevision] = useState(0);
@@ -84,6 +93,10 @@ export default function Apps({
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [privateOpen, setPrivateOpen] = useState(false);
+  const [unresolved, setUnresolved] = useState<string | null>(null);
+  const hostedLock = useRef(false);
+  const [hostedExpired, setHostedExpired] = useState<Set<string>>(() => new Set());
+  const [, setDeadlineTick] = useState(0);
   const href = useHref();
   const reviewId = new URLSearchParams(href.split("?")[1] ?? "").get("review");
   const closeReview = () => {
@@ -96,24 +109,46 @@ export default function Apps({
   const [catalogCards, setCatalogCards] = useState<CatalogCard[] | null>(() => (isOp ? readAppCatalogSnapshot() : null));
 
   useEffect(() => {
-    const bump = () => setRevision((r) => r + 1);
-    window.addEventListener(APPS_CHANGED_EVENT, bump);
     const clearCatalog = () => setCatalogCards(null);
+    const clearLifecycle = () => { setUnresolved(null); setHostedExpired(new Set()); };
+    const stopLifecyclePause = onPrivateReadsPaused(clearLifecycle);
+    const stopLifecycleReset = onPrivateSessionReset(clearLifecycle);
     const stopPause = onPrivateReadsPaused(clearCatalog);
     const stopReset = onPrivateSessionReset(clearCatalog);
     return () => {
-      window.removeEventListener(APPS_CHANGED_EVENT, bump);
       stopPause();
       stopReset();
+      stopLifecyclePause();
+      stopLifecycleReset();
     };
   }, []);
 
   // CAD-1189: every list here loads with the shared busy backoff, keeps
   // its last good answer on a failed refresh, and never reads an error as
   // "no apps". Seed with the tab-scoped SWR snapshot on return visits.
-  const homeLoad = useBackoffLoad((signal) => readAppHomeFresh(signal), revision, undefined, readAppHomeSnapshot());
+  const authority = viewer.operator === true ? "operator" : viewer.operator === false ? (viewer.readOnly ? "viewer" : "member") : undefined;
+  const homeLoad = useBackoffLoad((signal) => readAppHomeFresh(signal, authority), revision, undefined, authority ? readAppHomeSnapshot(authority) : null);
   const favLoad = useBackoffLoad((signal) => readAppFavoritesFresh(signal), revision, undefined, readAppFavoritesSnapshot());
   const home = homeLoad.data;
+  const setHome = homeLoad.setData;
+  useEffect(() => {
+    const bump = (event: Event) => {
+      const change = hostedLifecycleFromEvent(event);
+      if (change && isOp && hosted) setHome((rows) => applyHostedLifecycleToHome(rows, change));
+      setRevision((r) => r + 1);
+    };
+    window.addEventListener(APPS_CHANGED_EVENT, bump);
+    return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
+  }, [hosted, isOp, setHome]);
+  const pendingRow = hosted ? home?.find((row) => pendingHostedLifecycle(row.install_id) !== null) : undefined;
+  useEffect(() => {
+    if (!hosted || !home) return;
+    const deadlines = home.map((row) => row.restore_until).filter((value): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= Date.now());
+    if (!deadlines.length) return;
+    const delay = Math.min(...deadlines) - Date.now() + 1;
+    const timer = window.setTimeout(() => setDeadlineTick((n) => n + 1), Math.min(Math.max(delay, 1), 2147483647));
+    return () => window.clearTimeout(timer);
+  });
   const [pinned, setPinned] = useState<FavoritesPayload | null>(null);
   useEffect(() => setPinned(null), [favLoad.data]);
   const favs = pinned ?? favLoad.data;
@@ -290,7 +325,30 @@ export default function Apps({
       });
   };
   const opened = (id: string) => { void appExplorer.opened(id).catch(() => {}); };
-  const restore = (id: string) => {
+  const restore = (id: string, checkOnly = false) => {
+    if (hosted) {
+      const row = home?.find((item) => item.install_id === id);
+      if (!isOp || !hostedRemovalPresentationEnabled || !row || row.source_kind !== "private" || hostedLock.current || (unresolved !== null && !checkOnly)) return;
+      if (!checkOnly && !hostedRestoreAvailable(row.restore_until)) {
+        setActionError(t("The restore window has closed."));
+        return;
+      }
+      hostedLock.current = true;
+      const generation = privateSessionGeneration();
+      const action = checkOnly ? pendingHostedLifecycle(id) ?? "restore" : "restore";
+      setBusy(id); setActionError(null);
+      void runHostedLifecycle(id, action, checkOnly)
+        .then((outcome) => {
+          if (!outcome) return;
+          setUnresolved(outcome.kind === "uncertain" ? id : null);
+          if (outcome.kind === "denied" && outcome.expired) setHostedExpired((old) => new Set(old).add(id));
+          if (outcome.kind === "denied" || (outcome.kind === "confirmed" && !outcome.requestedStateReached)) {
+            setActionError(t(outcome.message));
+          }
+        })
+        .finally(() => { hostedLock.current = false; if (privateSessionGeneration() === generation) setBusy(null); });
+      return;
+    }
     setBusy(id);
     void appExplorer.restore(id)
       .then(notifyAppsChanged)
@@ -388,6 +446,15 @@ export default function Apps({
           </header>
 
           {actionError && <div className="alert fail mb-4" role="alert">{actionError}</div>}
+          {isOp && hostedRemovalPresentationEnabled && (unresolved ?? pendingRow?.install_id) && (
+            <div className="alert warn mb-4" role="status">
+              <p>{t("The result could not be confirmed. Check again before making another change.")}</p>
+              <Button className="btn-sm mt-2" disabled={busy !== null} onClick={() => {
+                const id = unresolved ?? pendingRow?.install_id;
+                if (id) restore(id, true);
+              }}>{t("Check again")}</Button>
+            </div>
+          )}
           {loadError !== null && (
             <div className="apps-state card mb-4" role="alert">
               {loadError === UNVERIFIED_APPS_COPY ? (
@@ -404,24 +471,7 @@ export default function Apps({
           )}
           {retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
           {home === null ? (
-            loadError === null && !retrying && (
-              <div
-                className="apps-grid apps-skeleton-grid"
-                role="status"
-                aria-live="polite"
-                aria-label={t("Loading your apps…")}
-              >
-                <span className="sr-only">{t("Loading your apps…")}</span>
-                {Array.from({ length: 6 }, (_, i) => (
-                  <div key={i} className="card app-card apps-skeleton-card" aria-hidden="true">
-                    <span className="apps-skeleton-icon wa-loading-bar wa-skel-pulse" />
-                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "62%", height: "0.9rem" }} />
-                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "86%", height: "0.75rem" }} />
-                    <span className="wa-loading-bar wa-skel-pulse" style={{ width: "44%", height: "0.7rem", marginTop: "auto" }} />
-                  </div>
-                ))}
-              </div>
-            )
+            loadError === null && <AppTileSkeletons label={t("Loading your apps…")} compact={layout === "list"} />
           ) : (
             <>
               {emptyWorkspace && (
@@ -659,7 +709,7 @@ export default function Apps({
                     <h2 className="apps-kicker">{t("Recently removed")}</h2>
                     <span className="apps-count-pill num">{removedList.length}</span>
                   </div>
-                  <p className="hint mb-2">{t("Removed apps restore for 30 days, then they're deleted for good.")}</p>
+                  <p className="hint mb-2">{t(hosted ? "Removed private apps retain their data. Connection grants are not restored." : "Removed apps restore for 30 days, then they're deleted for good.")}</p>
                   <div className="card p-0 divide-y divide-ink-800">
                     {removedList.map((h) => {
                       const title = localizedById.get(h.install_id)?.title ?? homeAppTitle(h, locale, t);
@@ -669,11 +719,11 @@ export default function Apps({
                           <div className="grow">
                             <b>{title}</b>
                             <small className="block text-ink-500">
-                              {t(h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}
+                              {t(hosted ? (!Number.isSafeInteger(h.restore_until) ? "The restore deadline could not be verified." : !hostedExpired.has(h.install_id) && hostedRestoreAvailable(h.restore_until) ? "Removed" : "Removed · restore window closed") : h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}
                             </small>
                           </div>
-                          {h.attention.action === "restore" && (
-                            <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
+                          {(hosted ? hostedRemovalPresentationEnabled && h.source_kind === "private" && !pendingHostedLifecycle(h.install_id) && !hostedExpired.has(h.install_id) && hostedRestoreAvailable(h.restore_until) : h.attention.action === "restore") && (
+                            <Button className="btn-sm" disabled={busy !== null || unresolved !== null} onClick={() => restore(h.install_id)}>
                               {t(busy === h.install_id ? "Restoring…" : "Restore")}
                             </Button>
                           )}
@@ -763,64 +813,34 @@ function InstalledCard({
     : effectiveState === "attention" ? "Needs attention"
     : "Installed";
   const tone = effectiveState === "update" ? "info" : effectiveState === "setup" || effectiveState === "attention" ? "warn" : "";
-  const nameId = `app-card-name-${h.install_id}`;
-  const statusId = `app-card-status-${h.install_id}`;
   const listing = h.listing;
   const category = listing?.category;
   const title = localized?.title ?? homeAppTitle(h, locale, t);
   const summary = localized?.tagline ?? homeAppTagline(h, locale, t);
   const publisher = listing?.publisher?.name;
   return (
-    <article className={`card app-card ${pinned ? "is-pinned" : ""}`}>
-      <div className="app-card-body">
-        <div className="app-tile-icon">
-          <AppGlyph name={h.name} icon={h.icon} title={title} size={layout === "list" ? "sm" : "xl"} />
-        </div>
-        <div className="app-card-copy">
-          <div className="app-card-title-group">
-            <h3 className="app-card-name" id={nameId}>
-              {href === null ? (
-                title
-              ) : (
-                <Link
-                  className="app-card-link"
-                  href={href}
-                  aria-describedby={statusId}
-                  onClick={onOpen}
-                  onMouseEnter={() => prefetchAppScope(h.install_id)}
-                  onFocus={() => prefetchAppScope(h.install_id)}
-                >
-                  {title}
-                </Link>
-              )}
-            </h3>
-            {category && <span className="card-category">{localizedAppCategory(category, locale)}</span>}
-          </div>
-          {summary && <p className="app-card-summary">{summary}</p>}
-          {publisher && <span className="card-publisher">{publisher}</span>}
-          {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
-          <div className="card-footer">
-            <span className="num">{h.version ? `v${h.version}` : t("Installed")}</span>
-            {catalogUpdate ? (
-              <Link
-                className="app-update-link num"
-                id={statusId}
-                href={catalogUpdateHref(catalogUpdate.catalogId, h.install_id)}
-                aria-label={`${t("Review update")} — ${title} (v${catalogUpdate.latestVersion})`}
-                title={t("Review update")}
-              >
-                → v{catalogUpdate.latestVersion}
-              </Link>
-            ) : (
-              <span className="app-status" id={statusId} data-state={tone}>{t(statusKey)}</span>
-            )}
-          </div>
-          {href === null && (
-            <div className="app-card-copy-note">{t("No unique app page — see Manage")}</div>
-          )}
-        </div>
-      </div>
-      <div className="app-card-actions">
+    <AppTile
+      name={h.name}
+      icon={h.icon}
+      title={title}
+      summary={summary}
+      category={category ? localizedAppCategory(category, locale) : undefined}
+      meta={<>
+        {publisher && <span className="card-publisher">{publisher}</span>}
+        {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
+      </>}
+      version={h.version ? `v${h.version}` : t("Installed")}
+      status={t(statusKey)}
+      statusId={`app-card-status-${h.install_id}`}
+      statusAction={catalogUpdate ? <Link id={`app-card-status-${h.install_id}`} className="app-update-link num" href={catalogUpdateHref(catalogUpdate.catalogId, h.install_id)} aria-label={`${t("Review update")} — ${title} (v${catalogUpdate.latestVersion})`} title={t("Review update")}>→ v{catalogUpdate.latestVersion}</Link> : undefined}
+      tone={tone}
+      href={href}
+      note={t("No unique app page — see Manage")}
+      onOpen={onOpen}
+      onPrefetch={() => prefetchAppScope(h.install_id)}
+      pinned={pinned}
+      compact={layout === "list"}
+      actions={<>
         <button
           type="button"
           className={`app-card-action-btn ${pinned ? "is-pinned" : ""}`}
@@ -842,8 +862,8 @@ function InstalledCard({
             <IconSettings size={14} />
           </Link>
         )}
-      </div>
-    </article>
+      </>}
+    />
   );
 }
 

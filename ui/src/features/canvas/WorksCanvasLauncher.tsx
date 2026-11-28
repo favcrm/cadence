@@ -4,6 +4,7 @@ import "../../ui/controls.css";
 import { installedAppHref } from "../apps/appViewModel";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import {
+  APPS_CHANGED_EVENT,
   readInstallationsGuarded,
   readInstallationsSnapshot,
   type Installation,
@@ -53,17 +54,27 @@ export default function WorksCanvasLauncher({ compact = false }: { compact?: boo
       setWorks(null);
       return;
     }
-    const controller = new AbortController();
-    const cached = findWorksApp(readInstallationsSnapshot());
-    if (cached) setWorks(cached);
-    readInstallationsGuarded(controller.signal)
-      .then((rows) => {
-        if (!controller.signal.aborted) setWorks(findWorksApp(rows));
-      })
-      .catch(() => {
-        // Fail closed silently if installations cannot be loaded.
-      });
-    return () => controller.abort();
+    let controller: AbortController | undefined;
+    const refresh = () => {
+      controller?.abort();
+      const request = controller = new AbortController();
+      // Changes update the warm operator snapshot before the event. Share
+      // its ongoing refresh rather than starting a second install-list read.
+      setWorks(findWorksApp(readInstallationsSnapshot()));
+      void readInstallationsGuarded(request.signal, true)
+        .then((rows) => {
+          if (!request.signal.aborted) setWorks(findWorksApp(rows));
+        })
+        .catch(() => {
+          // Fail closed silently if installations cannot be loaded.
+        });
+    };
+    window.addEventListener(APPS_CHANGED_EVENT, refresh);
+    refresh();
+    return () => {
+      window.removeEventListener(APPS_CHANGED_EVENT, refresh);
+      controller?.abort();
+    };
   }, [blocked]);
 
   useEffect(() => {

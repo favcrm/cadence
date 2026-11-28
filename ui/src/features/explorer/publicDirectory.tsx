@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
@@ -17,6 +17,7 @@ import { loadFailureMessage, loadWithBackoff } from "../workspace-apps/installat
 import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { installationAppHref } from "../apps/appViewModel";
+import { AppTile, AppTileSkeletons } from "../apps/AppTile";
 import AppCover from "./AppCover";
 import ReleasePanel, { InstalledActions } from "./releasePanel";
 import type { Viewer } from "../projects/work";
@@ -330,37 +331,36 @@ function useBoardInstalls(viewer: Viewer): {
     return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
   }, [signedIn, tick]);
 
-  const read = useCallback((signal: AbortSignal): Promise<InstallRef[]> => {
+  const read = useCallback((signal: AbortSignal, shared: boolean): Promise<InstallRef[]> => {
     const fromOperator = (list: Installation[]): InstallRef[] => list
-      .filter((row) => row.removed == null)
       .map((row) => ({
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
-        removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
+        state: row.state, removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
         i18n: row.i18n, listing: row.listing,
       }));
     const fromHome = (home: HomeInstallation[]): InstallRef[] => home
-      .filter((row) => row.attention?.state !== "removed")
       .map((row) => ({
         install_id: row.install_id, name: row.name, title: row.title, version: row.version,
         project_link: row.project ?? "", removed: null, catalogue: row.catalogue ?? null, project: row.project,
+        state: row.attention?.state === "removed" ? "removed" : row.attention?.state === "off" ? "disabled" : undefined,
         i18n: row.i18n, listing: row.listing,
       }));
     const once = () => operator
-      ? workspaceApps.installations(signal).then(fromOperator)
-      : appExplorer.home(signal).then((home) => {
+      ? workspaceApps.installations(signal, shared).then(fromOperator)
+      : appExplorer.home(signal, shared ? (viewer.readOnly ? "viewer" : "member") : undefined).then((home) => {
         if (!Array.isArray(home?.installations)) throw new Error("Installed apps could not be checked.");
         return fromHome(home.installations);
       });
     return loadWithBackoff(once, { signal });
-  }, [operator]);
+  }, [operator, viewer.readOnly]);
 
   useEffect(() => {
     if (!signedIn || !privateReadsAllowed()) { setRows(null); setError(null); setLoading(false); return; }
     const controller = new AbortController();
     const gen = ++generation.current;
     setLoading(true);
-    read(controller.signal).then(
+    read(controller.signal, true).then(
       (list) => { if (!controller.signal.aborted && generation.current === gen) { setRows(list); setError(null); } },
       (cause: unknown) => { if (!controller.signal.aborted && generation.current === gen) setError(loadFailureMessage(cause)); },
     ).finally(() => { if (!controller.signal.aborted && generation.current === gen) setLoading(false); });
@@ -372,7 +372,7 @@ function useBoardInstalls(viewer: Viewer): {
     const gen = ++generation.current;
     setLoading(true);
     try {
-      const list = await read(controller.signal);
+      const list = await read(controller.signal, false);
       if (!mounted.current || generation.current !== gen) return null;
       setRows(list);
       setError(null);
@@ -388,7 +388,7 @@ function useBoardInstalls(viewer: Viewer): {
     const confirmed: InstallRef = {
       install_id: row.install_id, name: row.name, title: row.title, version: row.version,
       digest: row.digest, catalog_generation: row.catalog_generation, project_link: row.project_link,
-      removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
+      state: row.state, removed: row.removed, catalogue: row.catalogue, project: row.project_link ?? undefined,
       i18n: row.i18n, listing: row.listing,
     };
     setRows((current) => [...(current ?? []).filter((item) => item.install_id !== row.install_id), confirmed]);
@@ -422,12 +422,19 @@ function catalogDetailHref(appId: string, installId: string | null): string {
   return installId ? `${base}?installation=${encodeURIComponent(installId)}` : base;
 }
 
-export function PublicDirectory({ viewer }: { viewer: Viewer }) {
+export function PublicDirectory({ viewer, afterListings }: {
+  viewer: Viewer;
+  afterListings?: (publishedIds: ReadonlySet<string>) => ReactNode;
+}) {
   const { locale, t } = useLocale();
   const { apps, error, retry } = usePublicList();
   const installs = useBoardInstalls(viewer);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("all");
+  const [availability, setAvailability] = useState("all");
+  const known = installs.rows !== null && installs.error === null;
+  const availabilityUnknown = availability !== "all" && !known;
+  const publishedIds = useMemo(() => new Set(apps?.map((app) => app.id)), [apps]);
   const categories = useMemo(() => {
     const set = new Set((apps ?? []).map((app) => app.listing.category).filter((c): c is string => !!c));
     return [...set].sort((a, b) => a.localeCompare(b));
@@ -435,6 +442,7 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
   const installsByName = useMemo(() => {
     const map = new Map<string, InstallRef[]>();
     for (const row of installs.rows ?? []) {
+      if (row.state === "removed" || row.removed != null) continue;
       const list = map.get(row.name) ?? [];
       list.push(row);
       map.set(row.name, list);
@@ -452,7 +460,11 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
       },
     ]),
   ), [apps, locale, t]);
-  const shown = (apps ?? []).filter((app) => {
+  const needle = query.trim().toLowerCase();
+  const shown = availabilityUnknown ? [] : (apps ?? []).filter((app) => {
+    if (category !== "all" && app.listing.category !== category) return false;
+    if (availability !== "all" && (availability === "installed") !== installsByName.has(app.app)) return false;
+    if (!needle) return true;
     const localized = localizedById.get(app.id);
     const hay = [
       app.title,
@@ -467,9 +479,7 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
       .filter(Boolean)
       .join(" ")
       .toLowerCase();
-    if (query && !hay.includes(query.trim().toLowerCase())) return false;
-    if (category !== "all" && app.listing.category !== category) return false;
-    return true;
+    return hay.includes(needle);
   });
   const canInstall = viewer.operator === true && !viewer.readOnly;
   return (
@@ -497,8 +507,15 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
             ]}
           />
         </div>
+        <div className="pubdir-category">
+          <Select full aria-label={t("Installation status")} value={availability} onChange={setAvailability} options={[
+            { value: "all", label: t("All apps") },
+            { value: "installed", label: t("Installed") },
+            { value: "available", label: t("Not installed") },
+          ]} />
+        </div>
       </div>
-      {apps && !error && (
+      {apps && !availabilityUnknown && (
         <p className="pubdir-count text-label text-ink-500">
           {shown.length === 1 ? t("1 app") : t("{count} apps").replace("{count}", String(shown.length))}
         </p>
@@ -508,52 +525,32 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
           {t(error)} <Button onClick={retry}>{t("Try again")}</Button>
         </div>
       )}
-      {apps === null && !error && <p className="text-label text-ink-400">{t("Loading published apps…")}</p>}
-      {apps && shown.length === 0 && !error && <p className="pubdir-empty">{t("No published apps match.")}</p>}
-      <div className="pubdir-grid">
+      {apps === null && !error && <AppTileSkeletons label={t("Loading published apps…")} />}
+      {apps !== null && availabilityUnknown && (
+        <p className="pubdir-empty" role="status">{t(installs.error ? "Installation unavailable" : "Checking this board…")}</p>
+      )}
+      {apps !== null && !availabilityUnknown && shown.length === 0 && !error && <p className="pubdir-empty">{t("No published apps match.")}</p>}
+      {shown.length > 0 && <div className="apps-grid">
         {shown.map((app) => {
           const rows = installsByName.get(app.app) ?? [];
           const only = rows.length === 1 ? rows[0] : null;
-          const known = installs.rows !== null && !installs.loading && !installs.error;
-          const hasUpdate =
-            known &&
-            only !== null &&
-            canOpenInstall(only.state, only.removed) &&
-            app.installable &&
-            typeof only.version === "string" &&
-            compareSemverVersions(app.version, only.version) === 1;
+          const installed = known && rows.length > 0;
+          const hasUpdate = known && !installs.loading && only !== null &&
+            canOpenInstall(only.state, only.removed) && app.installable &&
+            typeof only.version === "string" && compareSemverVersions(app.version, only.version) === 1;
           const localized = localizedById.get(app.id);
-          const displayTitle = localized?.title ?? app.title;
-          const displaySummary = localized?.tagline ?? app.listing.tagline ?? app.summary;
-          return (
-            <article className="pub-card" key={app.id}>
-              <Link href={catalogDetailHref(app.id, only?.install_id ?? null)} className="pub-card-link" aria-labelledby={`pub-name-${app.id}`} aria-describedby={`pub-state-${app.id}`}>
-                <AppCover name={app.app} title={displayTitle} category={app.listing.category} />
-                <span className="pub-card-copy">
-                  <span className="pub-card-category">{app.listing.category ? localizedAppCategory(app.listing.category, locale) : ""}</span>
-                  <span className="pub-card-title" id={`pub-name-${app.id}`}>{displayTitle}</span>
-                  <span className="pub-card-summary">{displaySummary}</span>
-                  {app.listing.publisher && <span className="pub-card-publisher">{app.listing.publisher}</span>}
-                  <span className="pub-card-footer">
-                    <span>v{app.version}</span>
-                    <span
-                      id={`pub-state-${app.id}`}
-                      className="pub-status"
-                      {...(hasUpdate
-                        ? { "data-state": "statusReady" }
-                        : known && rows.length
-                          ? { "data-state": "statusInstalled" }
-                          : {})}
-                    >
-                      {!known ? t("Not checked") : hasUpdate ? t("Update available") : rows.length ? t("Installed") : t("Not installed")}
-                    </span>
-                  </span>
-                </span>
-              </Link>
-            </article>
-          );
+          return <AppTile key={app.id}
+            name={app.app}
+            title={localized?.title ?? app.title}
+            summary={localized?.tagline ?? app.listing.tagline ?? app.summary}
+            version={`v${app.version}`}
+            status={t(!known ? "Not checked" : hasUpdate ? "Update available" : installed ? "Installed" : "Not installed")}
+            tone={hasUpdate ? "info" : installed ? "" : "muted"}
+            href={catalogDetailHref(app.id, only?.install_id ?? null)}
+          />;
         })}
-      </div>
+      </div>}
+      {(apps !== null || error !== null) && afterListings?.(publishedIds)}
     </section>
   );
 }
@@ -613,10 +610,14 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   // A claimant without a readable install_id stays a fact row — no Open,
   // Manage or chooser link can name it.
   const addressable = install !== null && typeof install.install_id === "string" ? install : null;
+  const removed = addressable !== null && (addressable.state === "removed" ||
+    (addressable.removed != null && addressable.removed !== 0));
   // A disabled or removed install has no openable route: offering Open there
   // sends the reader to "Unknown installation".
   const openable = addressable !== null && canOpenInstall(addressable.state, addressable.removed);
-  const openHref = addressable && openable ? installationAppHref(rows, addressable.install_id) : null;
+  const openHref = addressable && openable
+    ? installationAppHref(rows?.filter((row) => row.state !== "removed"), addressable.install_id)
+    : null;
   const titleSource = install ?? catalogued[0];
   const title = titleSource ? localizedAppTitle(titleSource, locale, t) : id;
   return (
@@ -665,13 +666,17 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
                   <dd>{addressable.version ?? "—"}</dd>
                 </div>
               </dl>
-              <div className="pub-actions">
-                <InstalledActions install={addressable} openHref={openHref} operator={operator} />
-              </div>
+              {removed ? (
+                <p className="pub-note" role="status">{t("This installation was removed and cannot be opened or changed here.")}</p>
+              ) : (
+                <div className="pub-actions">
+                  <InstalledActions install={addressable} openHref={openHref} operator={operator} />
+                </div>
+              )}
             </>
           )}
           <p className="pub-caption">
-            {t("The installed copy stays usable. Published versions and update checks return when the catalogue answers.")}
+            {t(removed ? "This removed installation is retained in the workspace." : "The installed copy stays usable. Published versions and update checks return when the catalogue answers.")}
           </p>
         </aside>
       )}
@@ -689,6 +694,25 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
       )}
     </article>
   );
+}
+
+export function CatalogDetailSkeleton({ label }: { label: string }) {
+  const { t } = useLocale();
+  return <article className="pub-detail">
+    <div className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></div>
+    <p className="sr-only" role="status">{label}</p>
+    <div aria-hidden="true">
+      <header className="pub-heading pub-skeleton-heading">
+        <span className="app-skeleton" /><span className="app-skeleton" /><span className="app-skeleton" /><span className="app-skeleton" />
+      </header>
+      <div className="pub-layout">
+        <div className="app-skeleton pub-skeleton-cover" />
+        <div className="card pub-install-panel pub-skeleton-workspace">
+          <span className="app-skeleton" /><span className="app-skeleton" /><span className="app-skeleton" />
+        </div>
+      </div>
+    </div>
+  </article>;
 }
 
 export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer: Viewer; onResolved?: (found: boolean) => void }) {
@@ -777,7 +801,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
     if (confirmedMiss) onResolved?.(false);
   }, [confirmedMiss, onResolved]);
 
-  if (app === null && installsPending) return <p className="text-label text-ink-400" role="status">{t("Checking this board…")}</p>;
+  if (app === null && installsPending) return <CatalogDetailSkeleton label={t("Checking this board…")} />;
   if (app === null || appError !== null) {
     if (confirmedMiss) return <p role="status">{t("No such app.")}</p>;
     return (
@@ -794,7 +818,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
       />
     );
   }
-  if (app === undefined) return <p className="text-label text-ink-400">{t("Loading…")}</p>;
+  if (app === undefined) return <CatalogDetailSkeleton label={t("Loading…")} />;
 
   // The same name, or the catalogue id recorded on the install — an
   // installation that claims neither is never treated as this app.
@@ -809,7 +833,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   const install = installationParam !== null ? named : matching.length === 1 ? matching[0] : null;
   const openHref =
     install && canOpenInstall(install.state, install.removed)
-      ? installationAppHref(installs.rows, install.install_id)
+      ? installationAppHref(installs.rows?.filter((row) => row.state !== "removed"), install.install_id)
       : null;
   const { release, missing } = selectedRelease(versions, versionParam);
 
