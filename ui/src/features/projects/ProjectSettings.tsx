@@ -16,25 +16,29 @@ import { cliCommand, type PolicyDraft } from "./policyView";
 import {
   draftDirty,
   draftOf,
+  effectiveMembers,
   nativeGrant,
+  policyCapabilities,
+  policyMyRole,
   policyWrite,
   privateRefused,
   readPolicy,
   type PolicyView,
+  type ProjectMemberEntry,
+  type ProjectMemberRole,
 } from "./policyContract";
 
 type Draft = PolicyDraft;
 
 /**
- * A project's access policy (CAD-1950, CAD-2255).
+ * A project's access policy, team roles, details, and archive lifecycle
+ * (CAD-1950, CAD-2255, CAD-2872, CAD-2884).
  *
- * Two stores answer this page and they are not interchangeable: a native board
- * records `{visibility, members}` in `project.yaml`, while a hosted board keeps
- * `{visibility, grants: <member subject ids>, revision}` and refuses a new
- * private row until end-to-end isolation is proven. `policyContract` reads and
- * writes both; this screen only renders what that module proved. An absent
- * record is called absent, an unreadable answer is an error, and no capability
- * is defaulted on — a private transition that cannot be proven stays disabled.
+ * Supports both native boards (`{visibility, members}` in `project.yaml`) and
+ * hosted boards (`{visibility, grants, members, my_role, capabilities,
+ * private_available, revision}`). When hosted capabilities are present, Project
+ * Owners as well as Workspace Owners can manage Project Team, Details, and
+ * Archive lifecycle, while Viewers see a read-only view.
  */
 type LifecycleState =
   | { kind: "loading" }
@@ -42,10 +46,28 @@ type LifecycleState =
   | { kind: "error"; message: string }
   | { kind: "ready"; data: ProjectLifecycle };
 
+const ROLE_VALUES: readonly ProjectMemberRole[] = ["owner", "member", "viewer"];
+
+function roleLabelKey(role: ProjectMemberRole): string {
+  if (role === "owner") return "Project Owner";
+  if (role === "viewer") return "Viewer";
+  return "Member";
+}
+
+function sameMemberSet(
+  left: readonly ProjectMemberEntry[],
+  right: readonly ProjectMemberEntry[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const map = new Map(left.map((item) => [item.userId, item.role]));
+  return right.every((item) => map.get(item.userId) === item.role);
+}
+
 export default function ProjectSettings({
   project,
   projectInfo,
   block,
+  sessionBlock,
   archived,
   hosted,
   onToast,
@@ -54,8 +76,10 @@ export default function ProjectSettings({
 }: {
   project: string;
   projectInfo?: Project | null;
-  /** Why this session may not change the policy, or null when it may. */
+  /** Operator/policy block for legacy servers without per-project capabilities. */
   block: string | null;
+  /** Session-level write block (signed-out / read-only board), distinct from operator-only check. */
+  sessionBlock?: string | null;
   /** True when the viewed project is already known to be archived. */
   archived?: boolean;
   /** The board's own claim from `/api/meta`; null when it has not answered. */
@@ -74,6 +98,7 @@ export default function ProjectSettings({
   const [edits, setEdits] = useState<Draft | null>(null);
   const [handle, setHandle] = useState("");
   const [picked, setPicked] = useState("");
+  const [pickedRole, setPickedRole] = useState<ProjectMemberRole>("member");
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -87,6 +112,7 @@ export default function ProjectSettings({
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [lifecycleError, setLifecycleError] = useState<string | null>(null);
   const selectId = useId();
+  const roleSelectId = useId();
   const confirmId = useId();
 
   const view: PolicyView = useMemo(
@@ -105,6 +131,7 @@ export default function ProjectSettings({
     setError(null);
     setHandle("");
     setPicked("");
+    setPickedRole("member");
     setAdding(false);
     setBusy(false);
     setConfirmOpen(false);
@@ -173,29 +200,58 @@ export default function ProjectSettings({
   const dirty = draftDirty(view, draft);
   const isArchived =
     archived === true || (lifecycle.kind === "ready" && lifecycle.data.archived);
-  const lifecycleLocked = block !== null;
+
+  const caps = hosted === true ? policyCapabilities(view) : null;
+  const myRole = hosted === true ? policyMyRole(view) : null;
+  const effectiveSessionBlock = sessionBlock ?? null;
+  const manageBlock =
+    caps !== null
+      ? (effectiveSessionBlock ??
+        (caps.can_manage
+          ? null
+          : myRole === "viewer"
+            ? t("You have read-only Viewer access to this project.")
+            : t("Only a workspace owner or Project Owner can change project settings.")))
+      : block;
+
+  const lifecycleLocked =
+    caps !== null ? effectiveSessionBlock !== null || !caps.can_archive : block !== null;
+  const lifecycleReadOnlyReason =
+    caps !== null
+      ? (effectiveSessionBlock ?? (!caps.can_archive ? manageBlock : null))
+      : block;
+
   const policyReadOnlyReason =
-    block ??
+    manageBlock ??
     (isArchived
       ? t("This project is archived. Restore it before changing its access policy.")
       : null);
   const locked = policyReadOnlyReason !== null;
   const unreadable = view.kind === "unreadable";
   const privateOffered =
-    view.kind === "recorded"
+    view.kind === "recorded" || view.kind === "absent" || view.kind === "not_stored"
       ? view.privateOffered === true
-      : view.kind === "absent"
-        ? view.privateOffered === true
-        : false;
+      : false;
   const pendingPrivate = privateRefused(view, draft, hosted === true);
   const hostedRosterKnown = roster !== null;
+  const teamMembers = draft ? effectiveMembers(draft) : [];
+  const teamMemberIds = new Set(teamMembers.map((entry) => entry.userId));
+  const ownerCount = teamMembers.filter((entry) => entry.role === "owner").length;
+  const lastOwnerProtected = myRole === "owner" && ownerCount <= 1;
+  const workspaceOwners = (roster ?? []).filter((member) => member.role === "owner");
+
   const grantOptions = (roster ?? [])
-    .filter((row) => !(draft?.grants ?? []).includes(row.userId))
+    .filter((row) => !teamMemberIds.has(row.userId))
     .map((row) => ({
       value: row.userId,
       label: row.name.trim() || row.email || row.userId,
       hint: row.name.trim() && row.email ? row.email : undefined,
     }));
+
+  const roleOptions = ROLE_VALUES.map((role) => ({
+    value: role,
+    label: t(roleLabelKey(role)),
+  }));
 
   function edit(next: Partial<Draft>) {
     if (!draft || adding || busy || locked) return;
@@ -240,7 +296,16 @@ export default function ProjectSettings({
           return;
         }
         setPicked("");
-        edit({ grants: [...draft.grants, id] });
+        const nextRole = pickedRole;
+        setPickedRole("member");
+        const nextGrants = draft.grants.includes(id) ? draft.grants : [...draft.grants, id];
+        if (draft.members !== undefined || nextRole !== "member") {
+          const baseMembers = effectiveMembers(draft).filter((entry) => entry.userId !== id);
+          const nextMembers = [...baseMembers, { userId: id, role: nextRole }];
+          edit({ grants: nextGrants, members: nextMembers });
+        } else {
+          edit({ grants: nextGrants });
+        }
       } catch (e) {
         if (!current()) return;
         setRoster(null);
@@ -263,6 +328,40 @@ export default function ProjectSettings({
     setError(null);
     setHandle("");
     edit({ grants: [...draft.grants, value] });
+  }
+
+  function changeMemberRole(userId: string, role: ProjectMemberRole) {
+    if (!draft || editingLocked) return;
+    if (lastOwnerProtected && role !== "owner") {
+      const target = effectiveMembers(draft).find((entry) => entry.userId === userId);
+      if (target?.role === "owner") return;
+    }
+    const baseMembers = effectiveMembers(draft);
+    const exists = baseMembers.some((entry) => entry.userId === userId);
+    const nextMembers = exists
+      ? baseMembers.map((entry) => (entry.userId === userId ? { ...entry, role } : entry))
+      : [...baseMembers, { userId, role }];
+    const nextGrants =
+      draft.visibility === "private"
+        ? nextMembers.map((entry) => entry.userId)
+        : draft.grants;
+    edit({ grants: nextGrants, members: nextMembers });
+  }
+
+  function removeMember(userId: string) {
+    if (!draft || editingLocked) return;
+    const baseMembers = effectiveMembers(draft);
+    const target = baseMembers.find((entry) => entry.userId === userId);
+    if (lastOwnerProtected && target?.role === "owner") return;
+    const nextGrants = draft.grants.filter((item) => item !== userId);
+    if (draft.members !== undefined) {
+      edit({
+        grants: nextGrants,
+        members: baseMembers.filter((entry) => entry.userId !== userId),
+      });
+    } else {
+      edit({ grants: nextGrants });
+    }
   }
 
   async function save() {
@@ -295,6 +394,7 @@ export default function ProjectSettings({
           : await api.setProjectPolicyHosted(project, {
               visibility: write.visibility,
               grants: write.grants,
+              ...(write.members !== undefined ? { members: write.members } : {}),
               if_rev: write.if_rev,
             });
       if (!current()) return;
@@ -312,9 +412,16 @@ export default function ProjectSettings({
             }
           : wrote;
       const committed = readPolicy(raw, write.contract === "hosted");
-      if (
-        committed.kind !== "recorded" ||
-        committed.visibility !== draft.visibility ||
+      if (committed.kind !== "recorded" || committed.visibility !== draft.visibility) {
+        throw new Error("The board answered without a matching policy receipt.");
+      }
+      if (write.contract === "hosted" && write.members !== undefined) {
+        const committedMembers =
+          committed.members ?? committed.grants.map((userId) => ({ userId, role: "member" as const }));
+        if (!sameMemberSet(committedMembers, write.members)) {
+          throw new Error("The board answered without a matching policy receipt.");
+        }
+      } else if (
         committed.grants.length !== draft.grants.length ||
         committed.grants.some((grant) => !draft.grants.includes(grant))
       ) {
@@ -324,7 +431,9 @@ export default function ProjectSettings({
       setEdits(null);
       onToast(
         write.contract === "hosted"
-          ? t("Project policy saved. Stored grants still admit no one unless it is private.")
+          ? write.members !== undefined
+            ? t("Project access saved.")
+            : t("Project policy saved. Stored grants still admit no one unless it is private.")
           : t("Project policy saved."),
       );
       void resource.refresh();
@@ -336,7 +445,9 @@ export default function ProjectSettings({
             ? t("The policy changed since this page read it. Nothing was saved — the current record is being reloaded.")
             : e.code === "private_unavailable"
               ? t("This board refuses a new private policy while end-to-end isolation is unproven. Nothing was saved.")
-              : e.message
+              : e.code === "last_owner_required"
+                ? t("A project must keep at least one Project Owner.")
+                : e.message
           : e instanceof Error
             ? e.message
             : t("The policy could not be saved.");
@@ -347,12 +458,14 @@ export default function ProjectSettings({
     }
   }
 
-  const sharesHeading = hosted === true ? t("Hosted project access") : t("Project access");
+  const sharesHeading = hosted === true ? t("Project Team & Access") : t("Project access");
   const detailsReadOnlyReason =
-    block ??
-    (isArchived
-      ? t("This project is archived. Restore it before editing its details.")
-      : null);
+    caps !== null
+      ? (effectiveSessionBlock ??
+        (!caps.can_edit_details ? manageBlock : null) ??
+        (isArchived ? t("This project is archived. Restore it before editing its details.") : null))
+      : (block ??
+        (isArchived ? t("This project is archived. Restore it before editing its details.") : null));
   const displayName = projectDisplayName(resolvedProject ?? projectInfo ?? { key: project });
 
   return (
@@ -382,7 +495,7 @@ export default function ProjectSettings({
       <StaleChip state={state} />
 
       {!hasAnswer ? null : unreadable ? (
-        <section className="card max-w-2xl p-5" role="alert">
+        <section className="project-summary-card max-w-2xl" role="alert">
           <div className="slabel">{sharesHeading}</div>
           <p className="mt-2 text-secondary text-fail">
             {t("This board answered with a policy shape this page cannot prove, so no visibility or grant is shown or offered.")}
@@ -409,161 +522,224 @@ export default function ProjectSettings({
           )}
           {draft && (
             <>
-              <section className="card max-w-2xl p-5" aria-label={t("Visibility")}>
-                <div className="slabel">{t("Visibility")}</div>
-                <div className="mt-3 grid gap-2">
-                  {(["workspace_visible", "private"] as const).map((option) => {
-                    const on = draft.visibility === option;
-                    const canChoosePrivate = privateOffered;
-                    const off = editingLocked;
-                    return (
-                      <button
-                        key={option}
-                        type="button"
-                        onClick={() => edit({ visibility: option })}
-                        disabled={off}
-                        aria-pressed={on}
-                        className={`ps-visibility w-full rounded border p-3 text-left transition-colors ${
-                          on ? "border-accent bg-accent/5" : "border-ink-700"
-                        } ${off ? "opacity-60" : ""}`}
-                      >
-                        <span className="text-secondary text-ink-100 font-medium">
-                          {t(option === "private" ? "Private" : "Workspace-visible")}
-                        </span>
-                        <span className="mt-1 block text-label text-ink-400">
-                          {t(
-                            option === "private"
-                              ? "Only the people granted below can see it. An owner can still open it without a grant."
-                              : "Every current and future member of this workspace can see it. Grants are stored but admit no one.",
-                          )}
-                          {option === "private" && !canChoosePrivate && (
-                            <>
-                              {" "}
-                              {hosted === true
-                                ? t("This workspace refuses a new private policy until end-to-end isolation is proven.")
-                                : t("This build cannot record private — the isolation gate has not passed.")}
-                              {view.kind === "recorded" &&
-                                view.visibility === "private" &&
-                                ` ${t("This project already carries a private policy recorded earlier.")}`}
-                            </>
-                          )}
-                        </span>
-                      </button>
-                    );
-                  })}
+              <section
+                className="project-summary-card max-w-2xl"
+                aria-label={sharesHeading}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="slabel">{sharesHeading}</div>
+                    {hosted === true && (
+                      <p className="mt-1 text-label text-ink-400">
+                        {t("Choose who can open this project and assign Project Owners, Members, or Viewers.")}
+                      </p>
+                    )}
+                  </div>
+                  {hosted === true && myRole && (
+                    <span className={`ps-role-pill ${myRole === "owner" || myRole === "workspace_owner" ? "is-owner" : myRole === "viewer" ? "is-viewer" : ""}`}>
+                      {t(
+                        myRole === "workspace_owner"
+                          ? "Workspace Owner"
+                          : roleLabelKey(myRole),
+                      )}
+                    </span>
+                  )}
                 </div>
 
-                {(draft.visibility === "private" || draft.grants.length > 0) && (
+                <div className="mt-4">
+                  <div className="slabel">{t("Visibility")}</div>
+                  <div className="ps-visibility-grid mt-2">
+                    {(["workspace_visible", "private"] as const).map((option) => {
+                      const on = draft.visibility === option;
+                      const canChoosePrivate = privateOffered;
+                      const off = editingLocked;
+                      return (
+                        <button
+                          key={option}
+                          type="button"
+                          onClick={() => {
+                            if (option === "private" && draft.members !== undefined) {
+                              edit({
+                                visibility: option,
+                                grants: draft.members.map((m) => m.userId),
+                              });
+                            } else {
+                              edit({ visibility: option });
+                            }
+                          }}
+                          disabled={off}
+                          aria-pressed={on}
+                          className={`ps-visibility ps-visibility-option${on ? " is-selected" : ""}`}
+                        >
+                          <span className="ps-visibility-head">
+                            <span className="text-secondary text-ink-100 font-medium">
+                              {t(option === "private" ? "Private" : "Workspace-visible")}
+                            </span>
+                            <span className="ps-visibility-dot" aria-hidden="true" />
+                          </span>
+                          <span className="block text-label text-ink-400">
+                            {hosted === true
+                              ? t(
+                                  option === "private"
+                                    ? "Only workspace owners and the project team below can open this project."
+                                    : "All workspace members can open and edit this project. Assign Project Owners or read-only Viewers below.",
+                                )
+                              : t(
+                                  option === "private"
+                                    ? "Only the people granted below can see it. An owner can still open it without a grant."
+                                    : "Every current and future member of this workspace can see it. Grants are stored but admit no one.",
+                                )}
+                            {option === "private" && !canChoosePrivate && (
+                              <>
+                                {" "}
+                                {hosted === true
+                                  ? t("This workspace refuses a new private policy until end-to-end isolation is proven.")
+                                  : t("This build cannot record private — the isolation gate has not passed.")}
+                                {view.kind === "recorded" &&
+                                  view.visibility === "private" &&
+                                  ` ${t("This project already carries a private policy recorded earlier.")}`}
+                              </>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {hosted === true && (
+                  <div className="ps-owners-note mt-4">
+                    <span className="text-label text-ink-300">
+                      {t("Workspace Owners always have full access to all projects.")}
+                    </span>
+                    {workspaceOwners.length > 0 && (
+                      <div className="ps-owner-chips">
+                        {workspaceOwners.map((owner) => (
+                          <span key={owner.userId} className="ps-owner-chip">
+                            {owner.name.trim() || owner.email || owner.userId}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {hosted === true ? (
                   <div className="mt-5">
-                    <div className="slabel">{t("Grants")}</div>
-                    <ul className="mt-2 grid gap-1">
-                      {draft.grants.map((grant) => {
-                        const member =
-                          hosted === true
-                            ? (roster?.find((row) => row.userId === grant) ?? null)
-                            : null;
+                    <div className="slabel">{t("Project Team")}</div>
+                    <ul className="ps-team-list mt-2">
+                      {teamMembers.map((entry) => {
+                        const member = roster?.find((row) => row.userId === entry.userId) ?? null;
+                        const displayLabel =
+                          member?.name.trim() || member?.email || entry.userId;
+                        const subLabel = member?.email || entry.userId;
+                        const protectedOwner = lastOwnerProtected && entry.role === "owner";
                         return (
-                          <li key={grant} className="flex items-center gap-2 text-secondary text-ink-200">
-                            {member ? (
-                              <span className="min-w-0">
-                                <span className="block truncate">{member.name.trim() || member.email || grant}</span>
-                                <span className="num text-micro text-ink-500 break-all">{grant}</span>
-                              </span>
-                            ) : (
-                              <span className="num text-micro text-ink-300 break-all">{grant}</span>
-                            )}
-                            {hosted === true && hostedRosterKnown && !member && (
-                              <span className="chip bg-warn/10 text-warn">{t("not a current member")}</span>
-                            )}
-                            {!locked && (
-                              <button
-                                type="button"
-                                className="btn btn-ghost ml-auto"
-                                disabled={editingLocked}
-                                onClick={() =>
-                                  edit({ grants: draft.grants.filter((item) => item !== grant) })
-                                }
-                              >
-                                {t("Remove")}
-                              </button>
-                            )}
+                          <li key={entry.userId} className="ps-team-row">
+                            <div className="ps-team-member-info">
+                              <div className="ps-team-member-name">
+                                <span className="truncate">{displayLabel}</span>
+                                {hostedRosterKnown && !member && (
+                                  <span className="chip bg-warn/10 text-warn">
+                                    {t("not a current member")}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="num text-micro text-ink-500 break-all">
+                                {subLabel}
+                              </div>
+                            </div>
+                            <div className="ps-team-actions">
+                              {!locked ? (
+                                <>
+                                  <Select
+                                    size="sm"
+                                    className="ps-role-select"
+                                    value={entry.role}
+                                    onChange={(next) =>
+                                      changeMemberRole(entry.userId, next as ProjectMemberRole)
+                                    }
+                                    options={roleOptions}
+                                    disabled={editingLocked || protectedOwner}
+                                    aria-label={`${t("Project role")} · ${displayLabel}`}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="btn btn-ghost btn-sm"
+                                    disabled={editingLocked || protectedOwner}
+                                    onClick={() => removeMember(entry.userId)}
+                                  >
+                                    {t("Remove")}
+                                  </button>
+                                </>
+                              ) : (
+                                <span
+                                  className={`ps-role-pill ${entry.role === "owner" ? "is-owner" : entry.role === "viewer" ? "is-viewer" : ""}`}
+                                >
+                                  {t(roleLabelKey(entry.role))}
+                                </span>
+                              )}
+                            </div>
                           </li>
                         );
                       })}
-                      {draft.grants.length === 0 && draft.visibility === "private" && (
+                      {teamMembers.length === 0 && (
                         <li className="text-label text-ink-500">
-                          {t("No grants yet — an owner can still open it.")}
+                          {draft.visibility === "private"
+                            ? t("No additional project members yet — workspace owners can always open it.")
+                            : t("No project-specific roles assigned — all workspace members can edit.")}
                         </li>
                       )}
                     </ul>
+                    {lastOwnerProtected && !locked && (
+                      <p className="mt-2 text-label text-ink-500">
+                        {t("A project must keep at least one Project Owner.")}
+                      </p>
+                    )}
 
                     {!locked && (
-                      <div className="ps-grant-add mt-2">
-                        {hosted === true ? (
-                          <>
-                            <Select
-                              id={selectId}
-                              className="ps-grant-field"
-                              full
-                              value={picked}
-                              onChange={setPicked}
-                              options={grantOptions}
-                              placeholder={
-                                rosterError
-                                  ? t("Member roster unavailable")
-                                  : grantOptions.length === 0
-                                    ? t("Every member already has a grant")
-                                    : t("Choose a member")
-                              }
-                              disabled={editingLocked || !hostedRosterKnown || grantOptions.length === 0}
-                              aria-label={t("Grant a workspace member")}
-                            />
-                            <button
-                              type="button"
-                              className="btn"
-                              onClick={() => void addGrant()}
-                              disabled={!picked || !hostedRosterKnown || editingLocked}
-                            >
-                              {adding ? t("Adding…") : t("Add")}
-                            </button>
-                          </>
-                        ) : (
-                          <>
-                            <input
-                              className="field ps-grant-field min-w-0"
-                              value={handle}
-                              disabled={editingLocked}
-                              onChange={(event) => setHandle(event.target.value)}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  addGrant();
-                                }
-                              }}
-                              placeholder="users/alex"
-                              aria-label={t("Grant a caller")}
-                              spellCheck={false}
-                            />
-                            <button type="button" className="btn" onClick={addGrant} disabled={!handle.trim() || editingLocked}>
-                              {t("Add")}
-                            </button>
-                          </>
-                        )}
+                      <div className="ps-team-add mt-3">
+                        <Select
+                          id={selectId}
+                          className="ps-grant-field"
+                          full
+                          value={picked}
+                          onChange={setPicked}
+                          options={grantOptions}
+                          placeholder={
+                            rosterError
+                              ? t("Member roster unavailable")
+                              : grantOptions.length === 0
+                                ? t("Every workspace member is already listed")
+                                : t("Add workspace member")
+                          }
+                          disabled={editingLocked || !hostedRosterKnown || grantOptions.length === 0}
+                          aria-label={t("Grant a workspace member")}
+                        />
+                        <Select
+                          id={roleSelectId}
+                          className="ps-role-field"
+                          full
+                          value={pickedRole}
+                          onChange={(value) => setPickedRole(value as ProjectMemberRole)}
+                          options={roleOptions}
+                          disabled={editingLocked}
+                          aria-label={t("Project role")}
+                        />
+                        <button
+                          type="button"
+                          className="btn"
+                          onClick={() => void addGrant()}
+                          disabled={!picked || !hostedRosterKnown || editingLocked}
+                        >
+                          {adding ? t("Adding…") : t("Add")}
+                        </button>
                       </div>
                     )}
-                    <p className="mt-2 text-label text-ink-500">
-                      {hosted === true
-                        ? t(
-                            "Hosted grants are verified member ids. The member roster is re-read before a grant is added.",
-                          )
-                        : t(
-                            "Accepts operator or users/<handle>. Agents and services cannot be granted access.",
-                          )}
-                    </p>
-                    {hosted === true && rosterError && (
-                      <p className="mt-1 flex flex-wrap items-center gap-2 text-label text-warn" role="status">
+                    {rosterError && (
+                      <p className="mt-2 flex flex-wrap items-center gap-2 text-label text-warn" role="status">
                         <span>
-                          {t("The member roster could not be read, so no grant can be resolved to a person. Nothing was added.")}
+                          {t("The member roster could not be read, so no member can be resolved to a person. Nothing was added.")}
                         </span>
                         <button
                           type="button"
@@ -575,9 +751,68 @@ export default function ProjectSettings({
                       </p>
                     )}
                   </div>
+                ) : (
+                  (draft.visibility === "private" || draft.grants.length > 0) && (
+                    <div className="mt-5">
+                      <div className="slabel">{t("Grants")}</div>
+                      <ul className="mt-2 grid gap-1">
+                        {draft.grants.map((grant) => (
+                          <li key={grant} className="flex items-center gap-2 text-secondary text-ink-200">
+                            <span className="num text-micro text-ink-300 break-all">{grant}</span>
+                            {!locked && (
+                              <button
+                                type="button"
+                                className="btn btn-ghost ml-auto"
+                                disabled={editingLocked}
+                                onClick={() => removeMember(grant)}
+                              >
+                                {t("Remove")}
+                              </button>
+                            )}
+                          </li>
+                        ))}
+                        {draft.grants.length === 0 && draft.visibility === "private" && (
+                          <li className="text-label text-ink-500">
+                            {t("No grants yet — an owner can still open it.")}
+                          </li>
+                        )}
+                      </ul>
+
+                      {!locked && (
+                        <div className="ps-grant-add mt-2">
+                          <input
+                            className="field ps-grant-field min-w-0"
+                            value={handle}
+                            disabled={editingLocked}
+                            onChange={(event) => setHandle(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                void addGrant();
+                              }
+                            }}
+                            placeholder="users/alex"
+                            aria-label={t("Grant a caller")}
+                            spellCheck={false}
+                          />
+                          <button
+                            type="button"
+                            className="btn"
+                            onClick={() => void addGrant()}
+                            disabled={!handle.trim() || editingLocked}
+                          >
+                            {t("Add")}
+                          </button>
+                        </div>
+                      )}
+                      <p className="mt-2 text-label text-ink-500">
+                        {t("Accepts operator or users/<handle>. Agents and services cannot be granted access.")}
+                      </p>
+                    </div>
+                  )
                 )}
 
-                {draft.visibility !== "private" && draft.grants.length > 0 && (
+                {hosted !== true && draft.visibility !== "private" && draft.grants.length > 0 && (
                   <p className="mt-4 text-label text-warn">
                     {t(
                       "This project has stored grants. They admit no one while it is workspace-visible; they apply if it becomes private.",
@@ -590,7 +825,7 @@ export default function ProjectSettings({
                   draft.visibility !== "private" && (
                     <p className="mt-4 text-label text-warn">
                       {t(
-                        "This project is private today. Saving workspace-visible lets every member of this workspace see it, and its stored grants stop admitting anyone.",
+                        "This project is private today. Saving workspace-visible lets every member of this workspace see and edit it unless marked Viewer below.",
                       )}
                     </p>
                   )}
@@ -644,7 +879,7 @@ export default function ProjectSettings({
           )}
 
           {lifecycle.kind === "error" && (
-            <section className="card mt-4 max-w-2xl p-5" aria-label={t("Project lifecycle")}>
+            <section className="project-summary-card mt-4 max-w-2xl" aria-label={t("Project lifecycle")}>
               <div className="slabel">{t("Project lifecycle")}</div>
               <p className="mt-2 text-label text-fail" role="alert">{lifecycle.message}</p>
               <button
@@ -658,7 +893,7 @@ export default function ProjectSettings({
           )}
 
           {lifecycle.kind === "ready" && (
-            <section className="card mt-4 max-w-2xl p-5" aria-label={t("Project lifecycle")}>
+            <section className="project-summary-card mt-4 max-w-2xl" aria-label={t("Project lifecycle")}>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="slabel">{t("Project lifecycle")}</div>
                 <span className="num text-micro text-ink-500">
@@ -684,7 +919,9 @@ export default function ProjectSettings({
                       "Restoring returns the project to active listings and re-enables writes. Prior runs are not restarted.",
                     )}
                   </p>
-                  {block && <p className="mt-3 text-label text-ink-400">{block}</p>}
+                  {lifecycleReadOnlyReason && (
+                    <p className="mt-3 text-label text-ink-400">{lifecycleReadOnlyReason}</p>
+                  )}
                   {lifecycleError && (
                     <p className="mt-3 text-secondary text-fail" role="alert">
                       {lifecycleError}
@@ -744,7 +981,9 @@ export default function ProjectSettings({
                       </ul>
                     </div>
                   )}
-                  {block && <p className="mt-3 text-label text-ink-400">{block}</p>}
+                  {lifecycleReadOnlyReason && (
+                    <p className="mt-3 text-label text-ink-400">{lifecycleReadOnlyReason}</p>
+                  )}
                   {lifecycleError && (
                     <p className="mt-3 text-secondary text-fail" role="alert">
                       {lifecycleError}

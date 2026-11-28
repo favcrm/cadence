@@ -1,13 +1,14 @@
 /**
- * CAD-2255: the two project-policy contracts, read and written as what they
- * are — never as one another.
+ * CAD-2255 / CAD-2884: the two project-policy contracts, read and written as
+ * what they are — never as one another.
  *
  * Native (`POST /api/projects/<key>/policy`) answers
  * `{project, recorded, policy: {version, visibility, members?} | null,
  * private_available}`. Hosted (`GET`/`PUT /api/projects/<key>/policy`) answers
- * `{state, project, visibility, grants, revision, provenance, updated_by,
- * updated_at}`; a project with no row answers `state: "not_stored"` — that is
- * *unknown* access policy, not workspace-visible, and the first write must pin
+ * `{state, project, visibility, grants, members?, my_role?, capabilities?,
+ * private_available?, revision, provenance, updated_by, updated_at}`; a
+ * project with no row answers `state: "not_stored"` — that is *unknown*
+ * access policy, not workspace-visible, and the first write must pin
  * `if_rev: ""` or it silently loses the compare-and-set.
  *
  * Every reader here is total and fail-closed: a missing, malformed or
@@ -23,6 +24,21 @@ export type RecordedVisibility = "workspace_visible" | "private";
 /** The wire spelling both writers accept. */
 export type WireVisibility = "workspace-visible" | "private";
 
+export type ProjectMemberRole = "owner" | "member" | "viewer";
+export type EffectiveProjectRole = "workspace_owner" | ProjectMemberRole;
+
+export interface ProjectMemberEntry {
+  userId: string;
+  role: ProjectMemberRole;
+}
+
+export interface ProjectPolicyCapabilities {
+  can_manage: boolean;
+  can_write: boolean;
+  can_edit_details: boolean;
+  can_archive: boolean;
+}
+
 export type PolicyView =
   | {
       kind: "recorded";
@@ -37,22 +53,41 @@ export type PolicyView =
        * treated exactly like `false` by every consumer.
        */
       privateOffered: boolean | null;
+      /** Hosted 3-role member list, when provided by AOS-814+. */
+      members?: ProjectMemberEntry[];
+      /** Caller's effective role on this project, when provided by AOS-814+. */
+      myRole?: EffectiveProjectRole | null;
+      /** Caller's project capability flags, when provided by AOS-814+. */
+      capabilities?: ProjectPolicyCapabilities | null;
     }
   /** Native only: no policy has ever been recorded (REQ-007 keeps access). */
   | { kind: "absent"; privateOffered: boolean | null }
   /** Hosted only: the project has no stored policy row. */
-  | { kind: "not_stored" }
+  | {
+      kind: "not_stored";
+      privateOffered?: boolean | null;
+      myRole?: EffectiveProjectRole | null;
+      capabilities?: ProjectPolicyCapabilities | null;
+    }
   | { kind: "unreadable"; reason: string };
 
 export interface PolicyDraft {
   visibility: RecordedVisibility;
   /** Wire grants: native `users/<handle>`/`operator`; hosted subject ids. */
   grants: string[];
+  /** Hosted explicit 3-role member list (`owner`, `member`, `viewer`). */
+  members?: ProjectMemberEntry[];
 }
 
 export type PolicyWrite =
   | { contract: "native"; visibility: WireVisibility; members: string[] }
-  | { contract: "hosted"; visibility: WireVisibility; grants: string[]; if_rev: string };
+  | {
+      contract: "hosted";
+      visibility: WireVisibility;
+      grants: string[];
+      members?: ProjectMemberEntry[];
+      if_rev: string;
+    };
 
 type Record_ = Record<string, unknown>;
 
@@ -70,6 +105,14 @@ function hostedVisibility(value: unknown): RecordedVisibility | null {
   return value === "workspace-visible" ? "workspace_visible" : value === "private" ? "private" : null;
 }
 
+function isProjectMemberRole(value: unknown): value is ProjectMemberRole {
+  return value === "owner" || value === "member" || value === "viewer";
+}
+
+function isEffectiveRole(value: unknown): value is EffectiveProjectRole {
+  return value === "workspace_owner" || isProjectMemberRole(value);
+}
+
 function grantsOf(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
   const out: string[] = [];
@@ -78,6 +121,51 @@ function grantsOf(value: unknown): string[] | null {
     out.push(entry);
   }
   return out;
+}
+
+function membersOf(value: unknown): ProjectMemberEntry[] | undefined | null {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return null;
+  const seen = new Set<string>();
+  const out: ProjectMemberEntry[] = [];
+  for (const entry of value) {
+    const obj = objectField(entry);
+    if (!obj || typeof obj.userId !== "string") return null;
+    const trimmed = obj.userId.trim();
+    if (trimmed === "" || seen.has(trimmed)) return null;
+    if (!isProjectMemberRole(obj.role)) return null;
+    seen.add(trimmed);
+    out.push({ userId: trimmed, role: obj.role });
+  }
+  return out;
+}
+
+function myRoleOf(value: unknown): EffectiveProjectRole | null | undefined | "invalid" {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  return isEffectiveRole(value) ? value : "invalid";
+}
+
+function capabilitiesOf(
+  value: unknown,
+): ProjectPolicyCapabilities | null | undefined | "invalid" {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const obj = objectField(value);
+  if (
+    !obj ||
+    typeof obj.can_manage !== "boolean" ||
+    typeof obj.can_write !== "boolean" ||
+    typeof obj.can_edit_details !== "boolean" ||
+    typeof obj.can_archive !== "boolean"
+  )
+    return "invalid";
+  return {
+    can_manage: obj.can_manage,
+    can_write: obj.can_write,
+    can_edit_details: obj.can_edit_details,
+    can_archive: obj.can_archive,
+  };
 }
 
 /**
@@ -119,15 +207,33 @@ function readNative(body: Record_): PolicyView {
 }
 
 function readHosted(body: Record_): PolicyView {
+  if (body.private_available !== undefined && typeof body.private_available !== "boolean")
+    return { kind: "unreadable", reason: "private_available must be a boolean" };
+  const privateFlag =
+    typeof body.private_available === "boolean" ? body.private_available : undefined;
+  const myRole = myRoleOf(body.my_role);
+  if (myRole === "invalid")
+    return { kind: "unreadable", reason: "my_role is not a valid project role" };
+  const capabilities = capabilitiesOf(body.capabilities);
+  if (capabilities === "invalid")
+    return { kind: "unreadable", reason: "capabilities is malformed" };
+
   if (body.state === "not_stored") {
-    // The documented no-row shape, exactly. Anything else claiming "not
-    // stored" while carrying values is not this shape.
+    // The documented no-row shape, plus optional AOS-814 metadata fields.
     if (body.visibility !== null || body.revision !== null)
       return { kind: "unreadable", reason: "not_stored carried a visibility or revision" };
     const grants = body.grants === undefined ? [] : grantsOf(body.grants);
     if (grants === null || grants.length > 0)
       return { kind: "unreadable", reason: "not_stored carried grants" };
-    return { kind: "not_stored" };
+    const members = membersOf(body.members);
+    if (members === null || (members !== undefined && members.length > 0))
+      return { kind: "unreadable", reason: "not_stored carried members" };
+    return {
+      kind: "not_stored",
+      ...(privateFlag !== undefined ? { privateOffered: privateFlag } : {}),
+      ...(myRole !== undefined ? { myRole } : {}),
+      ...(capabilities !== undefined ? { capabilities } : {}),
+    };
   }
   if (body.state !== "ok") return { kind: "unreadable", reason: "the policy state is not recognised" };
   const shown = hostedVisibility(body.visibility);
@@ -139,15 +245,22 @@ function readHosted(body: Record_): PolicyView {
   if (revision === null) return { kind: "unreadable", reason: "the policy revision is not a positive number" };
   const grants = grantsOf(body.grants);
   if (grants === null) return { kind: "unreadable", reason: "the policy grants are malformed" };
-  // The hosted server refuses a NEW private row while isolation is unproven;
-  // an existing private row stays manageable. There is no capability field to
-  // read, so the record itself is the whole answer.
+  const members = membersOf(body.members);
+  if (members === null)
+    return { kind: "unreadable", reason: "the policy members are malformed" };
+
+  // AOS-814 sends explicit `private_available: true`; legacy hosted servers omit
+  // it and only permit managing an already-private row.
+  const privateOffered = privateFlag !== undefined ? privateFlag : shown === "private";
   return {
     kind: "recorded",
     visibility: shown,
     grants,
     revision,
-    privateOffered: shown === "private",
+    privateOffered,
+    ...(members !== undefined ? { members } : {}),
+    ...(myRole !== undefined ? { myRole } : {}),
+    ...(capabilities !== undefined ? { capabilities } : {}),
   };
 }
 
@@ -159,10 +272,55 @@ function readHosted(body: Record_): PolicyView {
  * proposal built on an unproved read would be a guess.
  */
 export function draftOf(view: PolicyView): PolicyDraft | null {
-  if (view.kind === "recorded") return { visibility: view.visibility, grants: view.grants };
-  if (view.kind === "absent" || view.kind === "not_stored")
-    return { visibility: "workspace_visible", grants: [] };
+  if (view.kind === "recorded") {
+    return {
+      visibility: view.visibility,
+      grants: view.grants,
+      ...(view.members !== undefined
+        ? { members: view.members.map((m) => ({ ...m })) }
+        : {}),
+    };
+  }
+  if (view.kind === "absent" || view.kind === "not_stored") {
+    return {
+      visibility: "workspace_visible",
+      grants: [],
+      ...(view.kind === "not_stored" && view.privateOffered === true ? { members: [] } : {}),
+    };
+  }
   return null;
+}
+
+/** Effective team member list with roles for UI rendering. */
+export function effectiveMembers(draft: PolicyDraft): ProjectMemberEntry[] {
+  if (draft.members !== undefined) return draft.members;
+  return draft.grants.map((userId) => ({ userId, role: "member" as const }));
+}
+
+export function policyCapabilities(view: PolicyView): ProjectPolicyCapabilities | null {
+  if (view.kind === "recorded" || view.kind === "not_stored") return view.capabilities ?? null;
+  return null;
+}
+
+export function policyMyRole(view: PolicyView): EffectiveProjectRole | null {
+  if (view.kind === "recorded" || view.kind === "not_stored") return view.myRole ?? null;
+  return null;
+}
+
+export function isProjectViewer(view: PolicyView | null): boolean {
+  if (!view) return false;
+  const role = policyMyRole(view);
+  if (role === "viewer") return true;
+  const caps = policyCapabilities(view);
+  return caps !== null && caps.can_write === false;
+}
+
+export function canManageProjectPolicy(view: PolicyView | null): boolean {
+  if (!view) return false;
+  const caps = policyCapabilities(view);
+  if (caps !== null) return caps.can_manage;
+  const role = policyMyRole(view);
+  return role === "workspace_owner" || role === "owner";
 }
 
 /** The recorded `revision` a hosted compare-and-set pins; `""` for no row. */
@@ -188,6 +346,16 @@ export function policyWrite(
   if (!hosted) return { contract: "native", visibility, members: draft.grants };
   const ifRev = hostedIfRev(view);
   if (ifRev === null) return null;
+  if (draft.members !== undefined) {
+    const members = draft.members.map((m) => ({ userId: m.userId, role: m.role }));
+    return {
+      contract: "hosted",
+      visibility,
+      grants: draft.visibility === "private" ? members.map((m) => m.userId) : [],
+      members,
+      if_rev: ifRev,
+    };
+  }
   return { contract: "hosted", visibility, grants: draft.grants, if_rev: ifRev };
 }
 
@@ -211,7 +379,26 @@ export function privateRefused(
   if (!hosted) {
     return (view.kind !== "recorded" && view.kind !== "absent") || view.privateOffered !== true;
   }
-  return view.kind !== "recorded" || view.visibility !== "private";
+  if (view.kind === "recorded") {
+    return view.privateOffered !== true && view.visibility !== "private";
+  }
+  if (view.kind === "not_stored") {
+    return view.privateOffered !== true;
+  }
+  return true;
+}
+
+function membersEqual(
+  left: readonly ProjectMemberEntry[],
+  right: readonly ProjectMemberEntry[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((entry, idx) => {
+      const other = right[idx];
+      return other !== undefined && entry.userId === other.userId && entry.role === other.role;
+    })
+  );
 }
 
 /**
@@ -222,8 +409,13 @@ export function draftDirty(view: PolicyView, draft: PolicyDraft | null): boolean
   if (!draft) return false;
   if (view.kind === "absent" || view.kind === "not_stored") return true;
   if (view.kind !== "recorded") return false;
+  if (draft.visibility !== view.visibility) return true;
+  if (draft.members !== undefined || view.members !== undefined) {
+    const baseMembers =
+      view.members ?? view.grants.map((userId) => ({ userId, role: "member" as const }));
+    return !membersEqual(effectiveMembers(draft), baseMembers);
+  }
   return (
-    draft.visibility !== view.visibility ||
     draft.grants.length !== view.grants.length ||
     draft.grants.some((grant, index) => grant !== view.grants[index])
   );

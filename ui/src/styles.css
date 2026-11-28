@@ -3917,6 +3917,180 @@ button.refchip:hover {
   }
 }
 
+/* CAD-2884: borderless tonal Project Team & Access controls. */
+.ps-visibility-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .625rem;
+}
+.ps-visibility-option {
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+  width: 100%;
+  border: 0;
+  border-radius: .55rem;
+  padding: .8rem .9rem;
+  text-align: left;
+  background: var(--board-surface-recessed);
+  transition: background-color .15s ease, box-shadow .15s ease;
+  cursor: pointer;
+}
+.ps-visibility-option:hover:not(:disabled) {
+  background: var(--board-surface-recessed-hover);
+}
+.ps-visibility-option.is-selected {
+  background: color-mix(in srgb, var(--color-accent) 13%, var(--board-surface-recessed));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 55%, transparent);
+}
+.ps-visibility-option:disabled {
+  opacity: .62;
+  cursor: default;
+}
+.ps-visibility-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
+}
+.ps-visibility-dot {
+  width: .55rem;
+  height: .55rem;
+  border-radius: 999px;
+  background: var(--color-ink-600);
+  flex-shrink: 0;
+}
+.ps-visibility-option.is-selected .ps-visibility-dot {
+  background: var(--color-accent);
+}
+.ps-owners-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem .75rem;
+  border-radius: .5rem;
+  padding: .65rem .8rem;
+  background: var(--board-surface-recessed);
+}
+.ps-owner-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem;
+}
+.ps-owner-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: .12rem .55rem;
+  font-size: var(--text-micro);
+  background: color-mix(in srgb, var(--color-ink-500) 14%, transparent);
+  color: var(--color-ink-200);
+}
+.ps-team-list {
+  display: grid;
+  gap: .4rem;
+}
+.ps-team-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .65rem;
+  border-radius: .5rem;
+  padding: .55rem .75rem;
+  background: var(--board-surface-recessed);
+}
+.ps-team-member-info {
+  min-width: 0;
+}
+.ps-team-member-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .4rem;
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  color: var(--color-ink-100);
+}
+.ps-team-actions {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  flex-shrink: 0;
+}
+.ps-role-select {
+  min-width: 9.25rem;
+}
+.ps-role-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: .18rem .6rem;
+  font-size: var(--text-micro);
+  font-weight: 500;
+  background: color-mix(in srgb, var(--color-ink-500) 14%, transparent);
+  color: var(--color-ink-200);
+}
+.ps-role-pill.is-owner {
+  background: color-mix(in srgb, var(--color-accent) 16%, transparent);
+  color: var(--color-accent);
+}
+.ps-role-pill.is-viewer {
+  background: color-mix(in srgb, var(--color-ink-500) 12%, transparent);
+  color: var(--color-ink-400);
+}
+.ps-team-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 9.75rem auto;
+  align-items: stretch;
+  gap: .5rem;
+}
+.ps-team-add > .ps-grant-field,
+.ps-team-add .select,
+.ps-team-add .select-trigger,
+.ps-team-add > .btn {
+  height: 2.25rem;
+  font-size: .8125rem;
+}
+.ps-team-add .select {
+  width: 100%;
+}
+.ps-team-add > .btn {
+  padding-inline: .9rem;
+}
+.project-overview-team-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .45rem .75rem;
+  margin-top: .5rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+@media (width < 640px) {
+  .ps-visibility-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ps-team-row {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+  .ps-team-actions {
+    justify-content: space-between;
+    flex-wrap: wrap;
+  }
+  .ps-role-select {
+    flex: 1 1 8.5rem;
+    min-width: 0;
+  }
+  .ps-team-add {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ps-team-add > .btn {
+    width: 100%;
+  }
+}
+
 /* CAD-2363: assistant turns. The running turn's one clock sits beside the
    name in tabular figures; a known tool reads as what it did, its subject
    quieter; long identifiers are short copyable tokens; answer emphasis is
