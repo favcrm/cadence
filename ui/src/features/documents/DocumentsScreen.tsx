@@ -80,6 +80,8 @@ const isArtifactKind = (kind: string): kind is ArtifactKind => (ARTIFACT_KINDS a
 /** The refusals every write can meet, before its own fallback (as `Members.tsx`'s `sharedFailure`). */
 function sharedFailure(code: string | null, t: Translate): string | null {
   if (code === "not_found") return t("This document no longer exists.");
+  if (code === "project_viewer_readonly")
+    return t("You have read-only Viewer access to this project.");
   if (code === "owner_required") return t("Only the workspace’s own members can change documents.");
   if (code === "membership_changed") return t("Your access changed. Reload the page and try again.");
   return null;

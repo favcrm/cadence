@@ -27,6 +27,7 @@ import WorkItemDetail from "./features/work-items/WorkItemDetail";
 import { restoreDetailFocus } from "./features/work-items/focus";
 import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen, type MyWorkDraft, type WorkItemOrigin } from "./lib/workItems";
 import ProjectSettings from "./features/projects/ProjectSettings";
+import { isProjectViewer, readPolicy } from "./features/projects/policyContract";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, refreshIssueIds } from "./features/issues/model";
@@ -521,9 +522,30 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     if (personalWanted.current) void resources.myWork.refresh();
   }, []);
 
+  const viewedProjectPolicyResource = useMemo(
+    () => (hostedBoard && viewedProjectSlug ? resources.projectPolicy(viewedProjectSlug) : null),
+    [hostedBoard, viewedProjectSlug],
+  );
+  const viewedProjectPolicyState = useMaybeResource(viewedProjectPolicyResource);
+  useEffect(() => {
+    if (viewedProjectPolicyResource && privateReadsAllowed()) {
+      void viewedProjectPolicyResource.revalidate();
+    }
+  }, [viewedProjectPolicyResource]);
+  const viewedProjectPolicy = useMemo(
+    () =>
+      hostedBoard && viewedProjectSlug && viewedProjectPolicyState?.data
+        ? readPolicy(viewedProjectPolicyState.data, true)
+        : null,
+    [hostedBoard, viewedProjectSlug, viewedProjectPolicyState?.data],
+  );
+  const viewedProjectViewerReadOnly = isProjectViewer(viewedProjectPolicy);
+
   const projectWriteBlock = viewedProjectArchived
     ? t("This project is archived. Restore it in Project settings to make changes.")
-    : block;
+    : viewedProjectViewerReadOnly
+      ? t("You have read-only Viewer access to this project.")
+      : block;
   const projectReadOnly = projectWriteBlock !== null;
   const documentFollowUps: DocumentFollowUpState | undefined = managedFiles && meta?.signed_in === true
     ? overviewState.status === "failed"
@@ -1622,6 +1644,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             )}
           </div>
         )}
+        {!viewedProjectArchived && viewedProjectViewerReadOnly && viewedProjectSlug && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-2 bg-ink-900/60 px-4 lg:px-8 py-2 text-label text-ink-300"
+          >
+            <span>{t("Viewer access · Read-only")}</span>
+          </div>
+        )}
         {route.screen === "projects" && route.section === "overview" && (
           <ProjectsOverview
             project={project}
@@ -1644,6 +1674,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onRetryArchived={() => setLifecycleVersion((v) => v + 1)}
             canCreateProject={access.operator === true && !readOnly}
             hosted={meta?.hosted === true}
+            projectPolicy={route.slug ? viewedProjectPolicy : null}
             onProjectCreated={(created) => {
               say("ok", `${t("Created project")} ${created.project.name || created.project.key}`);
             }}
@@ -1662,7 +1693,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <DocumentsScreen
             project={route.slug}
             hosted={documentsHosted}
-            viewer={documentsViewer({ sub: viewerSub, operator: access.operator, readOnly })}
+            viewer={documentsViewer({ sub: viewerSub, operator: access.operator, readOnly: readOnly || projectReadOnly })}
             archived={route.archived === true}
             stage={route.stage}
             hrefFor={hrefFor}
@@ -1678,6 +1709,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               null
             }
             block={policyBlock(meta)}
+            sessionBlock={block}
             archived={viewedProjectArchived}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             openIssuesCount={

@@ -1,8 +1,13 @@
 import {
+  canManageProjectPolicy,
   draftDirty,
   draftOf,
+  effectiveMembers,
   hostedIfRev,
+  isProjectViewer,
   nativeGrant,
+  policyCapabilities,
+  policyMyRole,
   policyWrite,
   privateRefused,
   readPolicy,
@@ -228,5 +233,185 @@ equal(nativeGrant("users/mia"), "users/mia", "a users/<handle> grant is accepted
 equal(nativeGrant("operator"), "operator", "the operator grant is accepted");
 equal(nativeGrant("agents/dev"), null, "an agent spelling is refused");
 equal(nativeGrant("users/"), null, "an empty handle is refused");
+
+/* ---------------- AOS-814 / CAD-2884: private_available, 3 roles, capabilities ---------------- */
+
+const aos814WorkspaceVisible = {
+  state: "ok",
+  project: "alpha",
+  visibility: "workspace-visible",
+  grants: [],
+  members: [
+    { userId: "usr_owner", role: "owner" },
+    { userId: "usr_viewer", role: "viewer" },
+  ],
+  revision: 3,
+  provenance: "hosted-owner-attested",
+  updated_by: "usr_ws",
+  updated_at: "2026-11-28T00:00:00Z",
+  private_available: true,
+  my_role: "workspace_owner",
+  capabilities: {
+    can_manage: true,
+    can_write: true,
+    can_edit_details: true,
+    can_archive: true,
+  },
+};
+
+const aos814View = readPolicy(aos814WorkspaceVisible, true);
+equal(aos814View.kind, "recorded", "AOS-814 recorded policy decodes");
+equal(
+  privateRefused(aos814View, { visibility: "private", grants: ["usr_owner"] }, true),
+  false,
+  "hosted private_available=true unblocks switching existing project to private",
+);
+equal(
+  privateRefused(
+    readPolicy(
+      {
+        ...hostedNoRow,
+        private_available: true,
+        my_role: "workspace_owner",
+        capabilities: {
+          can_manage: true,
+          can_write: true,
+          can_edit_details: true,
+          can_archive: true,
+        },
+      },
+      true,
+    ),
+    { visibility: "private", grants: [] },
+    true,
+  ),
+  false,
+  "hosted private_available=true on not_stored unblocks private creation",
+);
+
+equal(
+  policyMyRole(aos814View),
+  "workspace_owner",
+  "policyMyRole reads workspace_owner",
+);
+equal(
+  policyCapabilities(aos814View),
+  { can_manage: true, can_write: true, can_edit_details: true, can_archive: true },
+  "policyCapabilities reads all four flags",
+);
+equal(canManageProjectPolicy(aos814View), true, "workspace_owner can manage");
+equal(isProjectViewer(aos814View), false, "workspace_owner is not viewer");
+
+const viewerPolicyView = readPolicy(
+  {
+    ...aos814WorkspaceVisible,
+    my_role: "viewer",
+    capabilities: {
+      can_manage: false,
+      can_write: false,
+      can_edit_details: false,
+      can_archive: false,
+    },
+  },
+  true,
+);
+equal(isProjectViewer(viewerPolicyView), true, "viewer role is detected as read-only viewer");
+equal(canManageProjectPolicy(viewerPolicyView), false, "viewer cannot manage policy");
+
+const aosDraft = draftOf(aos814View);
+equal(
+  aosDraft,
+  {
+    visibility: "workspace_visible",
+    grants: [],
+    members: [
+      { userId: "usr_owner", role: "owner" },
+      { userId: "usr_viewer", role: "viewer" },
+    ],
+  },
+  "draftOf includes explicit members array",
+);
+equal(draftDirty(aos814View, aosDraft), false, "unchanged members draft is clean");
+equal(
+  draftDirty(aos814View, {
+    visibility: "workspace_visible",
+    grants: [],
+    members: [
+      { userId: "usr_owner", role: "owner" },
+      { userId: "usr_viewer", role: "member" },
+    ],
+  }),
+  true,
+  "changing a member role marks draft dirty",
+);
+equal(
+  policyWrite(
+    aos814View,
+    {
+      visibility: "private",
+      grants: [],
+      members: [
+        { userId: "usr_owner", role: "owner" },
+        { userId: "usr_viewer", role: "viewer" },
+      ],
+    },
+    true,
+  ),
+  {
+    contract: "hosted",
+    visibility: "private",
+    grants: ["usr_owner", "usr_viewer"],
+    members: [
+      { userId: "usr_owner", role: "owner" },
+      { userId: "usr_viewer", role: "viewer" },
+    ],
+    if_rev: "3",
+  },
+  "policyWrite sends members and derives private grants when members exist",
+);
+equal(
+  effectiveMembers({ visibility: "private", grants: ["usr_1", "usr_2"] }),
+  [
+    { userId: "usr_1", role: "member" },
+    { userId: "usr_2", role: "member" },
+  ],
+  "legacy grants-only draft maps each grant to member role",
+);
+
+// Malformed AOS-814 metadata fails closed as unreadable.
+equal(
+  readPolicy({ ...aos814WorkspaceVisible, members: [{ userId: "usr_1", role: "admin" }] }, true).kind,
+  "unreadable",
+  "unknown member role fails closed",
+);
+equal(
+  readPolicy(
+    {
+      ...aos814WorkspaceVisible,
+      members: [
+        { userId: "usr_1", role: "owner" },
+        { userId: "usr_1", role: "viewer" },
+      ],
+    },
+    true,
+  ).kind,
+  "unreadable",
+  "duplicate userId in members fails closed",
+);
+equal(
+  readPolicy({ ...aos814WorkspaceVisible, my_role: "superadmin" }, true).kind,
+  "unreadable",
+  "unknown my_role fails closed",
+);
+equal(
+  readPolicy({ ...aos814WorkspaceVisible, capabilities: { can_manage: "yes" } }, true).kind,
+  "unreadable",
+  "malformed capabilities fails closed",
+);
+equal(
+  readPolicy({ ...aos814WorkspaceVisible, private_available: "true" }, true).kind,
+  "unreadable",
+  "non-boolean private_available fails closed",
+);
 
 console.log("project policy contract checks passed");

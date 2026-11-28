@@ -897,7 +897,12 @@ export const api = {
    *  (`""` for a project with no row yet). */
   setProjectPolicyHosted: (
     project: string,
-    req: { visibility: "workspace-visible" | "private"; grants: string[]; if_rev: string },
+    req: {
+      visibility: "workspace-visible" | "private";
+      grants: string[];
+      members?: Array<{ userId: string; role: "owner" | "member" | "viewer" }>;
+      if_rev: string;
+    },
   ) =>
     put<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`, req),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {

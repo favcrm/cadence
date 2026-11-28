@@ -1,6 +1,7 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ResourceState } from "../../lib/cache";
 import { prefetchIssue, resources } from "../../lib/resources";
+import { readTeamMembers, type TeamMember } from "../../lib/teamRoster";
 import type { CreateProjectResponse, IssueCard, Project } from "../../lib/types";
 import { navigate } from "../../lib/useLocation";
 import { useNavigation } from "../../../screen-ui/src/navigation";
@@ -10,6 +11,7 @@ import { HealthBadge, ProgressBar } from "./HealthBadge";
 import { healthView, progressView } from "./work";
 import { projectSummary } from "./overview";
 import NewProjectModal from "./NewProjectModal";
+import { canManageProjectPolicy, isProjectViewer, type PolicyView } from "./policyContract";
 import { projectDisplayName, projectPresetLabel } from "./projectCreate";
 import ProjectMilestoneSummary from "./ProjectMilestoneSummary";
 import { useLocale } from "../../lib/locale";
@@ -33,6 +35,7 @@ export default function ProjectsOverview({
   onRetryArchived,
   canCreateProject = false,
   hosted = false,
+  projectPolicy = null,
   onProjectCreated,
 }: {
   project: string;
@@ -52,12 +55,44 @@ export default function ProjectsOverview({
   onRetryArchived?: () => void;
   canCreateProject?: boolean;
   hosted?: boolean;
+  projectPolicy?: PolicyView | null;
   onProjectCreated?: (created: CreateProjectResponse) => void;
 }) {
   const { t, formatNumber } = useLocale();
   const navigation = useNavigation();
   const [createOpen, setCreateOpen] = useState(false);
   const newProjectBtnRef = useRef<HTMLButtonElement | null>(null);
+  const [roster, setRoster] = useState<TeamMember[] | null>(null);
+  const all = project === "all";
+  const projectOwners =
+    !all && projectPolicy?.kind === "recorded" && projectPolicy.members
+      ? projectPolicy.members.filter((entry) => entry.role === "owner")
+      : [];
+  const needRoster = Boolean(hosted && !all && projectOwners.length > 0);
+
+  useEffect(() => {
+    if (!needRoster) {
+      setRoster(null);
+      return;
+    }
+    const abort = new AbortController();
+    readTeamMembers(abort.signal)
+      .then((rows) => {
+        if (!abort.signal.aborted) setRoster(rows);
+      })
+      .catch(() => {
+        if (!abort.signal.aborted) setRoster(null);
+      });
+    return () => abort.abort();
+  }, [needRoster, project]);
+
+  const ownerNames = projectOwners.map((entry) => {
+    const member = roster?.find((row) => row.userId === entry.userId);
+    return member?.name.trim() || member?.email || entry.userId;
+  });
+  const viewerReadOnly = !all && isProjectViewer(projectPolicy);
+  const canManageTeam = !all && canManageProjectPolicy(projectPolicy);
+
   const goProject = (key: string) => {
     const dest = path(key);
     if (navigation) navigation.navigate(dest);
@@ -65,7 +100,6 @@ export default function ProjectsOverview({
   };
   const cards = issues.data ?? [];
   const summary = projectSummary(cards, project);
-  const all = project === "all";
   const selected = projects.find((item) => item.key === project);
   const selectedName = !all ? projectDisplayName(selected ?? { key: project }) : null;
   const selectedPreset = !all ? projectPresetLabel(selected?.preset) : null;
@@ -90,6 +124,24 @@ export default function ProjectsOverview({
               )
             : selectedGoal ?? t("Current work, active initiatives, and the next things to inspect.")}
         </p>
+        {!all && (ownerNames.length > 0 || viewerReadOnly || canManageTeam) && (
+          <div className="project-overview-team-bar">
+            {ownerNames.length > 0 && (
+              <span>
+                {t(ownerNames.length === 1 ? "Project owner" : "Project owners")}:{" "}
+                <strong className="font-medium text-ink-200">{ownerNames.join(", ")}</strong>
+              </span>
+            )}
+            {viewerReadOnly && (
+              <span className="ps-role-pill is-viewer">{t("Read-only Viewer")}</span>
+            )}
+            {canManageTeam && (
+              <Link className="lnk" href={path(project, "settings")}>
+                {t("Manage team")}
+              </Link>
+            )}
+          </div>
+        )}
       </div>
       <div className="project-heading-actions">
         {all && !archivedTab && canCreateProject && (
