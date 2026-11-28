@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
-import { isolate } from "../decisions/stagedWrite";
+import { isolate, visible } from "../decisions/stagedWrite";
 import { ageWords, kindSpec, type HomeNeed } from "./needs";
 import { cleanPermissionInline } from "./permissionFormat";
 import { todoPresentation } from "./railModel";
@@ -57,8 +57,68 @@ export default function TodoCard({
   const stagedFooterAsker = action.type === "staged" && need.summary && action.askedBy ? action.askedBy : null;
   const stagedExternal = action.type === "staged" && action.external;
 
+  const batch = action.type === "staged" ? action.batch ?? null : null;
+  const batchTone =
+    batch?.status === "partial_failed"
+      ? ("fail" as const)
+      : batch?.status === "running"
+        ? ("info" as const)
+        : pres.tone;
+  const batchKindLabel = batch
+    ? batch.status === "partial_failed"
+      ? t("Failed · {done}/{total}")
+          .replace("{done}", String(batch.completedCount))
+          .replace("{total}", String(batch.totalCount))
+      : batch.status === "running"
+        ? t("Running · {done}/{total}")
+            .replace("{done}", String(batch.completedCount))
+            .replace("{total}", String(batch.totalCount))
+        : t("Batch · {n}").replace("{n}", String(batch.totalCount))
+    : t(pres.kindLabel);
+  const batchPct =
+    batch && batch.totalCount > 0
+      ? Math.min(100, Math.round((batch.completedCount / batch.totalCount) * 100))
+      : 0;
+
   const summary = done
     ? doneText
+    : batch
+      ? (
+        <div className="todo-batch-summary">
+          {stagedDetail ? (
+            <span>
+              <bdi>{isolate(visible(stagedDetail))}</bdi>
+            </span>
+          ) : null}
+          {(batch.status === "running" || batch.status === "partial_failed" || batch.completedCount > 0) && (
+            <div
+              className="dx-batch-prog-track"
+              role="progressbar"
+              aria-label={t("Batch progress")}
+              aria-valuemin={0}
+              aria-valuemax={batch.totalCount}
+              aria-valuenow={batch.completedCount}
+            >
+              <div
+                className={`dx-batch-prog-fill${batch.failedCount > 0 ? " warn" : ""}`}
+                style={{ width: `${batchPct}%` }}
+              />
+            </div>
+          )}
+          {batch.status === "pending" && batch.sampleItems.length > 0 && (
+            <div className="todo-batch-samples">
+              {batch.sampleItems.slice(0, 3).map((item) => (
+                <span key={item.itemKey} className="todo-batch-chip">
+                  <bdi>{isolate(visible(item.recipient ?? item.label))}</bdi>
+                </span>
+              ))}
+              {batch.totalCount > 3 && (
+                <span className="num">+{batch.totalCount - 3}</span>
+              )}
+            </div>
+          )}
+        </div>
+      )
     : action.type === "staged"
       ? (stagedDetail ? <bdi>{isolate(stagedDetail)}</bdi> : undefined)
       : action.type === "permission"
@@ -89,7 +149,11 @@ export default function TodoCard({
       ? t("Sending…")
       : sent
         ? t("Sent to Master")
-        : t(pres.cueLabel);
+        : batch?.status === "partial_failed"
+          ? t("Retry")
+          : batch?.status === "running"
+            ? t("Progress")
+            : t(pres.cueLabel);
 
   return (
     <li
@@ -97,6 +161,7 @@ export default function TodoCard({
       data-need={need.kind}
       data-need-key={need.key}
       data-type={spec.type}
+      data-batch-status={batch?.status}
       data-done={done || undefined}
     >
       <RailCard
@@ -104,8 +169,8 @@ export default function TodoCard({
         bodyClassName="todo-main min-w-0"
         titleClassName="todo-hit"
         metaClassName="todo-meta"
-        tone={pres.tone}
-        statusLabel={t(pres.kindLabel)}
+        tone={batchTone}
+        statusLabel={batchKindLabel}
         source={action.type === "staged" && action.app ? <bdi>{isolate(rawSource)}</bdi> : rawSource}
         age={ageWords(need.age)}
         done={done}

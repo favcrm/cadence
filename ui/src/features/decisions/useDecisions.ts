@@ -3,6 +3,7 @@ import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSe
 import { requestThreadReload, subscribeMasterChanged } from "../../lib/masterChanged";
 import { decideAccessRequest, type AccessOutcome, type AccessRequestDuration, type AccessRequestScope } from "../home/accessRequest";
 import { decideShareRequest, type ShareOutcome } from "../home/shareRequest";
+import { isBatchActive } from "./actionBatch";
 import { failureReason, outcomeOf, parseStagedList, type StagedOutcome, type StagedWrite } from "./stagedWrite";
 
 /**
@@ -76,6 +77,9 @@ function hasUnresolved(attempts: ReadonlyMap<string, Attempt>): boolean {
   return false;
 }
 
+const isActionableWrite = (row: StagedWrite): boolean =>
+  row.kind === "action_batch" && row.batch ? isBatchActive(row.batch) : row.status === "pending";
+
 /** Each store owns one conversation; omission selects the owner's Home. */
 export function createDecisionsStore(conversation: string | null, retain: (unresolved: boolean) => void = () => {}) {
   const selector = conversation === null ? "" : `?conversation=${encodeURIComponent(conversation)}`;
@@ -83,12 +87,29 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
   let state: DecisionsState = EMPTY;
   const listeners = new Set<() => void>();
   const seenFailed = new Set<string>();
+  let batchPollTimer: ReturnType<typeof setTimeout> | null = null;
+  const BATCH_POLL_MS = 2_000;
+
+  function syncBatchPolling(rows: readonly StagedWrite[]) {
+    if (batchPollTimer !== null) {
+      clearTimeout(batchPollTimer);
+      batchPollTimer = null;
+    }
+    if (holders > 0 && rows.some((r) => r.batch?.status === "running")) {
+      batchPollTimer = setTimeout(() => {
+        batchPollTimer = null;
+        if (document.visibilityState === "hidden") return;
+        backgroundReload();
+      }, BATCH_POLL_MS);
+    }
+  }
 
   function publish(next: Omit<DecisionsState, "pending" | "decided" | "failedUnseen"> & Partial<Pick<DecisionsState, "failedUnseen">>) {
-    const pending = next.rows.filter((r) => r.status === "pending").sort((a, b) => a.createdAt - b.createdAt);
-    const decided = next.rows.filter((r) => r.status !== "pending").sort((a, b) => (b.decidedAt ?? b.createdAt) - (a.decidedAt ?? a.createdAt));
+    const pending = next.rows.filter(isActionableWrite).sort((a, b) => a.createdAt - b.createdAt);
+    const decided = next.rows.filter((r) => !isActionableWrite(r)).sort((a, b) => (b.decidedAt ?? b.createdAt) - (a.decidedAt ?? a.createdAt));
     const failedUnseen = decided.some((r) => outcomeOf(r) === "failed" && !seenFailed.has(r.id));
     state = { ...next, pending, decided, failedUnseen };
+    syncBatchPolling(next.rows);
     retain(hasUnresolved(state.attempts));
     for (const fn of listeners) fn();
   }
@@ -219,6 +240,8 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     stopPoll = null;
     clearTimeout(retryTimer ?? undefined);
     retryTimer = null;
+    clearTimeout(batchPollTimer ?? undefined);
+    batchPollTimer = null;
     // Discard private rows, but keep an unresolved request across remounts.
     state = attempts.size > 0 ? { ...EMPTY, attempts } : EMPTY;
     retain(attempts.size > 0);
@@ -378,6 +401,57 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     }
   }
 
+  /** Retry failed items on a `partial_failed` ActionBatch; completed items stay skipped server-side. */
+  async function retryBatchFailed(id: string): Promise<DecideResult> {
+    const epoch = lifetime;
+    const current = state.rows.find((r) => r.id === id);
+    if (current === undefined || current.kind !== "action_batch" || current.batch?.status !== "partial_failed") {
+      return "elsewhere";
+    }
+    for (const attempt of state.attempts.values()) if (attempt.phase === "busy") return "unconfirmed";
+    if (state.attempts.get(id)?.phase === "unconfirmed") return "unconfirmed";
+    setAttempt(id, { phase: "busy", verb: "approve" });
+    let status = 0;
+    try {
+      status = await withPrivateOperation(async (operation) => {
+        const response = await operation.fetch(
+          `/api/assist/actions/${encodeURIComponent(id)}/retry-failed${selector}`,
+          {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { accept: "application/json", "content-type": "application/json" },
+            body: "{}",
+          },
+        );
+        return response.status;
+      });
+    } catch {
+      if (epoch !== lifetime) return "unconfirmed";
+      setAttempt(id, { phase: "unconfirmed", verb: "approve" });
+      return "unconfirmed";
+    }
+    if (epoch !== lifetime) return "unconfirmed";
+    if (holders === 0) {
+      setAttempt(id, { phase: "unconfirmed", verb: "approve" });
+      return "unconfirmed";
+    }
+    if (status === 403 || status === 401) {
+      setAttempt(id, { phase: "access" });
+      return "access";
+    }
+    if (status === 409 || status === 404) {
+      await reloadDecisions();
+      if (epoch !== lifetime) return "unconfirmed";
+      setAttempt(id, { phase: "elsewhere" });
+      return "elsewhere";
+    }
+    if (status < 200 || status >= 300) {
+      setAttempt(id, { phase: "unconfirmed", verb: "approve" });
+      return "unconfirmed";
+    }
+    return settle(id, "approve", epoch);
+  }
+
   /** After a reply that says it worked, trust the list, not the reply. */
   async function settle(id: string, verb: Verb, epoch: number): Promise<DecideResult> {
     // If this read was superseded, the list that superseded it is as good.
@@ -396,7 +470,9 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     }
     const attempts = new Map(state.attempts);
     attempts.delete(id);
-    patch({ attempts, notice: failedOrDone(row) });
+    // An ActionBatch still processing asynchronously keeps running without flashing a premature terminal notice.
+    const batchInFlight = row.kind === "action_batch" && row.batch?.status === "running";
+    patch({ attempts, ...(batchInFlight ? {} : { notice: failedOrDone(row) }) });
     return "decided";
   }
 
@@ -422,7 +498,8 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     }
     const attempts = new Map(state.attempts);
     attempts.delete(id);
-    patch({ attempts, notice: failedOrDone(row) });
+    const batchInFlight = row.kind === "action_batch" && row.batch?.status === "running";
+    patch({ attempts, ...(batchInFlight ? {} : { notice: failedOrDone(row) }) });
     return "decided";
   }
 
@@ -445,6 +522,8 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
     lifetime += 1;
     generation += 1;
     seenFailed.clear();
+    clearTimeout(batchPollTimer ?? undefined);
+    batchPollTimer = null;
     state = holders > 0 ? { ...EMPTY, phase: "loading" } : EMPTY;
     retain(false);
     if (holders === 0) {
@@ -468,7 +547,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
 
   return {
     conversation,
-    acquire, release, currentDecisions, reloadDecisions, backgroundReload, decide, decideShare, decideAccess, checkDecision,
+    acquire, release, currentDecisions, reloadDecisions, backgroundReload, decide, decideShare, decideAccess, retryBatchFailed, checkDecision,
     clearNotice, markFailedSeen, resetDecisions, requestReview, onReviewRequest,
     subscribe(listener: () => void) {
       listeners.add(listener);

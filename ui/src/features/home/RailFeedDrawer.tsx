@@ -408,6 +408,26 @@ export default function RailFeedDrawer({
           label: t("Details"),
           panel: (
             <div className="dx-panel">
+              {write.batch && (
+                <dl className="dx-kv-card">
+                  <div className="dx-kv-line">
+                    <dt>{t("Completed")}</dt>
+                    <dd className="num">{write.batch.completedCount} / {write.batch.totalCount}</dd>
+                  </div>
+                  {write.batch.failedCount > 0 && (
+                    <div className="dx-kv-line">
+                      <dt>{t("Failed")}</dt>
+                      <dd className="num">{write.batch.failedCount}</dd>
+                    </div>
+                  )}
+                  {write.batch.decisionReason && (
+                    <div className="dx-kv-line">
+                      <dt>{t("Decision note")}</dt>
+                      <dd><bdi>{isolate(write.batch.decisionReason)}</bdi></dd>
+                    </div>
+                  )}
+                </dl>
+              )}
               {(outcome === "failed" || (outcome === "unconfirmed" && write.connected !== null && isUncertain(write))) && (
                 <p className="text-label text-ink-300">{reasonText(failureReason(write), t)}</p>
               )}

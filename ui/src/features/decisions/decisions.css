@@ -55,3 +55,39 @@
 .crm-drawer[data-drawer="staged"] textarea:focus-visible,
 .crm-drawer[data-drawer="staged"] pre:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 .crm-drawer[data-drawer="staged"] .btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; box-shadow: none; }
+
+/* ---- AOS-779: grouped ActionBatch preview, progress bar, and items ---- */
+.dx-batch-artifact { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.65rem; padding: 0.7rem 0.85rem; border: 1px solid var(--color-ink-700); border-radius: 0.55rem; background: var(--color-ink-850); }
+.dx-batch-prog-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; }
+.dx-batch-prog-track { width: 100%; height: 0.45rem; border-radius: 999px; background: var(--color-ink-800); border: 1px solid var(--color-ink-700); overflow: hidden; }
+.dx-batch-prog-fill { height: 100%; border-radius: 999px; background: var(--color-accent); transition: width 180ms ease-out; }
+.dx-batch-prog-fill.ok { background: var(--color-ok); }
+.dx-batch-prog-fill.warn { background: var(--color-warn); }
+.dx-batch-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.5rem; }
+.dx-batch-metric { display: grid; gap: 0.15rem; padding: 0.5rem 0.65rem; border-radius: 0.45rem; border: 1px solid var(--color-ink-700); background: var(--color-ink-850); min-width: 0; }
+.dx-batch-metric[data-fail] { border-color: var(--color-fail); }
+.dx-batch-metric-k { font-size: var(--text-micro); color: var(--color-ink-400); }
+.dx-batch-metric-v { font-size: var(--text-secondary); color: var(--color-ink-100); font-weight: 600; }
+.dx-batch-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.45rem; }
+.dx-batch-list-scroll { max-height: 18rem; overflow: auto; }
+.dx-batch-item { padding: 0.55rem 0.7rem; border: 1px solid var(--color-ink-700); border-radius: 0.5rem; background: var(--color-ink-850); min-width: 0; }
+.dx-batch-item[data-batch-item-status="failed"] { border-color: var(--color-fail); }
+.dx-batch-item-main { display: grid; gap: 0.25rem; min-width: 0; }
+.dx-batch-item-top { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; min-width: 0; }
+.dx-batch-item-title { font-size: var(--text-secondary); color: var(--color-ink-100); font-weight: 500; overflow-wrap: anywhere; min-width: 0; }
+.dx-batch-item-pill { flex-shrink: 0; padding: 0.08rem 0.45rem; border-radius: 999px; font-size: var(--text-micro); border: 1px solid var(--color-ink-700); color: var(--color-ink-300); background: var(--color-ink-800); }
+.dx-batch-item-pill[data-tone="ok"] { color: var(--color-ok); }
+.dx-batch-item-pill[data-tone="fail"] { color: var(--color-fail); }
+.dx-batch-item-pill[data-tone="warn"] { color: var(--color-warn); }
+.dx-batch-item-pill[data-tone="info"] { color: var(--color-accent); }
+.dx-batch-item-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; font-size: var(--text-micro); color: var(--color-ink-400); overflow-wrap: anywhere; }
+.dx-batch-item-err { font-size: var(--text-label); color: var(--color-fail); overflow-wrap: anywhere; }
+.dx-batch-all { display: grid; gap: 0.65rem; }
+.todo-batch-summary { display: grid; gap: 0.35rem; }
+.todo-batch-samples { display: flex; flex-wrap: wrap; gap: 0.25rem 0.45rem; font-size: var(--text-micro); color: var(--color-ink-400); }
+.todo-batch-chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0.06rem 0.4rem; border-radius: 0.35rem; border: 1px solid var(--color-ink-700); background: var(--color-ink-850); color: var(--color-ink-300); }
+@media (max-width: 639px) { .dx-batch-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (prefers-reduced-motion: reduce) {
+  .dx-batch-prog-fill { transition: none; }
+  .crm-drawer[data-drawer="staged"] .btn-spin { animation: none; }
+}

@@ -8,6 +8,8 @@ import { customMcpErrorText } from "../settings/customMcpView";
 import { ageText, approvable, askedBy, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, visible, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
 import AccessRequestDrawer from "./AccessRequestDrawer";
+import { isBatchActive } from "./actionBatch";
+import ActionBatchDrawer from "./ActionBatchDrawer";
 import ShareRequestDrawer from "./ShareRequestDrawer";
 import "./decisions.css";
 
@@ -567,6 +569,7 @@ export default function StagedWriteDetail({
   const attempt = decisions.attempts.get(id);
   const busy = [...decisions.attempts.values()].find((a) => a.phase === "busy");
   const pending = write?.status === "pending";
+  const activeBatch = write?.kind === "action_batch" && write.batch != null && isBatchActive(write.batch);
   const lost = decisions.phase === "unavailable" || attempt?.phase === "access";
   // Our own decision leaves "pending" a moment before the queue advances.
   const mine = useRef<string | null>(null);
@@ -574,7 +577,7 @@ export default function StagedWriteDetail({
   const resumed = useRef<string | null>(attempt?.phase === "busy" ? id : null);
   const uncertain = attempt?.phase === "unconfirmed";
   // Unsure of our own decision wins over "decided elsewhere": Check again reports the real outcome.
-  const elsewhere = !lost && !uncertain && !pending && mine.current !== id && resumed.current !== id;
+  const elsewhere = !lost && !uncertain && !pending && !activeBatch && mine.current !== id && resumed.current !== id;
   const idRef = useRef(id);
   idRef.current = id;
   const atRef = useRef(at);
@@ -620,11 +623,18 @@ export default function StagedWriteDetail({
   };
 
   const run = async (work: () => Promise<string>) => {
-    mine.current = idRef.current;
+    const activeId = idRef.current;
+    mine.current = activeId;
     const result = await work();
     if (!alive.current) return;
-    if (result === "decided") advance();
-    else mine.current = null;
+    if (result === "decided") {
+      const latest = store.currentDecisions().rows.find((r) => r.id === activeId);
+      if (latest?.kind === "action_batch" && (latest.batch?.status === "running" || latest.batch?.status === "partial_failed")) {
+        mine.current = null;
+        return;
+      }
+      advance();
+    } else mine.current = null;
   };
   // A new item is not armed at once: a second click of a double-click that
   // decided the previous item must not land on this one.
@@ -712,6 +722,48 @@ export default function StagedWriteDetail({
               : t("Already decided elsewhere. See Feed.")}
         </p>
       </DrawerShell>
+    );
+  }
+
+  // AOS-779: grouped ActionBatch drawer with sample preview, progress bar, and Retry Failed Only.
+  if (write.kind === "action_batch" && write.batch) {
+    const gone = elsewhere || attempt?.phase === "elsewhere";
+    return (
+      <ActionBatchDrawer
+        write={write}
+        conversation={store.conversation}
+        attempt={attempt}
+        notice={decisions.notice}
+        busy={busy !== undefined}
+        lost={lost}
+        uncertain={uncertain}
+        elsewhere={gone}
+        block={block}
+        at={at}
+        total={n}
+        onApprove={(clicks) => {
+          if (clicks <= 1 && Date.now() >= armedAt.current && write.id === idRef.current) {
+            void run(() => store.decide(write.id, "approve"));
+          }
+        }}
+        onDeny={(reason, clicks) => {
+          if (clicks <= 1 && Date.now() >= armedAt.current && write.id === idRef.current) {
+            void run(() => store.decide(write.id, "deny", reason));
+          }
+        }}
+        onRetryFailed={(clicks) => {
+          if (clicks <= 1 && Date.now() >= armedAt.current && write.id === idRef.current) {
+            void run(() => store.retryBatchFailed(write.id));
+          }
+        }}
+        onRefresh={() => {
+          void store.reloadDecisions();
+        }}
+        onCheck={check}
+        onContinue={advance}
+        onSkip={skip}
+        onClose={onClose}
+      />
     );
   }
 

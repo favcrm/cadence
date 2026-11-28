@@ -107,11 +107,18 @@ export default function ConversationDecisions({
           {decisions.pending.map((write) => {
             if (isInlineTool(write)) return inlineCard(inline[write.id] ?? { write, busy: false });
             const source = sourceLine(write, t);
+            const batchBadge = write.batch
+              ? write.batch.status === "running"
+                ? `${t("Running")} · ${write.batch.completedCount}/${write.batch.totalCount}`
+                : write.batch.status === "partial_failed"
+                  ? `${t("Failed")} · ${write.batch.failedCount}/${write.batch.totalCount}`
+                  : `${write.batch.totalCount} ${t("items")}`
+              : t("Waiting");
             return (
               <article className="app-assistant-card" key={write.id} data-chat-staged>
                 <div className="app-assistant-card-head">
                   <strong className="text-label text-ink-100"><bdi>{isolate(write.title)}</bdi></strong>
-                  <span className="text-micro text-ink-400">{t("Waiting")}</span>
+                  <span className="text-micro text-ink-400 num">{batchBadge}</span>
                 </div>
                 {source && <p className="text-label text-ink-300"><bdi>{isolate(source)}</bdi></p>}
                 <button type="button" className="btn btn-sm" aria-label={`${t("Review")} \u2068${isolate(write.title)}\u2069`} onClick={(event) => open(write.id, event.currentTarget)}>
