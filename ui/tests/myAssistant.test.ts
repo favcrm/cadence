@@ -84,6 +84,7 @@ const roster = (over: Partial<AgentsPayload> & { master?: Partial<Agent> } = {})
 const hostedRoster = (extra: Partial<AgentsPayload> = {}) =>
   roster({ master: { scope: "workspace", name: "Acme" }, personal_assistant: personalRow, ...extra });
 let memberStateReads = 0;
+let memberStateFail = false;
 let aliasReads = 0;
 let masterReads = 0;
 let connectionsReads = 0;
@@ -152,6 +153,7 @@ globalThis.fetch = async (input, init) => {
   }
   if (path === "/api/member-assistant/state") {
     memberStateReads += 1;
+    if (memberStateFail) return json({ error: "unavailable" }, 503);
     return json({
       assistant: {
         assistant_id: personalAssistantId,
@@ -828,6 +830,59 @@ async function main() {
     readPatch()?.expected_revision === 7 && readPatch()?.instructions === "Updated personal instructions",
     "Instructions save uses the revision synced from Identity save",
   );
+
+  // 409 conflict fail-closed checks: avatar popover closes cleanly and failed state reload blocks further mutations.
+  personalRev += 1;
+  memberStateFail = true;
+  lastPersonalPatch = null;
+  await click(host.querySelector<HTMLButtonElement>(".ap-avatar-btn"));
+  await click(host.querySelector<HTMLButtonElement>('[data-avatar-popover] [data-assistant-look="operations"]'));
+  assert(
+    host.querySelector("[data-avatar-popover]") === null &&
+      host.querySelector("[data-identity-conflict]") !== null &&
+      host.querySelector<HTMLButtonElement>(".ap-avatar-btn")?.disabled === true &&
+      host.querySelector<HTMLButtonElement>("[data-identity-edit]")?.disabled === true,
+    "avatar 409 conflict with failed refresh closes popover and fails closed until reload succeeds",
+  );
+  memberStateFail = false;
+  await click(host.querySelector<HTMLButtonElement>("[data-identity-conflict] button"));
+  assert(
+    host.querySelector("[data-identity-conflict]") === null &&
+      host.querySelector<HTMLButtonElement>(".ap-avatar-btn")?.disabled === false,
+    "Reload identity clears conflict block once personal state refreshes",
+  );
+
+  // Inline editor 409 conflict disables Save until Reload identity succeeds.
+  personalRev += 1;
+  await click(host.querySelector<HTMLButtonElement>("[data-identity-edit]"));
+  const conflictForm = host.querySelector<HTMLFormElement>("[data-identity-inline-edit]");
+  const conflictNameField = conflictForm!.querySelectorAll<HTMLInputElement>("input.field")[0]!;
+  await React.act(async () => {
+    const desc = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!;
+    desc.set!.call(conflictNameField, "Atlas Two");
+    conflictNameField.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await click(conflictForm!.querySelector<HTMLButtonElement>('button[type="submit"]'));
+  const saveAfterConflict = host.querySelector<HTMLButtonElement>('[data-identity-inline-edit] button[type="submit"]');
+  assert(
+    saveAfterConflict?.disabled === true && host.textContent?.includes("Reload identity"),
+    "inline 409 conflict disables Save and surfaces Reload identity",
+  );
+  memberStateFail = true;
+  await click(Array.from(host.querySelectorAll<HTMLButtonElement>("[data-identity-inline-edit] button")).find((b) => b.textContent === "Reload identity"));
+  assert(
+    host.querySelector<HTMLButtonElement>('[data-identity-inline-edit] button[type="submit"]')?.disabled === true &&
+      host.textContent?.includes("Unable to reload"),
+    "failed inline Reload identity keeps Save disabled and shows reload failure",
+  );
+  memberStateFail = false;
+  await click(Array.from(host.querySelectorAll<HTMLButtonElement>("[data-identity-inline-edit] button")).find((b) => b.textContent === "Reload identity"));
+  assert(
+    host.textContent?.includes("Atlas Two") === false &&
+      host.querySelector<HTMLInputElement>("[data-identity-inline-edit] input.field")?.value === "Atlas",
+    "Reload identity refreshes inline draft to latest server name",
+  );
+  await click(Array.from(host.querySelectorAll<HTMLButtonElement>("[data-identity-inline-edit] button")).find((b) => b.textContent === "Cancel"));
 
   // Memory tab: inspect SOUL.md / MEMORY.md / topics, save edit with expected_sha, Undo, and 409 conflict recovery.
   await at("/agents/assistant?tab=memory");

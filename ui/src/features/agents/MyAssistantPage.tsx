@@ -168,6 +168,8 @@ export default function MyAssistantPage({
   const [savedBadge, setSavedBadge] = useState<string | null>(null);
   const [directUnsupported, setDirectUnsupported] = useState(false);
   const avatarWrapRef = useRef<HTMLDivElement | null>(null);
+  const avatarBtnRef = useRef<HTMLButtonElement | null>(null);
+  const changeAvatarLinkRef = useRef<HTMLButtonElement | null>(null);
   const nameInputRef = useRef<HTMLInputElement | null>(null);
   const toneInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -217,25 +219,34 @@ export default function MyAssistantPage({
       if (avatarOpen) {
         event.stopPropagation();
         setAvatarOpen(false);
+        queueMicrotask(() => avatarBtnRef.current?.focus());
       } else if (editing) {
         event.stopPropagation();
         setEditing(false);
-        setEditError(null);
-        setConflictReload(false);
+        if (!conflictReload) {
+          setEditError(null);
+        }
       }
     };
-    const onPointerDown = (event: MouseEvent) => {
-      if (avatarOpen && avatarWrapRef.current && !avatarWrapRef.current.contains(event.target as Node)) {
+    const onPointerDown = (event: Event) => {
+      const target = event.target as Node | null;
+      if (
+        avatarOpen &&
+        target !== null &&
+        avatarWrapRef.current &&
+        !avatarWrapRef.current.contains(target) &&
+        !(changeAvatarLinkRef.current?.contains(target) ?? false)
+      ) {
         setAvatarOpen(false);
       }
     };
     document.addEventListener("keydown", onKey, true);
-    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("pointerdown", onPointerDown);
     return () => {
       document.removeEventListener("keydown", onKey, true);
-      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("pointerdown", onPointerDown);
     };
-  }, [avatarOpen, editing]);
+  }, [avatarOpen, conflictReload, editing]);
 
   const docRev = typeof doc.ownRevision === "number" ? doc.ownRevision : null;
   const ownRev = ownIdentity !== null && typeof ownIdentity.revision === "number" ? ownIdentity.revision : null;
@@ -251,48 +262,95 @@ export default function MyAssistantPage({
   const commitIdentity = (next: IdentityRecord, toastText: string, badgeText: string) => {
     setOwnIdentity(next);
     doc.syncOwnRevision?.(next.revision);
+    setConflictReload(false);
+    setEditError(null);
     setSavedBadge(badgeText);
     onToast("ok", toastText);
     void resources.agents.refresh();
     void resources.masterState.refresh();
   };
 
+  const reloadIdentityFromConflict = async () => {
+    if (saving) return false;
+    setSaving(true);
+    try {
+      const { read } = await loadPersonalState();
+      if (read.state !== "ready") {
+        setConflictReload(true);
+        const message = t("Unable to reload assistant profile. Try again.");
+        setEditError(message);
+        onToast("err", message);
+        return false;
+      }
+      if (editing) {
+        setDraftName(read.identity.name ?? "");
+        setDraftTone(read.identity.tone ?? "");
+      }
+      setEditError(null);
+      setConflictReload(false);
+      return true;
+    } catch {
+      setConflictReload(true);
+      const message = t("Unable to reload assistant profile. Try again.");
+      setEditError(message);
+      onToast("err", message);
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const pickAvatar = async (nextLook: AvatarLook) => {
-    if (!canEditIdentity || ownIdentity === null || effectiveRevision === null || saving) return;
+    if (!canEditIdentity || ownIdentity === null || effectiveRevision === null || saving || conflictReload) return;
     if (nextLook === ownIdentity.look) {
       setAvatarOpen(false);
       return;
     }
     setSaving(true);
     setEditError(null);
-    setConflictReload(false);
     const outcome = await postPersonalProfile(
       toPersonalUpdateMutation({
         expected_revision: effectiveRevision,
         look: nextLook,
       }),
     );
-    setSaving(false);
     if (!outcome.ok) {
       if (outcome.unsupported) {
+        setSaving(false);
         setDirectUnsupported(true);
         setAvatarOpen(false);
         onToast("warn", t(outcome.error));
         return;
       }
       if (outcome.conflict) {
+        setAvatarOpen(false);
         setConflictReload(true);
-        void loadPersonalState().catch(() => undefined);
+        setEditError(t(outcome.error));
+        onToast("err", t(outcome.error));
+        try {
+          const { read } = await loadPersonalState();
+          if (read.state === "ready" && !editing) {
+            setConflictReload(false);
+            setEditError(null);
+          }
+        } catch {
+          // Keep conflictReload active until an explicit reload succeeds.
+        } finally {
+          setSaving(false);
+        }
+        return;
       }
+      setSaving(false);
       onToast("err", t(outcome.error));
       return;
     }
+    setSaving(false);
     setAvatarOpen(false);
     commitIdentity(outcome.identity, t("Avatar updated."), t("Saved"));
   };
 
   const openEdit = (focusTone: boolean) => {
-    if (!canEditIdentity || ownIdentity === null) return;
+    if (!canEditIdentity || ownIdentity === null || conflictReload) return;
     setDraftName(ownIdentity.name ?? "");
     setDraftTone(ownIdentity.tone ?? "");
     setEditError(null);
@@ -306,7 +364,7 @@ export default function MyAssistantPage({
 
   const saveInlineEdit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!canEditIdentity || ownIdentity === null || effectiveRevision === null || saving) return;
+    if (!canEditIdentity || ownIdentity === null || effectiveRevision === null || saving || conflictReload) return;
     const nextName = draftName.trim() === "" ? null : draftName.trim();
     const nextTone = draftTone.trim() === "" ? null : draftTone.trim();
     const dirty = nextName !== ownIdentity.name || nextTone !== ownIdentity.tone;
@@ -379,14 +437,16 @@ export default function MyAssistantPage({
           <div className="ap-avatar-wrap" ref={avatarWrapRef}>
             {canEditIdentity ? (
               <button
+                ref={avatarBtnRef}
                 type="button"
                 className="ap-avatar-btn"
                 aria-label={t("Change avatar")}
                 title={t("Change avatar")}
                 aria-haspopup="dialog"
                 aria-expanded={avatarOpen}
-                disabled={saving}
+                disabled={saving || conflictReload}
                 onClick={() => {
+                  if (saving || conflictReload) return;
                   setAvatarOpen((v) => !v);
                   setSavedBadge(null);
                 }}
@@ -412,7 +472,10 @@ export default function MyAssistantPage({
                     type="button"
                     className="ap-pop-close"
                     aria-label={t("Close")}
-                    onClick={() => setAvatarOpen(false)}
+                    onClick={() => {
+                      setAvatarOpen(false);
+                      queueMicrotask(() => avatarBtnRef.current?.focus());
+                    }}
                   >
                     <IconClose size={12} />
                   </button>
@@ -427,7 +490,7 @@ export default function MyAssistantPage({
                       aria-label={t(LOOK_LABEL[option])}
                       title={t(LOOK_LABEL[option])}
                       data-assistant-look={option}
-                      disabled={saving}
+                      disabled={saving || conflictReload}
                       onClick={() => void pickAvatar(option)}
                     >
                       <span className="assistant-face">
@@ -450,6 +513,7 @@ export default function MyAssistantPage({
                   className="ap-edit-btn"
                   data-identity-edit=""
                   aria-expanded={editing}
+                  disabled={saving || conflictReload}
                   onClick={() => openEdit(false)}
                 >
                   <IconEdit size={12} />
@@ -476,6 +540,7 @@ export default function MyAssistantPage({
                         type="button"
                         className="ap-tone-link"
                         data-tone-edit=""
+                        disabled={saving || conflictReload}
                         onClick={() => openEdit(true)}
                       >
                         {ownIdentity.tone ?? t("Neutral, clear and practical")}
@@ -492,14 +557,34 @@ export default function MyAssistantPage({
             <Button href="/?chat=assistant">{t("Open Home")}</Button>
           </div>
         </header>
+        {!editing && conflictReload && (
+          <div className="ap-inline-edit" data-identity-conflict="" role="alert">
+            <p className="assistant-about-error">
+              {editError ?? t("Another edit was saved first. Reload before saving.")}
+            </p>
+            <div className="ap-inline-foot">
+              <Button
+                type="button"
+                size="sm"
+                loading={saving}
+                disabled={saving}
+                onClick={() => void reloadIdentityFromConflict()}
+              >
+                {t("Reload identity")}
+              </Button>
+            </div>
+          </div>
+        )}
         {editing && canEditIdentity && ownIdentity !== null && (
           <form className="ap-inline-edit" data-identity-inline-edit="" onSubmit={(event) => void saveInlineEdit(event)}>
             <div className="ap-inline-head">
               <b>{t("Edit assistant profile")}</b>
               <button
+                ref={changeAvatarLinkRef}
                 type="button"
                 className="ap-link"
-                onClick={() => setAvatarOpen(true)}
+                disabled={saving || conflictReload}
+                onClick={() => setAvatarOpen((open) => !open)}
               >
                 {t("Change avatar…")}
               </button>
@@ -560,19 +645,9 @@ export default function MyAssistantPage({
                 <Button
                   type="button"
                   size="sm"
+                  loading={saving}
                   disabled={saving}
-                  onClick={() => {
-                    void loadPersonalState()
-                      .then(({ read }) => {
-                        if (read.state === "ready") {
-                          setDraftName(read.identity.name ?? "");
-                          setDraftTone(read.identity.tone ?? "");
-                          setEditError(null);
-                          setConflictReload(false);
-                        }
-                      })
-                      .catch(() => undefined);
-                  }}
+                  onClick={() => void reloadIdentityFromConflict()}
                 >
                   {t("Reload identity")}
                 </Button>
@@ -584,8 +659,9 @@ export default function MyAssistantPage({
                 disabled={saving}
                 onClick={() => {
                   setEditing(false);
-                  setEditError(null);
-                  setConflictReload(false);
+                  if (!conflictReload) {
+                    setEditError(null);
+                  }
                 }}
               >
                 {t("Cancel")}
@@ -597,6 +673,7 @@ export default function MyAssistantPage({
                 loading={saving}
                 disabled={
                   saving ||
+                  conflictReload ||
                   ((draftName.trim() === "" ? null : draftName.trim()) === ownIdentity.name &&
                     (draftTone.trim() === "" ? null : draftTone.trim()) === ownIdentity.tone)
                 }
