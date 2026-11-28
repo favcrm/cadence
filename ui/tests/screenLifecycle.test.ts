@@ -1,4 +1,4 @@
-import { AUDIO_UPLOAD_BYTES_MAX, parseChild, parseDraftImageRef, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_LOCALE_V1, type AudioSessionRequest, type ScreenAudioSessionSnapshot, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
+import { AUDIO_UPLOAD_BYTES_MAX, parseChild, parseDraftImageRef, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_LOCALE_V1, SCREEN_WHATSAPP_PDF_PREVIEW_V1, type AudioSessionRequest, type ScreenAudioSessionSnapshot, type ScreenPush } from "../src/features/workspace-apps/screen/screenProtocol";
 import { parseMount, ScreenChannel } from "../src/features/workspace-apps/screen/screenLifecycle";
 
 function check(value: unknown, label: string): void { if (!value) throw new Error(label); }
@@ -227,10 +227,10 @@ check(SCREEN_LOCALE_V1 === "screen-locale.v1", "generic locale token exported");
 check(!parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "crm-locale.v1"] }), "legacy crm-locale.v1 token is refused");
 check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"] }),
   "up to five ready capabilities parse");
-check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1", "screen-locale.v1", "screen-whatsapp-compose.v1", "screen-whatsapp-reply-availability.v1", "screen-whatsapp-reply-layout.v2", "screen-whatsapp-media.v1", "screen-route-params.v1"] }),
-  "up to eight ready capabilities parse");
-check(!parseChild({ v: 1, op: "ready", accepts: ["publish-intents.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1", "screen-audio.v1", "screen-route-params.v1", "screen-whatsapp-media.v1"] }),
-  "more than eight ready capabilities refused");
+check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1", "screen-locale.v1", "screen-route-params.v1", "screen-whatsapp-compose.v1", "screen-whatsapp-reply-availability.v1", "screen-whatsapp-reply-layout.v2", "screen-whatsapp-media.v1", "screen-whatsapp-pdf-preview.v1", "screen-whatsapp-ux.v1"] }),
+  "up to ten WABA ready capabilities parse within 16 cap");
+check(!parseChild({ v: 1, op: "ready", accepts: ["publish-intents.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1", "screen-audio.v1", "screen-route-params.v1", "screen-whatsapp-media.v1", "screen-whatsapp-pdf-preview.v1", "screen-whatsapp-compose.v1", "screen-whatsapp-reply-availability.v1", "screen-whatsapp-reply-layout.v2", "screen-whatsapp-ux.v1", "screen-records.v1", "screen-presentation.v1", "screen-canvas.v1"] }),
+  "more than sixteen ready capabilities refused");
 check(parseChild({ v: 2, op: "leave", unsaved: true })?.op === "leave", "v2 leave boolean parses");
 check(!parseChild({ v: 1, op: "leave", unsaved: true }), "v1 leave refused");
 check(!parseChild({ v: 2, op: "leave", unsaved: "yes" }), "non-boolean leave refused");
@@ -770,3 +770,38 @@ check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1"
 const nonRecords = mount(); nonRecords.channel.receive(nonRecords.event);
 nonRecords.port.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-route-params.v1"] });
 check(nonRecords.port.closed, "route params without a records screen close the mount");
+
+// CAD-2883: screen-whatsapp-pdf-preview.v1 capability fencing and payload validation.
+check(parseChild({ v: 2, op: "whatsapp-pdf-preview", conversation_id: "85261034412@s.whatsapp.net", message_id: "msg-1", provider: "linked" })?.op === "whatsapp-pdf-preview",
+  "whatsapp-pdf-preview message parses");
+check(!parseChild({ v: 2, op: "whatsapp-pdf-preview", conversation_id: "bad\nid", message_id: "msg-1" }),
+  "control chars in whatsapp-pdf-preview rejected");
+check(!parseChild({ v: 2, op: "whatsapp-pdf-preview", conversation_id: "c1", message_id: "m1", provider: "sms" }),
+  "invalid provider in whatsapp-pdf-preview rejected");
+
+const wabaPdfReceipt = { ...receipt, tag: "waba", action_token: "e".repeat(64), tools: [], host_contract: "screen-records.v1" as const, operations: ["whatsapp.messages"] };
+const wabaPdfPush: ScreenPush = { ...actingPush, tag: "waba", installation: { ...actingPush.installation, name: "waba" } };
+const previewed: { c: string; m: string; p?: string }[] = [];
+const pdfHost = {
+  ...toolHost!,
+  onWhatsAppMediaDownload: async () => ({ ok: false as const, refusal: { code: "unavailable", text: "nope" } }),
+  onWhatsAppPdfPreview: (c: string, m: string, p?: string) => { previewed.push({ c, m, p }); },
+} as unknown as ConstructorParameters<typeof ScreenChannel>[7];
+
+const pdfOptedSource = {} as Window;
+const pdfOptedPort = new Port();
+const pdfOptedChannel = new ScreenChannel(pdfOptedSource, wabaPdfReceipt, wabaPdfPush, () => {}, () => {}, () => {}, undefined, pdfHost);
+pdfOptedChannel.receive({ source: pdfOptedSource, origin: "null", data: { ...init, tag: "waba" }, ports: [pdfOptedPort as unknown as MessagePort] });
+pdfOptedPort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1", SCREEN_WHATSAPP_PDF_PREVIEW_V1] });
+pdfOptedPort.receive({ v: 2, op: "whatsapp-pdf-preview", conversation_id: "conv_1", message_id: "msg_pdf_1", provider: "official" });
+check(!pdfOptedPort.closed && previewed.length === 1 && previewed[0].p === "official",
+  "opted-in WABA frame dispatches whatsapp-pdf-preview");
+
+const pdfUnoptedSource = {} as Window;
+const pdfUnoptedPort = new Port();
+const pdfUnoptedChannel = new ScreenChannel(pdfUnoptedSource, wabaPdfReceipt, wabaPdfPush, () => {}, () => {}, () => {}, undefined, pdfHost);
+pdfUnoptedChannel.receive({ source: pdfUnoptedSource, origin: "null", data: { ...init, tag: "waba" }, ports: [pdfUnoptedPort as unknown as MessagePort] });
+pdfUnoptedPort.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1"] });
+pdfUnoptedPort.receive({ v: 2, op: "whatsapp-pdf-preview", conversation_id: "conv_1", message_id: "msg_pdf_1" });
+check(pdfUnoptedPort.closed && previewed.length === 1,
+  "unopted frame sending whatsapp-pdf-preview closes immediately");

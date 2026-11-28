@@ -27,6 +27,7 @@ import { readInstallationsGuarded, readInstallationsSnapshot, type Installation 
 import { stageWorksImportFile } from "../workspace-apps/screen/screenFileDownload";
 import { attachmentHref } from "../home/AttachmentMedia";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
+import PdfOverlayDrawer from "./PdfOverlayDrawer";
 import { canvasChrome, setCanvasFull, setChatPeek, useCanvasChrome } from "./canvasChrome";
 import { effective, MULTI_MIN_WIDTH } from "./canvasLayout";
 import LayoutSwitcher from "./LayoutSwitcher";
@@ -36,6 +37,7 @@ import {
   canvasSnapshot,
   clampWidth,
   closeDrawer,
+  closePdfOverlay,
   defaultWidthFor,
   closeTab,
   drawerLayout,
@@ -60,7 +62,7 @@ const KEPT_VERSIONS = 20;
 const FOOT: Record<string, string[]> = {
   html: ["sandboxed frame", "no scripts · no network"],
   md: ["board Markdown renderer", "no raw HTML"],
-  pdf: ["download only"],
+  pdf: ["inline PDF"],
   image: ["inline image"],
   csv: ["table · first 2,000 rows · 50 columns"],
   docx: ["Word document"],
@@ -643,6 +645,11 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (canvas.pdfOverlay) {
+        e.preventDefault();
+        closePdfOverlay();
+        return;
+      }
       if (!expanded) {
         closeAll();
         return;
@@ -656,7 +663,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, expanded, closeAll]);
+  }, [open, expanded, closeAll, canvas.pdfOverlay]);
 
   useEffect(() => {
     if (!open) setExpanded(false);
@@ -959,6 +966,18 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
           canExpand={canExpand}
           onExpand={() => setExpanded((x) => !x)}
           onClose={closeAll}
+        />
+      ) : null}
+      {canvas.pdfOverlay ? (
+        <PdfOverlayDrawer
+          title={canvas.pdfOverlay.title}
+          bytes={canvas.pdfOverlay.bytes}
+          mime={canvas.pdfOverlay.mime}
+          fileName={canvas.pdfOverlay.fileName}
+          loading={canvas.pdfOverlay.loading}
+          error={canvas.pdfOverlay.error}
+          onClose={closePdfOverlay}
+          scope="canvas"
         />
       ) : null}
       </div>

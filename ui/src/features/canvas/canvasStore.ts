@@ -106,6 +106,15 @@ export interface Working {
 
 export type Surface = "home" | "app";
 
+export interface PdfOverlayDoc {
+  title: string;
+  bytes: ArrayBuffer | null;
+  mime: string;
+  fileName?: string;
+  loading?: boolean;
+  error?: string | null;
+}
+
 export interface CanvasState {
   conversation: string | null;
   /** Which host feeds the canvas (decides how much room the chat keeps). */
@@ -120,6 +129,8 @@ export interface CanvasState {
   layout: PaneLayout;
   /** The last view opened: where `beside`/`below` land when nothing is focused. */
   lastOpened: string | null;
+  /** CAD-2883: wide/full-canvas PDF overlay drawer stacked above the stage without unmounting tabs. */
+  pdfOverlay: PdfOverlayDoc | null;
 }
 
 /** One card in the conversation, as the feed describes it. */
@@ -190,7 +201,7 @@ function emptyState(
   composerKey: string | null = null,
   surface: Surface = "home",
 ): CanvasState {
-  return { conversation, surface, composerKey, open: false, tabs: [], active: null, working: null, layout: readLayout(conversation), lastOpened: null };
+  return { conversation, surface, composerKey, open: false, tabs: [], active: null, working: null, layout: readLayout(conversation), lastOpened: null, pdfOverlay: null };
 }
 
 /** An artifact took the active tab: "user" for a card or tab click, "auto"
@@ -591,11 +602,20 @@ function closeDrawerFor(turn: string | null): void {
   if (turn) closedTurns.add(turn);
 }
 
+export function openPdfOverlay(doc: PdfOverlayDoc): void {
+  set({ ...state, pdfOverlay: doc });
+}
+
+export function closePdfOverlay(): void {
+  if (!state.pdfOverlay) return;
+  set({ ...state, pdfOverlay: null });
+}
+
 /** The operator closed the drawer: it stays closed for this turn. */
 export function closeDrawer(): void {
-  if (!state.open) return;
+  if (!state.open && !state.pdfOverlay) return;
   closeDrawerFor(currentTurn);
-  set({ ...state, open: false });
+  set({ ...state, open: false, pdfOverlay: null });
 }
 
 /** Show the drawer again over the tabs it already holds (the Browser tab
@@ -606,6 +626,7 @@ export function showDrawer(): void {
 
 // An uncertain session pauses reads immediately, even before an identity reset.
 onPrivateReadsPaused(() => {
+  if (state.pdfOverlay) closePdfOverlay();
   for (const tab of state.tabs) if (tab.workbook) closeTab(tab.id);
 });
 

@@ -5,7 +5,7 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRef
   type ScreenSectionI18n,
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
-import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_MEDIA_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V2, SCREEN_WHATSAPP_UX_V1, WHATSAPP_REPLY_INSET_MAX, type WhatsAppComposeProvider, type WhatsAppDraftsMessage, type WhatsAppMediaReply, type WhatsAppMediaRequest, type WhatsAppOpenThreadMessage, type WhatsAppOutboundEchoMessage, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
+import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_MEDIA_V1, SCREEN_WHATSAPP_PDF_PREVIEW_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V2, SCREEN_WHATSAPP_UX_V1, WHATSAPP_REPLY_INSET_MAX, type WhatsAppComposeProvider, type WhatsAppDraftsMessage, type WhatsAppMediaReply, type WhatsAppMediaRequest, type WhatsAppOpenThreadMessage, type WhatsAppOutboundEchoMessage, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
 import type { WhatsAppMediaDownloadResult } from "./screenServices";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
@@ -75,6 +75,7 @@ export interface ScreenActions {
     provider?: WhatsAppComposeProvider,
   ): Promise<WhatsAppMediaDownloadResult>;
   onWhatsAppMediaSave?(bytes: ArrayBuffer, mimeType: string, fileName: string): void;
+  onWhatsAppPdfPreview?(conversationId: string, messageId: string, provider?: WhatsAppComposeProvider): void;
   onWhatsAppThreadUnread?(conversationId: string, provider: WhatsAppComposeProvider, unread: boolean): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
@@ -265,6 +266,7 @@ export abstract class FrameChannel {
   protected whatsappReplyLayout(_nomination: number, _bounds: WhatsAppReplyBounds | null): void { this.close(true); }
   protected whatsappReplyInsetReady(_nomination: number, _seq: number, _px: number): void { this.close(true); }
   protected whatsappMedia(_request: WhatsAppMediaRequest): void { this.close(true); }
+  protected whatsappPdfPreview(_conversationId: string, _messageId: string, _provider?: WhatsAppComposeProvider): void { this.close(true); }
   protected whatsappThreadUnread(_conversationId: string, _provider: WhatsAppComposeProvider, _unread: boolean): void { this.close(true); }
   /** screen.v2 host-mediated audio capture/upload: a frame kind without it closes. */
   protected audio(_request: AudioRequest): void { this.close(true); }
@@ -325,6 +327,10 @@ export abstract class FrameChannel {
       if (child.op === "whatsapp-media") {
         if (!this.ready) { this.close(true); return; }
         this.whatsappMedia(child);
+      }
+      if (child.op === "whatsapp-pdf-preview") {
+        if (!this.ready) { this.close(true); return; }
+        this.whatsappPdfPreview(child.conversation_id, child.message_id, child.provider);
       }
       if (child.op === "whatsapp-thread-unread") {
         if (!this.ready) { this.close(true); return; }
@@ -422,6 +428,7 @@ export class ScreenChannel extends FrameChannel {
   private wantsReplyAvailability = false;
   private wantsReplyLayout = false;
   private wantsReplyOverlay = false;
+  private wantsWhatsAppPdfPreview = false;
   private wantsWhatsAppUx = false;
   get whatsappUx(): boolean { return this.wantsWhatsAppUx && !this.closed; }
   private replyInset: number | undefined;
@@ -525,6 +532,10 @@ export class ScreenChannel extends FrameChannel {
   protected override whatsappThreadUnread(conversationId: string, provider: WhatsAppComposeProvider, unread: boolean): void {
     if (!this.wantsWhatsAppUx || !this.actions?.onWhatsAppThreadUnread) { this.close(true); return; }
     this.actions.onWhatsAppThreadUnread(conversationId, provider, unread);
+  }
+  protected override whatsappPdfPreview(conversationId: string, messageId: string, provider?: WhatsAppComposeProvider): void {
+    if (!this.wantsWhatsAppPdfPreview || !this.actions?.onWhatsAppPdfPreview) { this.close(true); return; }
+    this.actions.onWhatsAppPdfPreview(conversationId, messageId, provider);
   }
   whatsappOpenThread(conversationId: string): void {
     if (!this.closed && this.ready && this.wantsWhatsAppUx) {
@@ -943,6 +954,10 @@ export class ScreenChannel extends FrameChannel {
     if (wantsWhatsAppMedia && (!records || !admitsWhatsAppMediaDownload(this.receipt) ||
         this.projection.installation.name !== "waba" || !this.actions?.onWhatsAppMediaDownload)) return false;
     this.wantsWhatsAppMedia = wantsWhatsAppMedia;
+    const wantsWhatsAppPdfPreview = accepts.includes(SCREEN_WHATSAPP_PDF_PREVIEW_V1);
+    if (wantsWhatsAppPdfPreview && (!records || !admitsWhatsAppMediaDownload(this.receipt) ||
+        this.projection.installation.name !== "waba" || !this.actions?.onWhatsAppPdfPreview)) return false;
+    this.wantsWhatsAppPdfPreview = wantsWhatsAppPdfPreview;
     const wantsWhatsAppUx = accepts.includes(SCREEN_WHATSAPP_UX_V1);
     if (wantsWhatsAppUx && (!records || this.surfaceRole !== "primary" ||
         this.projection.installation.name !== "waba" || !this.actions?.onWhatsAppThreadUnread)) return false;

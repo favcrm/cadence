@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslate } from "../../lib/locale";
 import Md, { CodeSurface } from "../../ui/Md";
 import { artifactBytes } from "./artifactClient";
+import { openPdfOverlay } from "./canvasStore";
 import { CSV_MAX_COLS, CSV_MAX_ROWS, parseCsv } from "./csv";
 import type { ArtifactKind } from "./canvasStore";
 import ImageOverlay from "./ImageOverlay";
+import PdfDocumentView from "./PdfDocumentView";
 import { parseDocxPreview, parsePptxPreview, type DocxPreview, type PptxPreview } from "./officePreview";
 import WorkbookPreview from "./workbook/WorkbookPreview";
 
@@ -198,7 +200,6 @@ export default function ArtifactView({
   /** Open this Office file directly in an editable Works tab. */
   onOpenInWorks?: () => void;
 }) {
-  const t = useTranslate();
   switch (kind) {
     case "md":
       return (
@@ -248,23 +249,21 @@ export default function ArtifactView({
         </div>
       );
     case "pdf":
-      // No inline PDF: the board CSP allows no blob/object source, so the
-      // drawer offers Open in new tab (top-level blob navigation) and Download.
       return (
-        <div className="canvas-doc canvas-pdf" data-artifact-view="pdf">
-          <p className="text-body text-ink-100">{title}</p>
-          <p className="num text-micro text-ink-500">PDF · {sizeLabel(data.bytes.byteLength)}</p>
-          <p className="text-micro text-ink-400">{t("A preview is not available yet. Open in a new tab or use Download.")}</p>
-          <div className="flex flex-wrap items-center gap-3 pt-1">
-            <button
-              type="button"
-              className="lnk text-micro"
-              onClick={() => openPdfInTab(data.bytes)}
-            >
-              {t("Open in new tab")}
-            </button>
-          </div>
-        </div>
+        <PdfDocumentView
+          title={title}
+          bytes={data.bytes}
+          onOpenTab={() => openPdfInTab(data.bytes)}
+          onDownload={() => saveBytes(data.bytes, data.mime, downloadName(title, kind, data.mime))}
+          onOpenOverlay={() =>
+            openPdfOverlay({
+              title,
+              bytes: data.bytes,
+              mime: data.mime,
+              fileName: downloadName(title, kind, data.mime),
+            })
+          }
+        />
       );
     case "xlsx":
       return (
