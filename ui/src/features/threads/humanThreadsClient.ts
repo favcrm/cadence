@@ -64,12 +64,23 @@ export interface HumanRoomEvent {
   created: number;
 }
 
+export interface HumanActiveAgent {
+  id: string;
+  alias: string;
+  look?: string | null;
+  state: "queued" | "working";
+  started_at: number;
+  step?: string;
+}
+
 export interface HumanRoomPage {
   room: string;
   scope_id: string;
   members: HumanMember[];
   posts: HumanPost[];
   events: HumanRoomEvent[];
+  /** Live unsettled `@agent` dispatches in this room (omitted on older servers). */
+  active_agents?: HumanActiveAgent[];
   before: string | null;
   more_before: boolean;
   /** Fresh permission hint for an explicit Ask. */
@@ -210,6 +221,17 @@ function roomEvent(value: unknown): value is HumanRoomEvent {
     && typeof ev.created === "number";
 }
 
+function activeAgent(value: unknown): value is HumanActiveAgent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const ag = value as Record<string, unknown>;
+  return typeof ag.id === "string" && ag.id.length > 0
+    && typeof ag.alias === "string" && ag.alias.length > 0
+    && (ag.state === "queued" || ag.state === "working")
+    && typeof ag.started_at === "number"
+    && (ag.look === undefined || ag.look === null || typeof ag.look === "string")
+    && (ag.step === undefined || typeof ag.step === "string");
+}
+
 function invalidRoomResponse(): ApiError {
   return new ApiError("The server returned an invalid human room response", 502);
 }
@@ -229,6 +251,7 @@ export function readHumanRoom(id: string, at: { before?: string; limit?: number 
         && (member.look === undefined || member.look === null || typeof member.look === "string"))
       || !Array.isArray(page.posts) || !page.posts.every(humanPost)
       || !Array.isArray(page.events) || !page.events.every(roomEvent)
+      || (page.active_agents !== undefined && (!Array.isArray(page.active_agents) || !page.active_agents.every(activeAgent)))
       || typeof page.can_ask !== "boolean"
       || typeof page.can_manage !== "boolean"
       || typeof page.agent_chain_count !== "number"

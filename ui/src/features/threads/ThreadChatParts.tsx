@@ -87,6 +87,119 @@ export function Turn({
   );
 }
 
+export type ChannelDeliveryStatus = "sending" | "sent" | "failed";
+
+/** WhatsApp-style channel bubble (CAD-2892): distinct incoming surface + subtle
+ *  border, asymmetric corners, optional sender grouping, Agent pill, and inline
+ *  bottom-right timestamp + delivery status via CSS `display: flow-root`. */
+export function ChannelTurn({
+  who,
+  at,
+  me,
+  senderKind,
+  grouped = false,
+  status,
+  markdown,
+  inlineFormat,
+  attachments,
+  after,
+  onOpenIssue,
+  knownIssue,
+  avatar,
+  children,
+}: {
+  who: string;
+  at?: string;
+  me?: boolean;
+  senderKind?: "human" | "agent";
+  grouped?: boolean;
+  status?: ChannelDeliveryStatus;
+  markdown?: boolean;
+  inlineFormat?: boolean;
+  attachments?: ReactNode;
+  after?: ReactNode;
+  onOpenIssue?: (id: string) => void;
+  knownIssue?: (id: string) => boolean;
+  avatar?: ReactNode;
+  children: ReactNode;
+}) {
+  const t = useTranslate();
+  const hasBody = typeof children !== "string" || children.trim() !== "" || !attachments;
+  const isAgent = !me && senderKind === "agent";
+  const statusGlyph =
+    status === "sending" ? "◷" : status === "failed" ? "!" : status === "sent" ? "✓" : null;
+  const statusLabel =
+    status === "sending"
+      ? t("Sending…")
+      : status === "failed"
+        ? t("Failed to send")
+        : status === "sent"
+          ? t("Sent")
+          : undefined;
+
+  return (
+    <div
+      className={`threads-wa-turn ${me ? "is-me" : "is-them"} ${isAgent ? "is-agent" : ""} ${grouped ? "is-grouped" : ""} ${status ? `is-${status}` : ""}`}
+      data-chat-message={me ? "user" : isAgent ? "agent" : "human"}
+    >
+      {!me && (
+        <div className="threads-wa-avatar" aria-hidden>
+          {grouped ? null : avatar}
+        </div>
+      )}
+      <div className="threads-wa-col">
+        <div className={`threads-wa-bubble ${me ? "is-me" : "is-them"} ${isAgent ? "is-agent" : ""}`}>
+          {!me && !grouped && (
+            <div className="threads-wa-sender">
+              <span className="threads-wa-sender-name">{who}</span>
+              {isAgent && <span className="threads-wa-agent-pill">{t("Agent")}</span>}
+            </div>
+          )}
+          {me && <span className="sr-only">{who}</span>}
+          <div className="threads-wa-flow">
+            {hasBody && (
+              <div
+                className={`threads-wa-body [overflow-wrap:anywhere] ${
+                  me || inlineFormat
+                    ? ""
+                    : markdown && typeof children === "string"
+                      ? "answer"
+                      : "whitespace-pre-wrap"
+                }`}
+              >
+                {(me || inlineFormat) && typeof children === "string" ? (
+                  <OperatorText text={readableAnswer(children)} />
+                ) : markdown && typeof children === "string" ? (
+                  <div className="answer-body issue-reader">
+                    <Md text={children} idTokens onOpen={onOpenIssue} knownIssue={knownIssue} />
+                  </div>
+                ) : (
+                  children
+                )}
+              </div>
+            )}
+            {attachments}
+            {(at || statusGlyph) && (
+              <span className="threads-wa-meta num" title={statusLabel}>
+                {at ? <span className="threads-wa-at">{at}</span> : null}
+                {statusGlyph ? (
+                  <span
+                    className={`threads-wa-tick is-${status}`}
+                    aria-label={statusLabel}
+                  >
+                    {statusGlyph}
+                  </span>
+                ) : null}
+              </span>
+            )}
+          </div>
+        </div>
+        {after}
+      </div>
+    </div>
+  );
+}
+
 export type ComposerMode = "post" | "ask";
 
 /** The shared frame above a composer: Post or Ask mode, the Ask target

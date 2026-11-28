@@ -70,7 +70,7 @@ function previewOf(conversation: string | null): string | null {
  * block's first line on — concatenation cannot smuggle it past the check.
  * A token-bearing body is withheld whole, as it is for reasoning.
  */
-function previewText(text: string): string | null {
+export function sanitizePreviewText(text: string): string | null {
   const bounded = text.length > PREVIEW_TEXT_MAX ? text.slice(0, PREVIEW_TEXT_MAX) : text;
   if (carriesSecret(bounded)) return null;
   let offset = 0;
@@ -86,6 +86,8 @@ function previewText(text: string): string | null {
   }
   return bounded.trim() === "" ? null : bounded;
 }
+
+const previewText = sanitizePreviewText;
 
 /** Replace `conversation`'s live text; null clears it. */
 export function setConversationPreview(conversation: string | null, text: string | null): void {
