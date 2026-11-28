@@ -2,21 +2,21 @@ import { useEffect, useState, type ReactNode } from "react";
 import DrawerShell from "../app-shell/shared/DrawerShell";
 import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
-import { canvasSnapshot, openArtifact } from "../canvas/canvasStore";
+import { canvasSnapshot, feedCanvas, openArtifact } from "../canvas/canvasStore";
 import {
   fetchActionBatchDetail,
   type ActionBatchItemStatus,
   type ActionBatchStatus,
   type StagedBatchItem,
 } from "./actionBatch";
-import { ageText, askedBy, isolate, type StagedWrite } from "./stagedWrite";
+import { ageText, askedBy, isolate, visible, type StagedWrite } from "./stagedWrite";
 import type { Attempt, DecisionNotice } from "./useDecisions";
 
 type Say = (english: string) => string;
 type ItemFilter = "all" | "failed" | "pending" | "applied";
 
 const B = ({ children }: { children: ReactNode }) => (
-  <bdi>{typeof children === "string" ? isolate(children) : children}</bdi>
+  <bdi>{typeof children === "string" ? isolate(visible(children)) : children}</bdi>
 );
 
 function itemStatusTone(status: ActionBatchItemStatus): "ok" | "warn" | "fail" | "info" | "muted" {
@@ -233,12 +233,23 @@ export default function ActionBatchDrawer({
 
   const openCanvasPreview = () => {
     if (!batch.previewArtifactId) return;
-    const existing = canvasSnapshot().tabs.find((tab) => tab.id === batch.previewArtifactId);
+    const snap = canvasSnapshot();
+    const existing = snap.tabs.find((tab) => tab.id === batch.previewArtifactId);
+    if (snap.conversation === null) {
+      feedCanvas({
+        conversation: conversation ?? "batch:preview",
+        surface: "home",
+        composerKey: null,
+        cards: [],
+        working: null,
+        turn: null,
+      });
+    }
     openArtifact({
       id: batch.previewArtifactId,
       version: existing?.latest ?? 1,
       kind: existing?.kind && existing.kind !== "app" && existing.kind !== "record" && existing.kind !== "workbook" ? existing.kind : "html",
-      title: existing?.title || batch.title,
+      title: existing?.title || visible(batch.title),
     });
     onClose();
   };

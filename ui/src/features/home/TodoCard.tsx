@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
-import { isolate } from "../decisions/stagedWrite";
+import { isolate, visible } from "../decisions/stagedWrite";
 import { ageWords, kindSpec, type HomeNeed } from "./needs";
 import { cleanPermissionInline } from "./permissionFormat";
 import { todoPresentation } from "./railModel";
@@ -87,7 +87,7 @@ export default function TodoCard({
         <div className="todo-batch-summary">
           {stagedDetail ? (
             <span>
-              <bdi>{isolate(stagedDetail)}</bdi>
+              <bdi>{isolate(visible(stagedDetail))}</bdi>
             </span>
           ) : null}
           {(batch.status === "running" || batch.status === "partial_failed" || batch.completedCount > 0) && (
@@ -109,7 +109,7 @@ export default function TodoCard({
             <div className="todo-batch-samples">
               {batch.sampleItems.slice(0, 3).map((item) => (
                 <span key={item.itemKey} className="todo-batch-chip">
-                  <bdi>{isolate(item.recipient ?? item.label)}</bdi>
+                  <bdi>{isolate(visible(item.recipient ?? item.label))}</bdi>
                 </span>
               ))}
               {batch.totalCount > 3 && (

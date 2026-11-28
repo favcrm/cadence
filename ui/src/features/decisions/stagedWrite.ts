@@ -684,13 +684,13 @@ function parseActionBatch(
   return {
     ...base,
     kind: "action_batch",
-    title: batch.title,
+    title: visible(batch.title),
     app: "Batch",
     target: { kind: "batch", label: `${batch.totalCount} items`, id: batch.batchKey },
     changes: [],
     unchangedCount: 0,
     changesComplete: true,
-    reason: batch.summary,
+    reason: batch.summary ? visible(batch.summary) : null,
     consent: null,
     effects: [],
     raw: visible(rawText(row.batch ?? row.input)),
@@ -749,7 +749,8 @@ export const isUncertain = (write: StagedWrite): boolean =>
   (write.result.code === "uncertain" || write.result.retry === true);
 
 export function outcomeOf(write: StagedWrite): StagedOutcome {
-  if (write.kind === "action_batch" && write.batch) {
+  if (write.kind === "action_batch") {
+    if (!write.batch) return "unconfirmed";
     if (write.batch.status === "pending" || write.batch.status === "running") return "pending";
     if (write.batch.status === "denied") return "denied";
     if (write.batch.status === "completed") return "applied";

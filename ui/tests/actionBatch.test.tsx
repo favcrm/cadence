@@ -70,7 +70,19 @@ async function main() {
   const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import("../src/features/home/NeedsRail")).default;
   const { resetTodoLocal } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
   const { homeDecisions } = require("../src/features/decisions/useDecisions") as typeof import("../src/features/decisions/useDecisions");
+  const { parseStagedRow } = require("../src/features/decisions/stagedWrite") as typeof import("../src/features/decisions/stagedWrite");
   const { canvasSnapshot, resetCanvas } = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
+
+  assert(
+    parseStagedRow({
+      id: "c".repeat(32),
+      tool: "action_batch",
+      status: "approved",
+      createdAt: Date.now(),
+      input: { title: "Missing batch summary" },
+    }) === null,
+    "Approved action_batch without batch summary fails closed instead of showing Completed",
+  );
 
   const makeItems = (count: number, statusFor = (_n: number) => "pending" as string) =>
     Array.from({ length: count }, (_, idx) => {
@@ -384,7 +396,12 @@ async function main() {
       await click(rail2.cards()[0]!.querySelector(".todo-hit"));
       await settle(() => assert(drawerEl() !== null, "Reopened drawer"));
       await click(drawerEl()!.querySelector("[data-batch-preview-canvas]"));
-      assert(canvasSnapshot().open === true && canvasSnapshot().active === "art_batch_preview_1", "Preview link opens preview_artifact_id in Canvas");
+      assert(
+        canvasSnapshot().open === true &&
+          canvasSnapshot().conversation === "batch:preview" &&
+          canvasSnapshot().active === "art_batch_preview_1",
+        "Preview link binds fallback conversation and opens preview_artifact_id in Canvas",
+      );
       await rail2.unmount();
     } finally {
       Date.now = realDateNow;

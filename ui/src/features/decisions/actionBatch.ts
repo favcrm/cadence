@@ -63,15 +63,11 @@ const ITEM_STATUSES: ReadonlySet<string> = new Set([
   "denied",
 ]);
 
-const HIDDEN_CHARS = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g;
-const clean = (text: string): string =>
-  text.replace(HIDDEN_CHARS, (c) => `[U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}]`);
-
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 
 const str = (v: unknown): string | null =>
-  typeof v === "string" && v.trim() !== "" ? clean(v) : null;
+  typeof v === "string" && v.trim() !== "" ? v : null;
 
 const intOr = (v: unknown, fallback = 0): number =>
   typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.trunc(v)) : fallback;
@@ -123,15 +119,16 @@ export function parseBatchSummary(
   if (!id || !title || !batchKey) return null;
 
   const statusCandidate = src && typeof src.status === "string" ? src.status : undefined;
-  const derivedFallbackStatus =
-    fallbackStatus === "denied"
-      ? "denied"
-      : fallbackStatus === "approved"
-        ? "completed"
-        : "pending";
-  const status = (
-    statusCandidate && BATCH_STATUSES.has(statusCandidate) ? statusCandidate : derivedFallbackStatus
-  ) as ActionBatchStatus;
+  // Fail closed when an approved row arrives without an authoritative batch status.
+  const status: ActionBatchStatus | null =
+    statusCandidate && BATCH_STATUSES.has(statusCandidate)
+      ? (statusCandidate as ActionBatchStatus)
+      : fallbackStatus === "denied"
+        ? "denied"
+        : fallbackStatus === "pending"
+          ? "pending"
+          : null;
+  if (status === null) return null;
 
   const totalCount = Math.max(
     1,
@@ -174,6 +171,11 @@ export function parseBatchSummary(
 export const isBatchActive = (batch: Pick<StagedBatch, "status"> | null | undefined): boolean =>
   batch?.status === "pending" || batch?.status === "running" || batch?.status === "partial_failed";
 
+/**
+ * Fetch the full batch record (`{ batch: { batch: ActionBatchSummary, items: ActionBatchItemSummary[] } }`)
+ * matching `agenticos-v2` `GET /api/assist/actions/:id/batch` (`assistant/actions.ts`,
+ * `session.ts::getActionBatch`, and `packages/contracts/src/action-batch.ts`).
+ */
 export async function fetchActionBatchDetail(
   id: string,
   conversation: string | null,
