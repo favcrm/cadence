@@ -341,7 +341,7 @@ export function useAssistantComposerLabels(): { placeholder: string; ariaLabel: 
   );
 }
 
-const LOOK_LABEL: Record<AvatarLook, string> = {
+export const LOOK_LABEL: Record<AvatarLook, string> = {
   builder: "Builder",
   guard: "Guard",
   bookkeeper: "Bookkeeper",
@@ -355,9 +355,17 @@ const LOOK_LABEL: Record<AvatarLook, string> = {
   custom: "Custom",
 };
 
-/** The info control beside the actor's name. Opens the read-only details
- *  and (for the owning actor) the supported edit affordances. */
-export function AssistantAboutButton({ className = "", profileHref }: { className?: string; profileHref?: string }) {
+/** The info control beside or around the actor's identity. Opens the
+ *  About drawer (read-only for personal scope; guarded editor for workspace). */
+export function AssistantAboutButton({
+  className = "",
+  profileHref,
+  children,
+}: {
+  className?: string;
+  profileHref?: string;
+  children?: ReactNode;
+}) {
   const t = useTranslate();
   const actor = useAssistantActor();
   const [open, setOpen] = useState(false);
@@ -373,7 +381,7 @@ export function AssistantAboutButton({ className = "", profileHref }: { classNam
         aria-expanded={open}
         onClick={() => setOpen(true)}
       >
-        <IconInfo size={14} />
+        {children ?? <IconInfo size={14} />}
       </button>
       {open && <AssistantAboutDialog actor={actor} profileHref={profileHref} onClose={() => setOpen(false)} />}
     </>
@@ -450,13 +458,27 @@ function AssistantAboutDialog({
           )}
         </dl>
 
-        {profileHref && <Button href={profileHref}>{t("View assistant profile")}</Button>}
-
         {actor.scope === "personal" ? (
-          <PersonalIdentityDetails actor={actor} identity={identity} />
-        ) : actor.scope === "workspace" ? (
-          <WorkspaceIdentityDetails actor={actor} identity={identity} />
-        ) : null}
+          <>
+            <p className="assistant-about-note">
+              {profileHref
+                ? t("Private to you in this workspace. Edit avatar, name, tone, or instructions on your assistant’s profile page.")
+                : t("Ask me in this conversation to change my name or how I communicate. Your history and access stay the same.")}
+            </p>
+            {profileHref && (
+              <Button variant="primary" href={profileHref}>
+                {t("View assistant profile")}
+              </Button>
+            )}
+          </>
+        ) : (
+          <>
+            {profileHref && <Button href={profileHref}>{t("View assistant profile")}</Button>}
+            {actor.scope === "workspace" ? (
+              <WorkspaceIdentityDetails actor={actor} identity={identity} />
+            ) : null}
+          </>
+        )}
       </div>
     </DrawerShell>
   );
@@ -792,231 +814,6 @@ export function AssistantBootstrapCard({
         </div>
       </form>
     </section>
-  );
-}
-
-function PersonalIdentityDetails({
-  actor,
-  identity,
-}: {
-  actor: AssistantActorValue;
-  identity: IdentityRecord | null;
-}) {
-  const t = useTranslate();
-  const request = actor.personal;
-  const [directUnsupported, setDirectUnsupported] = useState(false);
-  const [fallbackNote, setFallbackNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
-
-  if (request?.saveProfile !== undefined && identity !== null && !directUnsupported) {
-    return (
-      <PersonalIdentityEditor
-        request={request}
-        identity={identity}
-        onUnsupported={(lookChanged) => {
-          setDirectUnsupported(true);
-          setFallbackNote(
-            t("Direct profile edits aren’t available on this board yet. Ask in chat to change my name."),
-          );
-          if (lookChanged !== null) void request.requestLook(lookChanged);
-        }}
-      />
-    );
-  }
-
-  const pick = async (look: AvatarLook) => {
-    if (request === null || sending) return;
-    setError(null);
-    setSending(true);
-    const result = await request.requestLook(look);
-    setSending(false);
-    if (!result.ok) setError(result.error ?? t("The avatar request was not sent."));
-  };
-
-  return (
-    <>
-      <p className="assistant-about-note">
-        {fallbackNote ?? t("Ask me in this conversation to change my name or how I communicate. Your history and access stay the same.")}
-      </p>
-      {request === null && (
-        <p className="assistant-about-note">{t("Avatar changes are unavailable on a read-only board.")}</p>
-      )}
-      <fieldset className="assistant-looks" disabled={request === null || identity === null}>
-        <legend className="text-label text-ink-300">{t("Avatar")}</legend>
-        <div className="assistant-look-grid">
-          {AVATAR_LOOKS.map((look) => (
-            <button
-              key={look}
-              type="button"
-              className="assistant-look"
-              aria-pressed={identity?.look === look}
-              aria-label={t(LOOK_LABEL[look])}
-              title={t(LOOK_LABEL[look])}
-              data-assistant-look={look}
-              disabled={sending}
-              onClick={() => void pick(look)}
-            >
-              <span className="assistant-face">
-                <AgentAvatar slug={look} size={34} still />
-              </span>
-            </button>
-          ))}
-        </div>
-      </fieldset>
-      {request?.pendingLook != null && (
-        <p className="assistant-about-pending" role="status">
-          {t("Avatar change requested. It appears here only after the assistant confirms and saves it.")}
-        </p>
-      )}
-      {error !== null && (
-        <p className="assistant-about-error" role="alert">
-          {error}
-        </p>
-      )}
-    </>
-  );
-}
-
-function PersonalIdentityEditor({
-  request,
-  identity,
-  onUnsupported,
-}: {
-  request: PersonalLookRequest;
-  identity: IdentityRecord;
-  onUnsupported: (lookChanged: AvatarLook | null) => void;
-}) {
-  const t = useTranslate();
-  const [base, setBase] = useState(identity);
-  const [name, setName] = useState(identity.name ?? "");
-  const [tone, setTone] = useState(identity.tone ?? "");
-  const [look, setLook] = useState<AvatarLook>(identity.look);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const stale = Number(identity.revision) > Number(base.revision);
-
-  const nextName = name.trim() === "" ? null : name.trim();
-  const nextTone = tone.trim() === "" ? null : tone.trim();
-  const dirty = nextName !== base.name || nextTone !== base.tone || look !== base.look;
-
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!request.saveProfile || pending || !dirty || stale) return;
-    setPending(true);
-    setError(null);
-    setNotice(null);
-    const result = await request.saveProfile({
-      expected_revision: Number(base.revision),
-      ...(nextName !== base.name ? { name: nextName ?? "" } : {}),
-      ...(nextTone !== base.tone ? { tone: nextTone ?? "" } : {}),
-      ...(look !== base.look ? { look } : {}),
-    });
-    setPending(false);
-    if (!result.ok) {
-      if (result.unsupported) {
-        onUnsupported(look !== base.look ? look : null);
-        return;
-      }
-      setError(t(result.error));
-      return;
-    }
-    setBase(result.identity);
-    setName(result.identity.name ?? "");
-    setTone(result.identity.tone ?? "");
-    setLook(result.identity.look);
-    setNotice(t("Saved. The new identity applies to the next turn."));
-  };
-
-  return (
-    <form className="assistant-edit" onSubmit={(event) => void submit(event)}>
-      <p className="assistant-about-note">
-        {t("Private to you in this workspace. Ask in chat anytime to adjust how I communicate.")}
-      </p>
-      <fieldset className="assistant-looks" disabled={pending}>
-        <legend className="text-label text-ink-300">{t("Avatar")}</legend>
-        <div className="assistant-look-grid">
-          {AVATAR_LOOKS.map((option) => (
-            <button
-              key={option}
-              type="button"
-              className="assistant-look"
-              aria-pressed={look === option}
-              aria-label={t(LOOK_LABEL[option])}
-              title={t(LOOK_LABEL[option])}
-              data-assistant-look={option}
-              onClick={() => setLook(option)}
-            >
-              <span className="assistant-face">
-                <AgentAvatar slug={option} size={34} still />
-              </span>
-            </button>
-          ))}
-        </div>
-      </fieldset>
-      {stale && (
-        <>
-          <p className="assistant-about-pending" role="status">
-            {t("Your assistant identity changed elsewhere. Your draft has been kept. Reload before editing again.")}
-          </p>
-          <Button
-            type="button"
-            size="sm"
-            disabled={pending}
-            onClick={() => {
-              setBase(identity);
-              setName(identity.name ?? "");
-              setTone(identity.tone ?? "");
-              setLook(identity.look);
-              setError(null);
-              setNotice(null);
-            }}
-          >
-            {t("Reload identity")}
-          </Button>
-        </>
-      )}
-      {error !== null && (
-        <p className="assistant-about-error" role="alert">
-          {`${t("The save could not be confirmed. Refresh to check the saved identity; it was not retried.")} ${error}`}
-        </p>
-      )}
-      {notice !== null && (
-        <p className="assistant-about-pending" role="status">
-          {notice}
-        </p>
-      )}
-      <div className="assistant-name-row">
-        <label className="assistant-field">
-          <span>{t("Display name")}</span>
-          <input
-            className="field"
-            value={name}
-            maxLength={80}
-            disabled={pending}
-            autoComplete="off"
-            onChange={(event) => setName(event.target.value)}
-            placeholder={t("Not named yet")}
-          />
-        </label>
-        <label className="assistant-field">
-          <span>{t("Tone")}</span>
-          <input
-            className="field"
-            value={tone}
-            maxLength={80}
-            disabled={pending}
-            autoComplete="off"
-            onChange={(event) => setTone(event.target.value)}
-            placeholder={t("e.g. Concise & direct")}
-          />
-        </label>
-        <Button type="submit" variant="primary" loading={pending} disabled={pending || !dirty || stale}>
-          {pending ? t("Saving…") : t("Save identity")}
-        </Button>
-      </div>
-    </form>
   );
 }
 

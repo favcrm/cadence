@@ -52,7 +52,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const CanvasDrawer = require("../src/features/canvas/CanvasDrawer").default;
 const HomeComposer = require("../src/features/home/Composer").default as typeof import("../src/features/home/Composer").default;
-const { BrowserCard } = require("../src/features/canvas/BrowserPanel") as typeof import("../src/features/canvas/BrowserPanel");
+const { BrowserCard, BrowserHeaderToggle } = require("../src/features/canvas/BrowserPanel") as typeof import("../src/features/canvas/BrowserPanel");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const canvasStore = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
 const store = require("../src/features/canvas/browserStore") as typeof import("../src/features/canvas/browserStore");
@@ -2172,6 +2172,36 @@ for (const next of ["ended", "none"] as const) {
   board.startStatus = 404;
   await click(btn(m, "start")!);
   assert(toasts.some((msg) => msg.includes("isn't supported")), "404 on older board degrades with a clear toast");
+  await m.unmount();
+}
+
+// ===== BrowserHeaderToggle: gated on availability, toggles Browser panel =====
+{
+  const unavailable = await start({ state: "none", signedIn: false, url: null, instructions: null }, "unavailable");
+  const unavailHost = document.createElement("div");
+  const unavailRoot = createRoot(unavailHost);
+  await React.act(async () => {
+    unavailRoot.render(React.createElement(LocaleProvider, null, React.createElement(BrowserHeaderToggle)));
+  });
+  assert(unavailHost.querySelector("[data-browser-toggle]") === null, "BrowserHeaderToggle hides when browser is unavailable");
+  await React.act(async () => { unavailRoot.unmount(); });
+  await unavailable.unmount();
+
+  const m = await start({ state: "none", signedIn: false, url: null, instructions: null });
+  const toggleHost = document.createElement("div");
+  document.body.append(toggleHost);
+  const toggleRoot = createRoot(toggleHost);
+  await React.act(async () => {
+    toggleRoot.render(React.createElement(LocaleProvider, null, React.createElement(BrowserHeaderToggle)));
+  });
+  const toggleBtn = () => toggleHost.querySelector<HTMLButtonElement>("[data-browser-toggle]");
+  assert(toggleBtn() !== null && toggleBtn()!.getAttribute("aria-pressed") === "false", "BrowserHeaderToggle renders unpressed when Browser drawer is closed");
+  await click(toggleBtn()!);
+  assert(toggleBtn()!.getAttribute("aria-pressed") === "true" && !panel(m)!.hasAttribute("hidden"), "BrowserHeaderToggle opens Browser panel and marks pressed");
+  await click(toggleBtn()!);
+  assert(toggleBtn()!.getAttribute("aria-pressed") === "false" && (panel(m) === null || panel(m)!.hasAttribute("hidden")), "second click closes Browser drawer");
+  await React.act(async () => { toggleRoot.unmount(); });
+  toggleHost.remove();
   await m.unmount();
 }
 

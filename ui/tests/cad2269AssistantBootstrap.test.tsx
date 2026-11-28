@@ -65,6 +65,8 @@ async function main() {
     toPersonalUpdateMutation,
   } = require("../src/features/assistant/AssistantIdentity") as typeof import("../src/features/assistant/AssistantIdentity");
   const SetupNudge = (require("../src/features/setup/SetupNudge") as typeof import("../src/features/setup/SetupNudge")).default;
+  const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+  const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 
   const host = document.createElement("div");
   document.body.appendChild(host);
@@ -200,100 +202,81 @@ async function main() {
   );
   assert(unsupportedSkipBtn.disabled, "404/501 defer disables retrying unsupported endpoint");
 
-  // 3. Hosted AssistantAboutDialog saves Name + Avatar directly, and falls back to requestLook on 501.
-  const chatLookRequests: AvatarLook[] = [];
-  let simulateUnsupported = false;
-  const savedUpdates: Array<{ expected_revision: number; name?: string | null; look?: AvatarLook }> = [];
-
-  const renderAbout = async () => {
+  // 3. Slim personal AssistantAboutDialog renders read-only details + profile link without inline identity editing.
+  const renderAbout = async (profileHref?: string, withChildTrigger = false) => {
     const actor: AssistantActorValue = {
       scope: "personal",
       alias: "assistant",
-      read: { state: "ready", identity: { name: "Nova", tone: null, look: "guard", revision: 2 } },
+      model: "agenticos/default",
+      read: { state: "ready", identity: { name: "Nova", tone: "Concise & direct", look: "guard", revision: 2 } },
       personal: {
         pendingLook: null,
-        requestLook: async (look) => {
-          chatLookRequests.push(look);
-          return { ok: true };
-        },
-        saveProfile: async (change) => {
-          savedUpdates.push(change);
-          if (simulateUnsupported) {
-            return { ok: false, unsupported: true, error: "501" };
-          }
-          return {
-            ok: true,
-            identity: {
-              name: change.name === undefined || change.name === "" ? null : change.name,
-              tone: null,
-              look: change.look ?? "guard",
-              revision: 3,
-            },
-          };
-        },
+        requestLook: async () => ({ ok: true }),
       },
       workspace: null,
     };
     await act(async () => {
       root.render(
-        React.createElement(AssistantActorProvider, {
-          actor,
-          children: React.createElement(AssistantAboutButton),
+        React.createElement(NavigationProvider, {
+          adapter: hostNavigation,
+          children: React.createElement(AssistantActorProvider, {
+            actor,
+            children: React.createElement(
+              AssistantAboutButton,
+              profileHref ? { profileHref, className: withChildTrigger ? "assistant-identity-trigger" : "" } : {},
+              withChildTrigger ? React.createElement("span", null, "Nova") : undefined,
+            ),
+          }),
         }),
       );
     });
   };
 
-  await renderAbout();
-  const trigger = host.querySelector<HTMLButtonElement>(".assistant-about-trigger");
-  assert(trigger !== null, "About trigger rendered");
+  await renderAbout("/agents/assistant?tab=instructions", true);
+  const trigger = host.querySelector<HTMLButtonElement>(".assistant-about-trigger.assistant-identity-trigger");
+  assert(trigger !== null && trigger.textContent === "Nova", "Identity trigger renders custom child label");
   await act(async () => {
     trigger.click();
   });
 
   const dialog = document.body.querySelector<HTMLElement>("[role='dialog']");
   assert(dialog !== null, "About dialog opened");
-  const nameInput = dialog.querySelector<HTMLInputElement>("input.field");
-  assert(nameInput !== null && nameInput.value === "Nova", "About dialog pre-fills committed personal name");
-
-  // Direct save on 200
-  const designerBtn = dialog.querySelector<HTMLButtonElement>('[data-assistant-look="designer"]');
-  assert(designerBtn !== null, "designer swatch in About dialog");
-  await act(async () => {
-    designerBtn.click();
-  });
-  const saveBtn = dialog.querySelector<HTMLButtonElement>('button[type="submit"]');
-  assert(saveBtn !== null && !saveBtn.disabled, "Save identity enabled on avatar change");
-  await act(async () => {
-    saveBtn.click();
-  });
   assert(
-    savedUpdates.length === 1 && savedUpdates[0]?.expected_revision === 2 && savedUpdates[0]?.look === "designer",
-    "hosted About dialog saves directly via saveProfile",
+    dialog.querySelector("[data-assistant-name]")?.textContent === "Nova" &&
+      dialog.textContent?.includes("Concise & direct") === true &&
+      dialog.textContent?.includes("agenticos/default") === true,
+    "Slim About dialog displays committed name, tone, and model",
   );
-  assert(chatLookRequests.join(",") === "", "direct save burns zero chat turns");
-
-  // Older board 501 fallback -> forwards look change to requestLook and switches cleanly
-  simulateUnsupported = true;
-  const builderBtn = dialog.querySelector<HTMLButtonElement>('[data-assistant-look="builder"]');
-  assert(builderBtn !== null, "builder swatch in About dialog");
-  await act(async () => {
-    builderBtn.click();
-  });
-  const saveBtn2 = dialog.querySelector<HTMLButtonElement>('button[type="submit"]');
-  assert(saveBtn2 !== null, "Save identity button present before fallback");
-  await act(async () => {
-    saveBtn2.click();
-  });
   assert(
-    chatLookRequests.join(",") === "builder",
-    "501 unsupported response degrades cleanly to chat avatar request",
+    dialog.querySelector("input.field") === null &&
+      dialog.querySelector("[data-assistant-look]") === null &&
+      dialog.querySelector('button[type="submit"]') === null,
+    "Slim personal About dialog omits inline avatar, name, and tone editor controls",
+  );
+  const profileLink = dialog.querySelector<HTMLAnchorElement>("a[href='/agents/assistant?tab=instructions']");
+  assert(profileLink !== null, "Slim About dialog links to /agents/assistant?tab=instructions");
+
+  await act(async () => {
+    dialog.querySelector<HTMLButtonElement>("button.s-drawer-close")?.click();
+  });
+  await renderAbout(undefined, false);
+  const infoTrigger = host.querySelector<HTMLButtonElement>(".assistant-about-trigger");
+  assert(infoTrigger !== null, "Fallback About trigger rendered");
+  await act(async () => {
+    infoTrigger.click();
+  });
+  const dialogNoLink = document.body.querySelector<HTMLElement>("[role='dialog']");
+  assert(
+    dialogNoLink !== null &&
+      dialogNoLink.textContent?.includes("Ask me in this conversation") === true &&
+      dialogNoLink.querySelector("a[href]") === null,
+    "Personal About dialog without profileHref falls back to chat guidance note",
   );
 
   await act(async () => {
     root.unmount();
   });
-  console.log("CAD-2269 personal assistant bootstrap and hosted editor passed");
+  console.log("CAD-2269 personal assistant bootstrap and slim About drawer passed");
 }
 
 void main();

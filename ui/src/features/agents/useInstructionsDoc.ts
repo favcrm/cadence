@@ -118,6 +118,10 @@ export interface InstructionsDoc {
   personalSkills?: string[] | null;
   /** Personal only: opt-in tool groups saved on the caller's actor profile. */
   personalEnabledTools?: string[] | null;
+  /** Latest committed revision for `workspace`/`personal` docs, for cross-field sync. */
+  ownRevision?: string | number | null;
+  /** Updates the stored own-doc revision after an external profile field save. */
+  syncOwnRevision?: (revision: string | number) => void;
   /** Native: what the last save said about when the agent reads it. */
   applies: string | null;
   /** What the busy phase is doing, so a read is not labelled "Saving". */
@@ -387,6 +391,11 @@ export function useInstructionsDoc(opts: {
     return () => checkNative(deps, alias, s.text);
   };
 
+  const syncOwnRevision = useCallback((revision: string | number) => {
+    setOwn((cur) => (cur ? { ...cur, revision } : cur));
+    setTheirsOwn((cur) => (cur ? { ...cur, revision } : cur));
+  }, []);
+
   return {
     kind,
     read: state,
@@ -398,6 +407,8 @@ export function useInstructionsDoc(opts: {
     profile,
     personalSkills,
     personalEnabledTools,
+    ownRevision: isOwnKind(kind) ? (currentOwn?.revision ?? null) : null,
+    syncOwnRevision: isOwnKind(kind) ? syncOwnRevision : undefined,
     applies,
     working,
     selection,

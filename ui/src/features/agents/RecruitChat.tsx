@@ -4,6 +4,7 @@ import { cache, resources } from "../../lib/resources";
 import { useTranslate } from "../../lib/locale";
 import { useQuery, useResource } from "../../lib/useResource";
 import Button from "../../ui/Button";
+import { IconCaret } from "../../ui/icons";
 import { AssistantAboutButton, AssistantActorProvider, AssistantFace, useConversationActor } from "../assistant/AssistantIdentity";
 import { displayName, scopeDescriptor } from "../assistant/identity";
 import HireProposalCard from "./HireProposalCard";
@@ -64,13 +65,17 @@ export default function RecruitChat({
         ← {t("Agents")}
       </button>
       <div className="rc-head">
-        <AssistantFace size={32} />
         <div>
           <h1>{t("Recruit")}</h1>
-          <p data-assistant-name>{displayName(actor.read, actor.scope, t)}</p>
-          <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
+          <AssistantAboutButton className="assistant-identity-trigger">
+            <AssistantFace size={24} />
+            <span className="assistant-identity-text">
+              <span className="assistant-identity-name" data-assistant-name>{displayName(actor.read, actor.scope, t)}</span>
+              <span className="assistant-scope">{scopeDescriptor(actor.scope, t)}</span>
+            </span>
+            <IconCaret size={11} className="assistant-identity-chevron" />
+          </AssistantAboutButton>
         </div>
-        <AssistantAboutButton />
       </div>
       <HireGate reason={hireBlock} />
       {error && (

@@ -48,8 +48,9 @@ import {
 } from "./thread";
 import { ImageConversation } from "../canvas/imageConversation";
 import { useCanvasFeed } from "../canvas/feed";
-import { BrowserCard } from "../canvas/BrowserPanel";
+import { BrowserCard, BrowserHeaderToggle } from "../canvas/BrowserPanel";
 import { useBrowserFeed } from "../canvas/browserStore";
+import { IconCaret } from "../../ui/icons";
 import {
   AssistantAboutButton,
   AssistantActorProvider,
@@ -673,10 +674,15 @@ export default function MemberChat({
             data-assistant-identity="personal"
             data-identity-state={identity.state}
           >
-            <AssistantFace size={30} />
             <div className="assistant-heading-text">
               <div className="assistant-heading-name">
-                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(identity, "personal", t)}</h1>
+                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>
+                  <AssistantAboutButton className="assistant-identity-trigger" profileHref={personalAssistantProfileHref(actor.scope, actor.read, roster)}>
+                    <AssistantFace size={30} />
+                    <span className="assistant-identity-name">{displayName(identity, "personal", t)}</span>
+                    <IconCaret size={11} className="assistant-identity-chevron" />
+                  </AssistantAboutButton>
+                </h1>
                 {surface?.ok === false && (
                   <span className="chip bg-warn/10 text-warn">{t("unavailable")}</span>
                 )}
@@ -700,7 +706,7 @@ export default function MemberChat({
                   {t("Finish setup")}
                 </button>
               )}
-              <AssistantAboutButton profileHref={personalAssistantProfileHref(actor.scope, actor.read, roster)} />
+              <BrowserHeaderToggle />
             </div>
           </div>
 

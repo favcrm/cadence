@@ -8,6 +8,7 @@ import {
   alertBrowser,
   browserSnapshot,
   cancelStop,
+  closeBrowserDrawer,
   confirmStop,
   isBrowserPanelShown,
   needsStopConfirm,
@@ -775,5 +776,38 @@ export function BrowserCard() {
         trailing={handoff ? <span className="artopen">{openLabel}</span> : undefined}
       />
     </div>
+  );
+}
+
+/** Header toggle for the Agent Browser drawer: gated on availability,
+ *  carries the live status dot, and opens or closes the Browser tab. */
+export function BrowserHeaderToggle() {
+  const t = useTranslate();
+  const b = useBrowserTab();
+  const canvas = useCanvas();
+  if (b.availability !== "available") return null;
+  const shown = isBrowserPanelShown(canvas, b);
+  const st = browserStatus(b, t);
+  const label = `${t(shown ? "Hide Browser" : "Open Browser")} · ${st.text}`;
+  return (
+    <button
+      type="button"
+      className="btn btn-ghost bz-header-toggle"
+      data-browser-toggle=""
+      aria-pressed={shown}
+      aria-controls="bz-panel"
+      aria-label={label}
+      title={label}
+      onClick={() => (shown ? closeBrowserDrawer() : openBrowser())}
+    >
+      <GlobeIcon size={14} />
+      <span className="bz-header-toggle-label">{t("Browser")}</span>
+      <span
+        className="bz-dot"
+        style={{ "--c": TONE[st.tone] } as React.CSSProperties}
+        data-pulse={st.pulse || undefined}
+        aria-hidden
+      />
+    </button>
   );
 }
